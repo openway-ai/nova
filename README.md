@@ -13,13 +13,13 @@ AR models are fundamentally limited by their sequential generation process, whic
 NAR models offer structural advantages to enhance parallelism, safety and controllability
 This year, it is exciting to see more substantial progress in NAR modeling this year, which includes:
 
-- **EBT** Energy-Based Transformers are Scalable Learners and Thinkers ICLR as an ORAL paper [Openreview](https://openreview.net/forum?id=ZBj3Qp1bYg)
+- **EBT:** #Energy-Based Transformers are Scalable Learners and Thinkers# [[ICLR Oral]](https://openreview.net/forum?id=ZBj3Qp1bYg)
 
-- **EBM** Logical Inteligence, the first startup company that focuses on developing energy-based foundation models. See [Logical Inteligence](https://logicalintelligence.com/).
+- **EBM:** Logical Intelligence, a startup focused on developing energy-based foundation models. See [Logical Inteligence](https://logicalintelligence.com/).
 
-- **MDLM** The first product-level diffusion LM has been online. See [Mercury-2](https://www.inceptionlabs.ai/blog/introducing-mercury-2).
+- **MDLM** The first product-level diffusion LM has been released online. See [Mercury-2](https://www.inceptionlabs.ai/blog/introducing-mercury-2).
 
-We are looking forward to more exciting research and product in the future.
+We look forward to continued breakthroughs in both research and real-world deployment of non-autoregressive models.
 
 
 ## What do we provide?
