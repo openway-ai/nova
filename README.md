@@ -48,8 +48,8 @@ On the way.
 ├── dev
 ├── nanochat
 ├── nova
-│   ├── ebt
-│   └── mdlm
+│   ├── ebt                         # Energy-based LM             
+│   └── mdlm                        # Masked Diffusion LM
 ├── pyproject.toml
 ├── runs
 │   ├── miniseries.sh               # Miniseries training script
