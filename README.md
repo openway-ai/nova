@@ -41,7 +41,6 @@ On the way.
 
 
 ## File structure
-
 ```
 .
 ├── LICENSE
