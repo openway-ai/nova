@@ -6,7 +6,7 @@ depending on the pytorch_lightning package. It implements the core
 functionality needed for training, validation, and testing workflows.
 
 Usage:
-    from claude_class.torchlightning_module import LightningModule
+    from nanolightning.torchlightning_module import LightningModule
 
     class MyModel(LightningModule):
         def __init__(self, hparams):

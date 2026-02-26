@@ -39,8 +39,8 @@ from modeling_ebt import EBT_NLP
 # from model.img.dit_denoise import Diffusion_Transformer_IMG_Denoise
 
 
-from claude_class.torchlightning_module import LightningModule
-from claude_class.iteratabledataset import generate_dataloader, IterableDataset
+from nanolightning.torchlightning_module import LightningModule
+from nanolightning.iteratabledataset import generate_dataloader, IterableDataset
 
 # from utils import save_frames, denormalize, load_image_encoder, center_crop_arr
 from generate import generate_text, get_ppl

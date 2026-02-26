@@ -5,7 +5,7 @@
 #SBATCH --gpus-per-node=4
 source .venv/bin/activate
 
-cd nanochat/extension/ebt
+cd nova/ebt
 ### LOG INFO ###
 #SBATCH --job-name=ebt-xxs-bs_256_s1_lr_
 #SBATCH --output=logs/slurm/nlp/ebt-xxs-bs_256_s1_lr_%A-%a.log

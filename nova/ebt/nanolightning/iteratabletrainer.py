@@ -25,8 +25,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from claude_class.torchlightning_function import DDPStrategy, ModelCheckpoint
-from claude_class.torchlightning_trainer import ModelSummary
+from nanolightning.torchlightning_function import DDPStrategy, ModelCheckpoint
+from nanolightning.torchlightning_trainer import ModelSummary
 
 
 class IterableTrainer:
@@ -593,7 +593,7 @@ class IterableTrainer:
 
             with self._autocast_ctx():
                 loss = model.training_step(batch, batch_idx)
-                print("IterableTrainer: ", loss)
+                # print("IterableTrainer: ", loss)
 
             if loss is None:
                 batch_idx += 1
