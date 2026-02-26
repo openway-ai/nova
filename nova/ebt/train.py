@@ -4,16 +4,16 @@ import torch
 import os
 from argparse import ArgumentParser
 import time
-from claude_class.torchlightning_trainer import Trainer
-from claude_class.iteratabletrainer import IterableTrainer
-from claude_class.torchlightning_trainer import ModelSummary
+from nanolightning.torchlightning_trainer import Trainer
+from nanolightning.iteratabletrainer import IterableTrainer
+from nanolightning.torchlightning_trainer import ModelSummary
 import random
 from datetime import datetime
-from claude_class.torchlightning_function import DDPStrategy
-from claude_class.torchlightning_function import seed_everything
-from claude_class.torchlightning_function import WandbLogger
-from claude_class.torchlightning_function import ModelCheckpoint
-from claude_class.torchlightning_function import rank_zero_only
+from nanolightning.torchlightning_function import DDPStrategy
+from nanolightning.torchlightning_function import seed_everything
+from nanolightning.torchlightning_function import WandbLogger
+from nanolightning.torchlightning_function import ModelCheckpoint
+from nanolightning.torchlightning_function import rank_zero_only
 
 import sys
 import wandb

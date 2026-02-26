@@ -1,58 +1,44 @@
-# nanochat
+# Non-autoregressive Optimization & Vast Architecture (NOVA)
 
 ![nanochat logo](dev/nova.png)
 
-# Non-autoregressive Optimization & Vast Architecture (NOVA)
-
-This project aims to explore non-autoregressive models.
-
-We 
+This project aims to explore non-autoregressive (NAR) large language models and investigate their potential to scale effectively with increasing training data and model size.
+While autoregressive (AR) models have demonstrated strong scaling behavior, non-autoregressive large models remain underexplored, especially in the context of foundation-scale training.
+We welcome contributions from the community to push this boundary, and make non-autoregressive models truly powerful and practical.
 
 
 
-## Getting started
+## Why non-autoregressive models?
 
-### Reproduce and talk to GPT-2
+AR models are fundamentally limited by their sequential generation process, which restricts parallelism and token-by-token error accumulation.
+NAR models offer structural advantages to enhance parallelism, safety and controllability
+This year, it is exciting to see more substantial progress in NAR modeling this year, which includes:
 
-The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:
+- **EBT** Energy-Based Transformers are Scalable Learners and Thinkers ICLR as an ORAL paper [Openreview](https://openreview.net/forum?id=ZBj3Qp1bYg)
 
-```bash
-bash runs/speedrun.sh
-```
+- **EBM** Logical Inteligence, the first startup company that focuses on developing energy-based foundation models. See [Logical Inteligence](https://logicalintelligence.com/).
 
-You may wish to do so in a screen session as this will take ~3 hours to run. Once it's done, you can talk to it via the ChatGPT-like web UI. Make sure again that your local uv virtual environment is active (run `source .venv/bin/activate`), and serve it:
+- **MDLM** The first product-level diffusion LM has been online. See [Mercury-2](https://www.inceptionlabs.ai/blog/introducing-mercury-2).
 
-```bash
-python -m scripts.chat_web
-```
+- We are looking forward to more exciting research and product in the future.
 
-And then visit the URL shown. Make sure to access it correctly, e.g. on Lambda use the public IP of the node you're on, followed by the port, so for example [http://209.20.xxx.xxx:8000/](http://209.20.xxx.xxx:8000/), etc. Then talk to your LLM as you'd normally talk to ChatGPT! Get it to write stories or poems. Ask it to tell you who you are to see a hallucination. Ask it why the sky is blue. Or why it's green. The speedrun is a 4e19 FLOPs capability model so it's a bit like talking to a kindergartener :).
 
----
+## What we provide?
 
-<img width="2672" height="1520" alt="image" src="https://github.com/user-attachments/assets/ed39ddf8-2370-437a-bedc-0f39781e76b5" />
+With this repository, you are ready to train NAR models on a 100B pretraining dataset, and explore the scaling laws of NAR models. The dataset has been carefully curated and cleaned to support training at the GPT-2 scale.
+The training data originates from the open-source project [nanochat](https://github.com/karpathy/nanochat). We gratefully acknowledge the contributions of Andrej Karpathy and the nanoGPT community.
 
----
 
-A few more notes:
-
-- The code will run just fine on the Ampere 8XA100 GPU node as well, but a bit slower.
-- All code will run just fine on even a single GPU by omitting `torchrun`, and will produce ~identical results (code will automatically switch to gradient accumulation), but you'll have to wait 8 times longer.
-- If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device_batch_size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
-- Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
-
-## Research
-
-If you are a researcher and wish to help merge more non-autoregressive models to this repository,
 
 ## Guides
 
 ### Energy-based Language Models
 
-Refer to the README file in the [ebt](https://github.com/openway-ai/nova/tree/main/nanochat/extension/ebt) directory.
+A step-by-step turtorial is given in the ['nova/ebt'](https://github.com/openway-ai/nova/tree/main/nanochat/extension/ebt) directory.
 
 ### Masked Diffusion Language Models
 
+On the way.
 
 
 ## File structure
@@ -63,7 +49,7 @@ Refer to the README file in the [ebt](https://github.com/openway-ai/nova/tree/ma
 ├── README.md
 ├── dev
 ├── nanochat
-├── extension
+├── nova
 │   ├── ebt
 │   └── mdlm
 ├── pyproject.toml
@@ -80,6 +66,11 @@ Refer to the README file in the [ebt](https://github.com/openway-ai/nova/tree/ma
 ├── tests
 └── uv.lock
 ```
+
+## Research
+
+If you are a researcher and wish to help merge more non-autoregressive models to this repository,
+
 
 ## Contributing
 

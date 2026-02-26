@@ -32,7 +32,7 @@ import ipdb
 # Lazy import to avoid circular dependency at module level.
 def __getattr__(name):
     if name == "ModelSummary":
-        from claude_class.torchlightning_trainer import ModelSummary
+        from nanolightning.torchlightning_trainer import ModelSummary
         return ModelSummary
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

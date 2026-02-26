@@ -1,5 +1,5 @@
 import sys
-sys.path.append("../../../")
+sys.path.append("../../")
 
 from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
 

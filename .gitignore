@@ -21,7 +21,7 @@ nanochat/__pycache__/
 
 # Logs
 wandb/
-nanochat/extension/ebt/logs/
+nova/ebt/logs/
 
 # Externel code
 nanochat/external/

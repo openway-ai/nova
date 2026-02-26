@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from claude_class.torchlightning_module import LightningModule
+from nanolightning.torchlightning_module import LightningModule
 # import torch.optim as optim
 # from torchmetrics import Accuracy
 # from transformers import AutoTokenizer

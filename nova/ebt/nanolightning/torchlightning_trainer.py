@@ -29,7 +29,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 from tqdm import tqdm
 
-from claude_class.torchlightning_function import DDPStrategy, ModelCheckpoint
+from nanolightning.torchlightning_function import DDPStrategy, ModelCheckpoint
 import ipdb
 
 # ============================================================================
