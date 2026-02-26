@@ -33,7 +33,7 @@ The training data originates from the open-source project [nanochat](https://git
 
 ### Energy-based Language Models
 
-A step-by-step turtorial is given in the ['nova/ebt'](https://github.com/openway-ai/nova/tree/main/nanochat/extension/ebt) directory.
+A step-by-step turtorial is given in the ['nova/ebt'](https://github.com/openway-ai/nova/tree/main/nova/ebt) directory.
 
 ### Masked Diffusion Language Models
 
