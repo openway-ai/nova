@@ -19,7 +19,7 @@ This year, it is exciting to see more substantial progress in NAR modeling this 
 
 - **MDLM** The first product-level diffusion LM has been released online. See [Mercury-2](https://www.inceptionlabs.ai/blog/introducing-mercury-2).
 
-We look forward to continued breakthroughs in both research and real-world deployment of non-autoregressive models.
+We look forward to continued deployment and breakthroughs of non-autoregressive models.
 
 
 ## What do we provide?
