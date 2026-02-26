@@ -7,7 +7,6 @@ While autoregressive (AR) models have demonstrated strong scaling behavior, non-
 We welcome contributions from the community to push this boundary, and make non-autoregressive models truly powerful and practical.
 
 
-
 ## Why non-autoregressive models?
 
 AR models are fundamentally limited by their sequential generation process, which restricts parallelism and token-by-token error accumulation.
@@ -20,13 +19,13 @@ This year, it is exciting to see more substantial progress in NAR modeling this 
 
 - **MDLM** The first product-level diffusion LM has been online. See [Mercury-2](https://www.inceptionlabs.ai/blog/introducing-mercury-2).
 
-- We are looking forward to more exciting research and product in the future.
+We are looking forward to more exciting research and product in the future.
 
 
-## What we provide?
+## What do we provide?
 
 With this repository, you are ready to train NAR models on a 100B pretraining dataset, and explore the scaling laws of NAR models. The dataset has been carefully curated and cleaned to support training at the GPT-2 scale.
-The training data originates from the open-source project [nanochat](https://github.com/karpathy/nanochat). We gratefully acknowledge the contributions of Andrej Karpathy and the nanoGPT community.
+The training data originates from the open-source project [nanochat](https://github.com/karpathy/nanochat). We gratefully acknowledge the contributions of Dr. Andrej Karpathy and the nanoGPT community.
 
 
 
@@ -69,18 +68,14 @@ On the way.
 
 ## Research
 
-If you are a researcher and wish to help merge more non-autoregressive models to this repository,
+If you are a researcher and wish to help merge more non-autoregressive models to this repository, we welcome your contributions. We encourage clean, modular, and well-documented implementations, and recommend opening an issue to briefly describe your implemented models, code structures, and experimental results before submitting a pull request. We welcome contributions from the community to push this boundary, and make non-autoregressive models truly powerful and practical.
 
 
-## Contributing
-
-The goal of nanochat is to improve the state of the art in micro models that are accessible to work with end to end on budgets of < $1000 dollars. Accessibility is about overall cost but also about cognitive complexity - nanochat is not an exhaustively configurable LLM "framework"; there are no giant configuration objects, model factories, or if-then-else monsters in the code base. It is a single, cohesive, minimal, readable, hackable, maximally-forkable "strong baseline" codebase designed to run start to end and produce a ChatGPT model you can talk to. Currently, the most interesting part personally is speeding up the latency to GPT-2 (i.e. getting a CORE score above 0.256525). Currently this takes ~3 hours, but by improving the pretraining stage we can improve this further.
-
-Current AI policy: disclosure. When submitting a PR, please declare any parts that had substantial LLM contribution and that you have not written or that you do not fully understand.
+<!-- Current AI policy: disclosure. When submitting a PR, please declare any parts that had substantial LLM contribution and that you have not written or that you do not fully understand. -->
 
 ## Acknowledgements
 
-- This project is primiarily forked from [nanogpt](https://github.com/karpathy/nanoGPT)
+This project is primiarily forked from [nanochat](https://github.com/karpathy/nanochat), and we extend our most deep appreciation to Dr. Andrej Karpathy for releasing such a powerful and accessible foundation. Without this groundwork, follow-up research and development would be more challenging. We remain grateful for the continued support and collaboration from the open-source research community.
 
 <!-- ## Cite
 
