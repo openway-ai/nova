@@ -228,3 +228,19 @@ class GaussianSampler:
     mu = x[:, :n]
     sigma = self.softplus(x[:, n:]).sqrt()
     return mu + sigma * torch.randn_like(mu)
+
+
+from lightning.pytorch.callbacks import TQDMProgressBar
+
+class StepProgressBar(TQDMProgressBar):
+  def on_train_epoch_start(self, trainer, pl_module):
+    if self.is_enabled:
+      self.train_progress_bar.total = trainer.max_steps
+      self.train_progress_bar.n = trainer.global_step
+      self.train_progress_bar.set_description('Training')
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    if self.is_enabled and self._should_update(trainer.global_step, self.refresh_rate):
+      self.train_progress_bar.n = trainer.global_step
+      self.train_progress_bar.set_postfix(self.get_metrics(trainer, pl_module))
+      self.train_progress_bar.refresh()

@@ -56,12 +56,13 @@ python train.py \
 --dataset_name "nanochat" \
 --num_workers 12 \
 --val_check_interval 1000 \
---limit_val_batches 1000 \
+# --limit_val_batches 1000 \
 --val_sanity 1 \
 \
 --wandb_project 'nlp_pretrain' \
 \
 --log_model_archi \
+--log_every_n_steps: 100 \
 # --log_gradients \
 \
 --set_matmul_precision "medium" \
