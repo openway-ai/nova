@@ -39,8 +39,12 @@ from modeling_ebt import EBT_NLP
 # from model.img.dit_denoise import Diffusion_Transformer_IMG_Denoise
 
 
-from nanolightning.torchlightning_module import LightningModule
-from nanolightning.iteratabledataset import generate_dataloader, IterableDataset
+# from nanolightning.torchlightning_module import LightningModule
+# from nanolightning.iteratabledataset import generate_dataloader, IterableDataset
+
+from pytorch_lightning import LightningModule
+from dataset import IterableDataset, generate_dataloader
+
 
 # from utils import save_frames, denormalize, load_image_encoder, center_crop_arr
 from generate import generate_text, get_ppl
@@ -54,7 +58,7 @@ from transformers import AutoTokenizer
 
 import ipdb
 
-sys.path.append("../../../")
+sys.path.append("../../")
 from nanochat.tokenizer import get_tokenizer
 
 class ModelTrainer(LightningModule):
@@ -578,48 +582,48 @@ class ModelTrainer(LightningModule):
         return collate_fn
     
     def  train_dataloader(self):
-        # train_dataloader = IterableDataset(
-        #         tokenizer=self.hparams.tokenizer,
-        #         B=self.hparams.batch_size_per_device,
-        #         T=self.hparams.context_length,
-        #         split="train",
-        #         max_iter=self.hparams.max_steps,
-        #         device=self.device,
-        #         resume_state_dict=None
-        #     )
+        train_dataloader = IterableDataset(
+                tokenizer=self.hparams.tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                split="train",
+                max_iter=self.hparams.max_steps,
+                device=self.device,
+                resume_state_dict=None
+            )
 
-        train_dataloader = generate_dataloader(
-            tokenizer=self.hparams.tokenizer,
-            batch_size=self.hparams.batch_size_per_device, 
-            max_seq_length=self.hparams.context_length,
-            max_iter=self.hparams.max_steps,
-            split="train",
-            device=self.device,
-            resume_state_dict=None,
-        )
+        # train_dataloader = generate_dataloader(
+        #     tokenizer=self.hparams.tokenizer,
+        #     batch_size=self.hparams.batch_size_per_device, 
+        #     max_len=self.hparams.context_length,
+        #     max_iter=self.hparams.max_steps,
+        #     split="train",
+        #     device=self.device,
+        #     resume_state_dict=None,
+        # )
         return train_dataloader
 
     def val_dataloader(self):
 
-        # val_dataloader = IterableDataset(
-        #         tokenizer=self.hparams.tokenizer,
-        #         B=self.hparams.batch_size_per_device,
-        #         T=self.hparams.context_length,
-        #         split="val",
-        #         max_iter=self.hparams.val_steps,
-        #         device=self.device,
-        #         resume_state_dict=None
-        #     )
+        val_dataloader = IterableDataset(
+                tokenizer=self.hparams.tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                split="val",
+                max_iter=self.hparams.val_steps,
+                device=self.device,
+                resume_state_dict=None
+            )
 
-        val_dataloader = generate_dataloader(
-            tokenizer=self.hparams.tokenizer,
-            batch_size=self.hparams.batch_size_per_device,
-            max_seq_length=self.hparams.context_length,
-            max_iter=self.hparams.val_steps,
-            split="val",
-            device=self.device,
-            resume_state_dict=None,
-        )
+        # val_dataloader = generate_dataloader(
+        #     tokenizer=self.hparams.tokenizer,
+        #     batch_size=self.hparams.batch_size_per_device,
+        #     max_len=self.hparams.context_length,
+        #     max_iter=self.hparams.val_steps,
+        #     split="val",
+        #     device=self.device,
+        #     resume_state_dict=None,
+        # )
 
         return val_dataloader
 

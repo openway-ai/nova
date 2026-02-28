@@ -7,17 +7,13 @@ This is the first version of the EBT extended to NanoChat dataset.
 ### Setup environment
 
 ```bash
-cd ../../
 bash runs/install.sh
-cd nova/ebt
 ```
 
 ### Dataset preparation
 
 ```bash
-cd ../../
 bash runs/dataset_prepare.sh
-cd nova/ebt
 ```
 
 ### Setting wandb logger
@@ -31,9 +27,7 @@ export WANDB_API_KEY=<Your API Key>
 ### Training
 
 ```bash
-cd ../../
 bash runs/run_ebt.sh
-cd nova/ebt
 ```
 
 You can check the training logs from the wandb dashboard at `https://wandb.ai/<Your account>/nlp_pretrain`.

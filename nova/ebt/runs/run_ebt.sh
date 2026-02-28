@@ -3,9 +3,8 @@
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
-source .venv/bin/activate
+source ../../.venv/ebt/bin/activate
 
-cd nova/ebt
 ### LOG INFO ###
 #SBATCH --job-name=ebt-xxs-bs_256_s1_lr_
 #SBATCH --output=logs/slurm/nlp/ebt-xxs-bs_256_s1_lr_%A-%a.log
@@ -14,7 +13,7 @@ export RUN_NAME="ebt-xxs-bs_256_s1_lr_"
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="${RUN_NAME#*-}"; export MODEL_SIZE="${MODEL_SIZE%%-*}"
 
-export WANDB_API_KEY="<Your Wandb API>"
+export WANDB_API_KEY="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"
 mkdir -p logs/slurm/nlp/
 module purge
 
@@ -56,9 +55,8 @@ python train.py \
 \
 --dataset_name "nanochat" \
 --num_workers 12 \
---val_every_n_step 1000 \
---val_after_n_step 0 \
---val_steps 1000 \
+--val_check_interval 1000 \
+--limit_val_batches 1000 \
 --val_sanity 1 \
 \
 --wandb_project 'nlp_pretrain' \

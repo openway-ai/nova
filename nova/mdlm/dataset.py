@@ -6,6 +6,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, 
 import torch
 from torch.utils.data import IterableDataset as _IterableDataset
 from torch.utils.data import IterableDataset, DataLoader
+import ipdb
 
 class IterableDataset(_IterableDataset):
     """
@@ -25,7 +26,6 @@ class IterableDataset(_IterableDataset):
         batch_size,
         max_len,
         split,
-        max_iter,
         # tokenizer_threads=4,
         # tokenizer_batch_size=128,
         device="cuda",
@@ -38,7 +38,6 @@ class IterableDataset(_IterableDataset):
         self.B = batch_size
         self.T = max_len
         self.split = split
-        self.max_iter = max_iter
         # self.tokenizer_threads = tokenizer_threads
         # self.tokenizer_batch_size = tokenizer_batch_size
         self.device = device
@@ -74,20 +73,18 @@ class IterableDataset(_IterableDataset):
         # state_dict["batch_idx"] = self.batch_idx
         # self.batch_idx += 1
         # yield inputs, targets, state_dict
-
     
-    def __len__(self):
-        return self.max_iter
+    # def __len__(self):
+    #     return self.max_iter
 
 
-def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device, resume_state_dict=None):
+def generate_dataloader(tokenizer, batch_size, max_len, split, device, resume_state_dict=None):
 
     dataset = IterableDataset(
         tokenizer=tokenizer,
         B=batch_size, 
         T=max_len,
         split=split,
-        max_iter=max_iter,
         device=device,
         resume_state_dict=resume_state_dict,
     )
@@ -100,3 +97,31 @@ def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device,
         pin_memory=False      # already handled internally
     )
     return dataloader
+
+
+def get_dataloaders(config, tokenizer, skip_train=False, valid_seed=None):
+    
+    # ipdb.set_trace()
+
+    if skip_train:
+        train_dataloader = None
+    else:
+        train_dataloader = generate_dataloader(
+            tokenizer=tokenizer,
+            batch_size=config['loader'].batch_size,
+            max_len=config['model'].length,
+            split="train",
+            device=config.device,
+            resume_state_dict=None,
+        )
+
+    val_dataloader = generate_dataloader(
+        tokenizer=tokenizer,
+        batch_size=config['loader'].batch_size,
+        max_len=config['model'].length,
+        split="val",
+        device=config.device,
+        resume_state_dict=None,
+    )
+    
+    return train_dataloader, val_dataloader

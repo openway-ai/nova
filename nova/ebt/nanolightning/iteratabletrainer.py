@@ -570,6 +570,7 @@ class IterableTrainer:
             opt.zero_grad()
 
         train_iter = iter(train_dl)
+        # train_step = 0
 
         while not self._should_stop:
 
@@ -593,7 +594,7 @@ class IterableTrainer:
 
             with self._autocast_ctx():
                 loss = model.training_step(batch, batch_idx)
-                # print("IterableTrainer: ", loss)
+                # print(f"IterableTrainer: Step = {train_step}, Loss = {loss}")
 
             if loss is None:
                 batch_idx += 1
@@ -649,6 +650,7 @@ class IterableTrainer:
             model.on_train_batch_end(loss, batch, batch_idx)
             model.clear_logged_metrics()
             batch_idx += 1
+            # train_step += 1
 
             # ----------------------------------------------------------
             # Step-based validation

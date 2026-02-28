@@ -64,7 +64,7 @@ class NanochatIterableDataset(_IterableDataset):
 IterableDataset = NanochatIterableDataset
 
 
-def generate_dataloader(tokenizer, batch_size, max_seq_length, max_iter, split, device, resume_state_dict=None):
+def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device, resume_state_dict=None):
     """Create a DataLoader wrapping nanochat's streaming data pipeline.
 
     batch_size=1 serves two purposes:
@@ -79,7 +79,7 @@ def generate_dataloader(tokenizer, batch_size, max_seq_length, max_iter, split, 
     dataset = NanochatIterableDataset(
         tokenizer=tokenizer,
         B=batch_size,
-        T=max_seq_length,
+        T=max_len,
         split=split,
         max_iter=max_iter,
         device=device,
