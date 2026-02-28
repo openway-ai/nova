@@ -9,15 +9,19 @@ eval_bundle/
 .env
 
 # Claude
-CLAUDE.md
-nanochat/extension/ebt/.claude/
-nanochat/extension/ebt/CLAUDE.md
 .claude/
+CLAUDE.md
+nova/ebt/.claude/
+nova/ebt/CLAUDE.md
+nova/mdlm/.claude/
+nova/mdlm/CLAUDE.md
 
 # Pycache
 __pycache__/
-nanochat/extension/ebt/__pycache__/
-nanochat/__pycache__/
+nova/ebt/__pycache__/
+nova/ebt/nanolightning/__pycache__/
+nova/mdlm/__pycache__/
+nova/mdlm/outputs/
 
 # Logs
 wandb/
@@ -28,6 +32,11 @@ nanochat/external/
 
 # User prompts
 prompt/
+
+# uv
+uv.lock
+nova/ebt/uv.lock
+nova/mdlm/uv.lock
 
 
 
