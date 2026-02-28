@@ -18,6 +18,7 @@ import noise_schedule
 import utils
 import dit
 import ema
+import ipdb
 
 LOG2 = math.log(2)
 
@@ -76,7 +77,7 @@ class Diffusion(L.LightningModule):
     self.config = config
 
     self.tokenizer = tokenizer
-    self.vocab_size = self.tokenizer.vocab_size
+    self.vocab_size = self.tokenizer.get_vocab_size()
     self.sampler = self.config.sampling.predictor
     self.gen_ppl_eval_model_name_or_path = self.config.eval.\
       gen_ppl_eval_model_name_or_path
@@ -126,14 +127,15 @@ class Diffusion(L.LightningModule):
     self.test_metrics = metrics.clone(prefix='test/')
 
     # generative perplexity
-    self.gen_ppl_metric = Perplexity()
-    self.eval_model_tokenizer = transformers.AutoTokenizer.\
-      from_pretrained(self.gen_ppl_eval_model_name_or_path)
-    if self.eval_model_tokenizer.pad_token is None:
-      self.eval_model_tokenizer.pad_token =\
-          self.eval_model_tokenizer.eos_token
-      self.eval_model_tokenizer.pad_token_id =\
-          self.eval_model_tokenizer.eos_token_id
+    if self.config.eval.compute_generative_perplexity:
+      self.gen_ppl_metric = Perplexity()
+      self.eval_model_tokenizer = transformers.AutoTokenizer.\
+        from_pretrained(self.gen_ppl_eval_model_name_or_path)
+      if self.eval_model_tokenizer.pad_token is None:
+        self.eval_model_tokenizer.pad_token =\
+            self.eval_model_tokenizer.eos_token
+        self.eval_model_tokenizer.pad_token_id =\
+            self.eval_model_tokenizer.eos_token_id
 
     self.noise = noise_schedule.get_noise(self.config,
                                           dtype=self.dtype)
@@ -229,6 +231,10 @@ class Diffusion(L.LightningModule):
       sampler_cls = dataloader.RandomFaultTolerantSampler
     updated_dls = []
     for dl in self.trainer.fit_loop._combined_loader.flattened:
+      # IterableDatasets manage their own ordering and have no len(); skip sampler replacement.
+      if isinstance(dl.dataset, torch.utils.data.IterableDataset):
+        updated_dls.append(dl)
+        continue
       if hasattr(dl.sampler, 'shuffle'):
         dl_sampler = sampler_cls(
           dl.dataset, shuffle=dl.sampler.shuffle)
@@ -313,7 +319,7 @@ class Diffusion(L.LightningModule):
   def forward(self, x, sigma):
     """Returns log score."""
     sigma = self._process_sigma(sigma)
-    with torch.cuda.amp.autocast(dtype=torch.float32):
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
       logits = self.backbone(x, sigma)
     
     if self.parameterization == 'subs':
@@ -363,7 +369,7 @@ class Diffusion(L.LightningModule):
       attention_mask = batch['attention_mask']
     else:
       attention_mask = None
-    losses = self._loss(batch['input_ids'], attention_mask)
+    losses = self._loss(batch['input_ids'], attention_mask) # batch[0] is the 'input_ids' # batch['input_ids']
     loss = losses.loss
 
     if prefix == 'train':
@@ -379,8 +385,8 @@ class Diffusion(L.LightningModule):
       raise ValueError(f'Invalid prefix: {prefix}')
 
     self.log_dict(metrics,
-                  on_step=False,
-                  on_epoch=True,
+                  on_step=(prefix == 'train'),
+                  on_epoch=(prefix != 'train'),
                   sync_dist=True)
     return loss
 
@@ -414,7 +420,8 @@ class Diffusion(L.LightningModule):
     return self._compute_loss(batch, prefix='val')
 
   def on_validation_epoch_end(self):
-    if ((self.config.eval.compute_perplexity_on_sanity
+    if (self.config.eval.compute_generative_perplexity and # skip log_table if GPT-2 eval is False
+         (self.config.eval.compute_perplexity_on_sanity
          or not self.trainer.sanity_checking)
          and self.config.eval.generate_samples
          and not self.parameterization == 'ar'):
@@ -427,6 +434,7 @@ class Diffusion(L.LightningModule):
         text_samples = self.tokenizer.batch_decode(samples)
         if self.config.eval.compute_generative_perplexity:
           self.compute_generative_perplexity(text_samples)
+
       if self.trainer.global_rank == 0 and hasattr(
         self.trainer.logger, 'log_table'):
         # Log the last generated samples
@@ -436,6 +444,7 @@ class Diffusion(L.LightningModule):
           key=f'samples@global_step{self.global_step}',
           columns=['Generated Samples'],
           data=[[s] for s in text_samples])
+
       if self.config.eval.compute_generative_perplexity:
         self.log('val/gen_ppl',
                  self.gen_ppl_metric,

@@ -10,13 +10,14 @@ import torch
 
 # import dataloader
 
-from dataset import get_dataloaders
+from nanochat_dataloader import get_dataloaders
 import diffusion
 import utils
 import sys
+import ipdb
 
 sys.path.append("../../")
-from nanochat.tokenizer import get_tokenizer
+from tokenizer import get_tokenizer
 
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
@@ -80,8 +81,8 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
     ('train', train_ds), ('valid', valid_ds)]:
     print(f'Printing {dl_type} dataloader batch.')
     batch = next(iter(dl))
-    print('Batch input_ids.shape', batch['input_ids'].shape)
-    first = batch['input_ids'][0, :k]
+    print('Batch input_ids.shape', batch['input_ids'].shape) # batch[0] is the 'input_ids'
+    first = batch['input_ids'][0, :k] # batch[0] is the 'input_ids'
     last = batch['input_ids'][0, -k:]
     print(f'First {k} tokens:', tokenizer.decode(first))
     print('ids:', first)

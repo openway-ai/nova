@@ -11,5 +11,5 @@ python train.py \
   wandb.name=mdlm-owt \
   parameterization=subs \
   model.length=1024 \
-  eval.compute_generative_perplexity=True \
+  eval.compute_generative_perplexity=False \
   sampling.steps=1000
