@@ -56,7 +56,7 @@ python train.py \
 --dataset_name "nanochat" \
 --num_workers 12 \
 --val_check_interval 1000 \
-# --limit_val_batches 1000 \
+--limit_val_batches 100 \
 --val_sanity 1 \
 \
 --wandb_project 'nlp_pretrain' \

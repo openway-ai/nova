@@ -3,6 +3,8 @@
 
 source ../../.venv/mdlm/bin/activate
 
+export WANDB_API_KEY=<Your API Key>
+
 python train.py \
   loader.batch_size=16 \
   loader.eval_batch_size=16 \
