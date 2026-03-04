@@ -705,7 +705,8 @@ if __name__ == '__main__':
 
     parser.add_argument("--wandb_tags", help="wandb tags to add", nargs='+', default=None)
 
-    parser.add_argument("--wandb_offline", help="set wandb to offline mode", action="store_true", default=False)
+    # parser.add_argument("--wandb_offline", help="set wandb to offline mode", action="store_true", default=False)
+    parser.add_argument("--wandb_offline", help="set wandb to offline mode", action="store_true", default=True) # TODO
 
     parser.add_argument("--wandb_watch", help="turns on watch mode for wandb - expensive so only use for debugging", action="store_true", default=False) 
 
