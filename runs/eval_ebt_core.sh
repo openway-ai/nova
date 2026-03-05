@@ -16,6 +16,8 @@ export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export NANOCHAT_OFFLINE_MODE=1
 export OMP_NUM_THREADS=1
 
+CKPT_PATH="/mnt/shared-storage-user/puyuan/code/nova/nova/ebt/logs/checkpoints/ebt-small-bs_256_s1_lr_0.0012_2026-03-05_01-01-55_/last.ckpt"
+
 # EBT checkpoint 路径（必须指定）
 CKPT_PATH="${CKPT_PATH:-}"
 if [ -z "$CKPT_PATH" ]; then
@@ -46,10 +48,9 @@ OUTPUT_DIR="../../nova/ebt/logs/core_eval/${RUN_NAME}/${CKPT_FILENAME}"
 LOG_FILE="../../nova/ebt/logs/core_eval_${TIMESTAMP}.log"
 
 # 创建输出目录
-cd /mnt/shared-storage-user/puyuan/code/nanochat
-cd nova/ebt
+cd /mnt/shared-storage-user/puyuan/code/nova/nova/ebt
 mkdir -p "$(dirname "$OUTPUT_DIR")"
-mkdir -p "logs"
+mkdir -p "logs_core"
 cd ../..
 
 # =============================================================================
@@ -95,11 +96,12 @@ echo ""
 # 激活环境
 # =============================================================================
 
-echo "🔧 激活虚拟环境..."
-source .venv/bin/activate 2>/dev/null || source /mnt/shared-storage-user/puyuan/code/nanochat/.venv/bin/activate
+# echo "🔧 激活 conda 环境..."
+# # 使用 conda 环境中的 Python
+# conda activate /mnt/shared-storage-user/puyuan/conda_envs/nanochat/bin/activate
 
-echo "✅ 环境已激活"
-echo ""
+# echo "✅ 环境已激活"
+# echo ""
 
 # =============================================================================
 # 运行 CORE 评估
@@ -112,6 +114,7 @@ echo ""
 # 构建评估命令
 cd nova/ebt
 
+# 使用 conda 环境的 Python
 EVAL_CMD="python -m scripts.ebt_core_eval \
     --ckpt-path '$CKPT_PATH' \
     --tokenizer-path '$TOKENIZER_PATH' \

@@ -137,12 +137,14 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
                 prompt += continuation_delimiter
 
             # 编码提示
-            prompt_tokens = tokenizer.encode(prompt, return_tensors='pt').to(device)
+            prompt_ids = tokenizer.encode(prompt)
+            prompt_tokens = torch.tensor([prompt_ids], dtype=torch.long).to(device)
 
             # 计算每个选项的 loss
             choice_losses = []
             for choice in choices:
-                choice_tokens = tokenizer.encode(choice, return_tensors='pt', add_special_tokens=False).to(device)
+                choice_ids = tokenizer.encode(choice, add_special_tokens=False)
+                choice_tokens = torch.tensor([choice_ids], dtype=torch.long).to(device)
                 full_tokens = torch.cat([prompt_tokens, choice_tokens], dim=1)
 
                 # 计算损失（只对 choice 部分）
@@ -175,7 +177,8 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
             else:
                 full_text = context + continuation
 
-            tokens = tokenizer.encode(full_text, return_tensors='pt').to(device)
+            full_ids = tokenizer.encode(full_text)
+            tokens = torch.tensor([full_ids], dtype=torch.long).to(device)
 
             # 计算困惑度
             with torch.no_grad():
@@ -207,7 +210,8 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
 
             choice_losses = []
             for choice_text in choices:
-                tokens = tokenizer.encode(choice_text, return_tensors='pt').to(device)
+                choice_ids = tokenizer.encode(choice_text)
+                tokens = torch.tensor([choice_ids], dtype=torch.long).to(device)
                 with torch.no_grad():
                     loss = model(tokens, targets=tokens[:, 1:])
                     choice_losses.append(loss.item())
