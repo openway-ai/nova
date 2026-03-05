@@ -1,7 +1,8 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-# from torch.utils.data import DataLoader, random_split, Dataset
+from torch.utils.data import DataLoader
+# from torch.utils.data import random_split, Dataset
 # from torchvision import transforms
 # from torchvision.transforms import ToPILImage
 from torch.distributed import all_reduce
@@ -27,6 +28,8 @@ import gc
 # from data.nlp.synthetic_dataset import NLPSyntheticDataset
 
 from collector import NLP_HF_Collator
+from datasets import load_dataset, load_from_disk
+import os
 # from model.vid.ebt import EBT_VID
 from modeling_ebt import EBT_NLP
 # from model.img.ebt_t2i import EBT_IMG_T2I
@@ -41,6 +44,34 @@ from modeling_ebt import EBT_NLP
 
 from nanolightning.torchlightning_module import LightningModule
 from nanolightning.iteratabledataset import generate_dataloader, IterableDataset
+
+# Simple GSM8K Dataset class for inference
+class GSM8KDataset(torch.utils.data.Dataset):
+    def __init__(self, hparams, split):
+        self.hparams = hparams
+        local_dataset_path = "/mnt/shared-storage-user/puyuan/code/EBT/data/gsm8k_offline"
+
+        if os.path.exists(local_dataset_path):
+            dataset = load_from_disk(local_dataset_path)
+            self.dataset = dataset[split]
+        else:
+            hf_token = os.getenv('HF_TOKEN')
+            hf_home = os.getenv('HF_HOME')
+            dataset_dir = self.hparams.dataset_dir if hasattr(self.hparams, 'dataset_dir') and self.hparams.dataset_dir != "" else hf_home
+            self.dataset = load_dataset("openai/gsm8k", "main", cache_dir=dataset_dir, token=hf_token, trust_remote_code=True)[split]
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        if self.hparams.execution_mode == "inference":
+            return f"[[Question]]: {self.dataset[idx]['question']}\n[[Answer]]: ", self.dataset[idx]['answer']
+        elif self.hparams.execution_mode == "pretrain":
+            return f"Question: {self.dataset[idx]['question']}\nAnswer: {self.dataset[idx]['answer']}"
+        elif self.hparams.execution_mode == "finetune":
+            return f"[[Question]]: {self.dataset[idx]['question']}\n[[Answer]]: {self.dataset[idx]['answer']}"
+        else:
+            raise ValueError(f"Execution mode not supported: {self.hparams.execution_mode}")
 
 # from utils import save_frames, denormalize, load_image_encoder, center_crop_arr
 from generate import generate_text, get_ppl
@@ -65,6 +96,11 @@ class ModelTrainer(LightningModule):
         else:
             self.hparams.update(vars(hparams))
         # self.txt_logger = hparams.txt_logger if txt_logger == None else txt_logger # txt_logger is no longer supported
+
+        # Initialize tracking for test metrics
+        self.test_losses = []
+        self.test_perplexities = []
+
         if self.hparams.modality == "NLP":
             if "execution_mode" in self.hparams and "save_generation_logs_dir" in self.hparams and self.hparams.execution_mode == "inference": # two of these are sanity check for loading pretrained ckpt that may not have newer params
                 print("setting up infer logger")
@@ -122,7 +158,10 @@ class ModelTrainer(LightningModule):
 
         # self.to_pil = ToPILImage()
         self.full_ds = None
-        self.hparams.tokenizer = tokenizer = get_tokenizer() # AutoTokenizer.from_pretrained(self.hparams.tokenizer, clean_up_tokenization_spaces = False)
+        self.hparams.tokenizer_obj = tokenizer = get_tokenizer() # Store tokenizer object
+        # Keep tokenizer path as string for generate_text compatibility
+        if not hasattr(self.hparams, 'tokenizer_path'):
+            self.hparams.tokenizer_path = self.hparams.tokenizer if isinstance(self.hparams.tokenizer, str) else "EleutherAI/gpt-neox-20b"
         if trained_model is not None:
             self.model = trained_model
         else:
@@ -275,12 +314,85 @@ class ModelTrainer(LightningModule):
         eval_step_dict = self.eval_step(batch, "valid")
         self.log_metrics(eval_step_dict, "valid")
 
+    def on_test_epoch_start(self):
+        """Reset test metrics at the start of test epoch"""
+        self.test_losses = []
+        self.test_perplexities = []
+
     def test_step(self, batch, batch_idx):
-        if self.hparams.execution_mode == "inference":  
+        if self.hparams.execution_mode == "inference":
             if self.hparams.modality == "NLP":
-                outputs = generate_text(self.model, batch, self.hparams)
-                for output in outputs:
-                    self.infer_logger.log_data(output)
+                # For GSM8K and other generation tasks that use DataLoader with collate_fn
+                if self.hparams.dataset_name == "gsm8k":
+                    outputs = generate_text(self.model, batch, self.hparams)
+                    for output in outputs:
+                        self.infer_logger.log_data(output)
+                else:
+                    # For nanochat and other PPL evaluation tasks
+                    # nanochat uses IterableDataset which returns (x, y) tuples
+                    # During training: x[0].squeeze(dim=0) is used (see modeling_ebt.py:189)
+                    # Convert to dict format for get_ppl
+                    if isinstance(batch, tuple):
+                        # batch is (x, y) from IterableDataset
+                        x, y = batch
+                        # x might have shape [1, B, S] or [B, S], squeeze to ensure [B, S]
+                        if x.dim() == 3 and x.shape[0] == 1:
+                            x = x.squeeze(0)  # [1, B, S] -> [B, S]
+                        # Add channel dimension for get_ppl: [B, S] -> [B, 1, S]
+                        batch_dict = {'input_ids': x.unsqueeze(1)}
+                    else:
+                        # batch is already a dict from DataLoader
+                        batch_dict = batch
+
+                    # Compute PPL and save sample outputs
+                    ppl_outputs = get_ppl(self.model, batch_dict, self.hparams)
+
+                    # Track metrics for averaging
+                    self.test_losses.append(ppl_outputs['loss'].item())
+                    self.test_perplexities.append(ppl_outputs['perplexity'].item())
+
+                    # Print progress every 10 batches
+                    if batch_idx % 10 == 0:
+                        import sys
+                        import numpy as np
+                        current_avg_loss = np.mean(self.test_losses)
+                        current_avg_ppl = np.mean(self.test_perplexities)
+                        sys.stdout.write(f"Batch {batch_idx:3d} | Loss: {ppl_outputs['loss'].item():.4f} | PPL: {ppl_outputs['perplexity'].item():.2f} | Avg Loss: {current_avg_loss:.4f} | Avg PPL: {current_avg_ppl:.2f}\n")
+                        sys.stdout.flush()
+
+                    # Save sample inputs/outputs to inference logger for first few batches
+                    if batch_idx < 5 and hasattr(self, 'infer_logger'):
+                        tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else None
+                        if tokenizer is not None:
+                            # Wrap nanochat tokenizer if needed
+                            from nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
+                            if hasattr(tokenizer, 'enc') and hasattr(tokenizer.enc, 'encode'):
+                                # It's a RustBPETokenizer, wrap it for HF compatibility
+                                tokenizer = NanoChatTokenizerWrapper(tokenizer_obj=tokenizer)
+
+                            # Log samples from this batch
+                            sample_ids = batch_dict['input_ids'][:2]  # First 2 samples
+                            for i, ids in enumerate(sample_ids):
+                                # Decode full sequence
+                                full_text = tokenizer.decode(ids.squeeze().tolist(), skip_special_tokens=True)
+
+                                # Create output record
+                                output_record = {
+                                    "batch_idx": batch_idx,
+                                    "sample_idx": i,
+                                    "text": full_text[:500],  # First 500 chars
+                                    "loss": ppl_outputs['loss'].item(),
+                                    "perplexity": ppl_outputs['perplexity'].item(),
+                                }
+                                self.infer_logger.log_data(output_record)
+
+                    # Log metrics (filter out energy metrics to avoid clutter)
+                    filtered_outputs = {k: v for k, v in ppl_outputs.items() if 'energy' not in k}
+                    self.log_metrics(filtered_outputs, "test")
+
+                # TODO
+                # outputs = get_ppl(self.model, batch, self.hparams)
+                # self.log_metrics(outputs, "test")
             # elif self.hparams.modality == "VID":
             #     if not self.reset_image_encoder_decoder: # this is done to prevent bug where loading ckpt image encoder doesnt work well, not sure why ckpt image decoder doesnt load well, maybe related to HF
             #         self.model.image_encoder = load_image_encoder(self.hparams.backbone_type, self.hparams.vit_backbone_size).to(self.device)
@@ -313,6 +425,7 @@ class ModelTrainer(LightningModule):
             # elif self.hparams.modality == "IMG":
             #     outputs = generate_image(self.model, batch, self.hparams)
             #     self.log_metrics(outputs, "test")
+            
             else:
                 raise NotImplementedError(f"Inference mode not supported for modality {self.hparams.modality} yet")
         else: # all other modes just get metrics
@@ -322,7 +435,41 @@ class ModelTrainer(LightningModule):
             else:
                 eval_step_dict = self.eval_step(batch, "test")
                 self.log_metrics(eval_step_dict, "test")
-            
+
+    def on_test_epoch_end(self):
+        """Print summary statistics at the end of test epoch"""
+        if len(self.test_losses) > 0:
+            import sys
+            import numpy as np
+
+            avg_loss = np.mean(self.test_losses)
+            avg_ppl = np.mean(self.test_perplexities)
+            std_loss = np.std(self.test_losses)
+            std_ppl = np.std(self.test_perplexities)
+            min_loss = np.min(self.test_losses)
+            max_loss = np.max(self.test_losses)
+            min_ppl = np.min(self.test_perplexities)
+            max_ppl = np.max(self.test_perplexities)
+
+            sys.stdout.write(f"\n\n")
+            sys.stdout.write(f"{'='*80}\n")
+            sys.stdout.write(f"                          TEST RESULTS SUMMARY\n")
+            sys.stdout.write(f"{'='*80}\n")
+            sys.stdout.write(f"  Total Batches:        {len(self.test_losses)}\n")
+            sys.stdout.write(f"  Total Samples:        ~{len(self.test_losses) * self.hparams.batch_size_per_device}\n")
+            sys.stdout.write(f"\n")
+            sys.stdout.write(f"  📊 Loss Statistics:\n")
+            sys.stdout.write(f"     Average:           {avg_loss:.4f}\n")
+            sys.stdout.write(f"     Std Dev:           {std_loss:.4f}\n")
+            sys.stdout.write(f"     Range:             [{min_loss:.4f}, {max_loss:.4f}]\n")
+            sys.stdout.write(f"\n")
+            sys.stdout.write(f"  📈 Perplexity Statistics:\n")
+            sys.stdout.write(f"     Average:           {avg_ppl:.2f}\n")
+            sys.stdout.write(f"     Std Dev:           {std_ppl:.2f}\n")
+            sys.stdout.write(f"     Range:             [{min_ppl:.2f}, {max_ppl:.2f}]\n")
+            sys.stdout.write(f"{'='*80}\n\n")
+            sys.stdout.flush()
+
     def eval_step(self, batch, phase):
         things_to_log = self.model.forward_loss_wrapper(batch, phase) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop
 
@@ -588,9 +735,12 @@ class ModelTrainer(LightningModule):
         #         resume_state_dict=None
         #     )
 
+        # Use tokenizer_obj for dataloader
+        tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
+
         train_dataloader = generate_dataloader(
-            tokenizer=self.hparams.tokenizer,
-            batch_size=self.hparams.batch_size_per_device, 
+            tokenizer=tokenizer,
+            batch_size=self.hparams.batch_size_per_device,
             max_seq_length=self.hparams.context_length,
             max_iter=self.hparams.max_steps,
             split="train",
@@ -611,8 +761,11 @@ class ModelTrainer(LightningModule):
         #         resume_state_dict=None
         #     )
 
+        # Use tokenizer_obj for dataloader
+        tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
+
         val_dataloader = generate_dataloader(
-            tokenizer=self.hparams.tokenizer,
+            tokenizer=tokenizer,
             batch_size=self.hparams.batch_size_per_device,
             max_seq_length=self.hparams.context_length,
             max_iter=self.hparams.val_steps,
@@ -624,7 +777,21 @@ class ModelTrainer(LightningModule):
         return val_dataloader
 
     def test_dataloader(self):
-        return self.val_dataloader()
+        # For inference mode with specific datasets, use DataLoader with collate_fn
+        if self.hparams.execution_mode == "inference" and self.hparams.dataset_name == "gsm8k":
+            test_ds = GSM8KDataset(self.hparams, split="test")
+            return DataLoader(
+                test_ds,
+                batch_size=self.hparams.batch_size_per_device,
+                num_workers=0,  # Keep 0 for simplicity
+                collate_fn=self.get_collate_fn(),
+                pin_memory=True,
+                drop_last=False,
+                shuffle=False
+            )
+        else:
+            # Default: use val_dataloader for pretrain mode
+            return self.val_dataloader()
         
     # def train_dataloader(self):
     #     return DataLoader(self.train_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = not self.hparams.no_shuffle, prefetch_factor=self.hparams.prefetch_factor)

@@ -110,6 +110,10 @@ def main(args):
         assert args.embedding_dim != 0, "must define embedding dim for NLP models"
         if args.vocab_to_embed_uses_prob_dist:
             assert args.normalize_initial_condition, "if vocab_to_embed_uses_prob_dist is true must use normalize_initial_condition"
+    elif args.modality == "VID":
+        # VID is old default, treat as NLP for backward compatibility
+        args.modality = "NLP"
+        print(f"WARNING: modality=VID is deprecated, treating as NLP")
     # elif args.modality == "IMG":
     #     args.backbone_type = "vae" # always uses vae
     #     assert args.embedding_dim != 0, "must define embedding dim for IMG models"
@@ -239,8 +243,12 @@ def main(args):
         trainer.test(model_trainer)
         if args.modality == "NLP": # can have modality specific logic here for inference
             if args.execution_mode == "inference":
-                em_score, f1_score = nlp_eval_acc(os.path.join(args.save_generation_logs_dir, "results.jsonl"))
-                trainer.logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
+                # Only compute EM/F1 for generation tasks (GSM8K, etc), not PPL tasks (nanochat)
+                if args.dataset_name in ["gsm8k", "arc", "humaneval", "mmlu", "smoltalk", "spellingbee"]:
+                    em_score, f1_score = nlp_eval_acc(os.path.join(args.save_generation_logs_dir, "results.jsonl"))
+                    trainer.logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
+                else:
+                    print(f"Skipping EM/F1 evaluation for PPL-only dataset: {args.dataset_name}")
         # elif args.modality == "VID":
         #     if args.infer_generate_video:
         #         print("calling style gan FVD code on generated video dataset, NOTE THIS CODE MAY NOT WORK AS EXPECTED or get stuck")
@@ -649,8 +657,8 @@ if __name__ == '__main__':
     
     parser.add_argument("--infer_max_gen_len", help="[Inference] Maximum number of tokens/frames/sequence to generate", type=int, default=256)
 
-    parser.add_argument("--infer_echo", help="[Inference] Include input prompt in the output", type=bool, default=False)
-    
+    parser.add_argument("--infer_echo", help="[Inference] Include input prompt in the output", action="store_true", default=False)
+
     parser.add_argument("--infer_output_dir", type=str, default="./logs/inference")
 
     # NLP INFERENCE ########################################################################

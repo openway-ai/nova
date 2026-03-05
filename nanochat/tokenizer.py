@@ -163,9 +163,18 @@ import tiktoken
 class RustBPETokenizer:
     """Light wrapper around tiktoken (for efficient inference) but train with rustbpe"""
 
-    def __init__(self, enc, bos_token):
+    def __init__(self, enc, bos_token, eos_token=None):
         self.enc = enc
         self.bos_token_id = self.encode_special(bos_token)
+        # For compatibility: many codebases expect eos_token_id
+        # In BPE tokenizers, BOS token is often used as both BOS and EOS
+        # If no explicit EOS token is provided, use BOS token as EOS
+        if eos_token is not None:
+            self.eos_token_id = self.encode_special(eos_token)
+        else:
+            self.eos_token_id = self.bos_token_id
+        # For compatibility with HuggingFace tokenizers
+        self.pad_token_id = self.eos_token_id
 
     @classmethod
     def train_from_iterator(cls, text_iterator, vocab_size):
@@ -204,7 +213,8 @@ class RustBPETokenizer:
         # yes this is confusing because this token is almost always PREPENDED to the beginning of the document
         # it most often is used to signal the start of a new sequence to the LLM during inference etc.
         # so in nanoChat we always use "<|bos|>" short for "beginning of sequence", but historically it is often called "<|endoftext|>".
-        return cls(enc, "<|endoftext|>")
+        # We set both bos and eos to the same token for compatibility
+        return cls(enc, "<|endoftext|>", "<|endoftext|>")
 
     def get_vocab_size(self):
         return self.enc.n_vocab
