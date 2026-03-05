@@ -316,8 +316,18 @@ class ModelTrainer(LightningModule):
 
     def on_test_epoch_start(self):
         """Reset test metrics at the start of test epoch"""
+        import time
         self.test_losses = []
         self.test_perplexities = []
+        self.test_energies = {}
+        self.test_start_time = time.time()
+
+        # Print header
+        import sys
+        sys.stdout.write(f"\n{'='*100}\n")
+        sys.stdout.write(f"{'🚀 STARTING EVALUATION':^100}\n")
+        sys.stdout.write(f"{'='*100}\n\n")
+        sys.stdout.flush()
 
     def test_step(self, batch, batch_idx):
         if self.hparams.execution_mode == "inference":
@@ -351,13 +361,50 @@ class ModelTrainer(LightningModule):
                     self.test_losses.append(ppl_outputs['loss'].item())
                     self.test_perplexities.append(ppl_outputs['perplexity'].item())
 
-                    # Print progress every 10 batches
-                    if batch_idx % 10 == 0:
+                    # Track energy metrics if available
+                    if not hasattr(self, 'test_energies'):
+                        self.test_energies = {}
+                    for key, value in ppl_outputs.items():
+                        if 'energy' in key:
+                            if key not in self.test_energies:
+                                self.test_energies[key] = []
+                            self.test_energies[key].append(value)
+
+                    # Print progress every 5 batches (more frequent)
+                    if batch_idx % 5 == 0:
                         import sys
                         import numpy as np
+                        import time
+
+                        # Calculate statistics
                         current_avg_loss = np.mean(self.test_losses)
                         current_avg_ppl = np.mean(self.test_perplexities)
-                        sys.stdout.write(f"Batch {batch_idx:3d} | Loss: {ppl_outputs['loss'].item():.4f} | PPL: {ppl_outputs['perplexity'].item():.2f} | Avg Loss: {current_avg_loss:.4f} | Avg PPL: {current_avg_ppl:.2f}\n")
+                        current_std_loss = np.std(self.test_losses) if len(self.test_losses) > 1 else 0.0
+                        current_std_ppl = np.std(self.test_perplexities) if len(self.test_perplexities) > 1 else 0.0
+
+                        # Estimate time remaining
+                        if not hasattr(self, 'test_start_time'):
+                            self.test_start_time = time.time()
+                        elapsed = time.time() - self.test_start_time
+                        batches_done = batch_idx + 1
+                        batches_total = self.hparams.limit_test_batches if self.hparams.limit_test_batches != 1 else 100
+                        eta = elapsed / batches_done * (batches_total - batches_done) if batches_done > 0 else 0
+
+                        sys.stdout.write(f"\n{'─'*100}\n")
+                        sys.stdout.write(f"📊 Batch {batch_idx:3d}/{batches_total} | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s\n")
+                        sys.stdout.write(f"{'─'*100}\n")
+                        sys.stdout.write(f"  Current Batch:  Loss={ppl_outputs['loss'].item():.4f}  PPL={ppl_outputs['perplexity'].item():.2f}\n")
+                        sys.stdout.write(f"  Running Avg:    Loss={current_avg_loss:.4f} (±{current_std_loss:.4f})  PPL={current_avg_ppl:.2f} (±{current_std_ppl:.2f})\n")
+
+                        # Show energy metrics if available
+                        if self.test_energies:
+                            energy_strs = []
+                            for key, values in self.test_energies.items():
+                                avg_energy = np.mean(values)
+                                energy_strs.append(f"{key}={avg_energy:.2f}")
+                            sys.stdout.write(f"  Energy Metrics: {' | '.join(energy_strs)}\n")
+
+                        sys.stdout.write(f"{'─'*100}\n")
                         sys.stdout.flush()
 
                     # Save sample inputs/outputs to inference logger for first few batches
@@ -385,6 +432,18 @@ class ModelTrainer(LightningModule):
                                     "perplexity": ppl_outputs['perplexity'].item(),
                                 }
                                 self.infer_logger.log_data(output_record)
+
+                                # Also print to console for first few samples
+                                if batch_idx < 3:
+                                    import sys
+                                    sys.stdout.write(f"\n{'─'*100}\n")
+                                    sys.stdout.write(f"📄 Sample Text [Batch {batch_idx}, Sample {i}]:\n")
+                                    sys.stdout.write(f"{'─'*100}\n")
+                                    sys.stdout.write(f"{full_text[:300]}...\n")
+                                    sys.stdout.write(f"{'─'*100}\n")
+                                    sys.stdout.write(f"   Loss: {ppl_outputs['loss'].item():.4f} | PPL: {ppl_outputs['perplexity'].item():.2f}\n")
+                                    sys.stdout.write(f"{'─'*100}\n\n")
+                                    sys.stdout.flush()
 
                     # Log metrics (filter out energy metrics to avoid clutter)
                     filtered_outputs = {k: v for k, v in ppl_outputs.items() if 'energy' not in k}
@@ -437,11 +496,17 @@ class ModelTrainer(LightningModule):
                 self.log_metrics(eval_step_dict, "test")
 
     def on_test_epoch_end(self):
-        """Print summary statistics at the end of test epoch"""
+        """Print comprehensive summary statistics at the end of test epoch"""
         if len(self.test_losses) > 0:
             import sys
             import numpy as np
+            import time
 
+            # Calculate timing
+            total_time = time.time() - self.test_start_time
+            samples_per_sec = len(self.test_losses) * self.hparams.batch_size_per_device / total_time
+
+            # Calculate statistics
             avg_loss = np.mean(self.test_losses)
             avg_ppl = np.mean(self.test_perplexities)
             std_loss = np.std(self.test_losses)
@@ -450,24 +515,112 @@ class ModelTrainer(LightningModule):
             max_loss = np.max(self.test_losses)
             min_ppl = np.min(self.test_perplexities)
             max_ppl = np.max(self.test_perplexities)
+            median_loss = np.median(self.test_losses)
+            median_ppl = np.median(self.test_perplexities)
+
+            # Calculate percentiles
+            p25_loss, p75_loss = np.percentile(self.test_losses, [25, 75])
+            p25_ppl, p75_ppl = np.percentile(self.test_perplexities, [25, 75])
 
             sys.stdout.write(f"\n\n")
-            sys.stdout.write(f"{'='*80}\n")
-            sys.stdout.write(f"                          TEST RESULTS SUMMARY\n")
-            sys.stdout.write(f"{'='*80}\n")
-            sys.stdout.write(f"  Total Batches:        {len(self.test_losses)}\n")
-            sys.stdout.write(f"  Total Samples:        ~{len(self.test_losses) * self.hparams.batch_size_per_device}\n")
+            sys.stdout.write(f"{'='*100}\n")
+            sys.stdout.write(f"{'📊 EVALUATION RESULTS SUMMARY':^100}\n")
+            sys.stdout.write(f"{'='*100}\n\n")
+
+            # Dataset info
+            sys.stdout.write(f"📦 Dataset Information:\n")
+            sys.stdout.write(f"   Dataset:           {self.hparams.dataset_name}\n")
+            sys.stdout.write(f"   Total Batches:     {len(self.test_losses)}\n")
+            sys.stdout.write(f"   Batch Size:        {self.hparams.batch_size_per_device}\n")
+            sys.stdout.write(f"   Total Samples:     ~{len(self.test_losses) * self.hparams.batch_size_per_device}\n")
+            sys.stdout.write(f"   Context Length:    {self.hparams.context_length}\n\n")
+
+            # Model info
+            sys.stdout.write(f"🤖 Model Information:\n")
+            sys.stdout.write(f"   Model Type:        {self.hparams.model_name.upper()}\n")
+            sys.stdout.write(f"   Model Size:        {self.hparams.model_size}\n")
+            if self.hparams.model_name == "ebt":
+                sys.stdout.write(f"   MCMC Steps:        {self.hparams.mcmc_num_steps}\n")
+                sys.stdout.write(f"   MCMC Step Size:    {self.hparams.mcmc_step_size}\n")
+                sys.stdout.write(f"   EBT Type:          {self.hparams.ebt_type}\n")
             sys.stdout.write(f"\n")
-            sys.stdout.write(f"  📊 Loss Statistics:\n")
-            sys.stdout.write(f"     Average:           {avg_loss:.4f}\n")
-            sys.stdout.write(f"     Std Dev:           {std_loss:.4f}\n")
-            sys.stdout.write(f"     Range:             [{min_loss:.4f}, {max_loss:.4f}]\n")
+
+            # Timing info
+            sys.stdout.write(f"⏱️  Performance:\n")
+            sys.stdout.write(f"   Total Time:        {total_time:.2f}s\n")
+            sys.stdout.write(f"   Time per Batch:    {total_time/len(self.test_losses):.3f}s\n")
+            sys.stdout.write(f"   Throughput:        {samples_per_sec:.2f} samples/s\n\n")
+
+            # Loss statistics
+            sys.stdout.write(f"📉 Cross-Entropy Loss Statistics:\n")
+            sys.stdout.write(f"   Mean:              {avg_loss:.4f}\n")
+            sys.stdout.write(f"   Median:            {median_loss:.4f}\n")
+            sys.stdout.write(f"   Std Dev:           {std_loss:.4f}\n")
+            sys.stdout.write(f"   Min:               {min_loss:.4f}\n")
+            sys.stdout.write(f"   Max:               {max_loss:.4f}\n")
+            sys.stdout.write(f"   25th Percentile:   {p25_loss:.4f}\n")
+            sys.stdout.write(f"   75th Percentile:   {p75_loss:.4f}\n\n")
+
+            # Perplexity statistics
+            sys.stdout.write(f"📈 Perplexity (PPL) Statistics:\n")
+            sys.stdout.write(f"   Mean:              {avg_ppl:.2f}\n")
+            sys.stdout.write(f"   Median:            {median_ppl:.2f}\n")
+            sys.stdout.write(f"   Std Dev:           {std_ppl:.2f}\n")
+            sys.stdout.write(f"   Min:               {min_ppl:.2f}\n")
+            sys.stdout.write(f"   Max:               {max_ppl:.2f}\n")
+            sys.stdout.write(f"   25th Percentile:   {p25_ppl:.2f}\n")
+            sys.stdout.write(f"   75th Percentile:   {p75_ppl:.2f}\n\n")
+
+            # Energy statistics if available
+            if hasattr(self, 'test_energies') and self.test_energies:
+                sys.stdout.write(f"⚡ Energy Landscape Statistics:\n")
+                for key, values in sorted(self.test_energies.items()):
+                    avg_energy = np.mean(values)
+                    std_energy = np.std(values)
+                    min_energy = np.min(values)
+                    max_energy = np.max(values)
+                    sys.stdout.write(f"   {key}:\n")
+                    sys.stdout.write(f"      Mean: {avg_energy:.4f} ± {std_energy:.4f}\n")
+                    sys.stdout.write(f"      Range: [{min_energy:.4f}, {max_energy:.4f}]\n")
+                sys.stdout.write(f"\n")
+
+            # ASCII histogram for PPL distribution
+            sys.stdout.write(f"📊 Perplexity Distribution (Histogram):\n")
+            hist, bin_edges = np.histogram(self.test_perplexities, bins=10)
+            max_count = max(hist)
+            for i in range(len(hist)):
+                bar_length = int(40 * hist[i] / max_count) if max_count > 0 else 0
+                bar = '█' * bar_length
+                sys.stdout.write(f"   [{bin_edges[i]:6.2f}-{bin_edges[i+1]:6.2f}]: {bar} ({hist[i]})\n")
             sys.stdout.write(f"\n")
-            sys.stdout.write(f"  📈 Perplexity Statistics:\n")
-            sys.stdout.write(f"     Average:           {avg_ppl:.2f}\n")
-            sys.stdout.write(f"     Std Dev:           {std_ppl:.2f}\n")
-            sys.stdout.write(f"     Range:             [{min_ppl:.2f}, {max_ppl:.2f}]\n")
-            sys.stdout.write(f"{'='*80}\n\n")
+
+            # Quality assessment
+            sys.stdout.write(f"✅ Quality Assessment:\n")
+            if avg_ppl < 20:
+                quality = "Excellent"
+                emoji = "🎉"
+            elif avg_ppl < 40:
+                quality = "Good"
+                emoji = "👍"
+            elif avg_ppl < 60:
+                quality = "Fair"
+                emoji = "😐"
+            else:
+                quality = "Needs Improvement"
+                emoji = "⚠️"
+            sys.stdout.write(f"   Overall: {emoji} {quality} (PPL={avg_ppl:.2f})\n\n")
+
+            # Output files
+            if hasattr(self.hparams, 'save_generation_logs_dir'):
+                import os
+                results_file = os.path.join(self.hparams.save_generation_logs_dir, "results.jsonl")
+                if os.path.exists(results_file):
+                    num_samples = sum(1 for _ in open(results_file))
+                    sys.stdout.write(f"📁 Output Files:\n")
+                    sys.stdout.write(f"   Results:           {results_file}\n")
+                    sys.stdout.write(f"   Num Samples:       {num_samples}\n\n")
+
+            sys.stdout.write(f"{'='*100}\n\n")
             sys.stdout.flush()
 
     def eval_step(self, batch, phase):
