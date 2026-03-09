@@ -33,9 +33,36 @@ fi
 
 # 评估配置
 EVAL_MODES="${EVAL_MODES:-core}"  # 默认只评估 CORE，可选 core,bpb,sample
-MAX_PER_TASK="${MAX_PER_TASK:--1}"  # -1 表示评估所有样本
+
+# 样本数配置
+# MAX_PER_TASK: 全局默认值，-1 表示评估所有样本（获得完整 CORE score）
+# 可以通过环境变量覆盖，例如: MAX_PER_TASK=100 bash runs/eval_ebt_core.sh
+MAX_PER_TASK="${MAX_PER_TASK:--1}"
+
+# 每个任务的样本数配置（可选，覆盖全局设置）
+# 格式: "task_name:num_samples,task_name:num_samples,..."
+# 例如: TASK_SAMPLES="hellaswag_zeroshot:100,arc_easy:50"
+TASK_SAMPLES="${TASK_SAMPLES:-}"
+
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
-NUM_GPUS="${NUM_GPUS:-1}"
+
+# GPU 配置
+# NUM_GPUS: 使用的 GPU 数量
+# -1 表示使用所有检测到的 GPU（默认）
+# 可以指定具体数量，例如: NUM_GPUS=2
+NUM_GPUS="${NUM_GPUS:--1}"
+
+# 自动检测可用 GPU 数量
+if [ "$NUM_GPUS" = "-1" ]; then
+    if command -v nvidia-smi &> /dev/null; then
+        DETECTED_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+        NUM_GPUS=$DETECTED_GPUS
+        echo "🔍 自动检测到 $NUM_GPUS 个 GPU"
+    else
+        NUM_GPUS=1
+        echo "⚠️  无法检测 GPU，默认使用 1 个 GPU"
+    fi
+fi
 
 # Tokenizer 路径
 TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer}"
@@ -63,7 +90,10 @@ echo "════════════════════════�
 echo "📦 Checkpoint: $CKPT_PATH"
 echo "📦 Tokenizer: $TOKENIZER_PATH"
 echo "📊 评估模式: $EVAL_MODES"
-echo "📊 每任务最大样本数: $MAX_PER_TASK"
+echo "📊 全局最大样本数: $MAX_PER_TASK (-1 = 全部样本)"
+if [ -n "$TASK_SAMPLES" ]; then
+    echo "📊 任务特定样本数: $TASK_SAMPLES"
+fi
 echo "📊 Batch Size: $DEVICE_BATCH_SIZE"
 echo "📊 GPU 数量: $NUM_GPUS"
 echo "📁 输出目录: $OUTPUT_DIR"
@@ -114,6 +144,12 @@ echo ""
 # 构建评估命令
 cd nova/ebt
 
+# 构建任务样本数参数
+TASK_SAMPLES_ARG=""
+if [ -n "$TASK_SAMPLES" ]; then
+    TASK_SAMPLES_ARG="--task-samples '$TASK_SAMPLES'"
+fi
+
 # 使用 conda 环境的 Python
 EVAL_CMD="python -m scripts.ebt_core_eval \
     --ckpt-path '$CKPT_PATH' \
@@ -121,6 +157,7 @@ EVAL_CMD="python -m scripts.ebt_core_eval \
     --eval-bundle-dir '$NANOCHAT_BASE_DIR/eval_bundle' \
     --eval-modes '$EVAL_MODES' \
     --max-per-task $MAX_PER_TASK \
+    $TASK_SAMPLES_ARG \
     --device-batch-size $DEVICE_BATCH_SIZE \
     --output-dir '$OUTPUT_DIR' \
     --gpus $NUM_GPUS"

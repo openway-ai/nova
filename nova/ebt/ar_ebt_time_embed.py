@@ -723,6 +723,17 @@ class EBTTimeConcat(nn.Module):
         _bsz, seqlen = embeddings.shape[:2]
         seqlen = (seqlen+3) // 2 # do this since passed in seqlen is 2(S-1)+1 so add 3 div 2 = S+1 which corresponds to concatting time embed
         self.freqs_cis = self.freqs_cis.to(embeddings.device)
+
+        # 动态扩展 freqs_cis 如果需要的长度超过预计算的长度
+        required_length = start_pos + seqlen
+        if required_length > self.freqs_cis.shape[0]:
+            # 重新计算更长的 freqs_cis
+            new_freqs_cis = precompute_freqs_cis(
+                self.params.dim // self.params.n_heads,
+                required_length
+            ).to(embeddings.device)
+            self.freqs_cis = new_freqs_cis
+
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None

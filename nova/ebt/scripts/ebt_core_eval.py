@@ -230,9 +230,17 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     return accuracy
 
 
-def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1):
+def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1, task_samples=None):
     """
     运行完整的 CORE 评估
+
+    Args:
+        model: 模型
+        tokenizer: tokenizer
+        device: 设备
+        eval_bundle_dir: 评估数据目录
+        max_per_task: 全局默认每个任务的最大样本数，-1 表示全部
+        task_samples: 字典，指定每个任务的样本数，例如 {"hellaswag_zeroshot": 100}
     """
     config_path = os.path.join(eval_bundle_dir, "core.yaml")
     data_base_path = os.path.join(eval_bundle_dir, "eval_data")
@@ -279,14 +287,20 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1):
         with open(data_path, 'r', encoding='utf-8') as f:
             data = [json.loads(line.strip()) for line in f]
 
+        # 确定该任务使用的样本数
+        task_max_samples = max_per_task
+        if task_samples and label in task_samples:
+            task_max_samples = task_samples[label]
+            print(f"  Using task-specific sample limit: {task_max_samples}")
+
         # 子采样（用于快速测试）
-        if max_per_task > 0:
+        if task_max_samples > 0:
             shuffle_rng = random.Random(1337)
             shuffle_rng.shuffle(data)
-            data = data[:max_per_task]
-            print(f"  Using {len(data)} samples (max_per_task={max_per_task})")
+            data = data[:task_max_samples]
+            print(f"  Using {len(data)} samples (limited from {len(data)} total)")
         else:
-            print(f"  Total samples: {len(data)}")
+            print(f"  Total samples: {len(data)} (evaluating ALL samples)")
 
         # 评估
         accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
@@ -311,26 +325,82 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="EBT CORE Evaluation")
+    parser = argparse.ArgumentParser(
+        description="EBT CORE Evaluation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例用法:
+
+1. 评估所有样本（完整 CORE score）:
+   python -m scripts.ebt_core_eval --ckpt-path model.ckpt --tokenizer-path tokenizer/ \\
+       --eval-bundle-dir eval_bundle/ --output-dir output/ --max-per-task -1
+
+2. 快速测试（每个任务 100 个样本）:
+   python -m scripts.ebt_core_eval --ckpt-path model.ckpt --tokenizer-path tokenizer/ \\
+       --eval-bundle-dir eval_bundle/ --output-dir output/ --max-per-task 100
+
+3. 为特定任务设置不同样本数:
+   python -m scripts.ebt_core_eval --ckpt-path model.ckpt --tokenizer-path tokenizer/ \\
+       --eval-bundle-dir eval_bundle/ --output-dir output/ --max-per-task 100 \\
+       --task-samples "hellaswag_zeroshot:500,arc_easy:200"
+
+4. 使用多个 GPU:
+   python -m scripts.ebt_core_eval --ckpt-path model.ckpt --tokenizer-path tokenizer/ \\
+       --eval-bundle-dir eval_bundle/ --output-dir output/ --gpus 4
+        """
+    )
     parser.add_argument('--ckpt-path', type=str, required=True, help='EBT checkpoint path')
     parser.add_argument('--tokenizer-path', type=str, required=True, help='Tokenizer path')
     parser.add_argument('--eval-bundle-dir', type=str, required=True, help='Path to eval_bundle directory')
     parser.add_argument('--eval-modes', type=str, default='core', help='Evaluation modes (default: core)')
-    parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task (-1 = all)')
-    parser.add_argument('--device-batch-size', type=int, default=16, help='Batch size (not used yet)')
+    parser.add_argument('--max-per-task', type=int, default=-1,
+                        help='Max examples per task globally (-1 = all samples for complete CORE score)')
+    parser.add_argument('--task-samples', type=str, default='',
+                        help='Task-specific sample limits (format: "task1:num1,task2:num2")')
+    parser.add_argument('--device-batch-size', type=int, default=16, help='Batch size per device')
     parser.add_argument('--output-dir', type=str, required=True, help='Output directory')
-    parser.add_argument('--gpus', type=int, default=1, help='Number of GPUs')
+    parser.add_argument('--gpus', type=int, default=-1,
+                        help='Number of GPUs to use (-1 = auto-detect all available GPUs)')
     args = parser.parse_args()
 
-    # 设置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # 解析任务特定样本数
+    task_samples_dict = {}
+    if args.task_samples:
+        for item in args.task_samples.split(','):
+            if ':' in item:
+                task_name, num_samples = item.split(':', 1)
+                task_samples_dict[task_name.strip()] = int(num_samples.strip())
+
+    # 设置设备和 GPU
+    if args.gpus == -1:
+        # 自动检测所有可用 GPU
+        if torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+            print(f"🔍 Auto-detected {num_gpus} GPU(s)")
+        else:
+            num_gpus = 0
+            print("⚠️  No GPU detected, using CPU")
+    else:
+        num_gpus = args.gpus
+        print(f"📊 Using {num_gpus} GPU(s) as specified")
+
+    # 当前实现使用单 GPU，多 GPU 支持可以后续添加
+    if num_gpus > 1:
+        print(f"⚠️  Multi-GPU support not yet implemented, using GPU 0 only")
+        device = torch.device('cuda:0')
+    elif num_gpus == 1:
+        device = torch.device('cuda:0')
+    else:
+        device = torch.device('cpu')
+
     print(f"Using device: {device}")
+    print()
 
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
 
     # 加载模型
-    print("\n" + "="*80)
+    print("="*80)
     print("Loading EBT Model")
     print("="*80 + "\n")
 
@@ -338,7 +408,11 @@ def main():
 
     # 运行 CORE 评估
     if 'core' in args.eval_modes:
-        core_results = evaluate_core(model, tokenizer, device, args.eval_bundle_dir, args.max_per_task)
+        core_results = evaluate_core(
+            model, tokenizer, device, args.eval_bundle_dir,
+            max_per_task=args.max_per_task,
+            task_samples=task_samples_dict if task_samples_dict else None
+        )
 
         # 打印结果
         print("\n" + "="*80)
