@@ -12,8 +12,8 @@
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-mkdir -p $NANOCHAT_BASE_DIR
+export NOVA_BASE_DIR="$HOME/.cache/nova/ebt"
+mkdir -p $NOVA_BASE_DIR
 
 # -----------------------------------------------------------------------------
 # Python venv setup with uv
@@ -21,8 +21,9 @@ mkdir -p $NANOCHAT_BASE_DIR
 # install uv (if not already installed)
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 # create a .venv local virtual environment (if it doesn't exist)
-[ -d ".venv" ] || uv venv
+[ -d "../../.venv/ebt" ] || uv venv ../../.venv/ebt
 # install the repo dependencies
-uv sync --extra gpu
+
+UV_PROJECT_ENVIRONMENT=../../.venv/ebt uv sync --extra gpu
 # activate venv so that `python` uses the project's venv instead of system python
-source .venv/bin/activate
+# source .venv/ebt/bin/activate

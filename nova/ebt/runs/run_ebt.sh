@@ -3,9 +3,8 @@
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
-source .venv/bin/activate
+# source ../../.venv/ebt/bin/activate
 
-cd nova/ebt
 ### LOG INFO ###
 #SBATCH --job-name=ebt-xxs-bs_256_s1_lr_
 #SBATCH --output=logs/slurm/nlp/ebt-xxs-bs_256_s1_lr_%A-%a.log
@@ -43,7 +42,7 @@ current_time=$(date +"%Y%m%d_%H%M%S")
 # --tokenizer "EleutherAI/gpt-neox-20b" \
 
 
-torchrun --standalone --nproc_per_node=6 train.py \
+torchrun --standalone --nproc_per_node=8 train.py \
 --run_name ${RUN_NAME}${lr[${SLURM_ARRAY_TASK_ID}]} \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
@@ -77,10 +76,9 @@ torchrun --standalone --nproc_per_node=6 train.py \
 \
 --dataset_name "nanochat" \
 --num_workers 12 \
---val_every_n_step 1000 \
---val_after_n_step 1 \
---val_steps 1000 \
---val_sanity 0 \
+--val_check_interval 1000 \
+--limit_val_batches 100 \
+--val_sanity 1 \
 \
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \

@@ -1,13 +1,13 @@
 import sys
-sys.path.append("../../../")
+sys.path.append("../../")
 
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 
 import torch
+from torch.utils.data import IterableDataset as _IterableDataset
 from torch.utils.data import IterableDataset, DataLoader
 
-
-class IterableDataset(IterableDataset):
+class IterableDataset(_IterableDataset):
     """
     Wraps tokenizing_distributed_data_loader_with_state_bos_bestfit
     into a PyTorch IterableDataset.
@@ -22,8 +22,8 @@ class IterableDataset(IterableDataset):
     def __init__(
         self,
         tokenizer,
-        B,
-        T,
+        batch_size,
+        max_len,
         split,
         max_iter,
         # tokenizer_threads=4,
@@ -35,8 +35,8 @@ class IterableDataset(IterableDataset):
         super().__init__()
 
         self.tokenizer = tokenizer
-        self.B = B
-        self.T = T
+        self.B = batch_size
+        self.T = max_len
         self.split = split
         self.max_iter = max_iter
         # self.tokenizer_threads = tokenizer_threads
@@ -80,12 +80,12 @@ class IterableDataset(IterableDataset):
         return self.max_iter
 
 
-def generate_dataloader(tokenizer, batch_size, max_seq_length, max_iter, split, device, resume_state_dict=None):
+def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device, resume_state_dict=None):
 
     dataset = IterableDataset(
         tokenizer=tokenizer,
         B=batch_size, 
-        T=max_seq_length,
+        T=max_len,
         split=split,
         max_iter=max_iter,
         device=device,

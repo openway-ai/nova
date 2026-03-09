@@ -4,16 +4,26 @@ import torch
 import os
 from argparse import ArgumentParser
 import time
-from nanolightning.torchlightning_trainer import Trainer
-from nanolightning.iteratabletrainer import IterableTrainer
-from nanolightning.torchlightning_trainer import ModelSummary
+
 import random
 from datetime import datetime
-from nanolightning.torchlightning_function import DDPStrategy
-from nanolightning.torchlightning_function import seed_everything
-from nanolightning.torchlightning_function import WandbLogger
-from nanolightning.torchlightning_function import ModelCheckpoint
-from nanolightning.torchlightning_function import rank_zero_only
+
+# from nanolightning.torchlightning_trainer import Trainer
+# from nanolightning.iteratabletrainer import IterableTrainer
+# from nanolightning.torchlightning_trainer import ModelSummary
+# from nanolightning.torchlightning_function import DDPStrategy
+# from nanolightning.torchlightning_function import seed_everything
+# from nanolightning.torchlightning_function import WandbLogger
+# from nanolightning.torchlightning_function import ModelCheckpoint
+# from nanolightning.torchlightning_function import rank_zero_only
+
+from pytorch_lightning import Trainer
+from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning import seed_everything
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelSummary
 
 import sys
 import wandb
@@ -273,35 +283,7 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train"):
     limit_val_batches = 0 if args.overfit_batches > 0 else args.limit_val_batches
     # val_check_interval = args.val_check_interval if args.val_check_interval == 1.0 else args.val_check_interval * args.accumulate_grad_batches  #NOTE the reason we mult by args.accumulate_grad_batches is because of this bug https://github.com/Lightning-AI/pytorch-lightning/issues/12205
     limit_test_batches = args.limit_test_batches if args.limit_test_batches == 1 else args.limit_test_batches * args.accumulate_grad_batches
-    # trainer = Trainer(
-    #     accelerator="auto",
-    #     devices = args.gpus,
-    #     num_nodes=args.num_nodes,
-    #     precision=args.float_precision,
-    #     max_steps=args.max_steps,
-    #     logger=wandb_logger,
-    #     enable_model_summary=args.log_model_archi,
-    #     callbacks = [checkpoint_callback, ModelSummary(max_depth=-1)],
-    #     strategy = args.distributed_strategy, 
-    #     enable_checkpointing=True,
-    #     fast_dev_run = args.fast_dev_run,
-    #     num_sanity_val_steps = args.val_sanity,
-    #     limit_train_batches = args.limit_train_batches,
-    #     limit_val_batches = limit_val_batches,
-    #     limit_test_batches = limit_test_batches,
-    #     detect_anomaly=args.detect_anomaly,
-    #     gradient_clip_val=gradient_clip_val,
-    #     overfit_batches=args.overfit_batches,
-    #     profiler=profiler,
-    #     val_check_interval=val_check_interval,
-    #     check_val_every_n_epoch=args.check_val_every_n_epoch,
-    #     deterministic=args.deterministic,
-    #     log_every_n_steps=args.log_every_n_steps,
-    #     accumulate_grad_batches=args.accumulate_grad_batches,
-    #     inference_mode=False # set inference mode to false to get grad for models like ebt during testing
-    # )
-
-    trainer = IterableTrainer(
+    trainer = Trainer(
         accelerator="auto",
         devices = args.gpus,
         num_nodes=args.num_nodes,
@@ -321,13 +303,41 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train"):
         gradient_clip_val=gradient_clip_val,
         overfit_batches=args.overfit_batches,
         profiler=profiler,
-        val_every_n_step=args.val_every_n_step,
-        val_after_n_step=args.val_after_n_step,
+        val_check_interval=args.val_every_n_step,
+        # check_val_every_n_epoch=args.check_val_every_n_epoch,
         deterministic=args.deterministic,
         log_every_n_steps=args.log_every_n_steps,
         accumulate_grad_batches=args.accumulate_grad_batches,
         inference_mode=False # set inference mode to false to get grad for models like ebt during testing
     )
+
+    # trainer = IterableTrainer(
+    #     accelerator="auto",
+    #     devices = args.gpus,
+    #     num_nodes=args.num_nodes,
+    #     precision=args.float_precision,
+    #     max_steps=args.max_steps,
+    #     logger=wandb_logger,
+    #     enable_model_summary=args.log_model_archi,
+    #     callbacks = [checkpoint_callback, ModelSummary(max_depth=-1)],
+    #     strategy = args.distributed_strategy, 
+    #     enable_checkpointing=True,
+    #     fast_dev_run = args.fast_dev_run,
+    #     num_sanity_val_steps = args.val_sanity,
+    #     limit_train_batches = args.limit_train_batches,
+    #     limit_val_batches = limit_val_batches,
+    #     limit_test_batches = limit_test_batches,
+    #     detect_anomaly=args.detect_anomaly,
+    #     gradient_clip_val=gradient_clip_val,
+    #     overfit_batches=args.overfit_batches,
+    #     profiler=profiler,
+    #     val_every_n_step=args.val_every_n_step,
+    #     val_after_n_step=args.val_after_n_step,
+    #     deterministic=args.deterministic,
+    #     log_every_n_steps=args.log_every_n_steps,
+    #     accumulate_grad_batches=args.accumulate_grad_batches,
+    #     inference_mode=False # set inference mode to false to get grad for models like ebt during testing
+    # )
 
     return trainer
     
@@ -641,11 +651,11 @@ if __name__ == '__main__':
     
     parser.add_argument("--val_check_interval", help="interval to do validation per training epoch, 1 means once per epoch. useful if epochs are too large to wait to do validation", type=float, default=1.0)
 
-    parser.add_argument("--val_every_n_step", help="interval to do validation in steps", type=int, default=15000)
+    # parser.add_argument("--val_every_n_step", help="interval to do validation in steps", type=int, default=15000)
 
-    parser.add_argument("--val_after_n_step", help="how many steps to wait before doing validation. is useful when you have a small dataset and dont want to do validation every time", type=int, default=0)
+    # parser.add_argument("--val_after_n_step", help="how many steps to wait before doing validation. is useful when you have a small dataset and dont want to do validation every time", type=int, default=0)
 
-    parser.add_argument("--val_steps", help="how many steps of validation", type=int, default=1000)
+    # parser.add_argument("--val_steps", help="how many steps of validation", type=int, default=1000)
 
     #TESTING / INFERENCE#########################################################
 
