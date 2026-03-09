@@ -212,7 +212,7 @@ read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
 # 启动训练
 ################################################################################
 
-torchrun --standalone --nproc_per_node=${NUM_GPUS} train.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
 --run_name ${RUN_NAME}_${current_time} \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \

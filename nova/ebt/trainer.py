@@ -1006,7 +1006,7 @@ class ModelTrainer(LightningModule):
         train_dataloader = generate_dataloader(
             tokenizer=tokenizer,
             batch_size=self.hparams.batch_size_per_device,
-            max_seq_length=self.hparams.context_length,
+            max_len=self.hparams.context_length,
             max_iter=self.hparams.max_steps,
             split="train",
             device=self.device,
@@ -1038,7 +1038,7 @@ class ModelTrainer(LightningModule):
         val_dataloader = generate_dataloader(
             tokenizer=tokenizer,
             batch_size=self.hparams.batch_size_per_device,
-            max_seq_length=self.hparams.context_length,
+            max_len=self.hparams.context_length,
             max_iter=self.hparams.val_steps,
             split="val",
             device=self.device,
