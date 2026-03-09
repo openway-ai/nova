@@ -162,10 +162,25 @@ class ModelTrainer(LightningModule):
 
         # self.to_pil = ToPILImage()
         self.full_ds = None
+
+        # IMPORTANT: Tokenizer configuration for NanoChat dataset
+        # The tokenizer is loaded via get_tokenizer() which uses NanoChat custom BPE tokenizer
+        # from $NANOCHAT_BASE_DIR/tokenizer/ (vocab_size=32768)
+        # The --tokenizer parameter passed from command line is IGNORED for NanoChat!
         self.hparams.tokenizer_obj = tokenizer = get_tokenizer() # Store tokenizer object
         # Keep tokenizer path as string for generate_text compatibility
         if not hasattr(self.hparams, 'tokenizer_path'):
             self.hparams.tokenizer_path = self.hparams.tokenizer if isinstance(self.hparams.tokenizer, str) else "EleutherAI/gpt-neox-20b"
+
+        # Print tokenizer info for clarity
+        print(f"=" * 80)
+        print(f"TOKENIZER INFO:")
+        print(f"  Actual tokenizer used: NanoChat custom BPE tokenizer")
+        print(f"  Tokenizer location: $NANOCHAT_BASE_DIR/tokenizer/")
+        print(f"  Vocab size: {tokenizer.get_vocab_size()}")
+        print(f"  Command-line --tokenizer parameter: {self.hparams.tokenizer} (IGNORED)")
+        print(f"=" * 80)
+
         if trained_model is not None:
             self.model = trained_model
         else:
@@ -1000,6 +1015,12 @@ class ModelTrainer(LightningModule):
         return train_dataloader
 
     def val_dataloader(self):
+        # IMPORTANT: NanoChat dataset split information
+        # The train/val split is HARDCODED in nanochat/dataloader.py line 37:
+        # - Training: parquet_paths[:-1] (all files except the last one)
+        # - Validation: parquet_paths[-1:] (only the last file)
+        # With 370 total shards, this gives 369 train + 1 val (0.27% validation)
+        # The --validation_split_pct parameter does NOT control this split!
 
         val_dataloader = IterableDataset(
                 tokenizer=self.hparams.tokenizer,

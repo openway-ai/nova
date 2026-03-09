@@ -45,6 +45,11 @@ def parquets_iter_batched(split, start=0, step=1):
     Iterate through the dataset, in batches of underlying row_groups for efficiency.
     - split can be "train" or "val". the last parquet file will be val.
     - start/step are useful for skipping rows in DDP. e.g. start=rank, step=world_size
+
+    IMPORTANT: Train/Val split is HARDCODED:
+    - Training: All parquet files EXCEPT the last one (parquet_paths[:-1])
+    - Validation: Only the last parquet file (parquet_paths[-1:])
+    This split is NOT configurable!
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
     parquet_paths = list_parquet_files()

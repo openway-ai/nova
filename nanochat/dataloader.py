@@ -29,12 +29,25 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
     where text_batch is a list of document strings, indices track position for resumption,
     and epoch counts how many times we've cycled through the dataset (starts at 1).
+
+    IMPORTANT: Train/Val split is HARDCODED here:
+    - Training: All parquet files EXCEPT the last one (parquet_paths[:-1])
+    - Validation: Only the last parquet file (parquet_paths[-1:])
+    This split is NOT configurable via command-line parameters!
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
     parquet_paths = list_parquet_files()
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
+
+    # HARDCODED SPLIT: Last file for validation, rest for training
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+
+    print(f"[DataLoader] Split='{split}': Using {len(parquet_paths)} parquet file(s)")
+    if split == "train":
+        print(f"[DataLoader] Training on files: {parquet_paths[0]} to {parquet_paths[-1]}")
+    else:
+        print(f"[DataLoader] Validation on file: {parquet_paths[0]}")
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
     resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None

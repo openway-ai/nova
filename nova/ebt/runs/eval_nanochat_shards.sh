@@ -43,7 +43,7 @@ LIMIT_TEST_BATCHES="${LIMIT_TEST_BATCHES:-100}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer}"
 
 # 分片评估特定参数
-EVAL_SHARD_INDICES="${EVAL_SHARD_INDICES:-0,370}"  # 第一个和最后一个分片
+EVAL_SHARD_INDICES="${EVAL_SHARD_INDICES:-0,369}"  # 第一个和最后一个分片
 MAX_SAMPLES_PER_SHARD="${MAX_SAMPLES_PER_SHARD:-50}"  # 每个分片最多评估50个样本
 
 # 文本生成评估参数

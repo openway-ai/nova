@@ -39,6 +39,10 @@ current_time=$(date +"%Y%m%d_%H%M%S")
 
 # --gpus "-1" \
 
+# IMPORTANT: The --tokenizer parameter below is IGNORED during training!
+# The actual tokenizer used is NanoChat custom BPE tokenizer, loaded from:
+# $NANOCHAT_BASE_DIR/tokenizer/ (see trainer.py line 165: get_tokenizer())
+# This parameter is kept for backward compatibility only.
 # --tokenizer "EleutherAI/gpt-neox-20b" \
 
 
@@ -79,6 +83,14 @@ torchrun --standalone --nproc_per_node=8 train.py \
 --val_check_interval 1000 \
 --limit_val_batches 100 \
 --val_sanity 1 \
+\
+# IMPORTANT: NanoChat dataset split is HARDCODED in dataloader.py:
+# - Training: All parquet files EXCEPT the last one (parquet_paths[:-1])
+# - Validation: Only the last parquet file (parquet_paths[-1:])
+# With 370 total shards, this means 369 train + 1 val (0.27% validation)
+# The --validation_split_pct parameter below is for DOCUMENTATION ONLY
+# and does NOT control the actual split!
+--validation_split_pct 0.0027 \
 \
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \

@@ -381,7 +381,11 @@ if __name__ == '__main__':
      
     # NLP SPECIFIC PARAMS ############################################################################################################
 
-    parser.add_argument("--tokenizer", help="tokenizer for nlp tasks", type=str, default="EleutherAI/gpt-neox-20b")
+    # IMPORTANT: For NanoChat dataset, this parameter is IGNORED!
+    # The actual tokenizer is loaded via get_tokenizer() in trainer.py (line 165)
+    # which uses NanoChat custom BPE tokenizer from $NANOCHAT_BASE_DIR/tokenizer/
+    # This parameter is only used for non-NanoChat datasets.
+    parser.add_argument("--tokenizer", help="tokenizer for nlp tasks (IGNORED for nanochat dataset)", type=str, default="EleutherAI/gpt-neox-20b")
     
     parser.add_argument("--pretokenize_dataset", help="whether to pretokenize the dataset and save that or just tokenize as loading the dataset. tokenizing the dataset takes a long time and may need to be done using debug dataloader. due to a bug with HF does not always work reliably, may get stuck. not currently implemented for fine-tuning datasets", action="store_true", default=False)
 
@@ -644,7 +648,13 @@ if __name__ == '__main__':
 
     parser.add_argument("--ffprobe_path", help="path to ffprobe binary", default="")
 
-    parser.add_argument("--validation_split_pct", help="if training and validation set are being split - which percent is validation", type=float, default=0.1)
+    # IMPORTANT: For NanoChat dataset, this parameter is DOCUMENTATION ONLY!
+    # The actual train/val split is HARDCODED in nanochat/dataloader.py:
+    # - Training: parquet_paths[:-1] (all files except the last one)
+    # - Validation: parquet_paths[-1:] (only the last file)
+    # With 370 total shards, this gives 369 train + 1 val = 0.27% validation
+    # This parameter does NOT control the split for NanoChat!
+    parser.add_argument("--validation_split_pct", help="if training and validation set are being split - which percent is validation (IGNORED for nanochat dataset)", type=float, default=0.1)
     
     parser.add_argument("--test_split_pct", help="if training, validation, and test set are being split - which percent is test. by default this is not used", type=float, default=0)
     
