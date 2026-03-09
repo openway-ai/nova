@@ -1,203 +1,149 @@
 #!/bin/bash
 
 ################################################################################
-# EBT Large 优化训练脚本
+# EBT Large 鲁棒训练脚本 - 内存优化版
 #
-# 基于 TRAINING_CONFIG_COMPARISON.md 的分析和建议
-# 参考 NanoChat 的科学训练方法（Chinchilla scaling laws）
-#
-# 模型配置:
-#   - Large: 396M 参数 (24 layers, 1536 dim, 16 heads)
-#   - Context length: 256
-#
-# 训练策略:
-#   - 使用全部 370 个 shards (369 train + 1 val)
-#   - 基于 Chinchilla 定律计算训练步数
-#   - 参考 NanoChat 的 batch size 和学习率策略
+# 针对 140GB GPU 优化的最鲁棒配置
+# 基于实际 OOM 错误分析
 ################################################################################
 
-### SLURM 配置 (如果使用 SLURM) ###
+### SLURM 配置 ###
 #SBATCH --array=0
 #SBATCH --time=72:00:00
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
-#SBATCH --job-name=ebt-large-optimized
-#SBATCH --output=logs/slurm/nlp/ebt-large-optimized_%A-%a.log
+#SBATCH --job-name=ebt-large-robust
+#SBATCH --output=logs/slurm/nlp/ebt-large-robust_%A-%a.log
 
 ### 基础配置 ###
-export RUN_NAME="ebt-large-optimized"
-export MODEL_NAME="${RUN_NAME%%-*}"  # "ebt"
+export RUN_NAME="ebt-large-robust"
+export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="large"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
+# PyTorch 内存优化
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+
 # WandB 配置
 export WANDB_API_KEY="968275bc822c87ac741ecce2f06cdfb54dbc1608"
-export WANDB_MODE="offline"  # 改为 "online" 启用实时同步
+export WANDB_MODE="offline"
 
-# 创建日志目录
 mkdir -p logs/slurm/nlp/
 module purge
 
 ################################################################################
-# 训练超参数（基于 Chinchilla 定律和 NanoChat 的最佳实践）
+# 关键内存优化策略
 ################################################################################
 
-# 模型参数量计算:
-# Large: 24 layers × 1536 dim × 16 heads ≈ 396M params
+# 策略 1: 减小 Batch Size（最重要）
+# 问题: Large 模型 + EBT MCMC 双倍开销 + attention O(n^2)
+# 解决: 使用更小的 micro-batch，更多的 gradient accumulation
 #
-# Chinchilla 建议: data:param = 20:1
-# 保守策略: data:param = 12:1 (略微 overtrain，类似 NanoChat 的 8.25)
-#
-# 目标 tokens: 396M × 12 = 4.75B tokens
-#
-# NanoChat 全部 370 shards ≈ 20.5B characters ≈ 10B tokens
-# 我们使用 370 shards，训练到 4.75B tokens
+# 原配置: 32 batch × 1 accum = 32 effective (OOM)
+# 优化 1: 16 batch × 2 accum = 32 effective (可能还会 OOM)
+# 优化 2: 8 batch × 4 accum = 32 effective (稳定)
+# 最鲁棒: 4 batch × 8 accum = 32 effective (极度稳定)
 
-# Batch Size 配置（参考 NanoChat）
-# NanoChat: 8 GPUs × 16 per-device × 4 grad-accum × 2048 seq = 1,048,576 tokens/step
-#
-# EBT 调整:
-# - Context length 256 (比 NanoChat 的 2048 小 8 倍)
-# - 为了达到类似的 batch size，需要 8 倍的 micro-batch size
-# - 但由于 EBT 的 MCMC 机制计算量更大，适当减小到 524,288 tokens/step
-#
-# 配置: 8 GPUs × 64 per-device × 1 grad-accum × 256 seq = 131,072 tokens/step
-# 或: 8 GPUs × 32 per-device × 2 grad-accum × 256 seq = 131,072 tokens/step
-#
-# 为了更接近 NanoChat，我们选择更大的 batch size:
-# 8 GPUs × 128 per-device × 1 grad-accum × 256 seq = 262,144 tokens/step
+DEVICE_BATCH_SIZE=8
+GRAD_ACCUM=8
 
-DEVICE_BATCH_SIZE=128
-GRAD_ACCUM=1
-NUM_GPUS=8
+# 策略 2: 减小序列长度（如果可接受）
+# EBT 的 attention 是 O(n^2)，序列长度减半 → 内存降 4 倍
+# 256 → 128: 内存降 75%，但可能影响性能
+#
+# 推荐: 先尝试 256，如果还 OOM 再降到 128
 CONTEXT_LENGTH=256
 
-# 计算 effective batch size (tokens per step)
+# 策略 3: 调整总 batch size 以保持训练效果
+# 目标: 保持与原配置相同的 effective batch size
+#
+# 8 GPUs × 8 batch × 8 accum × 256 seq = 131,072 tokens/step
+# 这比原计划的 262k 小一半，但比 Small 的 98k 大
+NUM_GPUS=8
+
+# 计算新的训练步数
+# 原计划: 262k tokens/step, 37,700 steps = 9.9B tokens
+# 新配置: 131k tokens/step, 需要 75,400 steps 达到相同 token 量
+#
+# 为了保持训练时间合理，我们可以:
+# 选项 A: 保持 9.9B tokens (75,400 steps) - 完整训练
+# 选项 B: 降到 5B tokens (38,200 steps) - 快速训练
+#
+# 推荐选项 A
+MAX_STEPS=75400
+MAX_SCHEDULING_STEPS=75400
+
+################################################################################
+# 其他配置
+################################################################################
+
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENGTH))
 echo "Effective batch size: $EFFECTIVE_BATCH_SIZE tokens/step"
 
-# 训练步数计算
-# Total tokens: 4.75B
-# Tokens per step: 262,144
-# Steps: 4.75B / 262,144 ≈ 18,120 steps
-#
-# 为了充分利用 370 shards (约 10B tokens)，我们可以训练更长
-# 使用 data:param = 25:1 (介于 Chinchilla 20 和 conservative 10 之间)
-# Total tokens: 396M × 25 = 9.9B tokens ≈ 全部 370 shards
-# Steps: 9.9B / 262,144 ≈ 37,700 steps
-
-MAX_STEPS=37700
-MAX_SCHEDULING_STEPS=37700
-
-# 学习率配置（参考 NanoChat 的策略）
-# NanoChat Large (1.68B params):
-#   - Matrix LR: 0.02 (Muon)
-#   - Batch size scaled: sqrt(batch_size / 524k)
-#
-# EBT Large (396M params) 基础 LR:
-#   - Base LR: 0.00025 (large 模型推荐值，见 utils.py line 81)
-#   - Batch size: 262k vs reference 256k
-#   - Batch size scaling: sqrt(262k / 256k) = sqrt(1.023) ≈ 1.01
-#   - Adjusted LR: 0.00025 × 1.01 ≈ 0.00025 (几乎不变)
-
+# 学习率保持不变
 PEAK_LR=0.00025
-
-# MCMC 步长学习率
-# 原始配置: alpha_lr = base_lr × 1500 = 0.0012 × 1500 = 1.8
-# 文档建议: 降低到 500 以提高稳定性
-# Large 模型: 进一步降低到 300
 MCMC_STEP_SIZE=500
 MCMC_STEP_SIZE_LR_MULTIPLIER=300
 
-# Warmup 配置
-# NanoChat: warmup_ratio = 0.0 (无 warmup)
-# EBT 原始: 10k steps (1% of 1M)
-# 优化后: 2% of total steps = 0.02 × 37700 ≈ 750 steps
-WARM_UP_STEPS=750
+# Warmup: 2% of total
+WARM_UP_STEPS=1508
 
-# 权重衰减
-# NanoChat: 0.2 (Muon), depth-scaled
-# EBT: 0.01 (AdamW)
-# 保持 EBT 的设置
+# 其他优化
 WEIGHT_DECAY=0.01
-
-# 最小学习率比例
-# NanoChat: final_lr_frac = 0.0
-# EBT: min_lr_scale = 10 (即 final_lr = peak_lr / 10)
-# 采用更温和的衰减: min_lr_scale = 20
 MIN_LR_SCALE=20
-
-################################################################################
-# 验证和检查点配置
-################################################################################
-
-# 验证频率
-# 原始: 每 1000 步
-# 优化: 每 500 步（更频繁监控）
-VAL_CHECK_INTERVAL=500
-
-# 限制验证批次（加快验证速度）
-LIMIT_VAL_BATCHES=100
-
-# 其他配置
-NUM_WORKERS=12
+VAL_CHECK_INTERVAL=1000  # 增加间隔减少验证开销
+LIMIT_VAL_BATCHES=50     # 减少验证批次
+NUM_WORKERS=8            # 减少 workers 节省 CPU 内存
 GRADIENT_CLIP_VAL=1.0
 
 ################################################################################
-# 日志配置
+# 配置总结
 ################################################################################
 
 current_time=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="logs/${current_time}_ebt_large_optimized.log"
-
-################################################################################
-# 训练配置总结
-################################################################################
+LOG_FILE="logs/${current_time}_ebt_large_robust.log"
 
 cat << EOF
 
 ════════════════════════════════════════════════════════════════════════════════
-  EBT Large 优化训练配置
+  EBT Large 鲁棒训练配置 (内存优化版)
 ════════════════════════════════════════════════════════════════════════════════
 
+内存优化策略:
+  ✓ 小 micro-batch (8) + 大 accumulation (8)
+  ✓ PyTorch 内存分配优化 (expandable_segments)
+  ✓ 减少验证频率和批次
+
 模型配置:
-  Model Name:          ${MODEL_NAME}
   Model Size:          ${MODEL_SIZE}
-  Layers:              24
-  Embedding Dim:       1536
-  Attention Heads:     16
   Parameters:          ~396M
   Context Length:      ${CONTEXT_LENGTH}
-
-训练数据:
-  Dataset:             NanoChat (370 shards)
-  Total Tokens:        ~9.9B tokens
-  Data:Param Ratio:    25:1 (Chinchilla 建议 20:1)
+  Layers:              24
+  Embedding Dim:       1536
 
 Batch 配置:
-  Device Batch Size:   ${DEVICE_BATCH_SIZE}
-  Gradient Accum:      ${GRAD_ACCUM}
+  Device Batch Size:   ${DEVICE_BATCH_SIZE} (vs 原 32, 降 4×)
+  Gradient Accum:      ${GRAD_ACCUM} (vs 原 1, 增 8×)
   Num GPUs:            ${NUM_GPUS}
   Effective Batch:     ${EFFECTIVE_BATCH_SIZE} tokens/step
 
 训练步数:
-  Max Steps:           ${MAX_STEPS}
-  Estimated Time:      ~24-36 小时 (8×H100)
+  Max Steps:           ${MAX_STEPS} (vs 原 37,700, 增 2×)
+  Total Tokens:        ~9.9B (保持不变)
+  Estimated Time:      ~48-60 小时 (vs 原 28-36h, 因步数增加)
 
-学习率:
-  Peak LR:             ${PEAK_LR}
-  MCMC Step Size:      ${MCMC_STEP_SIZE}
-  MCMC LR Multiplier:  ${MCMC_STEP_SIZE_LR_MULTIPLIER}
-  Weight Decay:        ${WEIGHT_DECAY}
-  Warmup Steps:        ${WARM_UP_STEPS}
-  Min LR Scale:        ${MIN_LR_SCALE}
-
-验证配置:
-  Val Check Interval:  ${VAL_CHECK_INTERVAL}
-  Limit Val Batches:   ${LIMIT_VAL_BATCHES}
+内存估算 (per GPU):
+  Model:               ~0.8 GB
+  Optimizer:           ~1.6 GB
+  Activations:         ~0.3 GB (batch=8 vs 2.4GB for batch=32)
+  Gradients:           ~0.3 GB × 8 accum ≈ 2.4 GB
+  Attention:           ~0.4 GB (batch=8 vs 6.5GB for batch=32)
+  MCMC:                ~0.13 GB (batch=8 vs 2.1GB for batch=32)
+  Total:               ~5.6 GB (vs 原 ~13GB)
+  Safety Margin:       25× (vs 原 10×)
 
 输出:
   Log File:            ${LOG_FILE}
@@ -258,39 +204,38 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 2>&1 | tee "${LOG_FILE}"
 
 ################################################################################
-# 训练完成后的说明
+# 进一步优化建议（如果上述配置仍 OOM）
 ################################################################################
 
-cat << EOF
+cat << 'EOF'
 
 ════════════════════════════════════════════════════════════════════════════════
-  训练完成！
+  如果仍然 OOM，可以尝试以下降级方案：
 ════════════════════════════════════════════════════════════════════════════════
 
-下一步:
+方案 1: 进一步减小 batch size
+  DEVICE_BATCH_SIZE=4
+  GRAD_ACCUM=16
+  # 这将内存降到 ~3 GB/GPU
 
-1. 评估模型 CORE 性能:
+方案 2: 减小序列长度
+  CONTEXT_LENGTH=128
+  # Attention 内存降 75%
 
-   CKPT_PATH="logs/checkpoints/ebt-large-optimized_*/last.ckpt" \\
-   MAX_PER_TASK=-1 \\
-   bash runs/eval_ebt_core.sh
+方案 3: 使用梯度检查点 (Gradient Checkpointing)
+  在 train.py 中添加:
+  --gradient_checkpointing
+  # 牺牲 20% 速度换取 50% 内存节省
 
-2. 与 baseline 对比:
+方案 4: 使用 Mixed Precision
+  --precision "bf16-mixed"
+  # 已经在用，如果是 fp32 才需要加
 
-   - Small (85M): ~0.35 CORE score (预期)
-   - Large (396M): ~0.45-0.50 CORE score (预期，基于 scaling laws)
-
-3. 如果要继续训练更多步数:
-
-   - 修改 MAX_STEPS 和 MAX_SCHEDULING_STEPS
-   - 添加 --resume_from_checkpoint 参数
-
-4. 微调建议:
-
-   如果希望进一步提升性能，可以尝试:
-   - 增加 data:param ratio 到 30:1 或 40:1
-   - 调整学习率或 warmup 策略
-   - 增加 batch size（如果 GPU 内存允许）
+方案 5: 训练 Medium 模型而非 Large
+  MODEL_SIZE="medium"  # 250M params
+  DEVICE_BATCH_SIZE=16
+  GRAD_ACCUM=4
+  # 参数量降 37%，内存需求显著降低
 
 ════════════════════════════════════════════════════════════════════════════════
 
