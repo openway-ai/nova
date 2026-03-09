@@ -84,8 +84,8 @@ def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device,
 
     dataset = IterableDataset(
         tokenizer=tokenizer,
-        B=batch_size, 
-        T=max_len,
+        batch_size=batch_size,
+        max_len=max_len,
         split=split,
         max_iter=max_iter,
         device=device,

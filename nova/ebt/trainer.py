@@ -990,16 +990,6 @@ class ModelTrainer(LightningModule):
         return collate_fn
     
     def  train_dataloader(self):
-        train_dataloader = IterableDataset(
-                tokenizer=self.hparams.tokenizer,
-                batch_size=self.hparams.batch_size_per_device,
-                max_len=self.hparams.context_length,
-                split="train",
-                max_iter=self.hparams.max_steps,
-                device=self.device,
-                resume_state_dict=None
-            )
-
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
 
@@ -1021,16 +1011,6 @@ class ModelTrainer(LightningModule):
         # - Validation: parquet_paths[-1:] (only the last file)
         # With 370 total shards, this gives 369 train + 1 val (0.27% validation)
         # The --validation_split_pct parameter does NOT control this split!
-
-        val_dataloader = IterableDataset(
-                tokenizer=self.hparams.tokenizer,
-                batch_size=self.hparams.batch_size_per_device,
-                max_len=self.hparams.context_length,
-                split="val",
-                max_iter=self.hparams.val_steps,
-                device=self.device,
-                resume_state_dict=None
-            )
 
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
