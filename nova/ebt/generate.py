@@ -215,16 +215,16 @@ def generate_text(model, batch, hparams):
                 "generation": tokenizer.decode(t, skip_special_tokens=True),
                 "tokens": [tokenizer.decode(x) for x in t],
                 "logprobs": logprobs_i,
-                "gt_answer": tokenizer.decode(gt_ans, skip_special_tokens=True),
-                "question": tokenizer.decode(question, skip_special_tokens=True),
+                "target": tokenizer.decode(gt_ans, skip_special_tokens=True),
+                "prompt": tokenizer.decode(question, skip_special_tokens=True),
             }
             for t, logprobs_i, gt_ans, question in zip(out_tokens, out_logprobs, answers['input_ids'], questions['input_ids'])
         ]
     return [
         {
             "generation": tokenizer.decode(t, skip_special_tokens=True),
-            "gt_answer": tokenizer.decode(gt_ans, skip_special_tokens=True),
-            "question": tokenizer.decode(question, skip_special_tokens=True),
+            "target": tokenizer.decode(gt_ans, skip_special_tokens=True),
+            "prompt": tokenizer.decode(question, skip_special_tokens=True),
         } for t, gt_ans, question in zip(out_tokens, answers['input_ids'], questions['input_ids'])
     ]
 

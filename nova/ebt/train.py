@@ -622,7 +622,14 @@ if __name__ == '__main__':
     parser.add_argument("--dataset_name", help="dataset name", default="ucf101")
     
     parser.add_argument("--dataset_dir", help="dataset base directory", default="")
-    
+
+    # NanoChat shard evaluation specific parameters
+    parser.add_argument("--eval_shard_indices", help="Comma-separated list of shard indices to evaluate (e.g., '0,15' for first and last)", type=str, default="0,15")
+    parser.add_argument("--max_samples_per_shard", help="Maximum number of samples to evaluate per shard", type=int, default=50)
+    parser.add_argument("--enable_nanochat_generation", help="Enable text generation evaluation for nanochat (in addition to PPL)", action="store_true", default=True)
+    parser.add_argument("--generation_split_ratio", help="Ratio to split sequence for generation (0.5 = half prompt, half target)", type=float, default=0.5)
+    parser.add_argument("--min_generation_length", help="Minimum token length for generation samples", type=int, default=64)
+
     parser.add_argument("--image_dims", help="List of image dimensions", nargs='+', type=int, default = [224, 224])
     
     parser.add_argument("--no_randomness_dataloader", help="makes dataloader have no randomness by only sampling from start", action="store_true", default=False)
@@ -651,11 +658,11 @@ if __name__ == '__main__':
     
     parser.add_argument("--val_check_interval", help="interval to do validation per training epoch, 1 means once per epoch. useful if epochs are too large to wait to do validation", type=float, default=1.0)
 
-    # parser.add_argument("--val_every_n_step", help="interval to do validation in steps", type=int, default=15000)
+    parser.add_argument("--val_every_n_step", help="interval to do validation in steps", type=int, default=15000)
 
-    # parser.add_argument("--val_after_n_step", help="how many steps to wait before doing validation. is useful when you have a small dataset and dont want to do validation every time", type=int, default=0)
+    parser.add_argument("--val_after_n_step", help="how many steps to wait before doing validation. is useful when you have a small dataset and dont want to do validation every time", type=int, default=0)
 
-    # parser.add_argument("--val_steps", help="how many steps of validation", type=int, default=1000)
+    parser.add_argument("--val_steps", help="how many steps of validation", type=int, default=1000)
 
     #TESTING / INFERENCE#########################################################
 

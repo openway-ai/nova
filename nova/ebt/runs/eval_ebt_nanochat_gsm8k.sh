@@ -2,10 +2,16 @@
 ################################################################################
 # EBT 评估使用示例（改进版）
 # 使用改进的评估脚本，输出结构化日志
+#
+# 运行位置: /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/runs/
 ################################################################################
 
+# 获取脚本所在目录的绝对路径
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
+
 # 设置 checkpoint 路径
-CHECKPOINT="/mnt/shared-storage-user/puyuan/code/nova/nova/ebt/logs/checkpoints/ebt-small-bs_256_s1_lr_0.0012_2026-03-05_01-01-55_/last.ckpt"
+CHECKPOINT="${CHECKPOINT:-$EBT_DIR/logs/checkpoints/ebt-small-bs_256_s1_lr_0.0012_2026-03-05_01-01-55_/last.ckpt}"
 
 LATEST_CKPT=$(ls -t $CHECKPOINT 2>/dev/null | head -n 1)
 
@@ -18,7 +24,7 @@ echo "📦 使用 checkpoint: $LATEST_CKPT"
 echo ""
 
 # 创建汇总日志目录（在统一的评估日志目录下）
-EVAL_BASE_DIR="../../nova/ebt/logs/eval"
+EVAL_BASE_DIR="$EBT_DIR/logs/eval"
 SUMMARY_DIR="${EVAL_BASE_DIR}/summary"
 mkdir -p "$SUMMARY_DIR"
 SUMMARY_FILE="$SUMMARY_DIR/eval_summary_$(date +%Y%m%d_%H%M%S).txt"
@@ -33,29 +39,31 @@ SUMMARY_FILE="$SUMMARY_DIR/eval_summary_$(date +%Y%m%d_%H%M%S).txt"
 } > "$SUMMARY_FILE"
 
 ################################################################################
-# 示例 1: NanoChat PPL 测试
+# 示例 1: NanoChat 分片评估 (第一个和最后一个分片)
 ################################################################################
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "示例 1: NanoChat 数据集评估 (计算 PPL)"
+echo "示例 1: NanoChat 分片评估 (训练数据第一个和最后一个分片)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
 {
     echo "----------------------------------------"
-    echo "任务 1: NanoChat PPL"
+    echo "任务 1: NanoChat 分片 PPL (shard_00000 和 shard_00015)"
     echo "----------------------------------------"
 } >> "$SUMMARY_FILE"
 
 CKPT_PATH="$LATEST_CKPT" \
-EVAL_TASK="nanochat" \
-LIMIT_TEST_BATCHES=50 \
-bash runs/eval_ebt.sh
+EVAL_SHARD_INDICES="0,15" \
+# MAX_SAMPLES_PER_SHARD=50 \
+MAX_SAMPLES_PER_SHARD=5 \
+bash "$SCRIPT_DIR/eval_nanochat_shards.sh"
 
 # 提取结果到汇总文件
-RESULT_FILE=$(ls -t ${EVAL_BASE_DIR}/logs/nanochat_*_result.txt 2>/dev/null | head -1)
+RESULT_FILE=$(ls -t $EBT_DIR/logs/eval_nanochat_shards_*.log 2>/dev/null | head -1)
 if [ -n "$RESULT_FILE" ]; then
-    cat "$RESULT_FILE" >> "$SUMMARY_FILE"
+    echo "结果摘要:" >> "$SUMMARY_FILE"
+    grep -A 15 "TEST EPOCH SUMMARY" "$RESULT_FILE" | tail -16 >> "$SUMMARY_FILE" 2>/dev/null || echo "  未找到汇总指标" >> "$SUMMARY_FILE"
     echo "" >> "$SUMMARY_FILE"
 fi
 
@@ -81,46 +89,10 @@ CKPT_PATH="$LATEST_CKPT" \
 EVAL_TASK="gsm8k" \
 LIMIT_TEST_BATCHES=100 \
 BATCH_SIZE=4 \
-bash runs/eval_ebt.sh
+bash "$SCRIPT_DIR/eval_ebt.sh"
 
 RESULT_FILE=$(ls -t ${EVAL_BASE_DIR}/logs/gsm8k_*_result.txt 2>/dev/null | head -1)
 if [ -n "$RESULT_FILE" ]; then
-    cat "$RESULT_FILE" >> "$SUMMARY_FILE"
-    echo "" >> "$SUMMARY_FILE"
-fi
-
-echo ""
-echo ""
-
-################################################################################
-# 示例 3: CORE 评估 (综合能力评估)
-################################################################################
-
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "示例 3: CORE 评估 (综合能力评估)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "CORE 评估包含 20+ 个任务，涵盖:"
-echo "  - 常识推理 (commonsense reasoning)"
-echo "  - 语言理解 (language understanding)"
-echo "  - 世界知识 (world knowledge)"
-echo "  - 符号问题求解 (symbolic problem solving)"
-echo "  - 阅读理解 (reading comprehension)"
-echo ""
-
-{
-    echo "----------------------------------------"
-    echo "任务 3: CORE 评估"
-    echo "----------------------------------------"
-} >> "$SUMMARY_FILE"
-
-CKPT_PATH="$LATEST_CKPT" \
-MAX_PER_TASK=100 \
-bash runs/eval_ebt_core.sh
-
-RESULT_FILE=$(ls -t ${EVAL_BASE_DIR}/../core_eval_*/*.csv 2>/dev/null | head -1)
-if [ -n "$RESULT_FILE" ]; then
-    echo "CORE 分数详情:" >> "$SUMMARY_FILE"
     cat "$RESULT_FILE" >> "$SUMMARY_FILE"
     echo "" >> "$SUMMARY_FILE"
 fi

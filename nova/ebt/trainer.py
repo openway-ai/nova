@@ -341,6 +341,99 @@ class ModelTrainer(LightningModule):
                     outputs = generate_text(self.model, batch, self.hparams)
                     for output in outputs:
                         self.infer_logger.log_data(output)
+
+                # For nanochat_shard_eval with dual-mode evaluation (PPL + Generation)
+                elif self.hparams.dataset_name == "nanochat_shard_eval":
+                    # Check if generation is enabled
+                    enable_generation = getattr(self.hparams, 'enable_nanochat_generation', True)
+
+                    # 1. Always compute PPL on full sequence
+                    batch_dict = batch  # Already a dict from DataLoader
+                    ppl_outputs = get_ppl(self.model, batch_dict, self.hparams)
+
+                    # Track metrics for averaging
+                    self.test_losses.append(ppl_outputs['loss'].item())
+                    self.test_perplexities.append(ppl_outputs['perplexity'].item())
+
+                    # Track energy metrics if available
+                    if not hasattr(self, 'test_energies'):
+                        self.test_energies = {}
+                    for key, value in ppl_outputs.items():
+                        if 'energy' in key:
+                            if key not in self.test_energies:
+                                self.test_energies[key] = []
+                            self.test_energies[key].append(value)
+
+                    # 2. If generation is enabled and prompt data is available, do text generation
+                    if enable_generation and 'prompt_ids' in batch:
+                        # Prepare batch for generation (similar to GSM8K format)
+                        # questions = prompts, answers = targets
+                        questions = {
+                            'input_ids': batch['prompt_ids'],
+                            'attention_mask': batch['prompt_attention_mask']
+                        }
+                        answers = {
+                            'input_ids': torch.stack([t for t in batch['target_ids']])  # Stack target tensors
+                        }
+
+                        generation_batch = (questions, answers)
+                        generation_outputs = generate_text(self.model, generation_batch, self.hparams)
+
+                        # Log generation results with additional context
+                        for i, output in enumerate(generation_outputs):
+                            # Add PPL info and shard index
+                            output['loss'] = ppl_outputs['loss'].item()
+                            output['ppl'] = ppl_outputs['perplexity'].item()
+                            output['shard_idx'] = batch['shard_indices'][i]
+                            # Note: prompt and target are already in output from generate_text()
+                            # No need to add duplicate fields
+
+                            self.infer_logger.log_data(output)
+
+                    # Print progress every 5 batches
+                    if batch_idx % 5 == 0:
+                        import sys
+                        import numpy as np
+                        import time
+
+                        # Calculate statistics
+                        current_avg_loss = np.mean(self.test_losses)
+                        current_avg_ppl = np.mean(self.test_perplexities)
+                        current_std_loss = np.std(self.test_losses) if len(self.test_losses) > 1 else 0.0
+                        current_std_ppl = np.std(self.test_perplexities) if len(self.test_perplexities) > 1 else 0.0
+
+                        # Estimate time remaining
+                        if not hasattr(self, 'test_start_time'):
+                            self.test_start_time = time.time()
+                        elapsed = time.time() - self.test_start_time
+                        batches_done = batch_idx + 1
+                        batches_total = self.hparams.limit_test_batches if self.hparams.limit_test_batches != 1 else 100
+                        eta = elapsed / batches_done * (batches_total - batches_done) if batches_done > 0 else 0
+
+                        sys.stdout.write(f"\n{'─'*100}\n")
+                        sys.stdout.write(f"📊 Batch {batch_idx:3d}/{batches_total} | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s\n")
+                        sys.stdout.write(f"{'─'*100}\n")
+                        sys.stdout.write(f"  Current Batch:  Loss={ppl_outputs['loss'].item():.4f}  PPL={ppl_outputs['perplexity'].item():.2f}\n")
+                        sys.stdout.write(f"  Running Avg:    Loss={current_avg_loss:.4f} (±{current_std_loss:.4f})  PPL={current_avg_ppl:.2f} (±{current_std_ppl:.2f})\n")
+
+                        # Show energy metrics if available
+                        if self.test_energies:
+                            energy_strs = []
+                            for key, values in self.test_energies.items():
+                                avg_energy = np.mean(values)
+                                energy_strs.append(f"{key}={avg_energy:.2f}")
+                            sys.stdout.write(f"  Energy Metrics: {' | '.join(energy_strs)}\n")
+
+                        if enable_generation and 'prompt_ids' in batch:
+                            sys.stdout.write(f"  Generation: Enabled (prompt→target)\n")
+
+                        sys.stdout.write(f"{'─'*100}\n")
+                        sys.stdout.flush()
+
+                    # Log metrics
+                    filtered_outputs = {k: v for k, v in ppl_outputs.items() if 'energy' not in k}
+                    self.log_metrics(filtered_outputs, "test")
+
                 else:
                     # For nanochat and other PPL evaluation tasks
                     # nanochat uses IterableDataset which returns (x, y) tuples
@@ -892,7 +985,6 @@ class ModelTrainer(LightningModule):
                 resume_state_dict=None
             )
 
-<<<<<<< HEAD
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
 
@@ -905,17 +997,6 @@ class ModelTrainer(LightningModule):
             device=self.device,
             resume_state_dict=None,
         )
-=======
-        # train_dataloader = generate_dataloader(
-        #     tokenizer=self.hparams.tokenizer,
-        #     batch_size=self.hparams.batch_size_per_device, 
-        #     max_len=self.hparams.context_length,
-        #     max_iter=self.hparams.max_steps,
-        #     split="train",
-        #     device=self.device,
-        #     resume_state_dict=None,
-        # )
->>>>>>> origin-pu/main
         return train_dataloader
 
     def val_dataloader(self):
@@ -930,7 +1011,6 @@ class ModelTrainer(LightningModule):
                 resume_state_dict=None
             )
 
-<<<<<<< HEAD
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
 
@@ -943,17 +1023,6 @@ class ModelTrainer(LightningModule):
             device=self.device,
             resume_state_dict=None,
         )
-=======
-        # val_dataloader = generate_dataloader(
-        #     tokenizer=self.hparams.tokenizer,
-        #     batch_size=self.hparams.batch_size_per_device,
-        #     max_len=self.hparams.context_length,
-        #     max_iter=self.hparams.val_steps,
-        #     split="val",
-        #     device=self.device,
-        #     resume_state_dict=None,
-        # )
->>>>>>> origin-pu/main
 
         return val_dataloader
 
@@ -966,6 +1035,41 @@ class ModelTrainer(LightningModule):
                 batch_size=self.hparams.batch_size_per_device,
                 num_workers=0,  # Keep 0 for simplicity
                 collate_fn=self.get_collate_fn(),
+                pin_memory=True,
+                drop_last=False,
+                shuffle=False
+            )
+        elif self.hparams.execution_mode == "inference" and self.hparams.dataset_name == "nanochat_shard_eval":
+            # Custom NanoChat shard evaluation dataset
+            from dataset_nanochat_eval import NanoChatShardEvalDataset, collate_fn_nanochat_eval
+
+            # Parse shard indices from comma-separated string
+            shard_indices_str = getattr(self.hparams, 'eval_shard_indices', '0,15')
+            if isinstance(shard_indices_str, str):
+                shard_indices = [int(x.strip()) for x in shard_indices_str.split(',')]
+            else:
+                shard_indices = shard_indices_str
+
+            max_samples_per_shard = getattr(self.hparams, 'max_samples_per_shard', 50)
+            enable_generation = getattr(self.hparams, 'enable_nanochat_generation', True)
+            generation_split_ratio = getattr(self.hparams, 'generation_split_ratio', 0.5)
+            min_generation_length = getattr(self.hparams, 'min_generation_length', 64)
+
+            test_ds = NanoChatShardEvalDataset(
+                tokenizer=self.hparams.tokenizer_obj,
+                context_length=self.hparams.context_length,
+                shard_indices=shard_indices,
+                max_samples_per_shard=max_samples_per_shard,
+                enable_generation=enable_generation,
+                generation_split_ratio=generation_split_ratio,
+                min_generation_length=min_generation_length
+            )
+
+            return DataLoader(
+                test_ds,
+                batch_size=self.hparams.batch_size_per_device,
+                num_workers=0,
+                collate_fn=collate_fn_nanochat_eval,
                 pin_memory=True,
                 drop_last=False,
                 shuffle=False
