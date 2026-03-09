@@ -3,6 +3,9 @@ import torchmetrics
 # import nltk
 import string
 from typing import List
+import torch.distributed as dist
+import ipdb
+import math
 
 def get_torchmetrics(metric, metrics_average_type, num_classes, metrics_task):
     if 'accuracy' in metric:
@@ -70,3 +73,48 @@ def normalize_text(text: str) -> str:
     text = ''.join(ch for ch in text if ch not in set(string.punctuation))
     text = ' '.join(text.split())
     return text
+
+
+@torch.no_grad()
+def calculate_bpb_score(next_token_indices, per_token_loss,token_bytes):
+    """
+      Compute bits-per-byte (BPB) loss, a vocab-size agnostic evaluation metric.
+      Mirrors forward_loss_wrapper's structure. Normalizes cross-entropy (nats) by
+      the byte length of each target token, following nanochat/loss_eval.py:evaluate_bpb().
+
+      Args:
+          x: same tuple format as forward_loss_wrapper — (input_ids_batch, targets_batch, ...)
+          token_bytes: 1D LongTensor of shape (vocab_size,), byte count per token id;
+                       0 marks special tokens (e.g. <|bos|>) excluded from the metric.
+          phase: "val" or "test" — always uses no_randomness=True
+
+      Returns:
+          log_dict with 'bpb' and auxiliary keys matching forward_loss_wrapper.
+    """
+    # Map target tokens → byte lengths; explicitly handle ignore_index (y < 0) from finetune masking
+    
+    if (next_token_indices.int() < 0).any():
+        valid = next_token_indices >= 0
+        y_safe = torch.where(valid, next_token_indices, torch.zeros_like(next_token_indices))
+        num_bytes = torch.where(
+            valid,
+            token_bytes[y_safe],
+            torch.zeros_like(next_token_indices, dtype=token_bytes.dtype),
+        )
+    else:
+        num_bytes = token_bytes[next_token_indices]  # [B*S]
+
+    # Only count positions where token has bytes > 0 (excludes special tokens)
+    total_nats = (per_token_loss * (num_bytes > 0)).sum()
+    total_bytes = num_bytes.sum().to(torch.int64)
+
+    # DDP aggregation across ranks
+    if dist.is_initialized():
+        dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+
+    total_nats_val = total_nats.item()
+    total_bytes_val = total_bytes.item()
+    bpb = total_nats_val / (math.log(2) * total_bytes_val) if total_bytes_val > 0 else float('inf')
+    
+    return bpb

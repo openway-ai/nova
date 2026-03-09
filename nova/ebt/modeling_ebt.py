@@ -12,6 +12,7 @@ import os
 from utils import setup_ebt, init_whole_model_weights
 from utils import MLP, Memory_Augmented_MLP, Memory_Gating_MLP, mask_q_tokens
 from replay_buffer import CausalReplayBuffer
+from metrics import calculate_bpb_score
 
 import ipdb
 
@@ -176,7 +177,7 @@ class EBT_NLP(LightningModule):
 
         return predicted_distributions, predicted_energies
 
-    def forward_loss_wrapper(self, x, phase="train"):
+    def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
         no_randomness = False if phase == "train" else True
         if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
             # all_tokens = x['input_ids'].squeeze(dim=1)
@@ -239,6 +240,11 @@ class EBT_NLP(LightningModule):
         else:
             total_loss = self.hparams.reconstruction_coeff * reconstruction_loss
             contrastive_loss = 0.0
+        
+        if token_bytes is not None:
+            bpb_loss = calculate_bpb_score(next_token_indices, cce_loss.detach(), token_bytes)
+        else:
+            bpb_loss = 0
 
         log_dict = {
             'loss': total_loss,
@@ -246,7 +252,8 @@ class EBT_NLP(LightningModule):
             'final_step_loss': final_reconstruction_loss,
             'contrastive_loss' : contrastive_loss,
             'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
-            'perplexity': ppl_loss
+            'perplexity': ppl_loss,
+            'bpb_loss': bpb_loss
         }
         return log_dict
     

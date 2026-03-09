@@ -8,7 +8,7 @@ source ../../.venv/ebt/bin/activate
 ### LOG INFO ###
 # SBATCH --job-name=ebt-xxs-bs_256_s1_lr_
 # SBATCH --output=logs/slurm/nlp/ebt-xxs-bs_256_s1_lr_%A-%a.log
-export RUN_NAME="ebt-d26-bs_256_s1_lr_"
+export RUN_NAME="ebt-xxs-bs_256_s1_lr_"
 # NOTE ctrl d ALL THREE of above to modify job-name, output, and RUN_NAME (which should all be the same)
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="${RUN_NAME#*-}"; export MODEL_SIZE="${MODEL_SIZE%%-*}"
@@ -17,7 +17,7 @@ export WANDB_API_KEY="wandb_v1_RIPrnhitmmA1peN9zBhVg5NaJhD_0LVwYbQyamWFeNoqOlnfF
 mkdir -p logs/slurm/nlp/
 module purge
 
-lr=(0.0002)
+lr=(0.0012)
 alpha=(500)
 alpha_lr=(1500)
 MAX_STEP=10000
@@ -63,7 +63,7 @@ python train.py \
 --wandb_project 'nlp_pretrain' \
 \
 --log_model_archi \
---log_every_n_steps 100 \
+--log_every_n_steps 1000 \
 \
 --set_matmul_precision "medium" \
 --wandb_watch \
