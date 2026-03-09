@@ -42,7 +42,28 @@ class EBTModelArgs:
     ebt_act_func: str = "silu"
     weight_initialization_gain: float = 1.0
 
+# nanochat depth-based auto-scaling
+# base_dim = depth * aspect_ratio # aspect_ratio = 64
+# head_dim = 128
+# embedding_dim = ((base_dim + head_dim - 1) // head_dim) * head_dim
+# num_heads = model_dim // head_dim
+
+NANOCHAT_HEAD_DIM = 128
+
+def nanochat_depth_scaling(depth, aspect_ratio=64):
+    base_dim = depth * aspect_ratio
+    head_dim = NANOCHAT_HEAD_DIM
+    embedding_dim = ((base_dim + head_dim - 1) // head_dim) * head_dim
+    num_heads = embedding_dim // head_dim
+    return {
+        "num_transformer_blocks": depth,
+        "embedding_dim": embedding_dim, 
+        "multiheaded_attention_heads": num_heads,
+    }
+
+
 model_sizes = { # small -> xl same as mamba https://arxiv.org/pdf/2312.00752; all others estimated empirically. LRs based off mamba where applicable
+
     "4xs": { # LR 0.0024 recommended
         "num_transformer_blocks": 2,
         "multiheaded_attention_heads": 2,
@@ -87,7 +108,9 @@ model_sizes = { # small -> xl same as mamba https://arxiv.org/pdf/2312.00752; al
         "num_transformer_blocks": 24,
         "multiheaded_attention_heads": 32,
         "embedding_dim": 2048,
-    }
+    },
+
+    "d26": nanochat_depth_scaling(26),
 }
 
 

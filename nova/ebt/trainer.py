@@ -59,7 +59,7 @@ from transformers import AutoTokenizer
 import ipdb
 
 sys.path.append("../../")
-from nanochat.tokenizer import get_tokenizer
+from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
 class ModelTrainer(LightningModule):
     def __init__(self, hparams, trained_model = None):
@@ -127,6 +127,7 @@ class ModelTrainer(LightningModule):
         # self.to_pil = ToPILImage()
         self.full_ds = None
         self.hparams.tokenizer = tokenizer = get_tokenizer() # AutoTokenizer.from_pretrained(self.hparams.tokenizer, clean_up_tokenization_spaces = False)
+        self.register_buffer('token_bytes', get_token_bytes()) # Auto-map self.token_bytes to GPU
         if trained_model is not None:
             self.model = trained_model
         else:
@@ -276,7 +277,7 @@ class ModelTrainer(LightningModule):
     #         optimizer.update_epoch(self.current_epoch)   
 
     def validation_step(self, batch, batch_idx):
-        eval_step_dict = self.eval_step(batch, "valid")
+        eval_step_dict = self.eval_step(batch, "valid", self.token_bytes)
         self.log_metrics(eval_step_dict, "valid")
 
     def test_step(self, batch, batch_idx):
@@ -327,8 +328,8 @@ class ModelTrainer(LightningModule):
                 eval_step_dict = self.eval_step(batch, "test")
                 self.log_metrics(eval_step_dict, "test")
             
-    def eval_step(self, batch, phase):
-        things_to_log = self.model.forward_loss_wrapper(batch, phase) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop
+    def eval_step(self, batch, phase, token_bytes=None):
+        things_to_log = self.model.forward_loss_wrapper(batch, phase, token_bytes) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop
 
         if len(self.metrics) > 0:
             raise NotImplementedError("Need to implement torchmetrics stuff, i.e. looping through self.torchmetrics_dict.keys(), checking to make sure 'phase in key', and updating based off predicted and labels i.e. self.torchmetrics_dict[key].update(logits, labels), more info https://lightning.ai/docs/torchmetrics/stable/pages/lightning.html (just be careful make sure to detach logits before using them and only update current phase). recommended to possibly return things_to_log and logits from forward_loss_wrapper to do this easily")
@@ -610,7 +611,7 @@ class ModelTrainer(LightningModule):
                 batch_size=self.hparams.batch_size_per_device,
                 max_len=self.hparams.context_length,
                 split="val",
-                max_iter=self.hparams.val_steps,
+                max_iter=self.hparams.limit_val_batches,
                 device=self.device,
                 resume_state_dict=None
             )
