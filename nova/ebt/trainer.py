@@ -247,47 +247,51 @@ class ModelTrainer(LightningModule):
         return hook
     
     def training_step(self, batch, batch_idx):
-        if not self.hparams.no_wandb and self.hparams.wandb_watch and self.global_step % self.hparams.wandb_watch_log_freq == 0: # activation logging
-            hook_handles = []
-            hook_function = self.wandb_activation_hook(run=self.logger, step=self.global_step)
-            for module in self.model.modules():
-                if any(param.requires_grad for param in module.parameters(recurse=False)): # only do for unfrozen params that are training
-                    handle = module.register_forward_hook(hook_function)
-                    hook_handles.append(handle)
-            
-            eval_step_dict = self.eval_step(batch, "train")
-            for handle in hook_handles:
-                handle.remove()
+        # Profile the entire training step including MCMC forward pass and loss computation
+        with torch.profiler.record_function("training_step"):
+            if not self.hparams.no_wandb and self.hparams.wandb_watch and self.global_step % self.hparams.wandb_watch_log_freq == 0: # activation logging
+                hook_handles = []
+                hook_function = self.wandb_activation_hook(run=self.logger, step=self.global_step)
+                for module in self.model.modules():
+                    if any(param.requires_grad for param in module.parameters(recurse=False)): # only do for unfrozen params that are training
+                        handle = module.register_forward_hook(hook_function)
+                        hook_handles.append(handle)
+                
+                eval_step_dict = self.eval_step(batch, "train")
+                for handle in hook_handles:
+                    handle.remove()
 
-        else:
-            eval_step_dict = self.eval_step(batch, "train")
-        
-        self.log_metrics(eval_step_dict, "train")
-        return eval_step_dict['loss']   
+            else:
+                eval_step_dict = self.eval_step(batch, "train")
+            
+            self.log_metrics(eval_step_dict, "train")
+            return eval_step_dict['loss']
     
     def on_after_backward(self):
-        if self.hparams.log_gradients:
-            total_norm = 0.0
-            num_parameters = 0
-            num_grads_exceeding_clip_val = 0
-            total_gradients = 0 # this is different from num_parameters since .parameters is for tensors of params but doesnt count each invididual parameter
-            for param in self.parameters():
-                if param.grad is not None:
-                    param_norm = param.grad.data.norm(2)
-                    total_norm += param_norm  # Add the norm value to the total sum
-                    num_parameters += 1
-                    
-                    total_gradients += torch.numel(param.grad)
-                    num_grads_exceeding_clip_val += torch.sum(param.grad.abs() > self.hparams.gradient_clip_val)
-                    
-            assert num_parameters > 0, "no gradients after backwards detected please investigate"
-            average_norm = (total_norm / num_parameters).detach()
-            percentage_clipped = ((num_grads_exceeding_clip_val / total_gradients) * 100).detach()              
-            
-            things_to_log = {} 
-            things_to_log['avg_gradient_norms'] = average_norm
-            things_to_log['pct_gradient_clipped'] = percentage_clipped
-            self.log_metrics(things_to_log, "train", log_torchmetrics = False)
+        # Profile gradient analysis after backward pass
+        with torch.profiler.record_function("gradient_analysis"):
+            if self.hparams.log_gradients:
+                total_norm = 0.0
+                num_parameters = 0
+                num_grads_exceeding_clip_val = 0
+                total_gradients = 0 # this is different from num_parameters since .parameters is for tensors of params but doesnt count each invididual parameter
+                for param in self.parameters():
+                    if param.grad is not None:
+                        param_norm = param.grad.data.norm(2)
+                        total_norm += param_norm  # Add the norm value to the total sum
+                        num_parameters += 1
+                        
+                        total_gradients += torch.numel(param.grad)
+                        num_grads_exceeding_clip_val += torch.sum(param.grad.abs() > self.hparams.gradient_clip_val)
+                        
+                assert num_parameters > 0, "no gradients after backwards detected please investigate"
+                average_norm = (total_norm / num_parameters).detach()
+                percentage_clipped = ((num_grads_exceeding_clip_val / total_gradients) * 100).detach()
+                
+                things_to_log = {}
+                things_to_log['avg_gradient_norms'] = average_norm
+                things_to_log['pct_gradient_clipped'] = percentage_clipped
+                self.log_metrics(things_to_log, "train", log_torchmetrics = False)
         
     def on_train_batch_end(self, outputs, batch, batch_idx):
         #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
@@ -311,8 +315,10 @@ class ModelTrainer(LightningModule):
     #         optimizer.update_epoch(self.current_epoch)   
 
     def validation_step(self, batch, batch_idx):
-        eval_step_dict = self.eval_step(batch, "valid")
-        self.log_metrics(eval_step_dict, "valid")
+        # Profile the entire validation step including MCMC forward pass and loss computation
+        with torch.profiler.record_function("validation_step"):
+            eval_step_dict = self.eval_step(batch, "valid")
+            self.log_metrics(eval_step_dict, "valid")
 
     def on_test_epoch_start(self):
         """Reset test metrics at the start of test epoch"""

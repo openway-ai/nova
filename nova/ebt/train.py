@@ -321,6 +321,7 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train"):
         gradient_clip_val=gradient_clip_val,
         overfit_batches=args.overfit_batches,
         profiler=profiler,
+        profiler_steps=args.profiler_steps,
         val_every_n_step=args.val_every_n_step,
         val_after_n_step=args.val_after_n_step,
         deterministic=args.deterministic,
@@ -769,9 +770,11 @@ if __name__ == '__main__':
     # parser.add_argument("--debug_dataloader", help="makes mode to just debug dataloader", action="store_true", default=False)
 
     parser.add_argument("--overfit_batches", help="if nonzero will overfit to specified num/percent of batches", type=float, default=0.0)
-
-    parser.add_argument("--profiler", choices=["simple", "advanced"], type=str, default="")
-
+    
+    parser.add_argument("--profiler", choices=["simple", "advanced", "torch"], type=str, default="")
+    
+    parser.add_argument("--profiler_steps", help="number of steps to profile when using torch profiler", type=int, default=10)
+    
     parser.add_argument("--no_shuffle", help="stops shuffling - helpful for debugging", action="store_true", default=False)
 
     parser.add_argument("--create_model_viz", help="creates model for visualization", action="store_true", default=False)
