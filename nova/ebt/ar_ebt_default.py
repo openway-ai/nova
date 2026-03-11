@@ -8,7 +8,6 @@ from typing import Optional, Tuple
 
 from utils import init_whole_model_weights, EBTModelArgs
 
-
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         """

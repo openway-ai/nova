@@ -11,7 +11,10 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 
 # 设置 checkpoint 路径
-CHECKPOINT="${CHECKPOINT:-$EBT_DIR/logs/checkpoints/ebt-small-bs_256_s1_lr_0.0012_2026-03-05_01-01-55_/last.ckpt}"
+# CHECKPOINT="${CHECKPOINT:-$EBT_DIR/logs/checkpoints/ebt-small-bs_256_s1_lr_0.0012_2026-03-05_01-01-55_/last.ckpt}"
+
+CHECKPOINT="${CHECKPOINT:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-large-robust_20260310_004033_2026-03-10_00-40-45_/last.ckpt}"
+
 
 LATEST_CKPT=$(ls -t $CHECKPOINT 2>/dev/null | head -n 1)
 

@@ -90,7 +90,7 @@ from transformers import AutoTokenizer
 import ipdb
 
 sys.path.append("../../")
-from nanochat.tokenizer import get_tokenizer
+from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
 class ModelTrainer(LightningModule):
     def __init__(self, hparams, trained_model = None):
@@ -330,7 +330,7 @@ class ModelTrainer(LightningModule):
     #         optimizer.update_epoch(self.current_epoch)   
 
     def validation_step(self, batch, batch_idx):
-        eval_step_dict = self.eval_step(batch, "valid")
+        eval_step_dict = self.eval_step(batch, "valid", self.token_bytes)
         self.log_metrics(eval_step_dict, "valid")
 
     def on_test_epoch_start(self):

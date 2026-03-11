@@ -303,7 +303,7 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train"):
         gradient_clip_val=gradient_clip_val,
         overfit_batches=args.overfit_batches,
         profiler=profiler,
-        val_check_interval=args.val_every_n_step,
+        val_check_interval=args.val_check_interval,
         # check_val_every_n_epoch=args.check_val_every_n_epoch,
         deterministic=args.deterministic,
         log_every_n_steps=args.log_every_n_steps,
@@ -450,7 +450,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--clamp_max_after_warm_up", help="clamps the absolute value of predicted_tokens to be within range [-val, val], after warming up. not used anymore", type=float, default=0.0)
 
-    parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero"], type=str, default="default")
+    parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
 
     parser.add_argument("--ebt_norm", help="type of norm to use for energy based transformer, NOTE is only supported for ebt_time_embed. not used anymore didnt work better than default rms from llama2", choices=["rms", "none", "layer", "ebm_backwards_norm", "dyt"], type=str, default="rms")
 

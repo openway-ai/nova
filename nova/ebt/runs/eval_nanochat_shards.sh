@@ -32,8 +32,8 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 
 # 设置 checkpoint 路径
-CKPT_PATH="${CKPT_PATH:-$EBT_DIR/logs/checkpoints/ebt-small-bs_256_s1_lr_0.0012_2026-03-05_01-01-55_/last.ckpt}"
-
+# CKPT_PATH="${CKPT_PATH:-$EBT_DIR/logs/checkpoints/ebt-small-bs_256_s1_lr_0.0012_2026-03-05_01-01-55_/last.ckpt}"
+CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-large-robust_20260310_004033_2026-03-10_00-40-45_/last.ckpt}"
 
 WANDB_API_KEY="${WANDB_API_KEY:-}"
 USE_WANDB="${USE_WANDB:-false}"

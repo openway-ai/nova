@@ -11,7 +11,8 @@
 # export RUN_NAME="ebt-xxs-bs_256_s1_lr_"
 
 # export RUN_NAME="ebt-medium-bs_256_s1_lr_"
-export RUN_NAME="ebt-small-bs_256_s1_lr_"
+# export RUN_NAME="ebt-small-bs_256_s1_lr_"
+export RUN_NAME="ebt-d26-bs_256_s1_lr_"
 
 
 # NOTE ctrl d ALL THREE of above to modify job-name, output, and RUN_NAME (which should all be the same)
