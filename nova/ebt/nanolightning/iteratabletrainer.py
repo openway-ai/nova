@@ -411,7 +411,7 @@ class IterableTrainer:
         its own gradient context via torch.set_grad_enabled internally.
         """
         # Profile the entire validation loop
-        with torch.profiler.record_function("validation_loop"):
+        with torch.profiler.record_function("Eval: Validation Loop"):
             model.eval()
             model.on_validation_epoch_start()
 
@@ -439,7 +439,7 @@ class IterableTrainer:
                 model.on_validation_batch_start(batch, batch_idx)
 
                 # Profile validation step (includes MCMC energy landscape descent)
-                with torch.profiler.record_function("validation_step"):
+                with torch.profiler.record_function("Eval: 1. Forward Pass"):
                     output = model.validation_step(batch, batch_idx)
 
                 model.on_validation_batch_end(output, batch, batch_idx)
@@ -648,12 +648,12 @@ class IterableTrainer:
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
                 schedule=torch.profiler.schedule(
-                    wait=1,
-                    warmup=1,
+                    wait=2,
+                    warmup=2,
                     active=self.profiler_steps,
                     repeat=1
                 ),
-                on_trace_ready=torch.profiler.tensorboard_trace_handler('./logs/profiler'),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./logs/profiler/rank_{self.local_rank}'),
                 record_shapes=True,
                 profile_memory=True,
                 with_stack=True,
@@ -688,7 +688,7 @@ class IterableTrainer:
             model.on_train_batch_start(batch, batch_idx)
 
             # Profile forward pass (includes MCMC energy landscape search)
-            with torch.profiler.record_function("train_forward_pass"):
+            with torch.profiler.record_function("Train: 1. Forward Pass"):
                 with self._autocast_ctx():
                     loss = model.training_step(batch, batch_idx)
 
@@ -702,7 +702,7 @@ class IterableTrainer:
             scaled_loss = loss / self.accumulate_grad_batches
 
             # Profile backward pass (includes gradient computation for ŷ→y)
-            with torch.profiler.record_function("train_backward_pass"):
+            with torch.profiler.record_function("Train: 2. Backward Pass"):
                 model.on_before_backward(scaled_loss)
                 if scaler is not None:
                     scaler.scale(scaled_loss).backward()
@@ -724,7 +724,7 @@ class IterableTrainer:
             did_step = False
             if accum_count >= self.accumulate_grad_batches:
                 # Profile optimizer step (gradient clipping, weight update, etc.)
-                with torch.profiler.record_function("optimizer_step"):
+                with torch.profiler.record_function("Train: 3. Optimizer Step"):
                     if self.gradient_clip_val is not None:
                         if scaler is not None:
                             scaler.unscale_(self.optimizers[0])
@@ -807,6 +807,19 @@ class IterableTrainer:
         if profiler_context is not None:
             profiler.__exit__(None, None, None)
             self._print_rank0('Torch profiler stopped and trace saved to ./logs/profiler')
+            
+            # Print profiler results only on rank 0
+            if self.is_global_zero:
+                self._print_rank0("\n" + "="*20 + " 按 CPU 耗时排序 (查看数据加载/调度瓶颈) " + "="*20)
+                # key_averages aggregates our record_function labels
+                self._print_rank0(profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=15))
+                
+                self._print_rank0("\n" + "="*20 + " 按 GPU 耗时排序 (查看计算瓶颈) " + "="*20)
+                self._print_rank0(profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=15))
+                
+                # Print with stack trace for detailed code line analysis
+                self._print_rank0("\n" + "="*20 + " 按代码行分析 (查看具体算子调用) " + "="*20)
+                self._print_rank0(profiler.key_averages(group_by_stack_n=5).table(sort_by="self_cuda_time_total", row_limit=10))
 
 
         # Final validation after training completes

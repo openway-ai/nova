@@ -307,7 +307,7 @@ class ModelTrainer(LightningModule):
     
     def training_step(self, batch, batch_idx):
         # Profile the entire training step including MCMC forward pass and loss computation
-        with torch.profiler.record_function("training_step"):
+        with torch.profiler.record_function("Train: Model Training Step"):
             if not self.hparams.no_wandb and self.hparams.wandb_watch and self.global_step % self.hparams.wandb_watch_log_freq == 0: # activation logging
                 hook_handles = []
                 hook_function = self.wandb_activation_hook(run=self.logger, step=self.global_step)
@@ -328,7 +328,7 @@ class ModelTrainer(LightningModule):
     
     def on_after_backward(self):
         # Profile gradient analysis after backward pass
-        with torch.profiler.record_function("gradient_analysis"):
+        with torch.profiler.record_function("Train: Gradient Analysis"):
             if self.hparams.log_gradients:
                 total_norm = 0.0
                 num_parameters = 0
@@ -375,7 +375,7 @@ class ModelTrainer(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         # Profile the entire validation step including MCMC forward pass and loss computation
-        with torch.profiler.record_function("validation_step"):
+        with torch.profiler.record_function("Eval: Model Validation Step"):
             eval_step_dict = self.eval_step(batch, "valid")
             self.log_metrics(eval_step_dict, "valid")
 
