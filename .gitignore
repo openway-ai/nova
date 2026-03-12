@@ -26,6 +26,7 @@ nova/mdlm/outputs/
 # Logs
 wandb/
 nova/ebt/logs/
+logs/
 
 # Externel code
 nanochat/external/

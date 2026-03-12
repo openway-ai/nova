@@ -67,6 +67,7 @@ class IterableTrainer:
         gradient_clip_val: Optional[float] = None,
         overfit_batches: Union[int, float] = 0,
         profiler: Optional[str] = None,
+        profiler_steps: int = 10,
         val_every_n_step: Union[int] = 15000,
         val_after_n_step: int = 0,  
         deterministic: bool = False,
@@ -94,6 +95,7 @@ class IterableTrainer:
         self.gradient_clip_val = gradient_clip_val
         self.overfit_batches = overfit_batches
         self.profiler = profiler
+        self.profiler_steps = profiler_steps
         self.val_every_n_step = val_every_n_step
         self.val_after_n_step = val_after_n_step
         self.deterministic = deterministic
@@ -408,67 +410,73 @@ class IterableTrainer:
         this method does NOT wrap in no_grad or inference_mode; the model manages
         its own gradient context via torch.set_grad_enabled internally.
         """
-        model.eval()
-        model.on_validation_epoch_start()
+        # Profile the entire validation loop
+        with torch.profiler.record_function("validation_loop"):
+            model.eval()
+            model.on_validation_epoch_start()
 
-        num_val_batches = self._limit_batches(val_dataloader, self.limit_val_batches)
+            num_val_batches = self._limit_batches(val_dataloader, self.limit_val_batches)
 
-        all_metrics: Dict[str, float] = {}
-        count = 0
+            all_metrics: Dict[str, float] = {}
+            count = 0
 
-        val_iter = iter(val_dataloader)
+            val_iter = iter(val_dataloader)
 
-        for batch_idx in range(num_val_batches):
-            try:
-                batch = next(val_iter)
-            except StopIteration:
-                # Re-create the iterator if the val dataset wraps around
-                val_iter = iter(val_dataloader)
+            for batch_idx in range(num_val_batches):
+                if self.profiler == 'torch' and hasattr(self, '_profiler') and self._profiler is not None:
+                    self._profiler.step()
                 try:
                     batch = next(val_iter)
                 except StopIteration:
-                    break
+                    # Re-create the iterator if the val dataset wraps around
+                    val_iter = iter(val_dataloader)
+                    try:
+                        batch = next(val_iter)
+                    except StopIteration:
+                        break
 
-            batch = self._move_batch_to_device(batch)
-            model.on_validation_batch_start(batch, batch_idx)
+                batch = self._move_batch_to_device(batch)
+                model.on_validation_batch_start(batch, batch_idx)
 
-            output = model.validation_step(batch, batch_idx)
+                # Profile validation step (includes MCMC energy landscape descent)
+                with torch.profiler.record_function("validation_step"):
+                    output = model.validation_step(batch, batch_idx)
 
-            model.on_validation_batch_end(output, batch, batch_idx)
+                model.on_validation_batch_end(output, batch, batch_idx)
 
-            step_metrics = model.get_logged_metrics()
-            for k, v in step_metrics.items():
-                if isinstance(v, torch.Tensor) and v.numel() == 1:
-                    v = v.item()
-                if isinstance(v, (int, float)):
-                    all_metrics[k] = all_metrics.get(k, 0.0) + v
-            count += 1
-            model.clear_logged_metrics()
+                step_metrics = model.get_logged_metrics()
+                for k, v in step_metrics.items():
+                    if isinstance(v, torch.Tensor) and v.numel() == 1:
+                        v = v.item()
+                    if isinstance(v, (int, float)):
+                        all_metrics[k] = all_metrics.get(k, 0.0) + v
+                count += 1
+                model.clear_logged_metrics()
 
-            # Progress logging every 100 validation batches
-            if (batch_idx + 1) % 100 == 0 or (batch_idx + 1) == num_val_batches:
-                progress_pct = (batch_idx + 1) / num_val_batches * 100
-                self._print_rank0(
-                    f"  Validation progress: {batch_idx + 1}/{num_val_batches} ({progress_pct:.1f}%)"
-                )
+                # Progress logging every 100 validation batches
+                if (batch_idx + 1) % 100 == 0 or (batch_idx + 1) == num_val_batches:
+                    progress_pct = (batch_idx + 1) / num_val_batches * 100
+                    self._print_rank0(
+                        f"  Validation progress: {batch_idx + 1}/{num_val_batches} ({progress_pct:.1f}%)"
+                    )
 
-        if count > 0:
-            for k in all_metrics:
-                all_metrics[k] /= count
+            if count > 0:
+                for k in all_metrics:
+                    all_metrics[k] /= count
 
-        # Print validation metrics summary
-        if all_metrics:
-            self._print_rank0(f"  Validation metrics:")
-            for k, v in sorted(all_metrics.items()):
-                if isinstance(v, float):
-                    self._print_rank0(f"    {k}: {v:.4f}")
-                else:
-                    self._print_rank0(f"    {k}: {v}")
+            # Print validation metrics summary
+            if all_metrics:
+                self._print_rank0(f"  Validation metrics:")
+                for k, v in sorted(all_metrics.items()):
+                    if isinstance(v, float):
+                        self._print_rank0(f"    {k}: {v:.4f}")
+                    else:
+                        self._print_rank0(f"    {k}: {v}")
 
-        model.on_validation_epoch_end()
-        model.train()
+            model.on_validation_epoch_end()
+            model.train()
 
-        return all_metrics
+            return all_metrics
 
     # ====================================================================
     # Test loop
@@ -629,6 +637,30 @@ class IterableTrainer:
         accum_count = 0  # micro-batches accumulated since last optimizer step
         batch_idx = 0    # total micro-batches processed (used in hook signatures)
 
+        # ---- Torch profiler setup ----
+        profiler = None
+        profiler_context = None
+        if self.profiler == 'torch' and self.is_global_zero:
+            self._print_rank0(f'Setting up torch.profiler for {self.profiler_steps} steps')
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(
+                    wait=1,
+                    warmup=1,
+                    active=self.profiler_steps,
+                    repeat=1
+                ),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler('./logs/profiler'),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+            profiler_context = profiler.__enter__()
+            self._print_rank0('Torch profiler started')
+
         for opt in self.optimizers:
             opt.zero_grad()
 
@@ -655,9 +687,10 @@ class IterableTrainer:
             batch = self._move_batch_to_device(batch)
             model.on_train_batch_start(batch, batch_idx)
 
-            with self._autocast_ctx():
-                loss = model.training_step(batch, batch_idx)
-                # print(f"IterableTrainer: Step = {train_step}, Loss = {loss}")
+            # Profile forward pass (includes MCMC energy landscape search)
+            with torch.profiler.record_function("train_forward_pass"):
+                with self._autocast_ctx():
+                    loss = model.training_step(batch, batch_idx)
 
             if loss is None:
                 batch_idx += 1
@@ -668,44 +701,54 @@ class IterableTrainer:
             # ----------------------------------------------------------
             scaled_loss = loss / self.accumulate_grad_batches
 
-            model.on_before_backward(scaled_loss)
-            if scaler is not None:
-                scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
-            model.on_after_backward()
+            # Profile backward pass (includes gradient computation for ŷ→y)
+            with torch.profiler.record_function("train_backward_pass"):
+                model.on_before_backward(scaled_loss)
+                if scaler is not None:
+                    scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
+                model.on_after_backward()
 
             accum_count += 1
+
+            # ----------------------------------------------------------
+            # Profiler step
+            # ----------------------------------------------------------
+            if profiler is not None:
+                profiler.step()
 
             # ----------------------------------------------------------
             # Optimizer step after accumulating enough micro-batches
             # ----------------------------------------------------------
             did_step = False
             if accum_count >= self.accumulate_grad_batches:
-                if self.gradient_clip_val is not None:
+                # Profile optimizer step (gradient clipping, weight update, etc.)
+                with torch.profiler.record_function("optimizer_step"):
+                    if self.gradient_clip_val is not None:
+                        if scaler is not None:
+                            scaler.unscale_(self.optimizers[0])
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), self.gradient_clip_val
+                        )
+
+                    model.on_before_optimizer_step(self.optimizers[0])
+
                     if scaler is not None:
-                        scaler.unscale_(self.optimizers[0])
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), self.gradient_clip_val
-                    )
+                        for opt in self.optimizers:
+                            scaler.step(opt)
+                        scaler.update()
+                    else:
+                        for opt in self.optimizers:
+                            opt.step()
 
-                model.on_before_optimizer_step(self.optimizers[0])
-
-                if scaler is not None:
                     for opt in self.optimizers:
-                        scaler.step(opt)
-                    scaler.update()
-                else:
-                    for opt in self.optimizers:
-                        opt.step()
+                        opt.zero_grad()
 
-                for opt in self.optimizers:
-                    opt.zero_grad()
-
-                self.global_step += 1 # global_step += 1 should before _step_schedulers
-                self._step_schedulers("step")
-                accum_count = 0
-                did_step = True
+                    self.global_step += 1 # global_step += 1 should before _step_schedulers
+                    self._step_schedulers("step")
+                    accum_count = 0
+                    did_step = True
 
                 # Progress logging every 10 steps
                 if self.global_step % 10 == 0:
@@ -759,6 +802,12 @@ class IterableTrainer:
 
         # ---- End of training ----
         model.on_train_end()
+        
+        # Stop profiler if active
+        if profiler_context is not None:
+            profiler.__exit__(None, None, None)
+            self._print_rank0('Torch profiler stopped and trace saved to ./logs/profiler')
+
 
         # Final validation after training completes
         if self.limit_val_batches != 0:

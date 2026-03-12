@@ -115,85 +115,93 @@ class EBT_NLP(LightningModule):
 
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
-                
-                if self.hparams.no_mcmc_detach:
-                    predicted_tokens.requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
-                else: # default, do detach
-                    predicted_tokens = predicted_tokens.detach().requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
+                # Profile each MCMC step (energy landscape search)
+                with torch.profiler.record_function(f"mcmc_step_{i}_energy_landscape_search"):
+                    if self.hparams.no_mcmc_detach:
+                        predicted_tokens.requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
+                    else: # default, do detach
+                        predicted_tokens = predicted_tokens.detach().requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
 
-                if self.hparams.langevin_dynamics_noise != 0:
-                    ld_noise = torch.randn_like(predicted_tokens.detach()) * langevin_dynamics_noise_std # langevin dynamics
-                    predicted_tokens = predicted_tokens + ld_noise
+                    if self.hparams.langevin_dynamics_noise != 0:
+                        ld_noise = torch.randn_like(predicted_tokens.detach()) * langevin_dynamics_noise_std # langevin dynamics
+                        predicted_tokens = predicted_tokens + ld_noise
 
-                if self.hparams.normalize_initial_condition:
-                    if self.hparams.normalize_initial_condition_only_first_step:
-                        if mcmc_step == 0:
+                    if self.hparams.normalize_initial_condition:
+                        if self.hparams.normalize_initial_condition_only_first_step:
+                            if mcmc_step == 0:
+                                predicted_tokens = self.softmax(predicted_tokens)
+                        else:
                             predicted_tokens = self.softmax(predicted_tokens)
-                    else:
-                        predicted_tokens = self.softmax(predicted_tokens)
-                        
-                    if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
-                        predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
+                            
+                        if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
+                            predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
+                        else:
+                            predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
                     else:
                         predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
-                else:
-                    predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
-                
-                all_embeddings = torch.cat((real_embeddings_input, predicted_embeddings), dim = 1) # B, 2*S, D
-                
-                energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
-                energy_preds = energy_preds.reshape(-1, 1)
-                predicted_energies.append(energy_preds)
-                
-                if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
-                    if i == (len(mcmc_steps) - 1):
-                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
-                    else:
-                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=False)[0]
-                else:
-                    predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
-                # predicted_tokens_grad has shape B, S, V
-                
-                if self.hparams.clamp_futures_grad:
-                    min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
-                    # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
-                    predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
                     
-                if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
-                    raise ValueError("NaN or Inf gradients detected during MCMC.")
-                
-                predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after  
-                
-                if self.hparams.absolute_clamp != 0.0:
-                    predicted_tokens = torch.clamp(predicted_tokens, min = -self.hparams.absolute_clamp, max = self.hparams.absolute_clamp)
-                
-                if self.hparams.sharpen_predicted_distribution != 0.0:
-                    predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
+                    all_embeddings = torch.cat((real_embeddings_input, predicted_embeddings), dim = 1) # B, 2*S, D
+                    
+                    # Profile transformer forward pass
+                    with torch.profiler.record_function("transformer_energy_prediction"):
+                        energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+                    energy_preds = energy_preds.reshape(-1, 1)
+                    predicted_energies.append(energy_preds)
+                    
+                    # Profile gradient computation
+                    with torch.profiler.record_function("energy_gradient_computation"):
+                        if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
+                            if i == (len(mcmc_steps) - 1):
+                                predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+                            else:
+                                predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=False)[0]
+                        else:
+                            predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+                    # predicted_tokens_grad has shape B, S, V
+                    
+                    if self.hparams.clamp_futures_grad:
+                        min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
+                        # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
+                        predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
+                        
+                    if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
+                        raise ValueError("NaN or Inf gradients detected during MCMC.")
+                    
+                    predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after
+                    
+                    if self.hparams.absolute_clamp != 0.0:
+                        predicted_tokens = torch.clamp(predicted_tokens, min = -self.hparams.absolute_clamp, max = self.hparams.absolute_clamp)
+                    
+                    if self.hparams.sharpen_predicted_distribution != 0.0:
+                        predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
 
-                if return_raw_logits:
-                    predicted_tokens_for_loss = predicted_tokens # BS, S, V
-                else:
-                    predicted_tokens_for_loss = self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size) # BS*S, V
-                predicted_distributions.append(predicted_tokens_for_loss)        
+                    if return_raw_logits:
+                        predicted_tokens_for_loss = predicted_tokens # BS, S, V
+                    else:
+                        predicted_tokens_for_loss = self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size) # BS*S, V
+                    predicted_distributions.append(predicted_tokens_for_loss)
 
         return predicted_distributions, predicted_energies
 
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
         no_randomness = False if phase == "train" else True
-        if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
-            # all_tokens = x['input_ids'].squeeze(dim=1)
-            all_tokens = x[0].squeeze(dim=0)
-            input_ids, replay_buffer_logits, next_token_indices = self.replay_buffer.get_batch(all_tokens) # this automatically does indexing for input ids and next token indices while also passing back the logits
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness)
-            self.replay_buffer.update(all_tokens.detach(), predicted_distributions[-1].detach()) # update using the final predicted distributions
-        else:
-            input_ids = x[0].squeeze(dim=0)
-            next_token_indices = x[1].squeeze(dim=0)
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
+        
+        # Profile the entire MCMC forward pass
+        with torch.profiler.record_function(f"mcmc_forward_pass_{phase}"):
+            if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
+                # all_tokens = x['input_ids'].squeeze(dim=1)
+                all_tokens = x[0].squeeze(dim=0)
+                input_ids, replay_buffer_logits, next_token_indices = self.replay_buffer.get_batch(all_tokens) # this automatically does indexing for input ids and next token indices while also passing back the logits
+                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness)
+                self.replay_buffer.update(all_tokens.detach(), predicted_distributions[-1].detach()) # update using the final predicted distributions
+            else:
+                input_ids = x[0].squeeze(dim=0)
+                next_token_indices = x[1].squeeze(dim=0)
+                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
 
-            # input_ids = x['input_ids'].squeeze(dim=1)[:, :-1]
-            # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
-            # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
+                # input_ids = x['input_ids'].squeeze(dim=1)[:, :-1]
+                # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
+                # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
 
         if self.hparams.execution_mode == "finetune": # Only tokens after "[[Answer]]: " will be calculated in finetune
             next_token_indices = mask_q_tokens(next_token_indices, self.tokenizer)
@@ -201,51 +209,51 @@ class EBT_NLP(LightningModule):
 
         reconstruction_loss = 0
         total_mcmc_steps = len(predicted_energies) # in general this equals self.hparams.mcmc_num_steps, isnt in case of rand number
-        for mcmc_step, (predicted_distribution, predicted_energy) in enumerate(zip(predicted_distributions, predicted_energies)):
-            if self.hparams.soften_target_prob_dist != 0.0:
-                if total_mcmc_steps <= 1:
-                    label_smoothing = 0.0
+        
+        # Profile loss computation for each MCMC step
+        with torch.profiler.record_function(f"loss_computation_{phase}"):
+            for mcmc_step, (predicted_distribution, predicted_energy) in enumerate(zip(predicted_distributions, predicted_energies)):
+                if self.hparams.soften_target_prob_dist != 0.0:
+                    if total_mcmc_steps <= 1:
+                        label_smoothing = 0.0
+                    else:
+                        label_smoothing = ((total_mcmc_steps - 1) - mcmc_step) / (total_mcmc_steps - 1) * self.hparams.soften_target_prob_dist
+                    predicted_distribution = predicted_distribution.reshape(-1, self.vocab_size)
+                    cce_loss = F.cross_entropy(predicted_distribution, next_token_indices, label_smoothing=label_smoothing) # , ignore_index=self.tokenizer_pad_token_id
                 else:
-                    label_smoothing = ((total_mcmc_steps - 1) - mcmc_step) / (total_mcmc_steps - 1) * self.hparams.soften_target_prob_dist
-                predicted_distribution = predicted_distribution.reshape(-1, self.vocab_size)
-                cce_loss = F.cross_entropy(predicted_distribution, next_token_indices, label_smoothing=label_smoothing) # , ignore_index=self.tokenizer_pad_token_id
-            else:
-                predicted_distribution = self.log_softmax(predicted_distribution).reshape(-1, self.vocab_size)
-                cce_loss = F.nll_loss(predicted_distribution, next_token_indices) # , ignore_index=self.tokenizer_pad_token_id)
-            
-            if self.hparams.truncate_mcmc:
-                if mcmc_step == (total_mcmc_steps - 1):
-                    reconstruction_loss = cce_loss
-                    ppl_loss = torch.exp(cce_loss).detach()
-                    final_reconstruction_loss = cce_loss.detach()
-            else:
-                reconstruction_loss += cce_loss
-                if mcmc_step == (total_mcmc_steps - 1):
-                    ppl_loss = torch.exp(cce_loss).detach()
-                    final_reconstruction_loss = cce_loss.detach()
-                    reconstruction_loss = reconstruction_loss / total_mcmc_steps # normalize so is indifferent to number of mcmc steps
+                    predicted_distribution = self.log_softmax(predicted_distribution).reshape(-1, self.vocab_size)
+                    cce_loss = F.nll_loss(predicted_distribution, next_token_indices) # , ignore_index=self.tokenizer_pad_token_id)
                 
-            #pure logging things (no function for training)
-            if mcmc_step == 0:
-                initial_loss = cce_loss.detach()
-                initial_pred_energies = predicted_energy.squeeze().mean().detach()
-            if mcmc_step == (total_mcmc_steps - 1):
-                final_pred_energies = predicted_energy.squeeze().mean().detach()
-        
-        initial_final_pred_energies_gap = initial_pred_energies - final_pred_energies
+                if self.hparams.truncate_mcmc:
+                    if mcmc_step == (total_mcmc_steps - 1):
+                        reconstruction_loss = cce_loss
+                        ppl_loss = torch.exp(cce_loss).detach()
+                        final_reconstruction_loss = cce_loss.detach()
+                else:
+                    reconstruction_loss += cce_loss
+                    if mcmc_step == (total_mcmc_steps - 1):
+                        ppl_loss = torch.exp(cce_loss).detach()
+                        final_reconstruction_loss = cce_loss.detach()
+                        reconstruction_loss = reconstruction_loss / total_mcmc_steps # normalize so is indifferent to number of mcmc steps
+                    
+                #pure logging things (no function for training)
+                if mcmc_step == 0:
+                    initial_loss = cce_loss.detach()
+                    initial_pred_energies = predicted_energy.squeeze().mean().detach()
+                if mcmc_step == (total_mcmc_steps - 1):
+                    final_pred_energies = predicted_energy.squeeze().mean().detach()
+            
+            initial_final_pred_energies_gap = initial_pred_energies - final_pred_energies
 
-        if self.hparams.contrastive_loss: # works by pushing up on energies model predicted and pushing down on energy of true samples
-            contrastive_loss = self.calculate_contrastive_loss(predicted_energies, input_ids, next_token_indices)
-            total_loss = self.hparams.reconstruction_coeff * reconstruction_loss + self.hparams.contrastive_loss_coeff * contrastive_loss
-            contrastive_loss = contrastive_loss.detach()
-        else:
-            total_loss = self.hparams.reconstruction_coeff * reconstruction_loss
-            contrastive_loss = 0.0
-        
-        if token_bytes is not None:
-            bpb_loss = calculate_bpb_score(next_token_indices, cce_loss.detach(), token_bytes)
-        else:
-            bpb_loss = 0
+        # Profile total loss computation (including contrastive loss if applicable)
+        with torch.profiler.record_function(f"total_loss_computation_{phase}"):
+            if self.hparams.contrastive_loss: # works by pushing up on energies model predicted and pushing down on energy of true samples
+                contrastive_loss = self.calculate_contrastive_loss(predicted_energies, input_ids, next_token_indices)
+                total_loss = self.hparams.reconstruction_coeff * reconstruction_loss + self.hparams.contrastive_loss_coeff * contrastive_loss
+                contrastive_loss = contrastive_loss.detach()
+            else:
+                total_loss = self.hparams.reconstruction_coeff * reconstruction_loss
+                contrastive_loss = 0.0
 
         log_dict = {
             'loss': total_loss,

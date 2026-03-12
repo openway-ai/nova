@@ -339,6 +339,35 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train"):
     #     inference_mode=False # set inference mode to false to get grad for models like ebt during testing
     # )
 
+    trainer = IterableTrainer(
+        accelerator="auto",
+        devices = args.gpus,
+        num_nodes=args.num_nodes,
+        precision=args.float_precision,
+        max_steps=args.max_steps,
+        logger=wandb_logger,
+        enable_model_summary=args.log_model_archi,
+        callbacks = [checkpoint_callback, ModelSummary(max_depth=-1)],
+        strategy = args.distributed_strategy, 
+        enable_checkpointing=True,
+        fast_dev_run = args.fast_dev_run,
+        num_sanity_val_steps = args.val_sanity,
+        limit_train_batches = args.limit_train_batches,
+        limit_val_batches = limit_val_batches,
+        limit_test_batches = limit_test_batches,
+        detect_anomaly=args.detect_anomaly,
+        gradient_clip_val=gradient_clip_val,
+        overfit_batches=args.overfit_batches,
+        profiler=profiler,
+        profiler_steps=args.profiler_steps,
+        val_every_n_step=args.val_every_n_step,
+        val_after_n_step=args.val_after_n_step,
+        deterministic=args.deterministic,
+        log_every_n_steps=args.log_every_n_steps,
+        accumulate_grad_batches=args.accumulate_grad_batches,
+        inference_mode=False # set inference mode to false to get grad for models like ebt during testing
+    )
+
     return trainer
     
 
@@ -814,9 +843,11 @@ if __name__ == '__main__':
     # parser.add_argument("--debug_dataloader", help="makes mode to just debug dataloader", action="store_true", default=False)
 
     parser.add_argument("--overfit_batches", help="if nonzero will overfit to specified num/percent of batches", type=float, default=0.0)
-
-    parser.add_argument("--profiler", choices=["simple", "advanced"], type=str, default="")
-
+    
+    parser.add_argument("--profiler", choices=["simple", "advanced", "torch"], type=str, default="")
+    
+    parser.add_argument("--profiler_steps", help="number of steps to profile when using torch profiler", type=int, default=10)
+    
     parser.add_argument("--no_shuffle", help="stops shuffling - helpful for debugging", action="store_true", default=False)
 
     parser.add_argument("--create_model_viz", help="creates model for visualization", action="store_true", default=False)
