@@ -81,7 +81,7 @@ class GSM8KDataset(torch.utils.data.Dataset):
 from generate import generate_text, get_ppl
 # from inference.vid.generate_video import generate_video
 # from inference.img.generate_image import generate_image
-from optimization import WarmUpCosineAnnealingLR, LARS, exclude_bias_and_norm, StableAdamW, StableAdamWUnfused
+from optimization import WarmUpCosineAnnealingLR, WarmUpLinearWarmdownLR, LARS, exclude_bias_and_norm, StableAdamW, StableAdamWUnfused
 import logger as text_logger
 from metrics import get_torchmetrics
 import sys
@@ -172,6 +172,16 @@ class ModelTrainer(LightningModule):
         if not hasattr(self.hparams, 'tokenizer_path'):
             self.hparams.tokenizer_path = self.hparams.tokenizer if isinstance(self.hparams.tokenizer, str) else "EleutherAI/gpt-neox-20b"
 
+        # Load token_bytes for BPB (bits per byte) calculation
+        # token_bytes maps each token id to its byte length, used in validation/test metrics
+        try:
+            self.token_bytes = get_token_bytes(device="cpu")  # Will be moved to GPU when needed
+            print(f"  Token bytes loaded: shape={self.token_bytes.shape}")
+        except Exception as e:
+            print(f"  Warning: Could not load token_bytes: {e}")
+            print(f"  BPB metrics will not be available")
+            self.token_bytes = None
+
         # Print tokenizer info for clarity
         print(f"=" * 80)
         print(f"TOKENIZER INFO:")
@@ -216,9 +226,39 @@ class ModelTrainer(LightningModule):
             #         raise ValueError(f"Modality: {self.hparams.modality} not supported as a base model trainer model as of now")
             # else:
             #     raise ValueError(f"do not recognize model name: {self.hparams.model_name}")
-        
+
+        # torch.compile 支持
+        # 注意: EBT 使用 autograd.grad 进行 MCMC 更新，与 fullgraph=True 可能不兼容
+        # 推荐使用 --compile_model --compile_mode transformer_only 仅编译 transformer 部分
         if self.hparams.compile_model:
-            self.model = torch.compile(self.model, fullgraph=True)
+            compile_mode = getattr(self.hparams, 'compile_mode', 'full')
+            compile_backend = getattr(self.hparams, 'compile_backend', 'inductor')
+            compile_dynamic = getattr(self.hparams, 'compile_dynamic', False)
+
+            if compile_mode == 'full':
+                # 编译整个模型 (可能与 autograd.grad 不兼容)
+                print(f"[torch.compile] 编译整个模型 (mode=full, backend={compile_backend}, dynamic={compile_dynamic})")
+                print(f"[torch.compile] 警告: EBT 的 MCMC 循环使用 autograd.grad，可能导致编译失败")
+                self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
+
+            elif compile_mode == 'transformer_only':
+                # 仅编译 transformer 部分 (推荐，避开 MCMC 循环)
+                print(f"[torch.compile] 仅编译 transformer 部分 (mode=transformer_only, backend={compile_backend})")
+                if hasattr(self.model, 'transformer'):
+                    self.model.transformer = torch.compile(
+                        self.model.transformer,
+                        backend=compile_backend,
+                        dynamic=compile_dynamic
+                    )
+                    print(f"[torch.compile] transformer 编译成功")
+                else:
+                    print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过编译")
+
+            elif compile_mode == 'disabled':
+                print(f"[torch.compile] 编译已禁用")
+
+            else:
+                raise ValueError(f"未知的 compile_mode: {compile_mode}，可选: full, transformer_only, disabled")
 
         phases = ['train', 'valid', 'test']
         self.torchmetrics_dict = nn.ModuleDict()
@@ -330,7 +370,11 @@ class ModelTrainer(LightningModule):
     #         optimizer.update_epoch(self.current_epoch)   
 
     def validation_step(self, batch, batch_idx):
-        eval_step_dict = self.eval_step(batch, "valid", self.token_bytes)
+        # Move token_bytes to the same device as the model if needed
+        token_bytes = self.token_bytes
+        if token_bytes is not None and token_bytes.device != self.device:
+            token_bytes = token_bytes.to(self.device)
+        eval_step_dict = self.eval_step(batch, "valid", token_bytes)
         self.log_metrics(eval_step_dict, "valid")
 
     def on_test_epoch_start(self):
@@ -735,8 +779,8 @@ class ModelTrainer(LightningModule):
             sys.stdout.write(f"{'='*100}\n\n")
             sys.stdout.flush()
 
-    def eval_step(self, batch, phase):
-        things_to_log = self.model.forward_loss_wrapper(batch, phase) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop
+    def eval_step(self, batch, phase, token_bytes=None):
+        things_to_log = self.model.forward_loss_wrapper(batch, phase, token_bytes=token_bytes) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop
 
         if len(self.metrics) > 0:
             raise NotImplementedError("Need to implement torchmetrics stuff, i.e. looping through self.torchmetrics_dict.keys(), checking to make sure 'phase in key', and updating based off predicted and labels i.e. self.torchmetrics_dict[key].update(logits, labels), more info https://lightning.ai/docs/torchmetrics/stable/pages/lightning.html (just be careful make sure to detach logits before using them and only update current phase). recommended to possibly return things_to_log and logits from forward_loss_wrapper to do this easily")
@@ -775,8 +819,44 @@ class ModelTrainer(LightningModule):
             print("Warm up finished, no self.model.warm_up_finished() exists so not doing anything")
     
     def get_lr_scheduler(self, optimizer):
-        cosine_annealing_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.hparams.max_scheduling_steps - self.hparams.warm_up_steps, eta_min=self.hparams.peak_learning_rate / self.hparams.min_lr_scale)
-        lr_scheduler = WarmUpCosineAnnealingLR(optimizer, warm_up_steps = self.hparams.warm_up_steps, warm_up_base_lr_divider = self.hparams.warm_up_base_lr_divider, cosine_scheduler=cosine_annealing_scheduler, warm_up_finished_func=self.on_warm_up_finished)
+        # Option 2: 动态 Weight Decay
+        enable_wd_decay = getattr(self.hparams, 'dynamic_wd', False)
+
+        # Option 3: Linear Warmdown LR 调度
+        use_linear_warmdown = getattr(self.hparams, 'linear_warmdown', False)
+
+        if use_linear_warmdown:
+            warmup_ratio = getattr(self.hparams, 'warmup_ratio', 0.0)
+            warmdown_ratio = getattr(self.hparams, 'warmdown_ratio', 0.5)
+            final_lr_frac = getattr(self.hparams, 'final_lr_frac', 0.0)
+
+            lr_scheduler = WarmUpLinearWarmdownLR(
+                optimizer,
+                warmup_ratio=warmup_ratio,
+                warmdown_ratio=warmdown_ratio,
+                final_lr_frac=final_lr_frac,
+                total_steps=self.hparams.max_scheduling_steps,
+                warm_up_finished_func=self.on_warm_up_finished,
+                enable_wd_decay=enable_wd_decay
+            )
+        else:
+            # 原始 Cosine Annealing 调度
+            cosine_annealing_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.hparams.max_scheduling_steps - self.hparams.warm_up_steps,
+                eta_min=self.hparams.peak_learning_rate / self.hparams.min_lr_scale
+            )
+            total_steps = self.hparams.max_scheduling_steps if enable_wd_decay else None
+
+            lr_scheduler = WarmUpCosineAnnealingLR(
+                optimizer,
+                warm_up_steps=self.hparams.warm_up_steps,
+                warm_up_base_lr_divider=self.hparams.warm_up_base_lr_divider,
+                cosine_scheduler=cosine_annealing_scheduler,
+                warm_up_finished_func=self.on_warm_up_finished,
+                total_steps=total_steps,
+                enable_wd_decay=enable_wd_decay
+            )
         return lr_scheduler
     
     def get_optimizer_scheduler_dict(self, optimizer_parameters):
@@ -794,14 +874,71 @@ class ModelTrainer(LightningModule):
             
     def configure_optimizers_nlp(self):
         if self.hparams.model_name == "ebt":
-            alpha_param = self.model.alpha
-            other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha'])]
-            assert len(other_params) > 1, "Could not gather model params correctly please investigate"
+            # Option 1: 分层学习率 - 通过 --layered_lr 启用
+            use_layered_lr = getattr(self.hparams, 'layered_lr', False)
 
-            optimizer_parameters = [
-                {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},  # No weight decay for alpha
-                {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate}  # Weight decay for other parameters
-            ]
+            if use_layered_lr:
+                # 分层参数组 (参考 NanoChat base_train.py)
+                alpha_param = [self.model.alpha]
+                embedding_params = list(self.model.embeddings.parameters())
+
+                # vocab_to_embed 参数 (类似 unembedding)
+                vocab_to_embed_params = []
+                if hasattr(self.model, 'vocab_to_embed') and self.model.vocab_to_embed is not None:
+                    vocab_to_embed_params = list(self.model.vocab_to_embed.parameters())
+
+                # Transformer 参数分类: 矩阵 vs 标量/向量
+                transformer_matrix_params = []
+                transformer_scalar_params = []
+                for name, param in self.model.transformer.named_parameters():
+                    if param.ndim >= 2:  # 矩阵参数 (weights)
+                        transformer_matrix_params.append(param)
+                    else:  # 标量/向量参数 (biases, layer norms, etc.)
+                        transformer_scalar_params.append(param)
+
+                # 学习率倍数 (可通过命令行参数覆盖)
+                embedding_lr_mult = getattr(self.hparams, 'embedding_lr_mult', 0.3)
+                vocab_to_embed_lr_mult = getattr(self.hparams, 'vocab_to_embed_lr_mult', 0.1)
+                scalar_lr_mult = getattr(self.hparams, 'scalar_lr_mult', 0.5)
+
+                optimizer_parameters = [
+                    # Alpha: 高学习率，无 weight decay
+                    {'params': alpha_param, 'weight_decay': 0.0,
+                     'lr': self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate},
+                    # Embedding: 中等学习率，无 weight decay
+                    {'params': embedding_params, 'weight_decay': 0.0,
+                     'lr': self.hparams.peak_learning_rate * embedding_lr_mult},
+                    # vocab_to_embed: 较低学习率
+                    {'params': vocab_to_embed_params, 'weight_decay': self.hparams.weight_decay,
+                     'lr': self.hparams.peak_learning_rate * vocab_to_embed_lr_mult},
+                    # Transformer 矩阵: 主学习率
+                    {'params': transformer_matrix_params, 'weight_decay': self.hparams.weight_decay,
+                     'lr': self.hparams.peak_learning_rate},
+                    # Transformer 标量: 较高学习率，无 weight decay
+                    {'params': transformer_scalar_params, 'weight_decay': 0.0,
+                     'lr': self.hparams.peak_learning_rate * scalar_lr_mult},
+                ]
+
+                # 过滤空参数组
+                optimizer_parameters = [p for p in optimizer_parameters if len(p['params']) > 0]
+
+                print(f"[Option 1] 分层学习率已启用:")
+                print(f"  - Alpha LR: {self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate}")
+                print(f"  - Embedding LR: {self.hparams.peak_learning_rate * embedding_lr_mult}")
+                print(f"  - vocab_to_embed LR: {self.hparams.peak_learning_rate * vocab_to_embed_lr_mult}")
+                print(f"  - Transformer Matrix LR: {self.hparams.peak_learning_rate}")
+                print(f"  - Transformer Scalar LR: {self.hparams.peak_learning_rate * scalar_lr_mult}")
+            else:
+                # 原始实现
+                alpha_param = self.model.alpha
+                other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha'])]
+                assert len(other_params) > 1, "Could not gather model params correctly please investigate"
+
+                optimizer_parameters = [
+                    {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},
+                    {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate}
+                ]
+
             return self.get_optimizer_scheduler_dict(optimizer_parameters)
             
         elif self.hparams.model_name == "baseline_transformer":
@@ -1131,13 +1268,46 @@ class ModelTrainer(LightningModule):
 
         if scalar_metrics:
             self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True)
-        
+
+        # === 增强的调试日志 ===
+        if len(self.trainer.optimizers) > 0:
+            optimizer = self.trainer.optimizers[0]
+
+            # 记录所有参数组的学习率
+            for i, group in enumerate(optimizer.param_groups):
+                group_lr = group['lr']
+                group_wd = group.get('weight_decay', 0)
+                self.log(f"lr/param_group_{i}", group_lr, prog_bar=False)
+                self.log(f"wd/param_group_{i}", group_wd, prog_bar=False)
+
+            # 主学习率 (最后一个参数组，通常是 transformer 参数)
+            current_lr = optimizer.param_groups[-1]['lr']
+            self.log("Global_LR", current_lr)
+
+            # Alpha 参数的学习率 (第一个参数组)
+            if len(optimizer.param_groups) > 1:
+                alpha_lr = optimizer.param_groups[0]['lr']
+                self.log("Alpha_LR", alpha_lr)
+
+        # Alpha (MCMC step size) 值
         if self.hparams.mcmc_step_size_learnable:
             self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach())
+
+        # Langevin dynamics noise
         if self.hparams.langevin_dynamics_noise_learnable:
-            self.log("Langevin dynamics step size", self.model.langevin_dynamics_noise_std.detach())
-        if len(self.trainer.optimizers) == 0:
-            pass # is during testing lr doesnt matter
-        else:
-            current_lr = self.trainer.optimizers[0].param_groups[-1]['lr'] # relies on lr for most of model being the last param
-            self.log("Global_LR", current_lr)
+            self.log("Langevin_dynamics_noise", self.model.langevin_dynamics_noise_std.detach())
+
+        # 训练进度信息 (仅在训练阶段)
+        if phase == "train" and hasattr(self, 'trainer') and self.trainer is not None:
+            # 当前步数和进度
+            current_step = self.global_step
+            max_steps = self.hparams.max_steps
+            progress_pct = 100.0 * current_step / max_steps if max_steps > 0 else 0
+            self.log("progress_pct", progress_pct, prog_bar=False)
+
+            # GPU 内存使用 (如果可用)
+            if torch.cuda.is_available():
+                gpu_mem_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                gpu_mem_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+                self.log("gpu_mem_allocated_gb", gpu_mem_allocated, prog_bar=False)
+                self.log("gpu_mem_reserved_gb", gpu_mem_reserved, prog_bar=False)

@@ -617,6 +617,21 @@ if __name__ == '__main__':
     
     parser.add_argument("--lars_exclude_bias_bn_wd", help="excludes bias and batch norm from Lars adaptation and weight decay", action="store_true", default=False)
 
+    # Option 1: 分层学习率参数
+    parser.add_argument("--layered_lr", help="[Option 1] 启用分层学习率，不同参数类型使用不同学习率", action="store_true", default=False)
+    parser.add_argument("--embedding_lr_mult", help="[Option 1] embedding 层学习率倍数 (相对于 peak_lr)", type=float, default=0.3)
+    parser.add_argument("--vocab_to_embed_lr_mult", help="[Option 1] vocab_to_embed 层学习率倍数", type=float, default=0.1)
+    parser.add_argument("--scalar_lr_mult", help="[Option 1] transformer 标量参数学习率倍数", type=float, default=0.5)
+
+    # Option 2: 动态 Weight Decay 参数
+    parser.add_argument("--dynamic_wd", help="[Option 2] 启用动态 Weight Decay，线性衰减到 0", action="store_true", default=False)
+
+    # Option 3: Linear Warmdown LR 调度参数
+    parser.add_argument("--linear_warmdown", help="[Option 3] 启用 NanoChat 风格的 Linear Warmdown LR 调度", action="store_true", default=False)
+    parser.add_argument("--warmup_ratio", help="[Option 3] warmup 占总步数的比例 (NanoChat 默认 0.0)", type=float, default=0.0)
+    parser.add_argument("--warmdown_ratio", help="[Option 3] warmdown 占总步数的比例 (NanoChat 默认 0.5)", type=float, default=0.5)
+    parser.add_argument("--final_lr_frac", help="[Option 3] 最终 LR 占 peak_lr 的比例 (NanoChat 默认 0.0)", type=float, default=0.0)
+
     #DATASET AND DATALOADER #########################################################
 
     parser.add_argument("--num_workers", help="num_workers per GPU. idea to do per GPU gotten from https://discuss.pytorch.org/t/guidelines-for-assigning-num-workers-to-dataloader/813/", type=int, default=4)
@@ -780,6 +795,9 @@ if __name__ == '__main__':
     # SPEED ##################################################################
 
     parser.add_argument("--compile_model", help="compiles the model using torch.compile", action="store_true", default=False)
+    parser.add_argument("--compile_mode", help="torch.compile 模式: full (编译整个模型), transformer_only (仅编译 transformer，推荐), disabled", type=str, default="transformer_only", choices=["full", "transformer_only", "disabled"])
+    parser.add_argument("--compile_backend", help="torch.compile 后端: inductor (默认), eager, aot_eager", type=str, default="inductor")
+    parser.add_argument("--compile_dynamic", help="允许动态形状 (可能降低加速效果)", action="store_true", default=False)
 
     #SLURM#########################################################################
 

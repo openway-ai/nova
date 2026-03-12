@@ -74,14 +74,115 @@ class LARS(optim.Optimizer):
 def exclude_bias_and_norm(p):
     return p.ndim == 1
 
+
+class WarmUpLinearWarmdownLR(_LRScheduler):
+    """
+    Option 3: NanoChat 风格的 LR 调度
+    - warmup: 线性从 0 (或 lr/divider) 增加到 peak_lr
+    - constant: 保持 peak_lr
+    - warmdown: 线性从 peak_lr 衰减到 final_lr_frac * peak_lr
+
+    参考 base_train.py:
+    - warmup_ratio=0.0 (无 warmup)
+    - warmdown_ratio=0.5 (后 50% 衰减)
+    - final_lr_frac=0.0 (衰减到 0)
+    """
+    def __init__(self, optimizer, warmup_ratio, warmdown_ratio, final_lr_frac, total_steps,
+                 warm_up_finished_func=None, enable_wd_decay=False):
+        self.warmup_steps = int(warmup_ratio * total_steps)
+        self.warmdown_steps = int(warmdown_ratio * total_steps)
+        self.constant_steps = total_steps - self.warmup_steps - self.warmdown_steps
+        self.final_lr_frac = final_lr_frac
+        self.total_steps = total_steps
+        self.highest_lr = [group['lr'] for group in optimizer.param_groups]
+        self.last_step = 0
+        self.finished_warming_up = False
+        self.warm_up_finished_func = warm_up_finished_func
+
+        # Option 2 兼容: 动态 Weight Decay
+        self.enable_wd_decay = enable_wd_decay
+        self.initial_weight_decays = [group.get('weight_decay', 0) for group in optimizer.param_groups]
+
+        self._last_lr = [0.0 for _ in self.highest_lr] if self.warmup_steps > 0 else self.highest_lr.copy()
+
+        print(f"[Option 3] Linear Warmdown LR 调度已启用:")
+        print(f"  - Warmup steps: {self.warmup_steps} ({warmup_ratio*100:.1f}%)")
+        print(f"  - Constant steps: {self.constant_steps}")
+        print(f"  - Warmdown steps: {self.warmdown_steps} ({warmdown_ratio*100:.1f}%)")
+        print(f"  - Final LR fraction: {final_lr_frac}")
+
+        super(WarmUpLinearWarmdownLR, self).__init__(optimizer)
+
+    def step(self):
+        self.last_step += 1
+        super().step()
+
+    def get_lr(self):
+        # Option 2 兼容: 动态更新 weight decay
+        if self.enable_wd_decay and self.total_steps > 0:
+            wd_multiplier = max(0.0, 1.0 - self.last_step / self.total_steps)
+            for i, group in enumerate(self.optimizer.param_groups):
+                if self.initial_weight_decays[i] > 0:
+                    group['weight_decay'] = self.initial_weight_decays[i] * wd_multiplier
+
+        step = self.last_step
+
+        if step < self.warmup_steps:
+            # Linear warmup: 0 -> peak_lr
+            progress = (step + 1) / self.warmup_steps if self.warmup_steps > 0 else 1.0
+            self._last_lr = [lr * progress for lr in self.highest_lr]
+        elif step < self.warmup_steps + self.constant_steps:
+            # Constant phase
+            if not self.finished_warming_up:
+                self.finished_warming_up = True
+                if self.warm_up_finished_func is not None:
+                    self.warm_up_finished_func()
+            self._last_lr = self.highest_lr.copy()
+        else:
+            # Linear warmdown: peak_lr -> final_lr_frac * peak_lr
+            if not self.finished_warming_up:
+                self.finished_warming_up = True
+                if self.warm_up_finished_func is not None:
+                    self.warm_up_finished_func()
+            warmdown_progress = (step - self.warmup_steps - self.constant_steps) / self.warmdown_steps if self.warmdown_steps > 0 else 1.0
+            warmdown_progress = min(1.0, warmdown_progress)
+            self._last_lr = [lr * (1.0 - warmdown_progress * (1.0 - self.final_lr_frac)) for lr in self.highest_lr]
+
+        return self._last_lr
+
+    def get_last_lr(self):
+        return self._last_lr
+
+    def state_dict(self):
+        return {
+            'last_step': self.last_step,
+            'last_lr': self._last_lr,
+            'finished_warming_up': self.finished_warming_up,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.last_step = state_dict['last_step']
+        self._last_lr = state_dict['last_lr']
+        self.finished_warming_up = state_dict['finished_warming_up']
+
+
 class WarmUpCosineAnnealingLR(_LRScheduler):
-    def __init__(self, optimizer, warm_up_steps, warm_up_base_lr_divider, cosine_scheduler, warm_up_finished_func=None):
+    def __init__(self, optimizer, warm_up_steps, warm_up_base_lr_divider, cosine_scheduler,
+                 warm_up_finished_func=None, total_steps=None, enable_wd_decay=False):
         self.warm_up_steps = warm_up_steps
         self.cosine_scheduler = cosine_scheduler
         self.last_step = 0
         self.highest_lr = [group['lr'] for group in optimizer.param_groups]
         self.finished_warming_up = False
         self.warm_up_finished_func = warm_up_finished_func
+
+        # Option 2: 动态 Weight Decay
+        self.total_steps = total_steps
+        self.enable_wd_decay = enable_wd_decay
+        self.initial_weight_decays = [group.get('weight_decay', 0) for group in optimizer.param_groups]
+        if enable_wd_decay:
+            print(f"[Option 2] 动态 Weight Decay 已启用: 将从初始值线性衰减到 0")
+            print(f"  - 初始 WD 值: {self.initial_weight_decays}")
 
         self.base_lr_divider = warm_up_base_lr_divider
         if self.base_lr_divider == -1:
@@ -96,6 +197,13 @@ class WarmUpCosineAnnealingLR(_LRScheduler):
         super().step()
 
     def get_lr(self):
+        # Option 2: 动态更新 weight decay (线性衰减到 0)
+        if self.enable_wd_decay and self.total_steps and self.total_steps > 0:
+            wd_multiplier = max(0.0, 1.0 - self.last_step / self.total_steps)
+            for i, group in enumerate(self.optimizer.param_groups):
+                if self.initial_weight_decays[i] > 0:
+                    group['weight_decay'] = self.initial_weight_decays[i] * wd_multiplier
+
         if self.warm_up_steps != 0 and self.last_step <= self.warm_up_steps:
             if self.base_lr_divider == -1: # Warm-up from 0 to highest_lr
                 warmup_lr = [
