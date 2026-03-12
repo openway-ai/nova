@@ -226,10 +226,10 @@ OPTION_FLAGS="--layered_lr --dynamic_wd --linear_warmdown --warmup_ratio 0.0 --w
 # 推荐使用 transformer_only 模式，仅编译 transformer 部分
 
 # 启用 torch.compile (推荐)
-COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
+# COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
 
 # 或者禁用 torch.compile
-# COMPILE_FLAGS=""
+COMPILE_FLAGS=""
 
 # 或者尝试编译整个模型 (可能失败)
 # COMPILE_FLAGS="--compile_model --compile_mode full --compile_dynamic"
