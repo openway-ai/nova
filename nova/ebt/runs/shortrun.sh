@@ -24,7 +24,7 @@ alpha_lr=(1500)
 MAX_STEP=100
 WARMUP_STEP=10
 
-coverage run --branch train.py \
+python train.py \
 --run_name ${RUN_NAME}${lr[${SLURM_ARRAY_TASK_ID}]} \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
@@ -69,5 +69,3 @@ coverage run --branch train.py \
 --set_matmul_precision "medium" \
 --wandb_watch \
 ${SLURM_ARRAY_TASK_ID:+--is_slurm_run}
-
-coverage html -d runs/coverage_report --ignore-errors
