@@ -36,6 +36,7 @@ class EBTModelArgs:
     dyt_alpha_init: float = 0.5
     max_batch_size: int = 64
     max_seq_len: int = 16
+    vocab_size: int = None
     weight_initialization: str = "xavier"
     adaln_zero_init: bool = True
     ebt_norm: str = "rms"
@@ -452,6 +453,9 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
         ebt = EBTDefault(params=transformer_args)
     elif hparams.ebt_type == "time_embed": # time embed
         from ar_ebt_time_embed import EBTTimeConcat
+        ebt = EBTTimeConcat(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps)
+    elif hparams.ebt_type == "nanochat_time_embed": # time embed
+        from nanochat_ebt import NanoChatEBT
         ebt = EBTTimeConcat(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps)
     else: # adaln or adaln_zero
         from ar_ebt_adaln import EBTAdaLN

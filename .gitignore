@@ -22,6 +22,9 @@ nova/ebt/__pycache__/
 nova/ebt/nanolightning/__pycache__/
 nova/mdlm/__pycache__/
 nova/mdlm/outputs/
+data/__pycache__/
+data/fineweb/__pycache__/
+data/climbmix/__pycache__/
 
 # Logs
 wandb/
@@ -37,6 +40,12 @@ prompt/
 uv.lock
 nova/ebt/uv.lock
 nova/mdlm/uv.lock
+
+# coverage
+.coverage
+nova/ebt/.coverage
+nova/mdlm/.coverage
+nova/ebt/runs/coverage_report/
 
 
 

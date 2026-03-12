@@ -59,7 +59,7 @@ from transformers import AutoTokenizer
 import ipdb
 
 sys.path.append("../../")
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from data.utils import get_tokenizer, get_token_bytes
 
 class ModelTrainer(LightningModule):
     def __init__(self, hparams, trained_model = None):
@@ -126,8 +126,8 @@ class ModelTrainer(LightningModule):
 
         # self.to_pil = ToPILImage()
         self.full_ds = None
-        self.hparams.tokenizer = tokenizer = get_tokenizer() # AutoTokenizer.from_pretrained(self.hparams.tokenizer, clean_up_tokenization_spaces = False)
-        self.register_buffer('token_bytes', get_token_bytes()) # Auto-map self.token_bytes to GPU
+        self.hparams.tokenizer = tokenizer = get_tokenizer(self.hparams.dataset_name) # AutoTokenizer.from_pretrained(self.hparams.tokenizer, clean_up_tokenization_spaces = False)
+        self.register_buffer('token_bytes', get_token_bytes(self.hparams.dataset_name)) # Auto-map self.token_bytes to GPU
         if trained_model is not None:
             self.model = trained_model
         else:
@@ -588,9 +588,10 @@ class ModelTrainer(LightningModule):
                 batch_size=self.hparams.batch_size_per_device,
                 max_len=self.hparams.context_length,
                 split="train",
-                max_iter=self.hparams.max_steps,
+                max_batch_num=self.hparams.max_steps * self.hparams.accumulate_grad_batches,
                 device=self.device,
-                resume_state_dict=None
+                resume_state_dict=None,
+                dataset_name=self.hparams.dataset_name,
             )
 
         # train_dataloader = generate_dataloader(
@@ -611,9 +612,10 @@ class ModelTrainer(LightningModule):
                 batch_size=self.hparams.batch_size_per_device,
                 max_len=self.hparams.context_length,
                 split="val",
-                max_iter=self.hparams.limit_val_batches,
+                max_batch_num=self.hparams.limit_val_batches,
                 device=self.device,
-                resume_state_dict=None
+                resume_state_dict=None,
+                dataset_name=self.hparams.dataset_name,
             )
 
         # val_dataloader = generate_dataloader(

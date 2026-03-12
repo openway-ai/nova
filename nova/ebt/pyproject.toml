@@ -27,6 +27,7 @@ dependencies = [
     "torchmetrics==1.8.2",
     "ipdb==0.13.13",
     "pytorch-lightning==2.4.0",
+    "coverage==7.13.4",
 ]
 
 [dependency-groups]
