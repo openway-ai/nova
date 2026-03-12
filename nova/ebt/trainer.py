@@ -28,7 +28,7 @@ import gc
 
 from collector import NLP_HF_Collator
 # from model.vid.ebt import EBT_VID
-from modeling_ebt_cleanup import EBT_NLP
+from modeling_ebt import EBT_NLP
 # from model.img.ebt_t2i import EBT_IMG_T2I
 # from model.img.ebt_denoise import EBT_IMG_Denoise
 
@@ -184,19 +184,19 @@ class ModelTrainer(LightningModule):
                 module.name = name
 
         
-    # def on_train_start(self):
-    #     if self.hparams.debug_unused_parameters: 
-    #         for name, param in self.model.named_parameters():
-    #             if param.requires_grad and "image_encoder" not in name: # NOTE need to modify this code to exclude specific frozen portions
-    #                 print(f"registering param - {name}")
-    #                 param.register_hook(self.create_hook(name))
-    #             else:
-    #                 self.model.parameters_not_to_check.add(name)
+    def on_train_start(self):
+        if self.hparams.debug_unused_parameters: 
+            for name, param in self.model.named_parameters():
+                if param.requires_grad and "image_encoder" not in name: # NOTE need to modify this code to exclude specific frozen portions
+                    print(f"registering param - {name}")
+                    param.register_hook(self.create_hook(name))
+                else:
+                    self.model.parameters_not_to_check.add(name)
 
-    # def create_hook(self, name): #this is only used for debugging with `debug_unused_parameters`
-    #     def hook(grad):
-    #         self.model.used_parameters.add(name)  # Adjusted to self.model.used_parameters
-    #     return hook
+    def create_hook(self, name): #this is only used for debugging with `debug_unused_parameters`
+        def hook(grad):
+            self.model.used_parameters.add(name)  # Adjusted to self.model.used_parameters
+        return hook
     
     @staticmethod
     def wandb_activation_hook(run, step):
@@ -255,26 +255,26 @@ class ModelTrainer(LightningModule):
             things_to_log['pct_gradient_clipped'] = percentage_clipped
             self.log_metrics(things_to_log, "train", log_torchmetrics = False)
         
-    # def on_train_batch_end(self, outputs, batch, batch_idx):
-    #     #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
-    #     if self.hparams.debug_unused_parameters:
-    #         all_parameters = {name for name, _ in self.model.named_parameters()}
-    #         unused_parameters = all_parameters - self.model.used_parameters - self.model.parameters_not_to_check
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
+        if self.hparams.debug_unused_parameters:
+            all_parameters = {name for name, _ in self.model.named_parameters()}
+            unused_parameters = all_parameters - self.model.used_parameters - self.model.parameters_not_to_check
             
-    #         print(f"number of parameters total: {len(all_parameters)}")
-    #         print(f"number of unused_parameters: {len(unused_parameters)}")
-    #         print(f"Unused parameters: {unused_parameters}")
-    #         print(f"Used parameters: {self.model.used_parameters}")
+            print(f"number of parameters total: {len(all_parameters)}")
+            print(f"number of unused_parameters: {len(unused_parameters)}")
+            print(f"Unused parameters: {unused_parameters}")
+            print(f"Used parameters: {self.model.used_parameters}")
         
-    #     if self.hparams.manual_gc_collect_every_n_steps != -1:
-    #         if self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
-    #             print("calling GC manually")
-    #             gc.collect()            
+        if self.hparams.manual_gc_collect_every_n_steps != -1:
+            if self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
+                print("calling GC manually")
+                gc.collect()            
            
-    # def on_train_epoch_end(self): ## not effective for EBT
-    #     if self.hparams.optimizer != "adamw": # e.g. for lars need to manually update epoch
-    #         optimizer = self.trainer.optimizers[0]
-    #         optimizer.update_epoch(self.current_epoch)   
+    def on_train_epoch_end(self): ## not effective for EBT
+        if self.hparams.optimizer != "adamw": # e.g. for lars need to manually update epoch
+            optimizer = self.trainer.optimizers[0]
+            optimizer.update_epoch(self.current_epoch)   
 
     def validation_step(self, batch, batch_idx):
         eval_step_dict = self.eval_step(batch, "valid", self.token_bytes)

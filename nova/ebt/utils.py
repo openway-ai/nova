@@ -452,7 +452,7 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
         from ar_ebt_default import EBTDefault
         ebt = EBTDefault(params=transformer_args)
     elif hparams.ebt_type == "time_embed": # time embed
-        from ar_ebt_time_embed_cleanup import EBTTimeConcat
+        from ar_ebt_time_embed import EBTTimeConcat
         ebt = EBTTimeConcat(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps)
     elif hparams.ebt_type == "nanochat_time_embed": # time embed
         from nanochat_ebt import NanoChatEBT
