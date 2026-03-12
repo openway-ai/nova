@@ -76,14 +76,6 @@ class EBT_NLP(LightningModule):
         seq_length = x.shape[1]
         
         alpha = torch.clamp(self.alpha, min=0.0001)
-        if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
-            expanded_alpha = alpha.expand(batch_size, seq_length, 1)
-
-            scale = self.hparams.randomize_mcmc_step_size_scale
-            low = alpha / scale
-            high = alpha * scale
-            alpha = low + torch.rand_like(expanded_alpha) * (high - low)
-
         langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
 
         predicted_tokens = self.corrupt_embeddings(real_embeddings_input) # B, S, V
@@ -126,16 +118,8 @@ class EBT_NLP(LightningModule):
                     predicted_tokens = predicted_tokens + ld_noise
 
                 if self.hparams.normalize_initial_condition:
-                    if self.hparams.normalize_initial_condition_only_first_step:
-                        if mcmc_step == 0:
-                            predicted_tokens = self.softmax(predicted_tokens)
-                    else:
-                        predicted_tokens = self.softmax(predicted_tokens)
-                        
-                    if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
-                        predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
-                    else:
-                        predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
+                    predicted_tokens = self.softmax(predicted_tokens)
+                    predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
                 else:
                     predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
                 
@@ -145,13 +129,8 @@ class EBT_NLP(LightningModule):
                 energy_preds = energy_preds.reshape(-1, 1)
                 predicted_energies.append(energy_preds)
                 
-                if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
-                    if i == (len(mcmc_steps) - 1):
-                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
-                    else:
-                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=False)[0]
-                else:
-                    predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+
+                predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
                 # predicted_tokens_grad has shape B, S, V
                 
                 if self.hparams.clamp_futures_grad:
@@ -180,20 +159,10 @@ class EBT_NLP(LightningModule):
 
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
         no_randomness = False if phase == "train" else True
-        if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
-            # all_tokens = x['input_ids'].squeeze(dim=1)
-            all_tokens = x[0].squeeze(dim=0)
-            input_ids, replay_buffer_logits, next_token_indices = self.replay_buffer.get_batch(all_tokens) # this automatically does indexing for input ids and next token indices while also passing back the logits
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness)
-            self.replay_buffer.update(all_tokens.detach(), predicted_distributions[-1].detach()) # update using the final predicted distributions
-        else:
-            input_ids = x[0].squeeze(dim=0)
-            next_token_indices = x[1].squeeze(dim=0)
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
 
-            # input_ids = x['input_ids'].squeeze(dim=1)[:, :-1]
-            # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
-            # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
+        input_ids = x[0].squeeze(dim=0)
+        next_token_indices = x[1].squeeze(dim=0)
+        predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
 
         if self.hparams.execution_mode == "finetune": # Only tokens after "[[Answer]]: " will be calculated in finetune
             next_token_indices = mask_q_tokens(next_token_indices, self.tokenizer)
@@ -467,16 +436,8 @@ class EBT_NLP(LightningModule):
 
                 # Convert logits -> embeddings
                 if self.hparams.normalize_initial_condition:
-                    if self.hparams.normalize_initial_condition_only_first_step:
-                        if step_idx == 0:
-                            cur_pred_tokens = self.softmax(cur_pred_tokens)
-                    else:
-                        cur_pred_tokens = self.softmax(cur_pred_tokens)
-                            
-                    if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
-                        pred_embeds = torch.matmul(cur_pred_tokens, self.embeddings.weight) #BS, S, D
-                    else:
-                        pred_embeds = self.vocab_to_embed(cur_pred_tokens) #BS, S, D
+                    cur_pred_tokens = self.softmax(cur_pred_tokens)
+                    pred_embeds = self.vocab_to_embed(cur_pred_tokens) #BS, S, D
                 else:
                     pred_embeds = self.vocab_to_embed(cur_pred_tokens)
 
@@ -486,10 +447,6 @@ class EBT_NLP(LightningModule):
                 energies_list.append(energies.detach())
 
                 grad = torch.autograd.grad(energies.sum(), [cur_pred_tokens], create_graph=learning)[0]
-
-                if self.hparams.clamp_futures_grad:
-                    min_and_max = self.hparams.clamp_futures_grad_max_change / (alpha)
-                    grad = torch.clamp(grad, -min_and_max, min_and_max)
 
                 if self.hparams.infer_accept_lower_energies: # have to get energy to determine if should decrease
                     old_energies = energies.reshape(cur_pred_tokens.shape[:2])
@@ -508,16 +465,8 @@ class EBT_NLP(LightningModule):
 
                 # Convert logits -> embeddings
                 if self.hparams.normalize_initial_condition:
-                    if self.hparams.normalize_initial_condition_only_first_step:
-                        if step_idx == 0:
-                            cur_pred_tokens = self.softmax(cur_pred_tokens)
-                    else:
-                        cur_pred_tokens = self.softmax(cur_pred_tokens)
-                            
-                    if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
-                        pred_embeds = torch.matmul(cur_pred_tokens, self.embeddings.weight) #BS, S, D
-                    else:
-                        pred_embeds = self.vocab_to_embed(cur_pred_tokens) #BS, S, D
+                    cur_pred_tokens = self.softmax(cur_pred_tokens)
+                    pred_embeds = self.vocab_to_embed(cur_pred_tokens) #BS, S, D
                 else:
                     pred_embeds = self.vocab_to_embed(cur_pred_tokens)
                 combined_embeddings = torch.cat([real_embeds, pred_embeds], dim=1)  # (chunk_size, 2S, D)

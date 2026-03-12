@@ -21,10 +21,10 @@ module purge
 lr=(0.0002)
 alpha=(500)
 alpha_lr=(1500)
-MAX_STEP=10000
-WARMUP_STEP=1000
+MAX_STEP=100
+WARMUP_STEP=10
 
-python train.py \
+coverage run --branch train.py \
 --run_name ${RUN_NAME}${lr[${SLURM_ARRAY_TASK_ID}]} \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
@@ -57,8 +57,8 @@ python train.py \
 \
 --dataset_name "fineweb" \
 --num_workers 12 \
---val_check_interval 1000 \
---limit_val_batches 100 \
+--val_check_interval 50 \
+--limit_val_batches 10 \
 --val_sanity 1 \
 \
 --wandb_project 'nlp_pretrain' \
@@ -69,3 +69,5 @@ python train.py \
 --set_matmul_precision "medium" \
 --wandb_watch \
 ${SLURM_ARRAY_TASK_ID:+--is_slurm_run}
+
+coverage html -d runs/coverage_report --ignore-errors

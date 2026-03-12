@@ -1,7 +1,7 @@
 #!/bin/bash
 # activate venv so that `python` uses the project's venv instead of system python
-source .venv/ebt/bin/activate
-
+source ../../.venv/ebt/bin/activate
+cd ../../
 # -----------------------------------------------------------------------------
 # wandb setup
 # If you wish to use wandb for logging (it's nice!, recommended).
@@ -28,16 +28,16 @@ python -m nanochat.report reset
 # so we download 2e9 / 250e6 = 8 data shards at this point
 # each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
 # look at dev/repackage_data_reference.py for details on how this data was prepared
-python -m nanochat.dataset -n 8
-# Immediately also kick off downloading more shards in the background while tokenizer trains
-# Approximately 350 shards are needed for 10B tokens of data for pretraining.
-# The maximum total number of shards available in the entire dataset is 1822.
-python -m nanochat.dataset -n 370 &
-DATASET_DOWNLOAD_PID=$!
+# python -m data.climbmix.dataset -n 8
+# # Immediately also kick off downloading more shards in the background while tokenizer trains
+# # Approximately 350 shards are needed for 10B tokens of data for pretraining.
+# # The maximum total number of shards available in the entire dataset is 1822.
+# python -m data.climbmix.dataset -n 370 &
+# DATASET_DOWNLOAD_PID=$!
 # train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
-python -m scripts.tok_train
+python -m data.tok_train --dataset_name climbmix
 # evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
+python -m data.tok_eval --dataset_name climbmix
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)
@@ -45,5 +45,5 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # d24 model (slightly overtrained is enough to beat GPT-2 => increase data:params ratio from compute optimal 10.5 (default) to 12)
-# bash runs/ebt_s1.sh
+cd nova/ebt
 
