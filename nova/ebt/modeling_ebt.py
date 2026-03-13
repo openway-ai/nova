@@ -254,7 +254,7 @@ class EBT_NLP(LightningModule):
             'contrastive_loss' : contrastive_loss,
             'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
             'perplexity': ppl_loss,
-            'bpb_loss': bpb_loss
+            'bpb': bpb_loss  # Renamed from 'bpb_loss' for cleaner logging
         }
         return log_dict
     
