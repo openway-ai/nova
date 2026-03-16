@@ -253,9 +253,6 @@ class EBTChatEngine:
                 # 训练时只学习了 original_steps 个能量景观（time embeddings），
                 # 不能简单增加景观数。正确做法是保持景观数不变，
                 # 通过 randomize_mcmc_num_steps 在最终景观上多做迭代。
-                #
-                # 效果：step 0...(original-2) 各 1 次，step (original-1) 重复 extra 次
-                # 总步数 = (original-1) + (extra+1) = override_mcmc_steps
                 extra = self.override_mcmc_steps - original_steps
                 self.hparams.randomize_mcmc_num_steps = extra
                 self.model.hparams.randomize_mcmc_num_steps = extra
@@ -264,8 +261,33 @@ class EBTChatEngine:
                 self.hparams.randomize_mcmc_num_steps_min = extra + 1
                 self.model.hparams.randomize_mcmc_num_steps_min = extra + 1
                 mcmc_steps = self.override_mcmc_steps
-                print(f"    {Colors.YELLOW}⚠ 覆盖 MCMC 步数: {original_steps} → {self.override_mcmc_steps} "
-                      f"(保持 {original_steps} 个能量景观，最终景观迭代 {extra + 1} 次){Colors.RESET}")
+
+                # 当扩展步数超过训练景观数时，自动启用 Langevin 噪声，
+                # 否则重复的最终景观迭代因梯度为零而完全无效。
+                # 仅当用户未显式指定 --override-noise-std 时才自动启用。
+                trained_noise = getattr(self.hparams, 'langevin_dynamics_noise', 0.0)
+                if self.override_noise_std is None and trained_noise == 0:
+                    auto_noise = 0.01
+                    self.hparams.langevin_dynamics_noise = auto_noise
+                    self.model.hparams.langevin_dynamics_noise = auto_noise
+                    if hasattr(self.model, 'langevin_dynamics_noise_std'):
+                        self.model.langevin_dynamics_noise_std.data.fill_(auto_noise)
+                    noise_std_val = auto_noise
+
+                print()
+                print(f"    {Colors.YELLOW}{'='*60}")
+                print(f"    ⚠ MCMC 步数覆盖: {original_steps} → {self.override_mcmc_steps}")
+                print(f"    {'='*60}{Colors.RESET}")
+                print(f"    {Colors.CYAN}模型训练时使用 {original_steps} 个能量景观 (time embeddings)。")
+                print(f"    无法创建新的景观，改为在最终景观上重复迭代 {extra + 1} 次。")
+                print(f"    步骤序列: {list(range(original_steps - 1))} + [{original_steps - 1}] × {extra + 1}{Colors.RESET}")
+                if self.override_noise_std is None and trained_noise == 0:
+                    print(f"    {Colors.GREEN}✓ 已自动启用 Langevin 噪声 (σ={auto_noise})，")
+                    print(f"      使重复迭代能通过随机扰动继续优化能量。")
+                    print(f"      可通过 --override-noise-std 手动调整。{Colors.RESET}")
+                print(f"    {Colors.GRAY}注意: 超出训练景观数的额外步骤效果有限，")
+                print(f"    建议训练时增加 mcmc_num_steps 以获得更好效果。{Colors.RESET}")
+                print()
             elif self.override_mcmc_steps < original_steps:
                 # 减少步数：直接修改 mcmc_num_steps
                 self.hparams.mcmc_num_steps = mcmc_steps = self.override_mcmc_steps
@@ -277,11 +299,10 @@ class EBTChatEngine:
 
         if self.override_noise_std is not None:
             if hasattr(self.model, 'langevin_dynamics_noise_std'):
-                self.model.langevin_dynamics_noise_std = torch.tensor(
-                    self.override_noise_std,
-                    dtype=self.model.langevin_dynamics_noise_std.dtype,
-                    device=self.model.langevin_dynamics_noise_std.device
-                )
+                self.model.langevin_dynamics_noise_std.data.fill_(self.override_noise_std)
+                # 同时更新 hparam，否则 modeling_ebt.py:124 的条件检查不通过
+                self.hparams.langevin_dynamics_noise = self.override_noise_std
+                self.model.hparams.langevin_dynamics_noise = self.override_noise_std
                 noise_std_val = self.override_noise_std
                 print(f"    {Colors.YELLOW}⚠ 覆盖 Langevin 噪声: {self.override_noise_std:.6f}{Colors.RESET}")
 
@@ -374,8 +395,27 @@ class EBTChatEngine:
             return
 
         num_steps = len(history)
+        trained_landscapes = getattr(self.hparams, 'mcmc_num_steps', num_steps)
+
+        # 重建 mcmc_steps 列表以了解每步对应的景观索引
+        # 与 modeling_ebt.py forward() 中的逻辑对应
+        landscape_indices = []
+        extra_steps = getattr(self.model.hparams, 'randomize_mcmc_num_steps', 0)
+        if extra_steps > 0:
+            for s in range(trained_landscapes):
+                if s == trained_landscapes - 1:
+                    landscape_indices.extend([s] * (extra_steps + 1))
+                else:
+                    landscape_indices.append(s)
+        else:
+            landscape_indices = list(range(trained_landscapes))
+        # 截断/填充到实际步数
+        while len(landscape_indices) < num_steps:
+            landscape_indices.append(landscape_indices[-1] if landscape_indices else 0)
+
         print()
-        print(f"  {Colors.BOLD}═══ MCMC 迭代过程 (位置 {position}, {num_steps} 步) ═══{Colors.RESET}")
+        print(f"  {Colors.BOLD}═══ MCMC 迭代过程 (位置 {position}, {num_steps} 步, "
+              f"{trained_landscapes} 个能量景观) ═══{Colors.RESET}")
 
         # 收集能量范围
         all_energies = [h['energy_mean'] for h in history]
@@ -388,10 +428,14 @@ class EBTChatEngine:
             energy_bar = format_energy_bar(step_info['energy_mean'], min_e, max_e)
             energy_str = format_energy(step_info['energy_mean'])
 
+            # 景观标识
+            li = landscape_indices[i] if i < len(landscape_indices) else '?'
+            landscape_tag = f"L{li}"
+
             # Per-step energy delta
             if i > 0:
                 energy_delta = step_info['energy_mean'] - history[i-1]['energy_mean']
-                delta_color = Colors.GREEN if energy_delta < 0 else Colors.RED
+                delta_color = Colors.GREEN if energy_delta < 0 else (Colors.GRAY if abs(energy_delta) < 1e-6 else Colors.RED)
                 delta_str = f"{delta_color}ΔE={energy_delta:+.4f}{Colors.RESET}"
             else:
                 delta_str = f"{Colors.GRAY}ΔE=  ----{Colors.RESET}"
@@ -411,7 +455,7 @@ class EBTChatEngine:
             else:
                 prob_color = Colors.RED
 
-            print(f"  {step_color}Step {i:2d}{Colors.RESET} │ "
+            print(f"  {step_color}Step {i:2d}{Colors.RESET} {Colors.GRAY}[{landscape_tag}]{Colors.RESET} │ "
                   f"E={energy_str} │ {energy_bar} │ "
                   f"{delta_str} │ "
                   f"{entropy_color}H={entropy:.2f}{Colors.RESET} │ "
@@ -439,6 +483,23 @@ class EBTChatEngine:
                   f"({history[0]['prob_entropy']:.2f} → {history[-1]['prob_entropy']:.2f})")
             print(f"    最大概率 (↑好): {prob_change_color}{prob_change:+.3f}{Colors.RESET} "
                   f"({history[0]['prob_max']:.3f} → {history[-1]['prob_max']:.3f})")
+
+            # 当使用扩展步数时，显示额外诊断信息
+            extra_steps = getattr(self.model.hparams, 'randomize_mcmc_num_steps', 0)
+            if extra_steps > 0 and num_steps > trained_landscapes:
+                # 计算前 N 个景观阶段和扩展阶段的能量变化
+                landscape_phase_end = trained_landscapes - 1  # 最后一个景观首次出现的位置
+                if landscape_phase_end < num_steps:
+                    landscape_energy_change = history[landscape_phase_end]['energy_mean'] - history[0]['energy_mean']
+                    repeat_energy_change = history[-1]['energy_mean'] - history[landscape_phase_end]['energy_mean']
+                    print(f"    {Colors.GRAY}--- 分阶段分析 ---{Colors.RESET}")
+                    print(f"    景观切换阶段 (Step 0→{landscape_phase_end}): ΔE={landscape_energy_change:+.4f}")
+                    print(f"    最终景观重复 (Step {landscape_phase_end}→{num_steps-1}): ΔE={repeat_energy_change:+.4f}")
+                    noise_val = getattr(self.model.hparams, 'langevin_dynamics_noise', 0)
+                    if noise_val > 0:
+                        print(f"    Langevin 噪声: σ={noise_val} (启用随机扰动)")
+                    else:
+                        print(f"    {Colors.YELLOW}Langevin 噪声: 0 (无随机扰动，重复步骤可能无效){Colors.RESET}")
         print()
 
     def generate_token(
