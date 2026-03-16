@@ -431,8 +431,19 @@ class ModelTrainer(LightningModule):
                             'input_ids': batch['prompt_ids'],
                             'attention_mask': batch['prompt_attention_mask']
                         }
+                        # Pad target_ids to same length before stacking
+                        target_list = batch['target_ids']
+                        max_target_len = max(t.shape[0] for t in target_list)
+                        padded_targets = []
+                        for t in target_list:
+                            pad_len = max_target_len - t.shape[0]
+                            if pad_len > 0:
+                                padded_t = torch.cat([t, torch.zeros(pad_len, dtype=t.dtype, device=t.device)])
+                            else:
+                                padded_t = t
+                            padded_targets.append(padded_t)
                         answers = {
-                            'input_ids': torch.stack([t for t in batch['target_ids']])  # Stack target tensors
+                            'input_ids': torch.stack(padded_targets)
                         }
 
                         generation_batch = (questions, answers)
@@ -906,10 +917,12 @@ class ModelTrainer(LightningModule):
                     {'params': alpha_param, 'weight_decay': 0.0,
                      'lr': self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate},
                     # Embedding: 中等学习率，无 weight decay
+                    # {'params': embedding_params, 'weight_decay': self.hparams.weight_decay,
                     {'params': embedding_params, 'weight_decay': 0.0,
                      'lr': self.hparams.peak_learning_rate * embedding_lr_mult},
                     # vocab_to_embed: 较低学习率
-                    {'params': vocab_to_embed_params, 'weight_decay': self.hparams.weight_decay,
+                    # {'params': vocab_to_embed_params, 'weight_decay': self.hparams.weight_decay,
+                    {'params': vocab_to_embed_params, 'weight_decay': 0.0,
                      'lr': self.hparams.peak_learning_rate * vocab_to_embed_lr_mult},
                     # Transformer 矩阵: 主学习率
                     {'params': transformer_matrix_params, 'weight_decay': self.hparams.weight_decay,
