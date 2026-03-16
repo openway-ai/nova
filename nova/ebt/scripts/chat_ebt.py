@@ -89,12 +89,12 @@ def print_banner():
     print_colored(banner, Colors.CYAN)
 
 
-def format_energy(energy: float, width: int = 8) -> str:
+def format_energy(energy: float, width: int = 10) -> str:
     """格式化能量值显示"""
     if energy > 0:
-        return f"{Colors.RED}+{energy:>{width-1}.4f}{Colors.RESET}"
+        return f"{Colors.RED}+{energy:>{width-1}.6f}{Colors.RESET}"
     else:
-        return f"{Colors.GREEN}{energy:>{width}.4f}{Colors.RESET}"
+        return f"{Colors.GREEN}{energy:>{width}.6f}{Colors.RESET}"
 
 
 def format_energy_bar(energy: float, min_energy: float, max_energy: float, width: int = 20) -> str:
@@ -267,7 +267,9 @@ class EBTChatEngine:
                 # 仅当用户未显式指定 --override-noise-std 时才自动启用。
                 trained_noise = getattr(self.hparams, 'langevin_dynamics_noise', 0.0)
                 if self.override_noise_std is None and trained_noise == 0:
-                    auto_noise = 0.01
+                    # 推理使用 float32 autocast，σ=0.01 的噪声不会被量化截断。
+                    # auto_noise = 0.01
+                    auto_noise = 0.0
                     self.hparams.langevin_dynamics_noise = auto_noise
                     self.model.hparams.langevin_dynamics_noise = auto_noise
                     if hasattr(self.model, 'langevin_dynamics_noise_std'):
@@ -285,7 +287,8 @@ class EBTChatEngine:
                     print(f"    {Colors.GREEN}✓ 已自动启用 Langevin 噪声 (σ={auto_noise})，")
                     print(f"      使重复迭代能通过随机扰动继续优化能量。")
                     print(f"      可通过 --override-noise-std 手动调整。{Colors.RESET}")
-                print(f"    {Colors.GRAY}注意: 超出训练景观数的额外步骤效果有限，")
+                print(f"    {Colors.GRAY}注意: 推理使用 float32 精度以保证 MCMC 梯度和噪声的有效性。")
+                print(f"    超出训练景观数的额外步骤效果有限，")
                 print(f"    建议训练时增加 mcmc_num_steps 以获得更好效果。{Colors.RESET}")
                 print()
             elif self.override_mcmc_steps < original_steps:
@@ -349,9 +352,12 @@ class EBTChatEngine:
         mcmc_history = []
         start_time = time.time()
 
-        # 直接使用模型的 forward 方法，确保与 eval 一致
-        # 使用 autocast 匹配训练时的 dtype 环境，避免 float32/bfloat16 不匹配
-        with torch.amp.autocast('cuda', dtype=self.dtype):
+        # 使用 float32 autocast：模型权重是 bfloat16，但 autocast(float32) 会将
+        # 中间计算提升到 float32，避免 bfloat16 精度不足导致：
+        # 1. Langevin 噪声 (σ~0.1) 被量化截断
+        # 2. 能量值变化 (~0.01) 无法区分
+        # 3. 梯度更新被吞掉
+        with torch.amp.autocast('cuda', dtype=torch.float32):
             predicted_distributions, predicted_energies = self.model.forward(
                 input_ids, start_pos=0, learning=False, return_raw_logits=True, no_randomness=True
             )
@@ -364,7 +370,7 @@ class EBTChatEngine:
 
         for step_idx in range(num_steps):
             logits = predicted_distributions[step_idx]  # (B, S, V)
-            energy = predicted_energies[step_idx]  # (B*S, 1)
+            energy = predicted_energies[step_idx].float()  # (B*S, 1) → float32 避免 bfloat16 精度不足
 
             probs = F.softmax(logits.detach().float(), dim=-1)
             step_info = {
@@ -435,10 +441,10 @@ class EBTChatEngine:
             # Per-step energy delta
             if i > 0:
                 energy_delta = step_info['energy_mean'] - history[i-1]['energy_mean']
-                delta_color = Colors.GREEN if energy_delta < 0 else (Colors.GRAY if abs(energy_delta) < 1e-6 else Colors.RED)
-                delta_str = f"{delta_color}ΔE={energy_delta:+.4f}{Colors.RESET}"
+                delta_color = Colors.GREEN if energy_delta < 0 else (Colors.GRAY if abs(energy_delta) < 1e-7 else Colors.RED)
+                delta_str = f"{delta_color}ΔE={energy_delta:+.6f}{Colors.RESET}"
             else:
-                delta_str = f"{Colors.GRAY}ΔE=  ----{Colors.RESET}"
+                delta_str = f"{Colors.GRAY}ΔE=  ------{Colors.RESET}"
 
             # 添加熵和最大概率显示以诊断问题
             entropy = step_info['prob_entropy']
@@ -477,8 +483,8 @@ class EBTChatEngine:
             prob_change_color = Colors.GREEN if prob_change > 0 else Colors.RED
 
             print(f"  {Colors.BOLD}收敛统计:{Colors.RESET}")
-            print(f"    能量变化 (↓好): {change_color}{energy_change:+.4f}{Colors.RESET} "
-                  f"({history[0]['energy_mean']:.4f} → {history[-1]['energy_mean']:.4f})")
+            print(f"    能量变化 (↓好): {change_color}{energy_change:+.6f}{Colors.RESET} "
+                  f"({history[0]['energy_mean']:.6f} → {history[-1]['energy_mean']:.6f})")
             print(f"    熵值变化 (信息): {Colors.CYAN}{entropy_change:+.2f}{Colors.RESET} "
                   f"({history[0]['prob_entropy']:.2f} → {history[-1]['prob_entropy']:.2f})")
             print(f"    最大概率 (↑好): {prob_change_color}{prob_change:+.3f}{Colors.RESET} "
@@ -493,8 +499,8 @@ class EBTChatEngine:
                     landscape_energy_change = history[landscape_phase_end]['energy_mean'] - history[0]['energy_mean']
                     repeat_energy_change = history[-1]['energy_mean'] - history[landscape_phase_end]['energy_mean']
                     print(f"    {Colors.GRAY}--- 分阶段分析 ---{Colors.RESET}")
-                    print(f"    景观切换阶段 (Step 0→{landscape_phase_end}): ΔE={landscape_energy_change:+.4f}")
-                    print(f"    最终景观重复 (Step {landscape_phase_end}→{num_steps-1}): ΔE={repeat_energy_change:+.4f}")
+                    print(f"    景观切换阶段 (Step 0→{landscape_phase_end}): ΔE={landscape_energy_change:+.6f}")
+                    print(f"    最终景观重复 (Step {landscape_phase_end}→{num_steps-1}): ΔE={repeat_energy_change:+.6f}")
                     noise_val = getattr(self.model.hparams, 'langevin_dynamics_noise', 0)
                     if noise_val > 0:
                         print(f"    Langevin 噪声: σ={noise_val} (启用随机扰动)")
