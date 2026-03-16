@@ -16,7 +16,8 @@ export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export NANOCHAT_OFFLINE_MODE=1
 export OMP_NUM_THREADS=1
 
-CKPT_PATH="/mnt/shared-storage-user/puyuan/code/nova/nova/ebt/logs/checkpoints/ebt-small-bs_256_s1_lr_0.0012_2026-03-05_01-01-55_/last.ckpt"
+# CKPT_PATH="/mnt/shared-storage-user/puyuan/code/nova/nova/ebt/logs/checkpoints/ebt-small-bs_256_s1_lr_0.0012_2026-03-05_01-01-55_/last.ckpt"
+export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt}"
 
 # EBT checkpoint 路径（必须指定）
 CKPT_PATH="${CKPT_PATH:-}"
