@@ -47,6 +47,7 @@ from modeling_ebt import EBT_NLP
 
 from pytorch_lightning import LightningModule
 from dataset import IterableDataset, generate_dataloader
+from dataset_sft import generate_sft_dataloader
 
 
 # Simple GSM8K Dataset class for inference
@@ -1143,15 +1144,25 @@ class ModelTrainer(LightningModule):
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
 
-        train_dataloader = generate_dataloader(
-            tokenizer=tokenizer,
-            batch_size=self.hparams.batch_size_per_device,
-            max_len=self.hparams.context_length,
-            max_iter=self.hparams.max_steps,
-            split="train",
-            device=self.device,
-            resume_state_dict=None,
-        )
+        if getattr(self.hparams, 'dataset_name', 'nanochat') == 'nanochat_sft':
+            train_dataloader = generate_sft_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.max_steps,
+                split="train",
+                device=self.device,
+            )
+        else:
+            train_dataloader = generate_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.max_steps,
+                split="train",
+                device=self.device,
+                resume_state_dict=None,
+            )
         return train_dataloader
 
     def val_dataloader(self):
@@ -1165,15 +1176,25 @@ class ModelTrainer(LightningModule):
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
 
-        val_dataloader = generate_dataloader(
-            tokenizer=tokenizer,
-            batch_size=self.hparams.batch_size_per_device,
-            max_len=self.hparams.context_length,
-            max_iter=self.hparams.val_steps,
-            split="val",
-            device=self.device,
-            resume_state_dict=None,
-        )
+        if getattr(self.hparams, 'dataset_name', 'nanochat') == 'nanochat_sft':
+            val_dataloader = generate_sft_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.val_steps,
+                split="val",
+                device=self.device,
+            )
+        else:
+            val_dataloader = generate_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.val_steps,
+                split="val",
+                device=self.device,
+                resume_state_dict=None,
+            )
 
         return val_dataloader
 

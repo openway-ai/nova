@@ -192,6 +192,7 @@ python -m scripts.chat_ebt \
     --max-tokens "$MAX_TOKENS" \
     --dtype "$DTYPE" \
     --device "$DEVICE" \
+    --override-mcmc-steps 10 \
     $SHOW_MCMC_FLAG \
     $VERBOSE_FLAG \
     $SHOW_ENERGY_FLAG \

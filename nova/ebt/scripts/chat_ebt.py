@@ -146,6 +146,9 @@ class EBTChatEngine:
         verbose: bool = False,
         show_energy: bool = False,
         show_distribution: bool = False,
+        override_mcmc_steps: Optional[int] = None,
+        override_noise_std: Optional[float] = None,
+        override_alpha: Optional[float] = None,
     ):
         self.device = device
         self.dtype = dtype
@@ -153,6 +156,9 @@ class EBTChatEngine:
         self.verbose = verbose
         self.show_energy = show_energy
         self.show_distribution = show_distribution
+        self.override_mcmc_steps = override_mcmc_steps
+        self.override_noise_std = override_noise_std
+        self.override_alpha = override_alpha
 
         self.model = None
         self.tokenizer = None
@@ -229,14 +235,38 @@ class EBTChatEngine:
         alpha_val = '未知'
         if hasattr(self.model, 'alpha'):
             alpha_val = self.model.alpha.item() if isinstance(self.model.alpha, torch.Tensor) else self.model.alpha
-            
+
         noise_std_val = '未知'
         if hasattr(self.model, 'langevin_dynamics_noise_std'):
             noise_std_val = self.model.langevin_dynamics_noise_std.item() if isinstance(self.model.langevin_dynamics_noise_std, torch.Tensor) else self.model.langevin_dynamics_noise_std
 
-        # TODO
-        self.hparams.mcmc_num_steps =  mcmc_steps = 10
-        self.hparams.langevin_dynamics_noise_std = noise_std_val = torch.Tensor(0.05)
+        # 使用训练时的参数,而不是硬编码覆盖
+        # NOTE: 保持推理与训练一致性至关重要!
+
+        # 应用用户指定的覆盖参数
+        if self.override_mcmc_steps is not None:
+            self.hparams.mcmc_num_steps = mcmc_steps = self.override_mcmc_steps
+            print(f"    {Colors.YELLOW}⚠ 覆盖 MCMC 步数: {self.override_mcmc_steps}{Colors.RESET}")
+
+        if self.override_noise_std is not None:
+            if hasattr(self.model, 'langevin_dynamics_noise_std'):
+                self.model.langevin_dynamics_noise_std = torch.tensor(
+                    self.override_noise_std,
+                    dtype=self.model.langevin_dynamics_noise_std.dtype,
+                    device=self.model.langevin_dynamics_noise_std.device
+                )
+                noise_std_val = self.override_noise_std
+                print(f"    {Colors.YELLOW}⚠ 覆盖 Langevin 噪声: {self.override_noise_std:.6f}{Colors.RESET}")
+
+        if self.override_alpha is not None:
+            if hasattr(self.model, 'alpha'):
+                self.model.alpha = torch.tensor(
+                    self.override_alpha,
+                    dtype=self.model.alpha.dtype,
+                    device=self.model.alpha.device
+                )
+                alpha_val = self.override_alpha
+                print(f"    {Colors.YELLOW}⚠ 覆盖 Alpha 步长: {self.override_alpha:.6f}{Colors.RESET}")
 
         print()
         print(f"  {Colors.BOLD}模型配置:{Colors.RESET}")
@@ -263,92 +293,53 @@ class EBTChatEngine:
         input_ids: torch.Tensor,
         return_all_steps: bool = True
     ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-        """运行 MCMC 推理并追踪每一步的状态"""
+        """运行 MCMC 推理并追踪每一步的状态
+
+        直接调用 model.forward() 以保证与训练/评估时完全一致的 MCMC 逻辑。
+        """
 
         mcmc_history = []
+        start_time = time.time()
 
-        with torch.no_grad():
-            real_embeddings = self.model.embeddings(input_ids)  # (B, S, D)
-            predicted_tokens = self.model.corrupt_embeddings(real_embeddings)  # (B, S, V)
+        # 直接使用模型的 forward 方法，确保与 eval 一致
+        # 使用 autocast 匹配训练时的 dtype 环境，避免 float32/bfloat16 不匹配
+        with torch.cuda.amp.autocast(dtype=self.dtype):
+            predicted_distributions, predicted_energies = self.model.forward(
+                input_ids, start_pos=0, learning=False, return_raw_logits=True, no_randomness=True
+            )
 
-            alpha = self.model.alpha
-            noise_std = self.model.langevin_dynamics_noise_std
+        total_time = time.time() - start_time
 
-            B, S, V = predicted_tokens.shape
+        # 从 forward 返回的结果构建 mcmc_history 用于显示
+        num_steps = len(predicted_distributions)
+        step_time = total_time / max(num_steps, 1)
 
-            for step_idx in range(self.hparams.mcmc_num_steps):
-                step_start_time = time.time()
+        for step_idx in range(num_steps):
+            logits = predicted_distributions[step_idx]  # (B, S, V)
+            energy = predicted_energies[step_idx]  # (B*S, 1)
 
-                with torch.enable_grad():
-                    predicted_tokens = predicted_tokens.detach().requires_grad_()
+            probs = F.softmax(logits.detach().float(), dim=-1)
+            step_info = {
+                'step': step_idx,
+                'energy_mean': energy.mean().item(),
+                'energy_std': energy.std().item(),
+                'energy_min': energy.min().item(),
+                'energy_max': energy.max().item(),
+                'grad_norm': 0.0,  # 不再单独追踪梯度
+                'prob_entropy': -(probs * (probs + 1e-10).log()).sum(-1).mean().item(),
+                'prob_max': probs.max(-1).values.mean().item(),
+                'step_time': step_time,
+            }
 
-                    # 添加 Langevin 噪声
-                    if noise_std > 0:
-                        predicted_tokens = predicted_tokens + noise_std * torch.randn_like(predicted_tokens)
+            if return_all_steps:
+                step_info['logits'] = logits.detach().clone()
+                step_info['energies'] = energy.detach().clone()
 
-                    # 归一化 (使用 getattr 防止 hparams 缺少属性报错)
-                    norm_init = getattr(self.hparams, 'normalize_initial_condition', False)
-                    norm_first_only = getattr(self.hparams, 'normalize_initial_condition_only_first_step', False)
-                    
-                    if norm_init:
-                        if norm_first_only:
-                            if step_idx == 0:
-                                # softmax 建议在 float32 下计算以保证精度，然后再转回模型 dtype
-                                normalized_tokens = F.softmax(predicted_tokens.float(), dim=-1).to(self.dtype)
-                            else:
-                                normalized_tokens = predicted_tokens.to(self.dtype)
-                        else:
-                            normalized_tokens = F.softmax(predicted_tokens.float(), dim=-1).to(self.dtype)
-                    else:
-                        normalized_tokens = predicted_tokens.to(self.dtype)
+            mcmc_history.append(step_info)
 
-                    # 计算嵌入
-                    use_prob_dist = getattr(self.hparams, 'vocab_to_embed_uses_prob_dist', False)
-                    if use_prob_dist:
-                        pred_embeds = torch.matmul(normalized_tokens, self.model.embeddings.weight)
-                    else:
-                        pred_embeds = self.model.vocab_to_embed(normalized_tokens)
-
-                    # 拼接并计算能量
-                    combined = torch.cat([real_embeddings, pred_embeds], dim=1)
-                    energies = self.model.transformer(combined, start_pos=0, mcmc_step=step_idx)
-                    energies_flat = energies.reshape(-1)
-
-                    # 计算梯度
-                    grad = torch.autograd.grad(energies_flat.sum(), [predicted_tokens], create_graph=False)[0]
-
-                    # 梯度裁剪
-                    if self.hparams.clamp_futures_grad:
-                        max_change = self.hparams.clamp_futures_grad_max_change / alpha
-                        grad = torch.clamp(grad, -max_change, max_change)
-
-                    # 更新
-                    predicted_tokens = predicted_tokens - alpha * grad
-
-                step_time = time.time() - step_start_time
-
-                # 记录这一步的信息
-                probs = F.softmax(predicted_tokens, dim=-1)
-                step_info = {
-                    'step': step_idx,
-                    'energy_mean': energies_flat.mean().item(),
-                    'energy_std': energies_flat.std().item(),
-                    'energy_min': energies_flat.min().item(),
-                    'energy_max': energies_flat.max().item(),
-                    'grad_norm': grad.norm().item(),
-                    'prob_entropy': -(probs * (probs + 1e-10).log()).sum(-1).mean().item(),
-                    'prob_max': probs.max(-1).values.mean().item(),
-                    'step_time': step_time,
-                }
-
-                if return_all_steps:
-                    # 保存完整状态用于后续分析
-                    step_info['logits'] = predicted_tokens.detach().clone()
-                    step_info['energies'] = energies.detach().clone()
-
-                mcmc_history.append(step_info)
-
-        return predicted_tokens, mcmc_history
+        # 返回最终步骤的 logits
+        final_logits = predicted_distributions[-1]  # (B, S, V)
+        return final_logits, mcmc_history
 
     def _display_mcmc_progress(self, history: List[Dict[str, Any]], position: int = 0):
         """展示 MCMC 迭代过程"""
@@ -370,10 +361,31 @@ class EBTChatEngine:
             energy_bar = format_energy_bar(step_info['energy_mean'], min_e, max_e)
             energy_str = format_energy(step_info['energy_mean'])
 
+            # 添加熵和最大概率显示以诊断问题
+            entropy = step_info['prob_entropy']
+            max_prob = step_info['prob_max']
+
+            # 熵值颜色: 低熵(好) = 绿色, 高熵(差) = 红色
+            if entropy < 3.0:
+                entropy_color = Colors.GREEN
+            elif entropy < 6.0:
+                entropy_color = Colors.YELLOW
+            else:
+                entropy_color = Colors.RED
+
+            # 最大概率颜色: 高概率(好) = 绿色, 低概率(差) = 红色
+            if max_prob > 0.5:
+                prob_color = Colors.GREEN
+            elif max_prob > 0.1:
+                prob_color = Colors.YELLOW
+            else:
+                prob_color = Colors.RED
+
             print(f"  {step_color}Step {step:2d}{Colors.RESET} │ "
                   f"E={energy_str} │ {energy_bar} │ "
                   f"∇={step_info['grad_norm']:.4f} │ "
-                  f"H={step_info['prob_entropy']:.3f} │ "
+                  f"{entropy_color}H={entropy:.2f}{Colors.RESET} │ "
+                  f"{prob_color}P_max={max_prob:.3f}{Colors.RESET} │ "
                   f"t={step_info['step_time']*1000:.1f}ms")
 
             if self.verbose and 'logits' in step_info:
@@ -381,12 +393,23 @@ class EBTChatEngine:
                 top_tokens = format_top_tokens(probs, self.tokenizer, top_k=5)
                 print(f"         └─ Top tokens: {top_tokens}")
 
-        # 显示能量变化
+        # 显示能量和熵的变化
         if len(history) > 1:
             energy_change = history[-1]['energy_mean'] - history[0]['energy_mean']
+            entropy_change = history[-1]['prob_entropy'] - history[0]['prob_entropy']
+            prob_change = history[-1]['prob_max'] - history[0]['prob_max']
+
             change_color = Colors.GREEN if energy_change < 0 else Colors.RED
-            print(f"  {Colors.BOLD}能量变化:{Colors.RESET} {change_color}{energy_change:+.4f}{Colors.RESET} "
+            entropy_change_color = Colors.GREEN if entropy_change < 0 else Colors.RED
+            prob_change_color = Colors.GREEN if prob_change > 0 else Colors.RED
+
+            print(f"  {Colors.BOLD}收敛统计:{Colors.RESET}")
+            print(f"    能量变化: {change_color}{energy_change:+.4f}{Colors.RESET} "
                   f"({history[0]['energy_mean']:.4f} → {history[-1]['energy_mean']:.4f})")
+            print(f"    熵值变化: {entropy_change_color}{entropy_change:+.2f}{Colors.RESET} "
+                  f"({history[0]['prob_entropy']:.2f} → {history[-1]['prob_entropy']:.2f})")
+            print(f"    最大概率: {prob_change_color}{prob_change:+.3f}{Colors.RESET} "
+                  f"({history[0]['prob_max']:.3f} → {history[-1]['prob_max']:.3f})")
         print()
 
     def generate_token(
@@ -592,6 +615,15 @@ def main():
                        help='数据类型 (默认: bfloat16)')
     parser.add_argument('--device', type=str, default='cuda',
                        help='设备 (默认: cuda)')
+
+    # 高级推理参数 (覆盖训练配置)
+    parser.add_argument('--override-mcmc-steps', type=int, default=None,
+                       help='覆盖训练时的 MCMC 步数 (默认: 使用训练值)')
+    parser.add_argument('--override-noise-std', type=float, default=None,
+                       help='覆盖 Langevin 噪声标准差 (默认: 使用训练值)')
+    parser.add_argument('--override-alpha', type=float, default=None,
+                       help='覆盖 MCMC 步长 alpha (默认: 使用训练值)')
+
     args = parser.parse_args()
 
     # 打印横幅
@@ -615,6 +647,9 @@ def main():
             verbose=args.verbose,
             show_energy=args.show_energy,
             show_distribution=args.show_distribution,
+            override_mcmc_steps=args.override_mcmc_steps,
+            override_noise_std=args.override_noise_std,
+            override_alpha=args.override_alpha,
         )
     except Exception as e:
         print_colored(f"错误: 加载模型失败 - {str(e)}", Colors.RED)
