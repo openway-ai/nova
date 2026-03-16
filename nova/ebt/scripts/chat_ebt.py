@@ -245,8 +245,35 @@ class EBTChatEngine:
 
         # 应用用户指定的覆盖参数
         if self.override_mcmc_steps is not None:
-            self.hparams.mcmc_num_steps = mcmc_steps = self.override_mcmc_steps
-            print(f"    {Colors.YELLOW}⚠ 覆盖 MCMC 步数: {self.override_mcmc_steps}{Colors.RESET}")
+            original_steps = getattr(self.hparams, 'mcmc_num_steps', 2)
+            original_steps_model = getattr(self.model.hparams, 'mcmc_num_steps', original_steps)
+
+            if self.override_mcmc_steps > original_steps:
+                # 模型使用 time_embed 类型时，mcmc_num_steps 是能量景观的数量，不是迭代次数。
+                # 训练时只学习了 original_steps 个能量景观（time embeddings），
+                # 不能简单增加景观数。正确做法是保持景观数不变，
+                # 通过 randomize_mcmc_num_steps 在最终景观上多做迭代。
+                #
+                # 效果：step 0...(original-2) 各 1 次，step (original-1) 重复 extra 次
+                # 总步数 = (original-1) + (extra+1) = override_mcmc_steps
+                extra = self.override_mcmc_steps - original_steps
+                self.hparams.randomize_mcmc_num_steps = extra
+                self.model.hparams.randomize_mcmc_num_steps = extra
+                self.hparams.randomize_mcmc_num_steps_final_landscape = True
+                self.model.hparams.randomize_mcmc_num_steps_final_landscape = True
+                self.hparams.randomize_mcmc_num_steps_min = extra + 1
+                self.model.hparams.randomize_mcmc_num_steps_min = extra + 1
+                mcmc_steps = self.override_mcmc_steps
+                print(f"    {Colors.YELLOW}⚠ 覆盖 MCMC 步数: {original_steps} → {self.override_mcmc_steps} "
+                      f"(保持 {original_steps} 个能量景观，最终景观迭代 {extra + 1} 次){Colors.RESET}")
+            elif self.override_mcmc_steps < original_steps:
+                # 减少步数：直接修改 mcmc_num_steps
+                self.hparams.mcmc_num_steps = mcmc_steps = self.override_mcmc_steps
+                self.model.hparams.mcmc_num_steps = self.override_mcmc_steps
+                print(f"    {Colors.YELLOW}⚠ 覆盖 MCMC 步数: {original_steps} → {self.override_mcmc_steps}{Colors.RESET}")
+            else:
+                mcmc_steps = original_steps
+                print(f"    {Colors.GRAY}MCMC 步数已是 {original_steps}，无需覆盖{Colors.RESET}")
 
         if self.override_noise_std is not None:
             if hasattr(self.model, 'langevin_dynamics_noise_std'):
@@ -303,7 +330,7 @@ class EBTChatEngine:
 
         # 直接使用模型的 forward 方法，确保与 eval 一致
         # 使用 autocast 匹配训练时的 dtype 环境，避免 float32/bfloat16 不匹配
-        with torch.cuda.amp.autocast(dtype=self.dtype):
+        with torch.amp.autocast('cuda', dtype=self.dtype):
             predicted_distributions, predicted_energies = self.model.forward(
                 input_ids, start_pos=0, learning=False, return_raw_logits=True, no_randomness=True
             )
@@ -346,32 +373,35 @@ class EBTChatEngine:
         if not self.show_mcmc:
             return
 
+        num_steps = len(history)
         print()
-        print(f"  {Colors.BOLD}═══ MCMC 迭代过程 (位置 {position}) ═══{Colors.RESET}")
+        print(f"  {Colors.BOLD}═══ MCMC 迭代过程 (位置 {position}, {num_steps} 步) ═══{Colors.RESET}")
 
         # 收集能量范围
         all_energies = [h['energy_mean'] for h in history]
         min_e, max_e = min(all_energies), max(all_energies)
 
         for i, step_info in enumerate(history):
-            step = step_info['step']
-            color_idx = min(step, len(Colors.MCMC_COLORS) - 1)
+            color_idx = i % len(Colors.MCMC_COLORS)
             step_color = Colors.MCMC_COLORS[color_idx]
 
             energy_bar = format_energy_bar(step_info['energy_mean'], min_e, max_e)
             energy_str = format_energy(step_info['energy_mean'])
 
+            # Per-step energy delta
+            if i > 0:
+                energy_delta = step_info['energy_mean'] - history[i-1]['energy_mean']
+                delta_color = Colors.GREEN if energy_delta < 0 else Colors.RED
+                delta_str = f"{delta_color}ΔE={energy_delta:+.4f}{Colors.RESET}"
+            else:
+                delta_str = f"{Colors.GRAY}ΔE=  ----{Colors.RESET}"
+
             # 添加熵和最大概率显示以诊断问题
             entropy = step_info['prob_entropy']
             max_prob = step_info['prob_max']
 
-            # 熵值颜色: 低熵(好) = 绿色, 高熵(差) = 红色
-            if entropy < 3.0:
-                entropy_color = Colors.GREEN
-            elif entropy < 6.0:
-                entropy_color = Colors.YELLOW
-            else:
-                entropy_color = Colors.RED
+            # 熵值颜色: 使用 cyan (信息性指标，不直接表示好/坏)
+            entropy_color = Colors.CYAN
 
             # 最大概率颜色: 高概率(好) = 绿色, 低概率(差) = 红色
             if max_prob > 0.5:
@@ -381,9 +411,9 @@ class EBTChatEngine:
             else:
                 prob_color = Colors.RED
 
-            print(f"  {step_color}Step {step:2d}{Colors.RESET} │ "
+            print(f"  {step_color}Step {i:2d}{Colors.RESET} │ "
                   f"E={energy_str} │ {energy_bar} │ "
-                  f"∇={step_info['grad_norm']:.4f} │ "
+                  f"{delta_str} │ "
                   f"{entropy_color}H={entropy:.2f}{Colors.RESET} │ "
                   f"{prob_color}P_max={max_prob:.3f}{Colors.RESET} │ "
                   f"t={step_info['step_time']*1000:.1f}ms")
@@ -400,15 +430,14 @@ class EBTChatEngine:
             prob_change = history[-1]['prob_max'] - history[0]['prob_max']
 
             change_color = Colors.GREEN if energy_change < 0 else Colors.RED
-            entropy_change_color = Colors.GREEN if entropy_change < 0 else Colors.RED
             prob_change_color = Colors.GREEN if prob_change > 0 else Colors.RED
 
             print(f"  {Colors.BOLD}收敛统计:{Colors.RESET}")
-            print(f"    能量变化: {change_color}{energy_change:+.4f}{Colors.RESET} "
+            print(f"    能量变化 (↓好): {change_color}{energy_change:+.4f}{Colors.RESET} "
                   f"({history[0]['energy_mean']:.4f} → {history[-1]['energy_mean']:.4f})")
-            print(f"    熵值变化: {entropy_change_color}{entropy_change:+.2f}{Colors.RESET} "
+            print(f"    熵值变化 (信息): {Colors.CYAN}{entropy_change:+.2f}{Colors.RESET} "
                   f"({history[0]['prob_entropy']:.2f} → {history[-1]['prob_entropy']:.2f})")
-            print(f"    最大概率: {prob_change_color}{prob_change:+.3f}{Colors.RESET} "
+            print(f"    最大概率 (↑好): {prob_change_color}{prob_change:+.3f}{Colors.RESET} "
                   f"({history[0]['prob_max']:.3f} → {history[-1]['prob_max']:.3f})")
         print()
 
@@ -505,6 +534,7 @@ class EBTChatEngine:
                 break
 
             # 生成下一个 token
+            # 第一个 token 展示完整 MCMC 过程; verbose 模式下每 10 个 token 也展示
             show_pos = self.show_mcmc and (i == 0 or (self.verbose and i % 10 == 0))
             next_token, gen_info = self.generate_token(
                 input_ids,
