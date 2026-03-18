@@ -94,7 +94,7 @@ def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device,
 
     dataloader = DataLoader(
         dataset,
-        batch_size=1,      # IMPORTANT
+        batch_ebtsize=1,      # IMPORTANT
         shuffle=False,
         num_workers=0,        # keep 0 for stateful streaming
         pin_memory=False      # already handled internally

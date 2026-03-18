@@ -1149,7 +1149,7 @@ class ModelTrainer(LightningModule):
                 tokenizer=tokenizer,
                 batch_size=self.hparams.batch_size_per_device,
                 max_len=self.hparams.context_length,
-                max_iter=self.hparams.max_steps,
+                max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches,
                 split="train",
                 device=self.device,
             )
@@ -1158,7 +1158,7 @@ class ModelTrainer(LightningModule):
                 tokenizer=tokenizer,
                 batch_size=self.hparams.batch_size_per_device,
                 max_len=self.hparams.context_length,
-                max_iter=self.hparams.max_steps,
+                max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches, # 显示的1个epoch对应设置的self.hparams.max_steps个训练步数
                 split="train",
                 device=self.device,
                 resume_state_dict=None,

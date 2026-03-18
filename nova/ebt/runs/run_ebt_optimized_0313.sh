@@ -91,7 +91,7 @@ EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENG
 # 目标训练量: ~10B tokens
 # 131k tokens/step × 75,400 steps ≈ 9.88B tokens
 
-MAX_STEPS=75400
+MAX_STEPS=75400 # 对应模型实际优化步数，而不是梯度累计步数
 MAX_SCHEDULING_STEPS=75400
 
 ################################################################################
