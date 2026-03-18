@@ -96,18 +96,32 @@ NUM_GPUS=4
 # NUM_GPUS=8
 
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENGTH))
-# 131,072 tokens/step
+# 当前配置: 4 × 4 × 8 × 512 = 65,536 tokens/step
 
 ################################################################################
-# 训练步数计算
+# 训练步数计算 (对齐 NanoChat d26 的 token 总量)
 ################################################################################
+#
+# NanoChat d26 (speedrun.sh --depth=26):
+#   tokens/step = 16 × 2048 × 4(accum) × 8(GPUs) = 1,048,576
+#   7000 step × 1,048,576 = 7,340,032,000 ≈ 7.34B tokens → bpb=0.747
+#
+# EBT 当前配置:
+#   tokens/step = 4 × 512 × 8(accum) × 4(GPUs) = 65,536
+#   对齐 7.34B tokens: 7,340,032,000 / 65,536 ≈ 112,000 步
+#
+# 注意: NanoChat 的 batch size 大 16x (1M vs 65K),
+# 大 batch 梯度噪声更低, 每步更新更有效,
+# 所以即使 token 总量相同, EBT 可能需要更多步才能达到同等效果
 
-# d26 模型规模: 26层, 13头, 1664维 ≈ 400M 参数
-# 目标训练量: ~10B tokens
-# 131k tokens/step × 75,400 steps ≈ 9.88B tokens
+################################################################################
+# 训练步数计算 (对齐 NanoChat d26 的 token 总量)
+################################################################################
+TARGET_TOTAL_TOKENS=7340032000 # 约 7.34B tokens
 
-MAX_STEPS=75400 # 对应模型实际优化步数，而不是梯度累计步数
-MAX_SCHEDULING_STEPS=75400
+# 自适应计算 MAX_STEPS
+MAX_STEPS=$(( TARGET_TOTAL_TOKENS / EFFECTIVE_BATCH_SIZE ))
+MAX_SCHEDULING_STEPS=$MAX_STEPS
 
 ################################################################################
 # 学习率配置 (基于模型规模推荐)
@@ -329,9 +343,12 @@ print_kv "Gradient Clip" "${GRADIENT_CLIP_VAL}"
 echo ""
 echo -e "${CYAN}▶ 训练进度${NC}"
 print_separator "─" 60
-print_kv "Max Steps" "${MAX_STEPS}"
-local total_tokens=$(awk "BEGIN {printf \"%.2f\", ${MAX_STEPS} * ${EFFECTIVE_BATCH_SIZE} / 1000000000}")
-print_kv "Total Tokens" "~${total_tokens}B"
+print_kv "Target Tokens" "7.34B"
+print_kv "Max Steps" "${MAX_STEPS} (自适应计算)"
+print_kv "Max Sched Steps" "${MAX_SCHEDULING_STEPS}"
+# 注意：在 bash 脚本的全局作用域中不应使用 local 关键字，直接赋值即可
+total_tokens_b=$(awk "BEGIN {printf \"%.2f\", ${MAX_STEPS} * ${EFFECTIVE_BATCH_SIZE} / 1000000000}")
+print_kv "Actual Total Tokens" "~${total_tokens_b}B"
 print_kv "Val Check Interval" "${VAL_CHECK_INTERVAL}"
 
 echo ""
@@ -407,7 +424,7 @@ Weight Decay:             ${WEIGHT_DECAY}
 Beta1/Beta2:              ${BETA1} / ${BETA2}
 Warmup Steps:             ${WARM_UP_STEPS}
 Max Steps:                ${MAX_STEPS}
-Total Tokens:             ~${total_tokens}B
+Total Tokens:             ${total_tokens_b}
 
 Option Flags:             ${OPTION_FLAGS:-"None (Baseline)"}
 Compile Flags:            ${COMPILE_FLAGS:-"None"}

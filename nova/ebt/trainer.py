@@ -1512,9 +1512,12 @@ class ModelTrainer(LightningModule):
         # 训练进度信息 (仅在训练阶段)
         if phase == "train" and hasattr(self, 'trainer') and self.trainer is not None:
             # 当前步数和进度
+            # global_step 是 optimizer step 计数 (不是 micro-batch/forward 计数)
+            # 与 NanoChat base_train.py 的 step 变量语义一致, 方便对比
             current_step = self.global_step
             max_steps = self.hparams.max_steps
             progress_pct = 100.0 * current_step / max_steps if max_steps > 0 else 0
+            self.log("step", float(current_step), prog_bar=True)
             self.log("progress_pct", progress_pct, prog_bar=False)
 
             # GPU 内存使用 (如果可用)
