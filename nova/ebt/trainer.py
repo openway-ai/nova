@@ -883,9 +883,187 @@ class ModelTrainer(LightningModule):
                 'frequency': 1
             }
         }
-            
+
+    def _configure_muon_adamw_optimizer(self):
+        """
+        Muon + AdamW 混合优化器 (复用 nanochat/optim.py 的 MuonAdamW)
+
+        参数分组策略 (参考 NanoChat gpt.py:setup_optimizer):
+        - alpha: AdamW, 高 LR (mcmc_step_size_lr_multiplier × peak_lr), 无 weight decay [EBT 特有]
+        - embeddings: AdamW, 独立绝对 LR (对齐 NanoChat embedding_lr), 无 weight decay
+        - vocab_to_embed: AdamW, 独立绝对 LR (EBT 特有, 保守), 无 weight decay
+        - transformer 标量 (ndim < 2): AdamW, 独立绝对 LR, 无 weight decay
+        - transformer 矩阵 (ndim >= 2): Muon, 按 shape 分组 (Muon 要求同组参数 shape 相同)
+
+        LR 设计原理:
+        - embedding 不在 MCMC 循环内, 梯度行为与 NanoChat 一致, 可用高 LR
+        - vocab_to_embed 在 MCMC 循环内 (autograd.grad create_graph=True), 二阶梯度, 需保守
+        - transformer scalar (RMSNorm) 在 MCMC 循环内, 需适度保守
+        - 当 adamw_*_lr > 0 时使用绝对 LR, 否则 fallback 到 peak_lr × mult
+
+        注意: 使用 MuonAdamW (单 GPU 版), 不用 DistMuonAdamW,
+        因为 PL DDP 已经处理梯度同步, DistMuonAdamW 自己管理分布式通信会冲突。
+        """
+        from nanochat.optim import MuonAdamW
+
+        # --- Muon 超参数 ---
+        muon_lr = getattr(self.hparams, 'muon_lr', 0.02)
+        muon_momentum = getattr(self.hparams, 'muon_momentum', 0.95)
+        muon_ns_steps = getattr(self.hparams, 'muon_ns_steps', 5)
+        muon_beta2 = getattr(self.hparams, 'muon_beta2', 0.95)
+        adam_betas = (self.hparams.beta1, self.hparams.beta2)
+
+        # --- AdamW LR: 绝对值 or fallback to peak_lr × mult ---
+        adamw_embedding_lr = getattr(self.hparams, 'adamw_embedding_lr', -1)
+        adamw_vocab_to_embed_lr = getattr(self.hparams, 'adamw_vocab_to_embed_lr', -1)
+        adamw_scalar_lr = getattr(self.hparams, 'adamw_scalar_lr', -1)
+        use_dmodel_scaling = getattr(self.hparams, 'adamw_dmodel_lr_scaling', False)
+
+        # dmodel scaling: lr × (dim/768)^-0.5 (参考 NanoChat gpt.py:362)
+        dmodel_scale = 1.0
+        if use_dmodel_scaling:
+            model_dim = self.hparams.embedding_dim
+            dmodel_scale = (model_dim / 768) ** -0.5
+            print(f"[Muon+AdamW] dmodel LR scaling: (dim={model_dim}/768)^-0.5 = {dmodel_scale:.4f}")
+
+        # 计算各组 LR
+        if adamw_embedding_lr > 0:
+            embedding_lr = adamw_embedding_lr * dmodel_scale
+        else:
+            embedding_lr_mult = getattr(self.hparams, 'embedding_lr_mult', 0.3)
+            embedding_lr = self.hparams.peak_learning_rate * embedding_lr_mult
+
+        if adamw_vocab_to_embed_lr > 0:
+            vocab_to_embed_lr = adamw_vocab_to_embed_lr * dmodel_scale
+        else:
+            vocab_to_embed_lr_mult = getattr(self.hparams, 'vocab_to_embed_lr_mult', 0.1)
+            vocab_to_embed_lr = self.hparams.peak_learning_rate * vocab_to_embed_lr_mult
+
+        if adamw_scalar_lr > 0:
+            scalar_lr = adamw_scalar_lr * dmodel_scale
+        else:
+            scalar_lr_mult = getattr(self.hparams, 'scalar_lr_mult', 0.5)
+            scalar_lr = self.hparams.peak_learning_rate * scalar_lr_mult
+
+        alpha_lr = self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate
+
+        # --- 参数收集 ---
+        alpha_params = [self.model.alpha]
+        embedding_params = list(self.model.embeddings.parameters())
+
+        vocab_to_embed_params = []
+        if hasattr(self.model, 'vocab_to_embed') and self.model.vocab_to_embed is not None:
+            vocab_to_embed_params = list(self.model.vocab_to_embed.parameters())
+
+        transformer_matrix_params = []
+        transformer_scalar_params = []
+        for name, param in self.model.transformer.named_parameters():
+            if param.ndim >= 2:
+                transformer_matrix_params.append(param)
+            else:
+                transformer_scalar_params.append(param)
+
+        # --- 构建 param_groups ---
+        param_groups = []
+
+        # AdamW groups
+        if alpha_params:
+            param_groups.append(dict(
+                kind='adamw', params=alpha_params,
+                lr=alpha_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if embedding_params:
+            param_groups.append(dict(
+                kind='adamw', params=embedding_params,
+                lr=embedding_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if vocab_to_embed_params:
+            param_groups.append(dict(
+                kind='adamw', params=vocab_to_embed_params,
+                lr=vocab_to_embed_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if transformer_scalar_params:
+            param_groups.append(dict(
+                kind='adamw', params=transformer_scalar_params,
+                lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+
+        # Muon groups: 按 shape 分组 (Muon 要求同组参数 shape 相同用于 stack)
+        shape_groups = {}
+        for p in transformer_matrix_params:
+            shape_groups.setdefault(p.shape, []).append(p)
+
+        for shape in sorted(shape_groups.keys()):
+            group_params = shape_groups[shape]
+            param_groups.append(dict(
+                kind='muon', params=group_params,
+                lr=muon_lr, momentum=muon_momentum,
+                ns_steps=muon_ns_steps, beta2=muon_beta2,
+                weight_decay=self.hparams.weight_decay,
+            ))
+
+        # --- 创建优化器 ---
+        # PL 调用 optimizer.step(closure=closure), 但 MuonAdamW.step() 不接受 closure 参数
+        # 包装一下使其兼容 PL 的调用约定
+        class PLMuonAdamW(MuonAdamW):
+            """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
+            @torch.no_grad()
+            def step(self, closure=None):
+                if closure is not None:
+                    with torch.enable_grad():
+                        closure()
+                super().step()
+
+        optimizer = PLMuonAdamW(param_groups)
+
+        # 设置 initial_lr (PL LR scheduler 需要)
+        for group in optimizer.param_groups:
+            group['initial_lr'] = group['lr']
+
+        # --- LR Scheduler ---
+        lr_scheduler = self.get_lr_scheduler(optimizer)
+
+        # --- 日志 ---
+        num_muon_params = sum(p.numel() for p in transformer_matrix_params)
+        num_adamw_params = (
+            sum(p.numel() for p in alpha_params) +
+            sum(p.numel() for p in embedding_params) +
+            sum(p.numel() for p in vocab_to_embed_params) +
+            sum(p.numel() for p in transformer_scalar_params)
+        )
+        print(f"=" * 80)
+        print(f"[Muon+AdamW] 混合优化器已启用:")
+        print(f"  Muon groups: {len(shape_groups)} (按 shape 分组)")
+        print(f"  Muon params: {num_muon_params:,} ({num_muon_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
+        print(f"  AdamW params: {num_adamw_params:,} ({num_adamw_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
+        print(f"  Muon LR: {muon_lr}, momentum: {muon_momentum}, ns_steps: {muon_ns_steps}, beta2: {muon_beta2}")
+        print(f"  Alpha LR: {alpha_lr} (AdamW) [EBT 特有]")
+        print(f"  Embedding LR: {embedding_lr} (AdamW)")
+        print(f"  vocab_to_embed LR: {vocab_to_embed_lr} (AdamW) [EBT 特有, MCMC 内部]")
+        print(f"  Scalar LR: {scalar_lr} (AdamW)")
+        if use_dmodel_scaling:
+            print(f"  dmodel scaling: {dmodel_scale:.4f} (dim={self.hparams.embedding_dim})")
+        for shape, params in sorted(shape_groups.items()):
+            print(f"  Muon group shape={shape}: {len(params)} params")
+        print(f"=" * 80)
+
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': lr_scheduler,
+                'interval': 'step',
+                'frequency': 1
+            }
+        }
+
     def configure_optimizers_nlp(self):
         if self.hparams.model_name == "ebt":
+            # Muon + AdamW 混合优化器 - 通过 --optimizer muon_adamw 启用
+            use_muon = getattr(self.hparams, 'optimizer', 'adamw') == 'muon_adamw'
+
+            if use_muon:
+                return self._configure_muon_adamw_optimizer()
+
             # Option 1: 分层学习率 - 通过 --layered_lr 启用
             use_layered_lr = getattr(self.hparams, 'layered_lr', False)
 

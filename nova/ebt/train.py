@@ -611,11 +611,24 @@ if __name__ == '__main__':
     
     parser.add_argument("--warm_up_base_lr_divider", help="lr divider for when doing linear learning rate warm up. if is set to -1 then does warm up from 0", type=float, default=-1)
     
-    parser.add_argument("--optimizer", help="used to turn on different optimizers. current options include adamw (default), lars, stableadamw", type=str, default="adamw")
-    
+    parser.add_argument("--optimizer", help="used to turn on different optimizers. current options include adamw (default), lars, stableadamw, muon_adamw", type=str, default="adamw")
+
     parser.add_argument("--lars_trust_coeff", help="exponential decay rate for second movement estimate", type=float, default=0.001)
-    
+
     parser.add_argument("--lars_exclude_bias_bn_wd", help="excludes bias and batch norm from Lars adaptation and weight decay", action="store_true", default=False)
+
+    # Muon + AdamW 混合优化器参数 (--optimizer muon_adamw 时生效)
+    parser.add_argument("--muon_lr", help="[Muon] 矩阵参数学习率 (Muon optimizer)", type=float, default=0.02)
+    parser.add_argument("--muon_momentum", help="[Muon] Nesterov 动量系数", type=float, default=0.95)
+    parser.add_argument("--muon_ns_steps", help="[Muon] Polar Express 迭代次数", type=int, default=5)
+    parser.add_argument("--muon_beta2", help="[Muon] 二阶矩 beta2 (variance reduction)", type=float, default=0.95)
+    # Muon 模式下 AdamW 参数的独立绝对 LR (不再从 peak_lr 派生)
+    # 参考 NanoChat gpt.py:setup_optimizer 和 base_train.py 的默认值
+    # 设为 -1 表示 fallback 到 peak_lr × mult 的旧行为
+    parser.add_argument("--adamw_embedding_lr", help="[Muon] embedding 绝对 LR (NanoChat 默认 0.3, 会自动 dmodel scaling)", type=float, default=-1)
+    parser.add_argument("--adamw_vocab_to_embed_lr", help="[Muon] vocab_to_embed 绝对 LR (EBT 特有, 建议保守 0.01)", type=float, default=-1)
+    parser.add_argument("--adamw_scalar_lr", help="[Muon] transformer scalar 绝对 LR (NanoChat 默认 0.04)", type=float, default=-1)
+    parser.add_argument("--adamw_dmodel_lr_scaling", help="[Muon] 是否对 AdamW LR 做 dmodel scaling: lr × (dim/768)^-0.5", action="store_true", default=False)
 
     # Option 1: 分层学习率参数
     parser.add_argument("--layered_lr", help="[Option 1] 启用分层学习率，不同参数类型使用不同学习率", action="store_true", default=False)
