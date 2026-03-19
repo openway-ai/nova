@@ -1,3 +1,4 @@
+<!-- 
 # Non-autoregressive Optimization & Vast Architecture (NOVA)
 
 ![nanochat logo](dev/nova.png)
@@ -69,27 +70,12 @@ On the way.
 
 If you are a researcher and wish to help merge more non-autoregressive models to this repository, we welcome your contributions. We encourage clean, modular, and well-documented implementations, and recommend opening an issue to briefly describe your implemented models, code structures, and experimental results before submitting a pull request. We welcome contributions from the community to push this boundary, and make non-autoregressive models truly powerful and practical.
 
-
-<!-- Current AI policy: disclosure. When submitting a PR, please declare any parts that had substantial LLM contribution and that you have not written or that you do not fully understand. -->
-
 ## Acknowledgements
 
 This project is primiarily forked from [nanochat](https://github.com/karpathy/nanochat), and we extend our most deep appreciation to Dr. Andrej Karpathy for releasing such a powerful and accessible foundation. Without this groundwork, follow-up research and development would be more challenging. We remain grateful for the continued support and collaboration from the open-source research community.
 
-<!-- ## Cite
-
-If you find nanochat helpful in your research cite simply as:
-
-```bibtex
-@misc{openway-ai-nova,
-  author = {Guanchu Wang},
-  title = {nanochat: The best ChatGPT that \$100 can buy},
-  year = {2025},
-  publisher = {GitHub},
-  url = {https://github.com/karpathy/nanochat}
-}
-``` -->
 
 ## License
 
 MIT
+-->
