@@ -1,9 +1,9 @@
 # EBT xxs ctx2048 + Batch Size Training Summary
 
 ## Change vs Exp 1 (ctx2048)
-- **Only change**: batch_size_per_device 2 → 8, accumulate_grad_batches 2 → 4, + lr_scaling_rule
-- Effective tokens/step: 8 × 4 (accum) × 4 GPUs × 2048 = 262,144 (matches nanochat d6)
-- LR auto-scaled by lr_scaling_rule: 0.0002 × (128 / 256) × ... (see effective_batch calc)
+- **Only change**: accumulate_grad_batches 2 → 16, + lr_scaling_rule
+- Effective tokens/step: 2 × 16 (accum) × 4 GPUs × 2048 = 262,144 (matches nanochat d6)
+- LR auto-scaled by lr_scaling_rule: 0.0002 × (128 / 256) = 0.0001
 
 ## Model Architecture
 - Model size: xxs
@@ -18,7 +18,7 @@
 ## Training Configuration
 - Steps: 10000
 - Warmup steps: 1000
-- Batch size per device: 8, accumulate_grad_batches: 4 (4x GPU) → effective batch: 128 sequences / 262,144 tokens
+- Batch size per device: 2, accumulate_grad_batches: 16 (4x GPU) → effective batch: 128 sequences / 262,144 tokens
 - Peak LR: 0.0002 (scaled by lr_scaling_rule), min LR scale: 10
 - Weight decay: 0.01
 - Gradient clip: 1.0

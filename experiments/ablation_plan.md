@@ -39,9 +39,9 @@ By varying one factor at a time, we can isolate each variable's contribution to 
 ## Experiment 2: Fix Batch Size
 
 **Script**: `runs/run_ebt_ctx2048_bs.sh`
-**Change from Exp 1**: batch_size_per_device 2 → 8, accumulate_grad_batches 2 → 4, + lr_scaling_rule (lr scales with effective batch: 0.0002 × 128/256 = 0.0001)
+**Change from Exp 1**: accumulate_grad_batches 2 → 16, + lr_scaling_rule (lr scales with effective batch: 0.0002 × 128/256 = 0.0001)
 **Config**:
-- context_length=2048, batch_size_per_device=8, accumulate_grad_batches=4 (4× GPU) → effective batch: 128 sequences / 262,144 tokens
+- context_length=2048, batch_size_per_device=2, accumulate_grad_batches=16 (4× GPU) → effective batch: 128 sequences / 262,144 tokens
 - optimizer=adamw, peak_lr=0.0002 (scaled to ~0.0001 via lr_scaling_rule), min_lr_scale=10, weight_decay=0.01, grad_clip=1.0
 - steps=10000, warmup_steps=1000
 - MCMC num_steps=2, mcmc_step_size=500 (learnable, lr_multiplier=1500), denoising_init=random_noise, normalize_init=true
@@ -54,7 +54,7 @@ By varying one factor at a time, we can isolate each variable's contribution to 
 **Script**: `runs/run_ebt_ctx2048_bs_muon.sh`
 **Change from Exp 2**: optimizer adamw → muon (DistMuonAdamW), peak_lr 0.0002 → 0.02, lr_scaling_rule removed
 **Config**:
-- context_length=2048, batch_size_per_device=8, accumulate_grad_batches=4 (4× GPU) → effective batch: 128 sequences / 262,144 tokens
+- context_length=2048, batch_size_per_device=2, accumulate_grad_batches=16 (4× GPU) → effective batch: 128 sequences / 262,144 tokens
 - optimizer=muon: 2D weight matrices → Muon at lr=0.02 (momentum=0.95, ns_steps=5, beta2=0.99); embeddings/biases/scalars → AdamW at lr=0.3; weight_decay=0.01, grad_clip=1.0
 - steps=10000, warmup_steps=1000, min_lr_scale=10
 - MCMC num_steps=2, mcmc_step_size=500 (learnable, lr_multiplier=1500), denoising_init=random_noise, normalize_init=true

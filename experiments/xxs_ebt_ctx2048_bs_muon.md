@@ -17,7 +17,7 @@
 ## Training Configuration
 - Steps: 10000
 - Warmup steps: 1000
-- Batch size per device: 8, accumulate_grad_batches: 4 (4x GPU) → effective batch: 128 sequences / 262,144 tokens
+- Batch size per device: 2, accumulate_grad_batches: 16 (4x GPU) → effective batch: 128 sequences / 262,144 tokens
 - Peak LR: 0.02 (Muon matrix LR, matching nanochat), min LR scale: 10
 - Weight decay: 0.01
 - Gradient clip: 1.0
