@@ -6,10 +6,10 @@
 source ../../.venv/ebt/bin/activate
 
 ### LOG INFO ###
-# SBATCH --job-name=ebt-xxs-bs_256_s1_lr_
-# SBATCH --output=logs/slurm/nlp/ebt-xxs-bs_256_s1_lr_%A-%a.log
-# export RUN_NAME="ebt-d26-bs_256_s1_lr_"
-export RUN_NAME="ebt-xxs-bs_256_s1_lr_"
+# SBATCH --job-name=ebt-xxs-ctx2048_bs_muon_s1_lr_
+# SBATCH --output=logs/slurm/nlp/ebt-xxs-ctx2048_bs_muon_s1_lr_%A-%a.log
+# export RUN_NAME="ebt-d26-ctx2048_bs_muon_s1_lr_"
+export RUN_NAME="ebt-xxs-ctx2048_bs_muon_s1_lr_"
 # NOTE ctrl d ALL THREE of above to modify job-name, output, and RUN_NAME (which should all be the same)
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="${RUN_NAME#*-}"; export MODEL_SIZE="${MODEL_SIZE%%-*}"
@@ -18,7 +18,7 @@ export WANDB_API_KEY="wandb_v1_RIPrnhitmmA1peN9zBhVg5NaJhD_0LVwYbQyamWFeNoqOlnfF
 mkdir -p logs/slurm/nlp/
 module purge
 
-lr=(0.0002) 
+lr=(0.02)
 alpha=(500)
 alpha_lr=(1500)
 MAX_STEP=10000
@@ -40,14 +40,15 @@ python train.py \
 --mcmc_step_size_lr_multiplier ${alpha_lr[${SLURM_ARRAY_TASK_ID}]} \
 --mcmc_num_steps 2 \
 \
---context_length 256 \
+--context_length 2048 \
 \
 --gpus -1 \
 \
 --peak_learning_rate ${lr[${SLURM_ARRAY_TASK_ID}]} \
 --batch_size_per_device 2 \
---accumulate_grad_batches 2 \
+--accumulate_grad_batches 16 \
 --gradient_clip_val 1.0 \
+--optimizer muon \
 \
 --weight_decay 0.01 \
 --min_lr_scale 10 \

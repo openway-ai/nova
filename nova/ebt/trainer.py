@@ -51,6 +51,8 @@ from generate import generate_text, get_ppl
 # from inference.vid.generate_video import generate_video
 # from inference.img.generate_image import generate_image
 from optimization import WarmUpCosineAnnealingLR, LARS, exclude_bias_and_norm, StableAdamW, StableAdamWUnfused
+import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../nanochat'))
+from optim import DistMuonAdamW
 import logger as text_logger
 from metrics import get_torchmetrics
 import sys
@@ -356,6 +358,40 @@ class ModelTrainer(LightningModule):
             optimizer = LARS(optimizer_parameters, lr=self.hparams.peak_learning_rate, weight_decay=self.hparams.weight_decay, momentum=self.hparams.beta1, eta=self.hparams.lars_trust_coeff, weight_decay_filter=lars_exclude_bias_and_norm, lars_adaptation_filter=lars_exclude_bias_and_norm)
         elif self.hparams.optimizer == "stableadamw":
             optimizer = StableAdamWUnfused(optimizer_parameters, betas=[self.hparams.beta1, self.hparams.beta2])
+        elif self.hparams.optimizer == "muon":
+            # Split each param group: 2D params → Muon, non-2D params → AdamW.
+            # Preserve per-group LRs and weight_decay so EBT-specific params (e.g.
+            # alpha/mcmc_step_size) keep the same LR they had under AdamW.
+            # DistMuonAdamW requires all params in a Muon group to have the same shape
+            # (it stacks gradients), so we create one Muon group per unique shape.
+            matrix_lr = self.hparams.peak_learning_rate
+            muon_params_by_shape = {}  # shape -> list of params
+            adamw_groups = []
+            for item in optimizer_parameters:
+                if isinstance(item, dict):
+                    params = item['params']
+                    if isinstance(params, torch.Tensor):
+                        params = [params]
+                    group_lr = item.get('lr', matrix_lr)
+                    group_wd = item.get('weight_decay', self.hparams.weight_decay)
+                else:
+                    params = [item]
+                    group_lr = matrix_lr
+                    group_wd = self.hparams.weight_decay
+                matrix = [p for p in params if p.ndim == 2 and p.requires_grad]
+                other = [p for p in params if not (p.ndim == 2 and p.requires_grad) and p.requires_grad]
+                for p in matrix:
+                    muon_params_by_shape.setdefault(p.shape, []).append(p)
+                if other:
+                    adamw_groups.append(dict(kind='adamw', params=other, lr=group_lr,
+                                             betas=(self.hparams.beta1, self.hparams.beta2),
+                                             eps=1e-8, weight_decay=group_wd))
+            muon_groups = [
+                dict(kind='muon', params=params, lr=matrix_lr, momentum=0.95, ns_steps=5, beta2=0.99, weight_decay=self.hparams.weight_decay)
+                for params in muon_params_by_shape.values()
+            ]
+            param_groups = [*muon_groups, *adamw_groups]
+            optimizer = DistMuonAdamW(param_groups)
         else:
             optimizer = torch.optim.AdamW(optimizer_parameters, betas=[self.hparams.beta1, self.hparams.beta2])
         return optimizer

@@ -147,7 +147,7 @@ def main(args):
     print("num_nodes", args.num_nodes, "total num_workers across all GPUs", args.total_num_workers, "num workers per GPU", args.num_workers, "num_GPUs", num_gpus)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
-    assert (device == torch.device('cuda') and num_gpus > 0), "using cpu instead of cuda. if you would like to proceed please remove this line and change code below to not use GPUs, otherwise check packages to ensure torch/others have cuda support"
+    # assert (device == torch.device('cuda') and num_gpus > 0), "using cpu instead of cuda. if you would like to proceed please remove this line and change code below to not use GPUs, otherwise check packages to ensure torch/others have cuda support"
     print(f'GPU Availability: {device}, gpus: {num_gpus}\n')
     args.num_gpus = num_gpus
     effective_batch_size = args.num_gpus * args.batch_size_per_device * args.accumulate_grad_batches
@@ -275,9 +275,11 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train"):
     limit_val_batches = 0 if args.overfit_batches > 0 else args.limit_val_batches
     # val_check_interval = args.val_check_interval if args.val_check_interval == 1.0 else args.val_check_interval * args.accumulate_grad_batches  #NOTE the reason we mult by args.accumulate_grad_batches is because of this bug https://github.com/Lightning-AI/pytorch-lightning/issues/12205
     limit_test_batches = args.limit_test_batches if args.limit_test_batches == 1 else args.limit_test_batches * args.accumulate_grad_batches
+    import torch as _torch
+    _devices = "auto" if not _torch.cuda.is_available() else args.gpus
     trainer = Trainer(
         accelerator="auto",
-        devices = args.gpus,
+        devices = _devices,
         num_nodes=args.num_nodes,
         precision=args.float_precision,
         max_steps=args.max_steps,
@@ -599,7 +601,7 @@ if __name__ == '__main__':
     
     parser.add_argument("--warm_up_base_lr_divider", help="lr divider for when doing linear learning rate warm up. if is set to -1 then does warm up from 0", type=float, default=-1)
     
-    parser.add_argument("--optimizer", help="used to turn on different optimizers. current options include adamw (default), lars, stableadamw", type=str, default="adamw")
+    parser.add_argument("--optimizer", help="used to turn on different optimizers. current options include adamw (default), lars, stableadamw, muon", type=str, default="adamw")
     
     parser.add_argument("--lars_trust_coeff", help="exponential decay rate for second movement estimate", type=float, default=0.001)
     

@@ -281,7 +281,11 @@ class MuonAdamW(torch.optim.Optimizer):
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
-    def step(self):
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
         for group in self.param_groups:
             if group['kind'] == 'adamw':
                 self._step_adamw(group)
@@ -505,7 +509,11 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 torch._foreach_copy_(info["params"], list(info["stacked_params"][:len(info["params"])].unbind(0)))
 
     @torch.no_grad()
-    def step(self):
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
         rank = dist.get_rank()
         world_size = dist.get_world_size()
 
