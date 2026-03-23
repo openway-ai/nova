@@ -468,10 +468,18 @@ def setup_transformer(hparams): # specifically for baseline transformer
 def has_layer_norm(model):
     return any(isinstance(module, nn.LayerNorm) for _, module in model.named_modules())
 
-def init_wandb_watch(wandb_logger, model_trainer, wandb_watch_log_freq):
+def init_wandb_watch(wandb_logger, model_trainer, wandb_watch_log_freq, wandb_watch_level="parameters"):
+    """
+    wandb_watch_level controls what is logged:
+      - "parameters": only log parameter histograms (low overhead)
+      - "gradients": only log gradient histograms
+      - "all": log parameters + gradients (high overhead, debug only)
+    """
+    log_mode = wandb_watch_level  # "parameters", "gradients", or "all"
+
     if not has_layer_norm(model_trainer.model):
-        wandb_logger.watch(model_trainer.model, log="all", log_freq = wandb_watch_log_freq)
-    
+        wandb_logger.watch(model_trainer.model, log=log_mode, log_freq=wandb_watch_log_freq)
+
     else: # all of complex below code is to get around the issue where wandb watch with layer norm has 'AttributeError: 'NoneType' object has no attribute 'data'' when logging gradients...
         non_layernorm_container = nn.Module()
         layernorm_container = nn.Module()
@@ -488,7 +496,7 @@ def init_wandb_watch(wandb_logger, model_trainer, wandb_watch_log_freq):
                 ln_modules[safe_name] = module
             else:
                 # Only add modules that don't contain LayerNorm as submodules
-                has_ln_child = any(isinstance(child, nn.LayerNorm) 
+                has_ln_child = any(isinstance(child, nn.LayerNorm)
                                 for child in module.modules())
                 if not has_ln_child:
                     non_ln_modules[safe_name] = module
@@ -499,18 +507,10 @@ def init_wandb_watch(wandb_logger, model_trainer, wandb_watch_log_freq):
         for name, module in ln_modules.items():
             layernorm_container.add_module(name, module)
 
-        # print("\nNon-LayerNorm modules:")
-        # for name, _ in non_layernorm_container.named_modules():
-        #     if name != "":  # Skip the container itself
-        #         print(f"  - {name}")
-
-        # print("\nLayerNorm modules:")
-        # for name, _ in layernorm_container.named_modules():
-        #     if name != "":  # Skip the container itself
-        #         print(f"  - {name}")
-
-        wandb_logger.watch(non_layernorm_container, log="all", log_freq=wandb_watch_log_freq)
-        wandb_logger.watch(layernorm_container, log="parameters", log_freq=wandb_watch_log_freq)
+        wandb_logger.watch(non_layernorm_container, log=log_mode, log_freq=wandb_watch_log_freq)
+        # LayerNorm always uses "parameters" only to avoid gradient logging bug
+        ln_log_mode = "parameters" if log_mode in ("gradients", "all") else log_mode
+        wandb_logger.watch(layernorm_container, log=ln_log_mode, log_freq=wandb_watch_log_freq)
 
 # def save_frames(tensor, root_dir, subfolder, start_index=0):
 #     to_pil = ToPILImage()

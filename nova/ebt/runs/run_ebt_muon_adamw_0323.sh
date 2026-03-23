@@ -239,11 +239,29 @@ COMPILE_FLAGS=""
 # COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
 
 ################################################################################
-# 日志配置
+# WandB 配置 (训练参数)
+################################################################################
+# 默认: 只记录 loss 等基础 metric, 不记录 gradients/activations
+# 如需 debug 梯度, 取消下面注释切换到全量记录
+#
+# 选项说明:
+#   不传 --wandb_watch        → 只记录 scalar metrics (最快, 默认)
+#   --wandb_watch              → 记录 parameters only (中等开销)
+#   --wandb_watch --wandb_watch_level all → 记录 gradients+parameters+activations (最慢, debug 用)
+#   --disable_wandb            → 完全关闭 wandb
+#
+WANDB_FLAGS=""
+# WANDB_FLAGS="--disable_wandb"
+# WANDB_FLAGS="--wandb_watch --wandb_watch_level parameters"
+# WANDB_FLAGS="--wandb_watch --wandb_watch_level all"
+
+################################################################################
+# 日志配置 - 自动路由 stdout/stderr 到日志文件
 ################################################################################
 
 current_time=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="logs/${current_time}_ebt_d26_stable.log"
+# 日志文件名包含: 日期时间_模型名_层数_上下文长度_优化器_GPU数
+LOG_FILE="logs/${current_time}_${MODEL_NAME}_${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_muon-adamw_gpu${NUM_GPUS}.log"
 mkdir -p logs
 
 # 定义颜色
@@ -436,6 +454,11 @@ Compile Flags:            ${COMPILE_FLAGS:-"None"}
 LOG_HEADER
 
 ################################################################################
+# 自动重定向所有输出到日志文件 (替代手动 tee)
+################################################################################
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+################################################################################
 # 启动训练
 ################################################################################
 
@@ -488,10 +511,9 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
 --set_matmul_precision "medium" \
---wandb_watch \
+${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
-${COMPILE_FLAGS} \
-2>&1 | tee -a "${LOG_FILE}"
+${COMPILE_FLAGS}
 
 TRAIN_EXIT_CODE=$?
 set -e

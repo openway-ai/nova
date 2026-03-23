@@ -307,7 +307,8 @@ class ModelTrainer(LightningModule):
         return hook
     
     def training_step(self, batch, batch_idx):
-        if not self.hparams.no_wandb and self.hparams.wandb_watch and self.global_step % self.hparams.wandb_watch_log_freq == 0: # activation logging
+        # Activation logging only when wandb_watch is on AND level is "all"
+        if not self.hparams.no_wandb and self.hparams.wandb_watch and getattr(self.hparams, 'wandb_watch_level', 'parameters') == 'all' and self.global_step % self.hparams.wandb_watch_log_freq == 0: # activation logging
             hook_handles = []
             hook_function = self.wandb_activation_hook(run=self.logger, step=self.global_step)
             for module in self.model.modules():
