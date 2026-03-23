@@ -127,18 +127,11 @@ class WarmUpLinearWarmdownLR(_LRScheduler):
 
         step = self.last_step
 
-        # if step < self.warmup_steps:
-        #     # Linear warmup: 0 -> peak_lr
-        #     progress = (step + 1) / self.warmup_steps if self.warmup_steps > 0 else 1.0
-        #     self._last_lr = [lr * progress for lr in self.highest_lr]
-        # elif step < self.warmup_steps + self.constant_steps:
-        
         if step <= self.warmup_steps:
             # Linear warmup: 0 -> peak_lr
             progress = step / self.warmup_steps if self.warmup_steps > 0 else 1.0
             self._last_lr = [lr * progress for lr in self.highest_lr]
         elif step <= self.warmup_steps + self.constant_steps:
-            # Constant phase
             if not self.finished_warming_up:
                 self.finished_warming_up = True
                 if self.warm_up_finished_func is not None:
