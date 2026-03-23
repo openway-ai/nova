@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.func import grad, functional_call
 from torch.nn import functional as F
 from nanolightning.torchlightning_module import LightningModule
 # import torch.optim as optim
@@ -40,19 +41,12 @@ class EBT_NLP(LightningModule):
         self.log_softmax = nn.LogSoftmax(dim = -1)
         self.softmax = nn.Softmax(dim = -1)
         
-        if not self.hparams.vocab_to_embed_uses_prob_dist: # if are not using the prob dist * embed as vocab to embed
-            if 'learnable_process_memory' in self.hparams and self.hparams.learnable_process_memory and self.hparams.process_memory_type != None:
-                self.vocab_to_embed = Memory_Gating_MLP(self.vocab_size, self.hparams.embedding_dim, self.hparams.process_memory_type, self.hparams.process_memory_linear_layer)
-            elif 'learnable_process_memory' in self.hparams and self.hparams.learnable_process_memory:
-                assert self.hparams.num_modality_processing_mlp_layers > 1, "must set self.hparams.num_modality_processing_mlp_layers > 1 if not using self.hparams.process_memory_type"
-                self.vocab_to_embed = Memory_Augmented_MLP(self.vocab_size, self.hparams.embedding_dim, self.hparams.embedding_dim, self.hparams.embedding_dim, dropout_rate=0, layer_norm=True, num_hidden_layers = self.hparams.num_modality_processing_mlp_layers)
-            elif self.hparams.num_modality_processing_mlp_layers != 1:
-                self.vocab_to_embed = MLP(self.vocab_size, self.hparams.embedding_dim, self.hparams.embedding_dim, dropout_rate=0, layer_norm=True, num_hidden_layers = self.hparams.num_modality_processing_mlp_layers - 2)
-            else:
-                self.vocab_to_embed = nn.Linear(self.vocab_size, self.hparams.embedding_dim, bias = False, device = self.device) #NOTE this is ebt special, since we want to input a prob dist and pred this prob dist but the transformer needs an embedding as input
-            init_whole_model_weights(self.vocab_to_embed, self.hparams.weight_initialization_method, weight_initialization_gain=self.hparams.weight_initialization_gain)
+        # Vocab to Embed Projection
+        self._init_vocab_to_embed()
 
         self.transformer = setup_ebt(self.hparams)
+        # Store raw reference for torch.compile/torch.func compatibility
+        self.transformer_raw_ref = [self.transformer]
         
         self.finished_warming_up = False
 
@@ -62,11 +56,64 @@ class EBT_NLP(LightningModule):
             self.replay_buffer_samples = self.hparams.batch_size_per_device * self.hparams.mcmc_replay_buffer_sample_bs_percent
             self.replay_buffer = CausalReplayBuffer(max_size=replay_buffer_max_size, sample_size=self.replay_buffer_samples)
 
+        # Compilation for speed optimization
+        # Compiling grad_fn avoids repeated definition and recompilation in the forward loop
+        compile_mode = getattr(self.hparams, 'compile_mode', 'full')
+        
+        if self.hparams.compile_model and compile_mode == 'full':
+            print("[EBT] Compiling grad_fn with mode='max-autotune'...")
+            self.grad_fn = torch.compile(grad(self._energy_fn_impl, argnums=2), mode="max-autotune")
+        else:
+            self.grad_fn = grad(self._energy_fn_impl, argnums=2)
+
         # DEBUGGING CODE ################################################################################################################################################
         if self.hparams.debug_unused_parameters:
             self.used_parameters = set()
             self.parameters_not_to_check = set() # dont check these since may be frozen or dont want them to update
         
+    def _init_vocab_to_embed(self):
+        if not self.hparams.vocab_to_embed_uses_prob_dist:
+            if getattr(self.hparams, 'learnable_process_memory', False):
+                if self.hparams.process_memory_type:
+                    self.vocab_to_embed = Memory_Gating_MLP(self.vocab_size, self.hparams.embedding_dim, self.hparams.process_memory_type, self.hparams.process_memory_linear_layer)
+                else:
+                    assert self.hparams.num_modality_processing_mlp_layers > 1, "num_modality_processing_mlp_layers > 1 required if process_memory_type is None"
+                    self.vocab_to_embed = Memory_Augmented_MLP(self.vocab_size, self.hparams.embedding_dim, self.hparams.embedding_dim, self.hparams.embedding_dim, dropout_rate=0, layer_norm=True, num_hidden_layers=self.hparams.num_modality_processing_mlp_layers)
+            elif self.hparams.num_modality_processing_mlp_layers != 1:
+                self.vocab_to_embed = MLP(self.vocab_size, self.hparams.embedding_dim, self.hparams.embedding_dim, dropout_rate=0, layer_norm=True, num_hidden_layers=self.hparams.num_modality_processing_mlp_layers - 2)
+            else:
+                self.vocab_to_embed = nn.Linear(self.vocab_size, self.hparams.embedding_dim, bias=False, device=self.device)
+            
+            init_whole_model_weights(self.vocab_to_embed, self.hparams.weight_initialization_method, weight_initialization_gain=self.hparams.weight_initialization_gain)
+
+    def _get_probs(self, tokens, step):
+        if self.hparams.normalize_initial_condition:
+            if self.hparams.normalize_initial_condition_only_first_step and step != 0:
+                return tokens
+            return torch.softmax(tokens, dim=-1)
+        return tokens
+
+    def _energy_fn_impl(self, params, buffers, current_predicted_tokens, real_embeddings_input, start_pos, mcmc_step):
+        # Functional energy calculation for gradient computation
+        probs = self._get_probs(current_predicted_tokens, mcmc_step)
+
+        if self.hparams.vocab_to_embed_uses_prob_dist and self.hparams.normalize_initial_condition:
+            pred_embeds = torch.matmul(probs, self.embeddings.weight)
+        else:
+            pred_embeds = self.vocab_to_embed(probs)
+
+        all_embeddings = torch.cat((real_embeddings_input, pred_embeds), dim=1)
+        
+        # Use functional_call with raw transformer reference to support torch.func.grad
+        transformer_raw = self.transformer_raw_ref[0]
+        energy_preds = functional_call(
+            transformer_raw, 
+            {**params, **buffers}, 
+            (all_embeddings,), 
+            kwargs={'start_pos': start_pos, 'mcmc_step': mcmc_step}
+        )
+        return energy_preds.sum()
+
     def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
         predicted_distributions = []
         predicted_energies = []
@@ -75,108 +122,91 @@ class EBT_NLP(LightningModule):
         batch_size = x.shape[0]
         seq_length = x.shape[1]
         
+        # 1. Initialize Tokens
+        predicted_tokens = self.corrupt_embeddings(real_embeddings_input)
+        if replay_buffer_logits is not None:
+            predicted_tokens[batch_size - replay_buffer_logits.shape[0]:] = replay_buffer_logits
+
+        # 2. Determine Alpha
         alpha = torch.clamp(self.alpha, min=0.0001)
         if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
-            expanded_alpha = alpha.expand(batch_size, seq_length, 1)
-
             scale = self.hparams.randomize_mcmc_step_size_scale
-            low = alpha / scale
-            high = alpha * scale
-            alpha = low + torch.rand_like(expanded_alpha) * (high - low)
+            expanded_alpha = alpha.expand(batch_size, seq_length, 1)
+            alpha = (alpha / scale) + torch.rand_like(expanded_alpha) * (alpha * scale - alpha / scale)
 
-        langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
+        # 3. Determine MCMC Steps
+        mcmc_steps = self._get_mcmc_steps(no_randomness)
 
-        predicted_tokens = self.corrupt_embeddings(real_embeddings_input) # B, S, V
-        if replay_buffer_logits is not None: # using replay buffer, use the logits instead of corruption
-            predicted_tokens[batch_size - replay_buffer_logits.shape[0]:] = replay_buffer_logits # NOTE this assumes the fresh data is concatted first
-                
-        
-        mcmc_steps = [] # in the general case of no randomize_mcmc_num_steps then this has len == self.hparams.randomize_mcmc_num_steps
-        for step in range(self.hparams.mcmc_num_steps):
-            if not no_randomness and hasattr(self.hparams, 'randomize_mcmc_num_steps') and self.hparams.randomize_mcmc_num_steps > 0:
-                if self.hparams.randomize_mcmc_num_steps_final_landscape: # makes so only applies rand steps to final landscape
-                    if step == (self.hparams.mcmc_num_steps - 1):
-                        min_steps = 1 if self.hparams.randomize_mcmc_num_steps_min == 0 else self.hparams.randomize_mcmc_num_steps_min
-                        repeats = torch.randint(min_steps, self.hparams.randomize_mcmc_num_steps + 2, (1,)).item()
-                        mcmc_steps.extend([step] * repeats)
-                    else:
-                        mcmc_steps.append(step)
-                else:
-                    min_steps = 1 if self.hparams.randomize_mcmc_num_steps_min == 0 else self.hparams.randomize_mcmc_num_steps_min
-                    repeats = torch.randint(min_steps, self.hparams.randomize_mcmc_num_steps + 2, (1,)).item()
-                    mcmc_steps.extend([step] * repeats)
-            elif no_randomness and hasattr(self.hparams, 'randomize_mcmc_num_steps') and self.hparams.randomize_mcmc_num_steps > 0: # use max steps
-                if step == (self.hparams.mcmc_num_steps - 1): # i found this was a better pretraining metric and was more stable, only do several steps on final energy landscape instead of over all energy landscapes
-                    mcmc_steps.extend([step] * (self.hparams.randomize_mcmc_num_steps + 1))
-                else:
-                    mcmc_steps.append(step)
-            else:
-                mcmc_steps.append(step)
+        # 4. Prepare Parameters for Functional Call
+        transformer_raw = self.transformer_raw_ref[0]
+        params = dict(transformer_raw.named_parameters())
+        buffers = dict(transformer_raw.named_buffers())
+
+        langevin_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
 
         with torch.set_grad_enabled(True):
-            for i, mcmc_step in enumerate(mcmc_steps):
-                
-                if self.hparams.no_mcmc_detach:
-                    predicted_tokens.requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
-                else: # default, do detach
-                    predicted_tokens = predicted_tokens.detach().requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
+            for step in mcmc_steps:
+                # Detach & Require Grad
+                if not self.hparams.no_mcmc_detach:
+                    predicted_tokens = predicted_tokens.detach()
+                predicted_tokens = predicted_tokens.requires_grad_().reshape(batch_size, seq_length, self.vocab_size)
 
+                # Langevin Dynamics
                 if self.hparams.langevin_dynamics_noise != 0:
-                    ld_noise = torch.randn_like(predicted_tokens.detach()) * langevin_dynamics_noise_std # langevin dynamics
-                    predicted_tokens = predicted_tokens + ld_noise
+                    predicted_tokens = predicted_tokens + torch.randn_like(predicted_tokens) * langevin_std
 
-                if self.hparams.normalize_initial_condition:
-                    if self.hparams.normalize_initial_condition_only_first_step:
-                        if mcmc_step == 0:
-                            predicted_tokens = self.softmax(predicted_tokens)
-                    else:
-                        predicted_tokens = self.softmax(predicted_tokens)
-                        
-                    if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
-                        predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
-                    else:
-                        predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
-                else:
-                    predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
-                
-                all_embeddings = torch.cat((real_embeddings_input, predicted_embeddings), dim = 1) # B, 2*S, D
-                
-                energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
-                energy_preds = energy_preds.reshape(-1, 1)
-                predicted_energies.append(energy_preds)
-                
-                if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
-                    if i == (len(mcmc_steps) - 1):
-                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
-                    else:
-                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=False)[0]
-                else:
-                    predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
-                # predicted_tokens_grad has shape B, S, V
-                
-                if self.hparams.clamp_futures_grad:
-                    min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
-                    # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
-                    predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
+                # Compute Gradient
+                predicted_tokens_grad = self.grad_fn(params, buffers, predicted_tokens, real_embeddings_input, start_pos, step)
+
+                # Update Tokens
+                # Removed clamp_futures_grad as it is marked deprecated
+                predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad
+
+                # Re-calculate Energy for Logging (since grad_fn returns sum)
+                with torch.no_grad():
+                    probs = self._get_probs(predicted_tokens, step)
                     
-                if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
-                    raise ValueError("NaN or Inf gradients detected during MCMC.")
-                
-                predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after  
-                
-                if self.hparams.absolute_clamp != 0.0:
-                    predicted_tokens = torch.clamp(predicted_tokens, min = -self.hparams.absolute_clamp, max = self.hparams.absolute_clamp)
-                
-                if self.hparams.sharpen_predicted_distribution != 0.0:
-                    predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
+                    if self.hparams.vocab_to_embed_uses_prob_dist and self.hparams.normalize_initial_condition:
+                        pred_embeds = torch.matmul(probs, self.embeddings.weight)
+                    else:
+                        pred_embeds = self.vocab_to_embed(probs)
 
+                    all_embeddings = torch.cat((real_embeddings_input, pred_embeds), dim=1)
+                    # Use standard forward call here
+                    energy_preds = self.transformer(all_embeddings, start_pos=start_pos, mcmc_step=step)
+                    predicted_energies.append(energy_preds.reshape(-1, 1))
+
+                # Prepare Output
                 if return_raw_logits:
-                    predicted_tokens_for_loss = predicted_tokens # BS, S, V
+                    predicted_distributions.append(predicted_tokens)
                 else:
-                    predicted_tokens_for_loss = self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size) # BS*S, V
-                predicted_distributions.append(predicted_tokens_for_loss)        
+                    predicted_distributions.append(self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size))
 
         return predicted_distributions, predicted_energies
+
+    def _get_mcmc_steps(self, no_randomness):
+        steps = []
+        base_steps = self.hparams.mcmc_num_steps
+        randomize_steps = getattr(self.hparams, 'randomize_mcmc_num_steps', 0)
+
+        for step in range(base_steps):
+            if randomize_steps > 0:
+                is_final = (step == base_steps - 1)
+                should_randomize = (not self.hparams.randomize_mcmc_num_steps_final_landscape) or is_final
+                
+                if should_randomize:
+                    if no_randomness:
+                        # Use max steps for consistency during eval/determinism
+                        repeats = randomize_steps + 1 if is_final else 1 # logic copied from original: only extend final step
+                    else:
+                        min_steps = max(1, self.hparams.randomize_mcmc_num_steps_min)
+                        repeats = torch.randint(min_steps, randomize_steps + 2, (1,)).item()
+                    
+                    steps.extend([step] * repeats)
+                    continue
+            
+            steps.append(step)
+        return steps
 
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
         no_randomness = False if phase == "train" else True
@@ -321,10 +351,6 @@ class EBT_NLP(LightningModule):
         return contrastive_loss
     
     def warm_up_finished(self):
-        if self.hparams.clamp_max_after_warm_up != 0.0:
-            print(f"changing clamp value after warming up from {self.hparams.clamp_futures_grad_max_change} (see next line)")
-            self.hparams.clamp_futures_grad_max_change = self.hparams.clamp_max_after_warm_up
-            print(f"to the value {self.hparams.clamp_futures_grad_max_change}")
         self.finished_warming_up = True
         self.langevin_dynamics_noise_std.requires_grad = self.hparams.langevin_dynamics_noise_learnable
 
@@ -441,113 +467,70 @@ class EBT_NLP(LightningModule):
         # final_output shape (B, S, V), energies_list_accum (at each index for original num_mcmc_steps len) shape (B*G, S)
         return final_output, energies_list_accum, predicted_distributions_accum
 
-    def _run_ebt_inference_steps(
-        self,
-        initial_pred_tokens,
-        real_embeds,
-        adjusted_alpha,
-        noise,
-        start_pos,
-        learning
-    ):
+    def _run_ebt_inference_steps(self, initial_pred_tokens, real_embeds, adjusted_alpha, noise, start_pos, learning):
         energies_list = []
-        pred_states_list = []
-        pred_states_list.append(initial_pred_tokens)
+        pred_states_list = [initial_pred_tokens]
+        cur_pred_tokens = initial_pred_tokens
 
-        def do_mcmc_step(step_idx, cur_pred_tokens, alpha):
+        total_steps = self.hparams.infer_ebt_num_steps if self.hparams.ebt_type == "default" and self.hparams.infer_ebt_num_steps > 1 else self.hparams.mcmc_num_steps
+
+        # Flattened loop logic for simplicity
+        steps_config = []
+        if self.hparams.ebt_type == "default":
+            steps_config = [(i, adjusted_alpha) for i in range(total_steps)]
+        else:
+            # Complex scheduling for time_embed/adaln
+            for step_idx in range(self.hparams.mcmc_num_steps):
+                is_final_landscape = (step_idx == self.hparams.mcmc_num_steps - 1)
+                
+                if self.hparams.infer_steps_final_landscape and not is_final_landscape:
+                    alpha = self.alpha if self.hparams.infer_alpha_final_landscape else adjusted_alpha
+                    steps_config.append((step_idx, alpha))
+                else:
+                    inner_steps = self.hparams.infer_ebt_num_steps if self.hparams.infer_ebt_num_steps != 1 else max(1, self.hparams.randomize_mcmc_num_steps_min)
+                    for _ in range(inner_steps):
+                        alpha = self.alpha if (self.hparams.infer_alpha_final_landscape and not is_final_landscape) else adjusted_alpha
+                        steps_config.append((step_idx, alpha))
+
+        # Functional energy helper for inference gradient
+        def compute_energy_sum(tokens, step_idx):
+            probs = self._get_probs(tokens, step_idx)
+            if self.hparams.vocab_to_embed_uses_prob_dist and self.hparams.normalize_initial_condition:
+                embeds = torch.matmul(probs, self.embeddings.weight)
+            else:
+                embeds = self.vocab_to_embed(probs)
+            
+            combined = torch.cat([real_embeds, embeds], dim=1)
+            return self.transformer(combined, start_pos=start_pos, mcmc_step=step_idx).sum()
+
+        for i, (mcmc_step_idx, alpha) in enumerate(steps_config):
             with torch.set_grad_enabled(True):
                 cur_pred_tokens = cur_pred_tokens.detach().requires_grad_()
+                
+                # Noise
+                if not self.hparams.infer_langevin_first_step or i == 0:
+                     cur_pred_tokens = cur_pred_tokens + noise * torch.randn_like(cur_pred_tokens)
 
-                # Add noise if set
-                if not self.hparams.infer_langevin_first_step: # default
-                    cur_pred_tokens = cur_pred_tokens + noise * torch.randn_like(cur_pred_tokens)
-                else:
-                    if step_idx == 0: # only do langevin on first step
-                        cur_pred_tokens = cur_pred_tokens + noise * torch.randn_like(cur_pred_tokens)
+                # Gradient Step
+                # Recalculate energy for gradient
+                energy_sum = compute_energy_sum(cur_pred_tokens, mcmc_step_idx)
+                grad_val = torch.autograd.grad(energy_sum, [cur_pred_tokens], create_graph=learning)[0]
+                
+                # Update
+                cur_pred_tokens = cur_pred_tokens - alpha * grad_val
+                
+                # Store energy for logging (detached)
+                # Note: this recalculates forward pass, but it's inference so it's okay
+                with torch.no_grad():
+                     probs = self._get_probs(cur_pred_tokens, mcmc_step_idx)
+                     if self.hparams.vocab_to_embed_uses_prob_dist and self.hparams.normalize_initial_condition:
+                         embeds = torch.matmul(probs, self.embeddings.weight)
+                     else:
+                         embeds = self.vocab_to_embed(probs)
+                     combined = torch.cat([real_embeds, embeds], dim=1)
+                     energies = self.transformer(combined, start_pos=start_pos, mcmc_step=mcmc_step_idx)
+                     energies_list.append(energies.reshape(-1).detach())
 
-                # Convert logits -> embeddings
-                if self.hparams.normalize_initial_condition:
-                    if self.hparams.normalize_initial_condition_only_first_step:
-                        if step_idx == 0:
-                            cur_pred_tokens = self.softmax(cur_pred_tokens)
-                    else:
-                        cur_pred_tokens = self.softmax(cur_pred_tokens)
-                            
-                    if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
-                        pred_embeds = torch.matmul(cur_pred_tokens, self.embeddings.weight) #BS, S, D
-                    else:
-                        pred_embeds = self.vocab_to_embed(cur_pred_tokens) #BS, S, D
-                else:
-                    pred_embeds = self.vocab_to_embed(cur_pred_tokens)
+                pred_states_list.append(cur_pred_tokens.detach())
 
-                combined_embeddings = torch.cat([real_embeds, pred_embeds], dim=1)  # (chunk_size, 2S, D)
-                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx)
-                energies = energies.reshape(-1)
-                energies_list.append(energies.detach())
-
-                grad = torch.autograd.grad(energies.sum(), [cur_pred_tokens], create_graph=learning)[0]
-
-                if self.hparams.clamp_futures_grad:
-                    min_and_max = self.hparams.clamp_futures_grad_max_change / (alpha)
-                    grad = torch.clamp(grad, -min_and_max, min_and_max)
-
-                if self.hparams.infer_accept_lower_energies: # have to get energy to determine if should decrease
-                    old_energies = energies.reshape(cur_pred_tokens.shape[:2])
-                    proposed_tokens = cur_pred_tokens - alpha * grad
-                    new_energies = get_energy(step_idx, proposed_tokens).reshape(cur_pred_tokens.shape[:2])
-                    accept_mask = (new_energies < old_energies).float().unsqueeze(-1)
-                    updated_tokens = accept_mask * proposed_tokens + (1 - accept_mask) * cur_pred_tokens
-
-                else:
-                    updated_tokens = cur_pred_tokens - alpha * grad
-                return updated_tokens.detach()
-            
-        def get_energy(step_idx, cur_pred_tokens): # for if just want to get energy of currently predicted tokens
-            with torch.no_grad():
-                cur_pred_tokens = cur_pred_tokens.detach().requires_grad_()
-
-                # Convert logits -> embeddings
-                if self.hparams.normalize_initial_condition:
-                    if self.hparams.normalize_initial_condition_only_first_step:
-                        if step_idx == 0:
-                            cur_pred_tokens = self.softmax(cur_pred_tokens)
-                    else:
-                        cur_pred_tokens = self.softmax(cur_pred_tokens)
-                            
-                    if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
-                        pred_embeds = torch.matmul(cur_pred_tokens, self.embeddings.weight) #BS, S, D
-                    else:
-                        pred_embeds = self.vocab_to_embed(cur_pred_tokens) #BS, S, D
-                else:
-                    pred_embeds = self.vocab_to_embed(cur_pred_tokens)
-                combined_embeddings = torch.cat([real_embeds, pred_embeds], dim=1)  # (chunk_size, 2S, D)
-                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx)
-                energies = energies.reshape(-1)
-                return energies
-
-        # ebt_type
-        if self.hparams.ebt_type == "default":
-            total_steps = self.hparams.infer_ebt_num_steps if self.hparams.infer_ebt_num_steps > 1 else self.hparams.mcmc_num_steps
-            pred_state = initial_pred_tokens
-            for step_idx in range(total_steps):
-                pred_state = do_mcmc_step(step_idx, pred_state, adjusted_alpha)
-                pred_states_list.append(pred_state)
-        else:
-            # alternative ebt_type i.e. adaln or time embed
-            pred_state = initial_pred_tokens
-            for step_idx in range(self.hparams.mcmc_num_steps):
-                if self.hparams.infer_steps_final_landscape and step_idx != (self.hparams.mcmc_num_steps - 1):
-                    alpha = self.alpha if self.hparams.infer_alpha_final_landscape else adjusted_alpha
-                    pred_state = do_mcmc_step(step_idx, pred_state, alpha)
-                    pred_states_list.append(pred_state)
-                else:
-                    inner_steps = self.hparams.infer_ebt_num_steps if self.hparams.infer_ebt_num_steps != 1 else (self.hparams.randomize_mcmc_num_steps_min if self.hparams.randomize_mcmc_num_steps_min != 0 else 1)
-                    for _ in range(inner_steps):
-                        alpha = self.alpha if (self.hparams.infer_alpha_final_landscape and step_idx != (self.hparams.mcmc_num_steps - 1)) else adjusted_alpha
-                        pred_state = do_mcmc_step(step_idx, pred_state, alpha)
-                        pred_states_list.append(pred_state)
-
-
-        final_pred_state_energies = get_energy((self.hparams.mcmc_num_steps - 1), pred_state)
-        energies_list.append(final_pred_state_energies)
-        return pred_state, energies_list, pred_states_list
+        return cur_pred_tokens, energies_list, pred_states_list

@@ -277,8 +277,16 @@ def apply_rotary_emb(
         
 
     """
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    if xq.dtype == torch.float32:
+        xq_ = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2))
+    else:
+        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    if xk.dtype == torch.float32:
+        xk_ = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2))
+    else:
+        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    # xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    # xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
@@ -339,6 +347,9 @@ class Attention(nn.Module):
         
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
         init_whole_model_weights(self.wo, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
+        
+        self.register_buffer('superdiag_rows', torch.arange(args.max_seq_len - 1))
+        self.register_buffer('superdiag_cols', torch.arange(2, args.max_seq_len + 1))
         # self.wq = ColumnParallelLinear(
         #     args.dim,
         #     args.n_heads * self.head_dim,
@@ -474,12 +485,10 @@ class Attention(nn.Module):
         insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype) # for if using non 32 precision
         # bs, n, s-1 ; this calcs attn score of next preds with themselves, is like grabbing diag of matmul
         
-        # superdiag_rows = torch.arange(scores_p.shape[2]) #[0, ..., S-2] (len S-1)
-        # superdiag_cols = torch.arange(2, scores_p.shape[3]) # [2, ..., S] (len S-1); added 1 to superdiag from default_ebt since have extra time condition
-        superdiag_rows = torch.arange(scores_p.shape[2], device=scores_p.device)
-        superdiag_cols = torch.arange(2, scores_p.shape[3], device=scores_p.device)
-        # use [3] last line since is [2]+1 and scores_p is wider than is tall as has B, N, S-1, S
-        
+        seq_len_minus_1 = scores_p.shape[2]
+        superdiag_rows = self.superdiag_rows[:seq_len_minus_1]
+        superdiag_cols = self.superdiag_cols[:seq_len_minus_1]
+  
         # first remove superdiagonal values so doesnt use attention to future tokens--prevents leakage of probability mass
         zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device) # for zeroing out superdiag since dont want to include in matmul, do this in differentiable way
         diagonal_removal_mask = torch.ones_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
@@ -494,10 +503,14 @@ class Attention(nn.Module):
         if mask is not None:
             p_mask = mask[2:, :]  #S-1, S+1 like 0 0 0 -inf -inf -inf; 0 0 0 0 -inf -inf; etc  
             scores_p = scores_p + p_mask
-        scores_p = F.softmax(scores_p.float(), dim=-1).type_as(xq_p)
+        if scores_p.dtype != torch.float32:
+            scores_p = scores_p.float()
+        scores_p = F.softmax(scores_p, dim=-1)
+        if scores_p.dtype != xq_p.dtype:
+            scores_p = scores_p.to(xq_p.dtype)
         
         #Q: why do I need to extract superdiagonal why cant i just do matmul after? A: its bc would need same subsequence in value matrix but dont have it, have original subsequence and then seperately all next preds
-        scores_p_superdiagonal = scores_p.diagonal(offset=2, dim1=2, dim2=3).clone() # is B, N, S; basically how much each token on this superdiag should attent to itself; clone since dont want mask to change this
+        scores_p_superdiagonal = scores_p.diagonal(offset=2, dim1=2, dim2=3) # is B, N, S; basically how much each token on this superdiag should attent to itself; clone since dont want mask to change this
         
         scores_p = scores_p * diagonal_removal_mask # keeps scores_p as is except for superdiagonal which is next preds attention to selves, cant multiply these naively by values_p or values_o
         
@@ -718,7 +731,8 @@ class EBTTimeConcat(nn.Module):
 
         """
         _bsz = embeddings.shape[0]
-        mcmc_step = torch.full(size=(_bsz,), fill_value=mcmc_step, device = embeddings.device, dtype=torch.long)
+        mcmc_step_val = mcmc_step
+        mcmc_step = torch.empty((_bsz,), device=embeddings.device, dtype=torch.long).fill_(mcmc_step_val)
         time_embeddings = self.time_embeddings(mcmc_step).unsqueeze(dim=1) # needs to be expanded to B, 1, D
         embeddings = torch.cat((time_embeddings, embeddings), dim = 1) # B, 2S - 1, D
 
@@ -740,11 +754,9 @@ class EBTTimeConcat(nn.Module):
 
         mask = None
         if seqlen > 1:
-            mask = torch.full(
-                (seqlen, seqlen), float("-inf"), device=embeddings.device
-            )
+            mask = torch.empty((seqlen, seqlen), device=embeddings.device).fill_(float("-inf"))
 
-            mask = torch.triu(mask, diagonal=1)
+            mask.triu_(diagonal=1)
 
             # When performing key-value caching, we compute the attention scores
             # only for the new sequence. Thus, the matrix of scores is of size
