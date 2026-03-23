@@ -815,7 +815,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--overfit_batches", help="if nonzero will overfit to specified num/percent of batches", type=float, default=0.0)
 
-    parser.add_argument("--profiler", choices=["simple", "advanced"], type=str, default="")
+    parser.add_argument("--profiler", choices=["simple", "advanced", "pytorch"], type=str, default="")
 
     parser.add_argument("--no_shuffle", help="stops shuffling - helpful for debugging", action="store_true", default=False)
 
