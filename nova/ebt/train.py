@@ -120,6 +120,10 @@ def main(args):
         assert args.embedding_dim != 0, "must define embedding dim for NLP models"
         if args.vocab_to_embed_uses_prob_dist:
             assert args.normalize_initial_condition, "if vocab_to_embed_uses_prob_dist is true must use normalize_initial_condition"
+    elif args.modality == "VID":
+        # VID is old default, treat as NLP for backward compatibility
+        args.modality = "NLP"
+        print(f"WARNING: modality=VID is deprecated, treating as NLP")
     # elif args.modality == "IMG":
     #     args.backbone_type = "vae" # always uses vae
     #     assert args.embedding_dim != 0, "must define embedding dim for IMG models"
@@ -249,8 +253,12 @@ def main(args):
         trainer.test(model_trainer)
         if args.modality == "NLP": # can have modality specific logic here for inference
             if args.execution_mode == "inference":
-                em_score, f1_score = nlp_eval_acc(os.path.join(args.save_generation_logs_dir, "results.jsonl"))
-                trainer.logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
+                # Only compute EM/F1 for generation tasks (GSM8K, etc), not PPL tasks (nanochat)
+                if args.dataset_name in ["gsm8k", "arc", "humaneval", "mmlu", "smoltalk", "spellingbee"]:
+                    em_score, f1_score = nlp_eval_acc(os.path.join(args.save_generation_logs_dir, "results.jsonl"))
+                    trainer.logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
+                else:
+                    print(f"Skipping EM/F1 evaluation for PPL-only dataset: {args.dataset_name}")
         # elif args.modality == "VID":
         #     if args.infer_generate_video:
         #         print("calling style gan FVD code on generated video dataset, NOTE THIS CODE MAY NOT WORK AS EXPECTED or get stuck")
@@ -373,7 +381,11 @@ if __name__ == '__main__':
      
     # NLP SPECIFIC PARAMS ############################################################################################################
 
-    parser.add_argument("--tokenizer", help="tokenizer for nlp tasks", type=str, default="EleutherAI/gpt-neox-20b")
+    # IMPORTANT: For NanoChat dataset, this parameter is IGNORED!
+    # The actual tokenizer is loaded via get_tokenizer() in trainer.py (line 165)
+    # which uses NanoChat custom BPE tokenizer from $NANOCHAT_BASE_DIR/tokenizer/
+    # This parameter is only used for non-NanoChat datasets.
+    parser.add_argument("--tokenizer", help="tokenizer for nlp tasks (IGNORED for nanochat dataset)", type=str, default="EleutherAI/gpt-neox-20b")
     
     parser.add_argument("--pretokenize_dataset", help="whether to pretokenize the dataset and save that or just tokenize as loading the dataset. tokenizing the dataset takes a long time and may need to be done using debug dataloader. due to a bug with HF does not always work reliably, may get stuck. not currently implemented for fine-tuning datasets", action="store_true", default=False)
 
@@ -599,11 +611,39 @@ if __name__ == '__main__':
     
     parser.add_argument("--warm_up_base_lr_divider", help="lr divider for when doing linear learning rate warm up. if is set to -1 then does warm up from 0", type=float, default=-1)
     
-    parser.add_argument("--optimizer", help="used to turn on different optimizers. current options include adamw (default), lars, stableadamw", type=str, default="adamw")
-    
+    parser.add_argument("--optimizer", help="used to turn on different optimizers. current options include adamw (default), lars, stableadamw, muon_adamw", type=str, default="adamw")
+
     parser.add_argument("--lars_trust_coeff", help="exponential decay rate for second movement estimate", type=float, default=0.001)
-    
+
     parser.add_argument("--lars_exclude_bias_bn_wd", help="excludes bias and batch norm from Lars adaptation and weight decay", action="store_true", default=False)
+
+    # Muon + AdamW 混合优化器参数 (--optimizer muon_adamw 时生效)
+    parser.add_argument("--muon_lr", help="[Muon] 矩阵参数学习率 (Muon optimizer)", type=float, default=0.02)
+    parser.add_argument("--muon_momentum", help="[Muon] Nesterov 动量系数", type=float, default=0.95)
+    parser.add_argument("--muon_ns_steps", help="[Muon] Polar Express 迭代次数", type=int, default=5)
+    parser.add_argument("--muon_beta2", help="[Muon] 二阶矩 beta2 (variance reduction)", type=float, default=0.95)
+    # Muon 模式下 AdamW 参数的独立绝对 LR (不再从 peak_lr 派生)
+    # 参考 NanoChat gpt.py:setup_optimizer 和 base_train.py 的默认值
+    # 设为 -1 表示 fallback 到 peak_lr × mult 的旧行为
+    parser.add_argument("--adamw_embedding_lr", help="[Muon] embedding 绝对 LR (NanoChat 默认 0.3, 会自动 dmodel scaling)", type=float, default=-1)
+    parser.add_argument("--adamw_vocab_to_embed_lr", help="[Muon] vocab_to_embed 绝对 LR (EBT 特有, 建议保守 0.01)", type=float, default=-1)
+    parser.add_argument("--adamw_scalar_lr", help="[Muon] transformer scalar 绝对 LR (NanoChat 默认 0.04)", type=float, default=-1)
+    parser.add_argument("--adamw_dmodel_lr_scaling", help="[Muon] 是否对 AdamW LR 做 dmodel scaling: lr × (dim/768)^-0.5", action="store_true", default=False)
+
+    # Option 1: 分层学习率参数
+    parser.add_argument("--layered_lr", help="[Option 1] 启用分层学习率，不同参数类型使用不同学习率", action="store_true", default=False)
+    parser.add_argument("--embedding_lr_mult", help="[Option 1] embedding 层学习率倍数 (相对于 peak_lr)", type=float, default=0.3)
+    parser.add_argument("--vocab_to_embed_lr_mult", help="[Option 1] vocab_to_embed 层学习率倍数", type=float, default=0.1)
+    parser.add_argument("--scalar_lr_mult", help="[Option 1] transformer 标量参数学习率倍数", type=float, default=0.5)
+
+    # Option 2: 动态 Weight Decay 参数
+    parser.add_argument("--dynamic_wd", help="[Option 2] 启用动态 Weight Decay，线性衰减到 0", action="store_true", default=False)
+
+    # Option 3: Linear Warmdown LR 调度参数
+    parser.add_argument("--linear_warmdown", help="[Option 3] 启用 NanoChat 风格的 Linear Warmdown LR 调度", action="store_true", default=False)
+    parser.add_argument("--warmup_ratio", help="[Option 3] warmup 占总步数的比例 (NanoChat 默认 0.0)", type=float, default=0.0)
+    parser.add_argument("--warmdown_ratio", help="[Option 3] warmdown 占总步数的比例 (NanoChat 默认 0.5)", type=float, default=0.5)
+    parser.add_argument("--final_lr_frac", help="[Option 3] 最终 LR 占 peak_lr 的比例 (NanoChat 默认 0.0)", type=float, default=0.0)
 
     #DATASET AND DATALOADER #########################################################
 
@@ -614,7 +654,14 @@ if __name__ == '__main__':
     parser.add_argument("--dataset_name", help="dataset name", default="ucf101")
     
     parser.add_argument("--dataset_dir", help="dataset base directory", default="")
-    
+
+    # NanoChat shard evaluation specific parameters
+    parser.add_argument("--eval_shard_indices", help="Comma-separated list of shard indices to evaluate (e.g., '0,15' for first and last)", type=str, default="0,15")
+    parser.add_argument("--max_samples_per_shard", help="Maximum number of samples to evaluate per shard", type=int, default=50)
+    parser.add_argument("--enable_nanochat_generation", help="Enable text generation evaluation for nanochat (in addition to PPL)", action="store_true", default=True)
+    parser.add_argument("--generation_split_ratio", help="Ratio to split sequence for generation (0.5 = half prompt, half target)", type=float, default=0.5)
+    parser.add_argument("--min_generation_length", help="Minimum token length for generation samples", type=int, default=64)
+
     parser.add_argument("--image_dims", help="List of image dimensions", nargs='+', type=int, default = [224, 224])
     
     parser.add_argument("--no_randomness_dataloader", help="makes dataloader have no randomness by only sampling from start", action="store_true", default=False)
@@ -629,7 +676,13 @@ if __name__ == '__main__':
 
     parser.add_argument("--ffprobe_path", help="path to ffprobe binary", default="")
 
-    parser.add_argument("--validation_split_pct", help="if training and validation set are being split - which percent is validation", type=float, default=0.1)
+    # IMPORTANT: For NanoChat dataset, this parameter is DOCUMENTATION ONLY!
+    # The actual train/val split is HARDCODED in nanochat/dataloader.py:
+    # - Training: parquet_paths[:-1] (all files except the last one)
+    # - Validation: parquet_paths[-1:] (only the last file)
+    # With 370 total shards, this gives 369 train + 1 val = 0.27% validation
+    # This parameter does NOT control the split for NanoChat!
+    parser.add_argument("--validation_split_pct", help="if training and validation set are being split - which percent is validation (IGNORED for nanochat dataset)", type=float, default=0.1)
     
     parser.add_argument("--test_split_pct", help="if training, validation, and test set are being split - which percent is test. by default this is not used", type=float, default=0)
     
@@ -643,11 +696,11 @@ if __name__ == '__main__':
     
     parser.add_argument("--val_check_interval", help="interval to do validation per training epoch, 1 means once per epoch. useful if epochs are too large to wait to do validation", type=float, default=1.0)
 
-    # parser.add_argument("--val_every_n_step", help="interval to do validation in steps", type=int, default=15000)
+    parser.add_argument("--val_every_n_step", help="interval to do validation in steps", type=int, default=15000)
 
-    # parser.add_argument("--val_after_n_step", help="how many steps to wait before doing validation. is useful when you have a small dataset and dont want to do validation every time", type=int, default=0)
+    parser.add_argument("--val_after_n_step", help="how many steps to wait before doing validation. is useful when you have a small dataset and dont want to do validation every time", type=int, default=0)
 
-    # parser.add_argument("--val_steps", help="how many steps of validation", type=int, default=1000)
+    parser.add_argument("--val_steps", help="how many steps of validation", type=int, default=1000)
 
     #TESTING / INFERENCE#########################################################
 
@@ -659,8 +712,8 @@ if __name__ == '__main__':
     
     parser.add_argument("--infer_max_gen_len", help="[Inference] Maximum number of tokens/frames/sequence to generate", type=int, default=256)
 
-    parser.add_argument("--infer_echo", help="[Inference] Include input prompt in the output", type=bool, default=False)
-    
+    parser.add_argument("--infer_echo", help="[Inference] Include input prompt in the output", action="store_true", default=False)
+
     parser.add_argument("--infer_output_dir", type=str, default="./logs/inference")
 
     # NLP INFERENCE ########################################################################
@@ -715,7 +768,8 @@ if __name__ == '__main__':
 
     parser.add_argument("--wandb_tags", help="wandb tags to add", nargs='+', default=None)
 
-    parser.add_argument("--wandb_offline", help="set wandb to offline mode", action="store_true", default=False)
+    # parser.add_argument("--wandb_offline", help="set wandb to offline mode", action="store_true", default=False)
+    parser.add_argument("--wandb_offline", help="set wandb to offline mode", action="store_true", default=True) # TODO
 
     parser.add_argument("--wandb_watch", help="turns on watch mode for wandb - expensive so only use for debugging", action="store_true", default=False) 
 
@@ -754,6 +808,9 @@ if __name__ == '__main__':
     # SPEED ##################################################################
 
     parser.add_argument("--compile_model", help="compiles the model using torch.compile", action="store_true", default=False)
+    parser.add_argument("--compile_mode", help="torch.compile 模式: full (编译整个模型), transformer_only (仅编译 transformer，推荐), disabled", type=str, default="transformer_only", choices=["full", "transformer_only", "disabled"])
+    parser.add_argument("--compile_backend", help="torch.compile 后端: inductor (默认), eager, aot_eager", type=str, default="inductor")
+    parser.add_argument("--compile_dynamic", help="允许动态形状 (可能降低加速效果)", action="store_true", default=False)
 
     #SLURM#########################################################################
 

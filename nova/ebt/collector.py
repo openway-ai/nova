@@ -188,22 +188,66 @@ class NLP_HF_Collator:
         self.tokenizer = None  # Will be initialized in __call__
         self.data_collator = None
 
+    def _get_tokenizer_wrapper(self, tokenizer_obj):
+        """
+        Wrap nanochat tokenizer to support HuggingFace-like interface.
+        """
+        from nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
+
+        # Check if it's already wrapped
+        if isinstance(tokenizer_obj, NanoChatTokenizerWrapper):
+            return tokenizer_obj
+
+        # Check if it's a nanochat RustBPETokenizer that needs wrapping
+        if hasattr(tokenizer_obj, 'enc') and hasattr(tokenizer_obj.enc, 'encode'):
+            # It's a RustBPETokenizer, wrap it
+            return NanoChatTokenizerWrapper(tokenizer_obj=tokenizer_obj)
+
+        # Otherwise, return as is (it's likely already HF tokenizer)
+        return tokenizer_obj
+
     def __call__(self, batch):
         padding = "max_length" if self.hparams.mcmc_replay_buffer else True # for replay buffer need to pad to max since all elements in replay buffer need same seq dim
         if self.hparams.pretokenize_dataset:
             if self.tokenizer is None:
-                self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.tokenizer, clean_up_tokenization_spaces=False)
-                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id # is token 0, was right padding things
+                # CRITICAL FIX: Use tokenizer_obj (nanochat tokenizer) if available
+                # This fixes CUDA index out of bounds error when using wrong vocab_size
+                if hasattr(self.hparams, 'tokenizer_obj') and self.hparams.tokenizer_obj is not None:
+                    self.tokenizer = self._get_tokenizer_wrapper(self.hparams.tokenizer_obj)
+                else:
+                    # Use tokenizer_path if available, otherwise fallback
+                    tokenizer_path = self.hparams.tokenizer_path if hasattr(self.hparams, 'tokenizer_path') else self.hparams.tokenizer
+                    self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, clean_up_tokenization_spaces=False)
+                # Safe assignment: ensure eos_token_id exists before using it
+                if hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
+                    self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+                elif hasattr(self.tokenizer, 'bos_token_id'):
+                    self.tokenizer.pad_token_id = self.tokenizer.bos_token_id
+                else:
+                    self.tokenizer.pad_token_id = 0  # Fallback to 0 for GPT-NeoX style tokenizers
                 self.data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, return_tensors="pt", padding=padding, max_length=self.max_length)
             return self.data_collator(batch)
         else:
             if self.tokenizer is None:
-                self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.tokenizer, clean_up_tokenization_spaces = False)
-                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id # is token 0, was right padding things
+                # CRITICAL FIX: Use tokenizer_obj (nanochat tokenizer) if available
+                # This fixes CUDA index out of bounds error when using wrong vocab_size
+                if hasattr(self.hparams, 'tokenizer_obj') and self.hparams.tokenizer_obj is not None:
+                    self.tokenizer = self._get_tokenizer_wrapper(self.hparams.tokenizer_obj)
+                else:
+                    # Use tokenizer_path if available, otherwise fallback
+                    tokenizer_path = self.hparams.tokenizer_path if hasattr(self.hparams, 'tokenizer_path') else self.hparams.tokenizer
+                    self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, clean_up_tokenization_spaces = False)
+                # Safe assignment: ensure eos_token_id exists before using it
+                if hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
+                    self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+                elif hasattr(self.tokenizer, 'bos_token_id'):
+                    self.tokenizer.pad_token_id = self.tokenizer.bos_token_id
+                else:
+                    self.tokenizer.pad_token_id = 0  # Fallback to 0 for GPT-NeoX style tokenizers
             if self.hparams.execution_mode == "inference":
                 questions, answers = zip(*batch)
                 return self.tokenizer(questions, return_tensors="pt", padding=True, truncation=True, max_length=self.max_length), self.tokenizer(answers, return_tensors="pt", padding=True, truncation=True, max_length=self.max_length)
-            
+
             tokens = self.tokenizer(batch, return_tensors="pt", padding=padding, truncation=True, max_length=self.max_length)
             return tokens
         

@@ -66,10 +66,55 @@ def call_model_forward_ppl(hparams, model, input_tokens, start_pos, bsz):
     return logits, energies
 
 def generate_text(model, batch, hparams):
-    tokenizer = AutoTokenizer.from_pretrained(hparams.tokenizer, clean_up_tokenization_spaces = False)
-    tokenizer_pad_token_id = tokenizer.eos_token_id # is token 0, was right padding things
+    # Import the wrapper at the top of the function
+    from nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
+
+    # Use tokenizer_obj if available, otherwise load from path
+    if hasattr(hparams, 'tokenizer_obj') and hparams.tokenizer_obj is not None:
+        tokenizer = hparams.tokenizer_obj
+        # Wrap nanochat tokenizer if needed
+        if hasattr(tokenizer, 'enc') and hasattr(tokenizer.enc, 'encode'):
+            # It's a RustBPETokenizer, wrap it for HF compatibility
+            tokenizer = NanoChatTokenizerWrapper(tokenizer_obj=tokenizer)
+    elif hasattr(hparams, 'tokenizer_path'):
+        tokenizer = AutoTokenizer.from_pretrained(hparams.tokenizer_path, clean_up_tokenization_spaces = False)
+    else:
+        # Fallback: if tokenizer is already an object, use it directly
+        if isinstance(hparams.tokenizer, str):
+            tokenizer = AutoTokenizer.from_pretrained(hparams.tokenizer, clean_up_tokenization_spaces = False)
+        else:
+            tokenizer = hparams.tokenizer  # Already a tokenizer object
+            # Check if it needs wrapping
+            if hasattr(tokenizer, 'enc') and hasattr(tokenizer.enc, 'encode'):
+                tokenizer = NanoChatTokenizerWrapper(tokenizer_obj=tokenizer)
+
+    # Safe access to eos_token_id with fallback to bos_token_id (for compatibility)
+    if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
+        tokenizer_pad_token_id = tokenizer.eos_token_id
+    elif hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None:
+        tokenizer_pad_token_id = tokenizer.pad_token_id
+    elif hasattr(tokenizer, 'bos_token_id'):
+        tokenizer_pad_token_id = tokenizer.bos_token_id
+    else:
+        tokenizer_pad_token_id = 0  # Fallback to 0 (common for BOS/EOS/PAD in GPT-NeoX)
         
     questions, answers = batch
+
+    # Handle both dict/dict-like format (from DataCollator) and tensor format
+    # Normalize to ensure we can access via ['input_ids']
+    if not isinstance(questions, dict) and not hasattr(questions, '__getitem__'):
+        # questions is a raw tensor, wrap it
+        ids = questions if isinstance(questions, torch.Tensor) else torch.tensor(questions, dtype=torch.long)
+        attn_mask = (ids != tokenizer_pad_token_id).long()
+        # Create dict-like wrapper
+        questions = {'input_ids': ids, 'attention_mask': attn_mask}
+
+    if not isinstance(answers, dict) and not hasattr(answers, '__getitem__'):
+        # answers is a raw tensor, wrap it
+        ans_ids = answers if isinstance(answers, torch.Tensor) else torch.tensor(answers, dtype=torch.long)
+        answers = {'input_ids': ans_ids}
+
+    # Now we can safely access via dict keys
     ids = questions['input_ids']
     attn_mask = questions["attention_mask"]
     max_gen_len = hparams.infer_max_gen_len
@@ -99,7 +144,7 @@ def generate_text(model, batch, hparams):
     pad_id = tokenizer_pad_token_id
     tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
     for k, t in enumerate(prompt_tokens):
-        tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda").clone().detach()
+        tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
     if logprobs:
         token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
     prev_pos = 0
@@ -136,8 +181,10 @@ def generate_text(model, batch, hparams):
                     reduction="none",
                     ignore_index=pad_id,
                 )
+            # Get EOS token ID safely (use the same logic as above)
+            eos_token_id = getattr(tokenizer, 'eos_token_id', getattr(tokenizer, 'bos_token_id', 0))
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                next_token == tokenizer.eos_token_id
+                next_token == eos_token_id
             )
             prev_pos = cur_pos
             if all(eos_reached):
@@ -154,8 +201,9 @@ def generate_text(model, batch, hparams):
         if logprobs:
             probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
         # cut to eos tok if any
-        if tokenizer.eos_token_id in toks:
-            eos_idx = toks.index(tokenizer.eos_token_id)
+        eos_token_id = getattr(tokenizer, 'eos_token_id', getattr(tokenizer, 'bos_token_id', 0))
+        if eos_token_id in toks:
+            eos_idx = toks.index(eos_token_id)
             toks = toks[:eos_idx]
             probs = probs[:eos_idx] if logprobs else None
         out_tokens.append(toks)
@@ -167,16 +215,16 @@ def generate_text(model, batch, hparams):
                 "generation": tokenizer.decode(t, skip_special_tokens=True),
                 "tokens": [tokenizer.decode(x) for x in t],
                 "logprobs": logprobs_i,
-                "gt_answer": tokenizer.decode(gt_ans, skip_special_tokens=True),
-                "question": tokenizer.decode(question, skip_special_tokens=True),
+                "target": tokenizer.decode(gt_ans, skip_special_tokens=True),
+                "prompt": tokenizer.decode(question, skip_special_tokens=True),
             }
             for t, logprobs_i, gt_ans, question in zip(out_tokens, out_logprobs, answers['input_ids'], questions['input_ids'])
         ]
     return [
         {
             "generation": tokenizer.decode(t, skip_special_tokens=True),
-            "gt_answer": tokenizer.decode(gt_ans, skip_special_tokens=True),
-            "question": tokenizer.decode(question, skip_special_tokens=True),
+            "target": tokenizer.decode(gt_ans, skip_special_tokens=True),
+            "prompt": tokenizer.decode(question, skip_special_tokens=True),
         } for t, gt_ans, question in zip(out_tokens, answers['input_ids'], questions['input_ids'])
     ]
 
@@ -188,10 +236,16 @@ def get_ppl(model, batch, hparams): # is very similar to model forward_loss_wrap
         if hparams.model_name == "ebt":
             logits, energies = call_model_forward_ppl(hparams, model, input_ids, 0, batch_size)
         else:
-            logits, _ = call_model_forward_ppl(hparams, model, input_ids, 0, batch_size) 
+            logits, _ = call_model_forward_ppl(hparams, model, input_ids, 0, batch_size)
 
     next_token_indices = batch['input_ids'].squeeze(dim=1)[:, 1:].reshape(-1) # BS * S; reshape since targets are supposed to be 1D
-    cce_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), next_token_indices, ignore_index=model.tokenizer_pad_token_id)
+
+    # Get pad token id safely - nanochat doesn't have pad token, so use -100 (standard ignore index)
+    pad_token_id = model.tokenizer_pad_token_id
+    if pad_token_id is None:
+        pad_token_id = -100  # Standard ignore index that won't match any actual token
+
+    cce_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), next_token_indices, ignore_index=pad_token_id)
     perplexity = torch.exp(cce_loss).detach()
 
     outputs = {
@@ -205,9 +259,15 @@ def get_ppl(model, batch, hparams): # is very similar to model forward_loss_wrap
             step_tensor = torch.stack(step_energies)
             avg_step_energy = torch.mean(step_tensor, dim=0)
             energy_tensors.append(avg_step_energy)
-        
+
+        # Convert energy tensors to scalars for logging
         for step_idx, energy in enumerate(energy_tensors):
-            outputs[f"mcmc_step_{step_idx}_energy"] = energy
+            # Take mean if energy is not a scalar
+            if energy.numel() > 1:
+                energy_scalar = energy.mean().item()
+            else:
+                energy_scalar = energy.item()
+            outputs[f"mcmc_step_{step_idx}_energy"] = energy_scalar
 
     if hparams.infer_plot_energy_landscape:
         assert hparams.model_name == "ebt", "Energy landscape plotting only works with EBT models"

@@ -83,6 +83,15 @@ class TokenizerOutput:
         self.attention_mask = self.attention_mask.to(device)
         return self
 
+    def __getitem__(self, key: str):
+        """Support dict-like access for compatibility."""
+        if key == "input_ids":
+            return self.input_ids
+        elif key == "attention_mask":
+            return self.attention_mask
+        else:
+            raise KeyError(f"TokenizerOutput has no key '{key}'")
+
 
 class BaseTokenizer:
     """
@@ -120,6 +129,19 @@ class BaseTokenizer:
         self.cls_token_id = self.vocab.get(self.cls_token, self.unk_token_id)
         self.sep_token_id = self.vocab.get(self.sep_token, self.unk_token_id)
         self.mask_token_id = self.vocab.get(self.mask_token, self.unk_token_id)
+
+    def __len__(self) -> int:
+        """Return total vocabulary size (including special tokens)."""
+        return len(self.vocab)
+
+    def get_vocab_size(self) -> int:
+        """Return vocabulary size. Alias for __len__()."""
+        return len(self.vocab)
+
+    @property
+    def vocab_size(self) -> int:
+        """Vocabulary size property for compatibility."""
+        return len(self.vocab)
 
     # ---- core methods you should override ----
     def tokenize(self, text: str) -> List[str]:
@@ -281,6 +303,7 @@ class WordPieceTokenizer(BaseTokenizer):
         do_lower_case: bool = True,
         max_input_chars_per_word: int = 100,
         add_special_tokens: bool = True,
+        **kwargs  # Ignore extra kwargs like clean_up_tokenization_spaces
     ):
         super().__init__(
             vocab=vocab,
@@ -359,6 +382,7 @@ class SimpleJsonVocabTokenizer(BaseTokenizer):
         sep_token: str = "</s>",
         mask_token: str = "<mask>",
         add_special_tokens: bool = True,
+        **kwargs  # Ignore extra kwargs like clean_up_tokenization_spaces
     ):
         super().__init__(
             vocab=vocab,
@@ -406,6 +430,21 @@ class AutoTokenizer:
                 f"Got: {pretrained_model_name_or_path!r}"
             )
 
+        # Try to load special tokens configuration
+        special_tokens_path = os.path.join(pretrained_model_name_or_path, "special_tokens_map.json")
+        if os.path.isfile(special_tokens_path):
+            with open(special_tokens_path, 'r', encoding='utf-8') as f:
+                special_tokens = json.load(f)
+            # Override kwargs with special tokens from file
+            if 'unk_token' not in kwargs and 'unk_token' in special_tokens:
+                kwargs['unk_token'] = special_tokens['unk_token']
+            if 'pad_token' not in kwargs and 'pad_token' in special_tokens:
+                kwargs['pad_token'] = special_tokens['pad_token']
+            if 'bos_token' not in kwargs and 'bos_token' in special_tokens:
+                kwargs['cls_token'] = special_tokens['bos_token']  # Map bos to cls
+            if 'eos_token' not in kwargs and 'eos_token' in special_tokens:
+                kwargs['sep_token'] = special_tokens['eos_token']  # Map eos to sep
+
         vocab_txt = os.path.join(pretrained_model_name_or_path, "vocab.txt")
         vocab_json = os.path.join(pretrained_model_name_or_path, "vocab.json")
 
@@ -416,7 +455,17 @@ class AutoTokenizer:
 
         if os.path.isfile(vocab_json):
             vocab = _read_vocab_json(vocab_json)
-            return SimpleJsonVocabTokenizer(vocab=vocab, **kwargs)
+            tokenizer = SimpleJsonVocabTokenizer(vocab=vocab, **kwargs)
+
+            # For GPT-NeoX compatibility: set eos_token_id and bos_token_id
+            # GPT-NeoX uses <|endoftext|> for both
+            if '<|endoftext|>' in vocab:
+                tokenizer.eos_token_id = vocab['<|endoftext|>']
+                tokenizer.bos_token_id = vocab['<|endoftext|>']
+                tokenizer.eos_token = '<|endoftext|>'
+                tokenizer.bos_token = '<|endoftext|>'
+
+            return tokenizer
 
         raise FileNotFoundError(
             "Cannot infer tokenizer type. Expected one of:\n"
