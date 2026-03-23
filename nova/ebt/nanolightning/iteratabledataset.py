@@ -85,10 +85,23 @@ def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device,
         device=device,
         resume_state_dict=resume_state_dict,
     )
+
+    def collate_fn(batch):
+        """Custom collate function to handle (inputs, targets, state_dict) tuples.
+
+        Since batch_size=1, batch is a list with one element: [(inputs, targets, state_dict)]
+        We extract and return just the tuple, adding a leading dim to tensors.
+        Note: We discard state_dict since it's not needed for training.
+        """
+        inputs, targets, state_dict = batch[0]
+        # Clone tensors to avoid reusing views from nanochat's buffer
+        return (inputs.unsqueeze(0).clone(), targets.unsqueeze(0).clone())
+
     return DataLoader(
         dataset,
         batch_size=1,
         shuffle=False,
         num_workers=0,
         pin_memory=False,
+        collate_fn=collate_fn,
     )

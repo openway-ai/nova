@@ -186,7 +186,43 @@ class IterableTrainer:
     def _print_rank0(self, *args, **kwargs) -> None:
         """Print only on the master process."""
         if self.is_global_zero:
-            print(*args, **kwargs)
+            print(*args, **kwargs, flush=True)
+
+    def _get_batch_size(self):
+        """Get per-device batch size."""
+        return getattr(self._model.hparams, 'batch_size_per_device', 32)
+
+    def _print_training_sample(self, batch, model) -> None:
+        """Print a training sample for inspection."""
+        try:
+            # Get tokenizer if available
+            tokenizer = getattr(model, 'tokenizer', None)
+            if tokenizer is None:
+                return
+
+            # Extract first sample from batch
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                inputs = batch[0]  # [1, B, T] or [B, T]
+                targets = batch[1]
+
+                # Handle the [1, B, T] case by squeezing first dim
+                if inputs.dim() == 3 and inputs.size(0) == 1:
+                    inputs = inputs.squeeze(0)
+                    targets = targets.squeeze(0)
+
+                # Get first sample
+                sample_input = inputs[0].cpu().tolist()[:50]  # First 50 tokens
+                sample_target = targets[0].cpu().tolist()[:50]
+
+                # Decode tokens
+                input_text = tokenizer.decode(sample_input)
+                target_text = tokenizer.decode(sample_target)
+
+                self._print_rank0(f"  Sample input: {input_text[:200]}...")
+                self._print_rank0(f"  Sample target: {target_text[:200]}...")
+        except Exception:
+            # Silently fail if sample printing encounters any issues
+            pass
 
     # ====================================================================
     # Precision context manager
@@ -409,9 +445,25 @@ class IterableTrainer:
             count += 1
             model.clear_logged_metrics()
 
+            # Progress logging every 100 validation batches
+            if (batch_idx + 1) % 100 == 0 or (batch_idx + 1) == num_val_batches:
+                progress_pct = (batch_idx + 1) / num_val_batches * 100
+                self._print_rank0(
+                    f"  Validation progress: {batch_idx + 1}/{num_val_batches} ({progress_pct:.1f}%)"
+                )
+
         if count > 0:
             for k in all_metrics:
                 all_metrics[k] /= count
+
+        # Print validation metrics summary
+        if all_metrics:
+            self._print_rank0(f"  Validation metrics:")
+            for k, v in sorted(all_metrics.items()):
+                if isinstance(v, float):
+                    self._print_rank0(f"    {k}: {v:.4f}")
+                else:
+                    self._print_rank0(f"    {k}: {v}")
 
         model.on_validation_epoch_end()
         model.train()
@@ -562,6 +614,17 @@ class IterableTrainer:
         model.on_train_start()
         model.on_train_epoch_start()  # called once at the start; no epoch concept
 
+        # Print training configuration
+        batch_size_per_device = self._get_batch_size()
+        effective_batch_size = batch_size_per_device * self.accumulate_grad_batches * self.world_size
+        self._print_rank0("=" * 80)
+        self._print_rank0("TRAINING STARTED")
+        self._print_rank0(f"Max steps: {self.max_steps} | Val every: {val_every_n_steps} steps")
+        self._print_rank0(f"Batch size per device: {batch_size_per_device} | Accumulation: {self.accumulate_grad_batches}")
+        self._print_rank0(f"Effective batch size: {effective_batch_size} | World size: {self.world_size}")
+        self._print_rank0(f"Total tokens per step: {effective_batch_size * model.hparams.context_length:,}")
+        self._print_rank0("=" * 80)
+
         self._should_stop = False
         accum_count = 0  # micro-batches accumulated since last optimizer step
         batch_idx = 0    # total micro-batches processed (used in hook signatures)
@@ -644,6 +707,25 @@ class IterableTrainer:
                 accum_count = 0
                 did_step = True
 
+                # Progress logging every 10 steps
+                if self.global_step % 10 == 0:
+                    lr = self.optimizers[0].param_groups[0]['lr']
+                    tokens_seen = self.global_step * self.accumulate_grad_batches * self._get_batch_size() * model.hparams.context_length
+                    progress_pct = (self.global_step / self.max_steps * 100) if self.max_steps > 0 else 0
+                    self._print_rank0(
+                        f"Step {self.global_step}/{self.max_steps} ({progress_pct:.1f}%) | "
+                        f"Loss: {loss.item():.4f} | LR: {lr:.2e} | "
+                        f"Tokens: {tokens_seen/1e9:.2f}B"
+                    )
+
+                # Print training sample every 500 steps
+                if self.global_step % 500 == 0:
+                    self._print_rank0(f"\n{'='*80}")
+                    self._print_rank0(f"TRAINING SAMPLE at step {self.global_step}")
+                    self._print_rank0(f"{'='*80}")
+                    self._print_training_sample(batch, model)
+                    self._print_rank0(f"{'='*80}\n")
+
             # ----------------------------------------------------------
             # Post-batch hooks
             # ----------------------------------------------------------
@@ -661,9 +743,13 @@ class IterableTrainer:
                 and self.global_step >= self.val_after_n_step
                 and self.global_step % val_every_n_steps == 0
             ):
+                self._print_rank0(f"\n{'='*80}")
+                self._print_rank0(f"VALIDATION at step {self.global_step}")
+                self._print_rank0(f"{'='*80}")
                 val_metrics = self._run_validation(model, val_dl)
                 self._try_checkpoint(model, val_metrics)
                 model.train()
+                self._print_rank0(f"{'='*80}\n")
 
             # ----------------------------------------------------------
             # Step-based termination

@@ -53,6 +53,10 @@ def setup_wandb(args):
     return None
 
 def main(args):
+    # --disable_wandb is an alias for --no_wandb
+    if args.disable_wandb:
+        args.no_wandb = True
+
     if(args.is_random_seed):
         seed_everything(random.randint(0,1000000), workers=True)
     else:
@@ -181,7 +185,7 @@ def main(args):
         print(str(args))
 
     if not args.no_wandb and args.wandb_watch:
-        init_wandb_watch(wandb_logger, model_trainer, args.wandb_watch_log_freq)
+        init_wandb_watch(wandb_logger, model_trainer, args.wandb_watch_log_freq, args.wandb_watch_level)
 
     if args.create_model_viz:
         # BACKLOG use tensorboard for this if active eventually. disabled for now since makes some things challenging
@@ -761,6 +765,7 @@ if __name__ == '__main__':
     #WANDB##################################################################
 
     parser.add_argument("--no_wandb", help="no wandb", action="store_true", default=False)
+    parser.add_argument("--disable_wandb", help="alias for --no_wandb, completely disables wandb", action="store_true", default=False)
 
     parser.add_argument("--wandb_entity", help="wandb entity", default='')
 
@@ -771,9 +776,11 @@ if __name__ == '__main__':
     # parser.add_argument("--wandb_offline", help="set wandb to offline mode", action="store_true", default=False)
     parser.add_argument("--wandb_offline", help="set wandb to offline mode", action="store_true", default=True) # TODO
 
-    parser.add_argument("--wandb_watch", help="turns on watch mode for wandb - expensive so only use for debugging", action="store_true", default=False) 
+    parser.add_argument("--wandb_watch", help="turns on watch mode for wandb - expensive so only use for debugging", action="store_true", default=False)
 
-    parser.add_argument("--wandb_watch_log_freq", help="number of steps to log for wandb watch. is higher since is a bit expensive", type = int, default=1000)  
+    parser.add_argument("--wandb_watch_level", help="wandb watch log level: 'parameters' (default when --wandb_watch is on), 'gradients', or 'all' (most expensive)", type=str, default="parameters", choices=["parameters", "gradients", "all"])
+
+    parser.add_argument("--wandb_watch_log_freq", help="number of steps to log for wandb watch. is higher since is a bit expensive", type = int, default=1000)
 
     #LOGGING##################################################################
 

@@ -43,6 +43,9 @@ SHOW_MCMC_FLAG=""
 VERBOSE_FLAG=""
 SHOW_ENERGY_FLAG=""
 SHOW_DIST_FLAG=""
+OVERRIDE_MCMC_STEPS=""
+OVERRIDE_NOISE_STD=""
+OVERRIDE_ALPHA=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -78,6 +81,18 @@ while [[ $# -gt 0 ]]; do
             MAX_TOKENS="$2"
             shift 2
             ;;
+        --override-mcmc-steps)
+            OVERRIDE_MCMC_STEPS="$2"
+            shift 2
+            ;;
+        --override-noise-std)
+            OVERRIDE_NOISE_STD="$2"
+            shift 2
+            ;;
+        --override-alpha)
+            OVERRIDE_ALPHA="$2"
+            shift 2
+            ;;
         --dtype)
             DTYPE="$2"
             shift 2
@@ -93,39 +108,24 @@ while [[ $# -gt 0 ]]; do
             echo "  bash runs/chat_ebt.sh [选项]"
             echo ""
             echo "选项:"
-            echo "  -c, --checkpoint PATH    Checkpoint 路径"
-            echo "  -t, --temperature VAL    生成温度 (默认: 0.8)"
-            echo "  -p, --top-p VAL          Top-P 采样 (默认: 0.9)"
-            echo "  --max-tokens VAL         最大生成 tokens (默认: 256)"
-            echo "  -m, --show-mcmc          展示 MCMC 步骤过程"
-            echo "  -v, --verbose            详细模式"
-            echo "  -e, --show-energy        展示能量值变化"
-            echo "  -d, --show-distribution  展示概率分布变化"
-            echo "  --dtype TYPE             数据类型 (float32/bfloat16, 默认: bfloat16)"
-            echo "  --device DEVICE          设备 (cuda/cpu, 默认: cuda)"
-            echo "  -h, --help               显示此帮助"
-            echo ""
-            echo "环境变量:"
-            echo "  CKPT_PATH      - Checkpoint 路径"
-            echo "  TEMPERATURE    - 生成温度"
-            echo "  TOP_P          - Top-P 采样"
-            echo "  MAX_TOKENS     - 最大生成 tokens"
+            echo "  -c, --checkpoint PATH          Checkpoint 路径"
+            echo "  -t, --temperature VAL          生成温度 (默认: 0.8)"
+            echo "  -p, --top-p VAL                Top-P 采样 (默认: 0.9)"
+            echo "  --max-tokens VAL               最大生成 tokens (默认: 256)"
+            echo "  -m, --show-mcmc                展示 MCMC 步骤过程"
+            echo "  -v, --verbose                  详细模式"
+            echo "  -e, --show-energy              展示能量值变化"
+            echo "  -d, --show-distribution        展示概率分布变化"
+            echo "  --override-mcmc-steps N        覆盖 MCMC 步数 (默认: 训练值)"
+            echo "  --override-noise-std VAL       覆盖 Langevin 噪声"
+            echo "  --override-alpha VAL           覆盖 MCMC 步长 alpha"
+            echo "  --dtype TYPE                   数据类型 (float32/bfloat16)"
+            echo "  --device DEVICE                设备 (cuda/cpu)"
+            echo "  -h, --help                     显示此帮助"
             echo ""
             echo "示例:"
-            echo "  # 基本对话"
-            echo "  bash runs/chat_ebt.sh"
-            echo ""
-            echo "  # 展示 MCMC 迭代过程"
-            echo "  bash runs/chat_ebt.sh --show-mcmc"
-            echo ""
-            echo "  # 详细模式 + MCMC 显示"
             echo "  bash runs/chat_ebt.sh --show-mcmc --verbose"
-            echo ""
-            echo "  # 使用自定义 checkpoint"
-            echo "  bash runs/chat_ebt.sh -c /path/to/checkpoint.ckpt"
-            echo ""
-            echo "  # 调整生成参数"
-            echo "  TEMPERATURE=0.6 TOP_P=0.95 bash runs/chat_ebt.sh"
+            echo "  bash runs/chat_ebt.sh --show-mcmc --override-mcmc-steps 10"
             exit 0
             ;;
         *)
@@ -177,8 +177,17 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "Checkpoint: $CKPT_PATH"
 echo "温度: $TEMPERATURE | Top-P: $TOP_P | 最大 Tokens: $MAX_TOKENS"
 echo "MCMC 显示: ${SHOW_MCMC_FLAG:-关闭} | 详细模式: ${VERBOSE_FLAG:-关闭}"
+[ -n "$OVERRIDE_MCMC_STEPS" ] && echo "覆盖 MCMC 步数: $OVERRIDE_MCMC_STEPS"
+[ -n "$OVERRIDE_ALPHA" ] && echo "覆盖 Alpha: $OVERRIDE_ALPHA"
+[ -n "$OVERRIDE_NOISE_STD" ] && echo "覆盖 Noise Std: $OVERRIDE_NOISE_STD"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
+
+# 构建 override 参数
+OVERRIDE_FLAGS=""
+[ -n "$OVERRIDE_MCMC_STEPS" ] && OVERRIDE_FLAGS="$OVERRIDE_FLAGS --override-mcmc-steps $OVERRIDE_MCMC_STEPS"
+[ -n "$OVERRIDE_NOISE_STD" ] && OVERRIDE_FLAGS="$OVERRIDE_FLAGS --override-noise-std $OVERRIDE_NOISE_STD"
+[ -n "$OVERRIDE_ALPHA" ] && OVERRIDE_FLAGS="$OVERRIDE_FLAGS --override-alpha $OVERRIDE_ALPHA"
 
 # 切换到 EBT 目录
 cd "$EBT_DIR"
@@ -192,7 +201,7 @@ python -m scripts.chat_ebt \
     --max-tokens "$MAX_TOKENS" \
     --dtype "$DTYPE" \
     --device "$DEVICE" \
-    --override-mcmc-steps 10 \
+    $OVERRIDE_FLAGS \
     $SHOW_MCMC_FLAG \
     $VERBOSE_FLAG \
     $SHOW_ENERGY_FLAG \

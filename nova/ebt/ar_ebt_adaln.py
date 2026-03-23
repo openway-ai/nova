@@ -575,6 +575,17 @@ class EBTAdaLN(nn.Module):
         _bsz, seqlen = embeddings.shape[:2]
         seqlen = (seqlen+2) // 2 # do this since passed in seqlen is 2(S-1) so add 2 div 2 = S
         self.freqs_cis = self.freqs_cis.to(embeddings.device)
+
+        # 动态扩展 freqs_cis 如果需要的长度超过预计算的长度
+        required_length = start_pos + seqlen
+        if required_length > self.freqs_cis.shape[0]:
+            # 重新计算更长的 freqs_cis
+            new_freqs_cis = precompute_freqs_cis(
+                self.params.dim // self.params.n_heads,
+                required_length
+            ).to(embeddings.device)
+            self.freqs_cis = new_freqs_cis
+
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         mcmc_step = torch.full(size=(_bsz,), fill_value=mcmc_step, device = embeddings.device, dtype=torch.long)
         time_embeddings = self.time_embeddings(mcmc_step)

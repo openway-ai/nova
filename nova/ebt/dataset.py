@@ -1,9 +1,7 @@
 import sys
 sys.path.append("../../")
 
-# from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from data.fineweb.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit as fineweb_tokenizing_distributed_data_loader_with_state_bos_bestfit
-from data.climbmix.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit as climbmix_tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 
 import torch
 from torch.utils.data import IterableDataset as _IterableDataset
@@ -27,12 +25,11 @@ class IterableDataset(_IterableDataset):
         batch_size,
         max_len,
         split,
-        max_batch_num,
+        max_iter,
         # tokenizer_threads=4,
         # tokenizer_batch_size=128,
         device="cuda",
         resume_state_dict=None,
-        dataset_name="fineweb",
         # buffer_size=1000,
     ):
         super().__init__()
@@ -41,7 +38,7 @@ class IterableDataset(_IterableDataset):
         self.B = batch_size
         self.T = max_len
         self.split = split
-        self.max_batch_num = max_batch_num
+        self.max_iter = max_iter
         # self.tokenizer_threads = tokenizer_threads
         # self.tokenizer_batch_size = tokenizer_batch_size
         self.device = device
@@ -49,16 +46,9 @@ class IterableDataset(_IterableDataset):
         # self.buffer_size = buffer_size
         self.batch_idx = 0
 
-        if dataset_name == "fineweb":
-            self.iter_func = fineweb_tokenizing_distributed_data_loader_with_state_bos_bestfit
-        elif dataset_name == "webnlg":
-            self.iter_func = climbmix_tokenizing_distributed_data_loader_with_state_bos_bestfit
-        else:
-            raise ValueError(f"Unknown dataset name: {dataset_name}")
-
     def __iter__(self):
         
-        return self.iter_func(
+        return tokenizing_distributed_data_loader_with_state_bos_bestfit(
             tokenizer=self.tokenizer,
             B=self.B,
             T=self.T,
@@ -87,15 +77,15 @@ class IterableDataset(_IterableDataset):
 
     
     def __len__(self):
-        return self.max_batch_num
+        return self.max_iter
 
 
 def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device, resume_state_dict=None):
 
     dataset = IterableDataset(
         tokenizer=tokenizer,
-        B=batch_size, 
-        T=max_len,
+        batch_size=batch_size,
+        max_len=max_len,
         split=split,
         max_iter=max_iter,
         device=device,

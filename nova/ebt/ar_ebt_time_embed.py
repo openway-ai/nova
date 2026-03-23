@@ -474,8 +474,10 @@ class Attention(nn.Module):
         insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype) # for if using non 32 precision
         # bs, n, s-1 ; this calcs attn score of next preds with themselves, is like grabbing diag of matmul
         
-        superdiag_rows = torch.arange(scores_p.shape[2]) #[0, ..., S-2] (len S-1)
-        superdiag_cols = torch.arange(2, scores_p.shape[3]) # [2, ..., S] (len S-1); added 1 to superdiag from default_ebt since have extra time condition
+        # superdiag_rows = torch.arange(scores_p.shape[2]) #[0, ..., S-2] (len S-1)
+        # superdiag_cols = torch.arange(2, scores_p.shape[3]) # [2, ..., S] (len S-1); added 1 to superdiag from default_ebt since have extra time condition
+        superdiag_rows = torch.arange(scores_p.shape[2], device=scores_p.device)
+        superdiag_cols = torch.arange(2, scores_p.shape[3], device=scores_p.device)
         # use [3] last line since is [2]+1 and scores_p is wider than is tall as has B, N, S-1, S
         
         # first remove superdiagonal values so doesnt use attention to future tokens--prevents leakage of probability mass
@@ -723,6 +725,17 @@ class EBTTimeConcat(nn.Module):
         _bsz, seqlen = embeddings.shape[:2]
         seqlen = (seqlen+3) // 2 # do this since passed in seqlen is 2(S-1)+1 so add 3 div 2 = S+1 which corresponds to concatting time embed
         self.freqs_cis = self.freqs_cis.to(embeddings.device)
+
+        # 动态扩展 freqs_cis 如果需要的长度超过预计算的长度
+        required_length = start_pos + seqlen
+        if required_length > self.freqs_cis.shape[0]:
+            # 重新计算更长的 freqs_cis
+            new_freqs_cis = precompute_freqs_cis(
+                self.params.dim // self.params.n_heads,
+                required_length
+            ).to(embeddings.device)
+            self.freqs_cis = new_freqs_cis
+
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
