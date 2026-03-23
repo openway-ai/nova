@@ -185,10 +185,10 @@ OPTION_FLAGS=""
 # 推荐: transformer_only 模式,仅编译 transformer 部分
 
 # 暂时禁用,确保稳定性优先
-COMPILE_FLAGS=""
+# COMPILE_FLAGS=""
 
 # 稳定后可尝试启用
-# COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
+COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
 
 ################################################################################
 # 日志配置
@@ -439,7 +439,6 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
 --set_matmul_precision "medium" \
---wandb_watch \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS} \
 2>&1 | tee -a "${LOG_FILE}"

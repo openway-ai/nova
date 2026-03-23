@@ -294,15 +294,26 @@ class ModelTrainer(LightningModule):
     
     @staticmethod
     def wandb_activation_hook(run, step):
-        """ Weights & Biases histogram activation hook. """
+        """ Weights & Biases stats logging hook (optimized). """
         def hook(module, input, output):
             if isinstance(output, tuple):
-                pass # when tried to do things had bug AttributeError: 'list' object has no attribute 'detach'
+                pass 
             else:
-                run.experiment.log(
-                    {f"activations/{module.name}": wandb.Histogram(output.detach().cpu().float())}, 
-                    step=step
-                )
+                try:
+                    # Optimize: Log stats on GPU instead of moving full tensor to CPU for Histogram
+                    data = output.detach().float()
+                    run.experiment.log(
+                        {
+                            f"activations/{module.name}_mean": data.mean().item(),
+                            f"activations/{module.name}_std": data.std().item(),
+                            f"activations/{module.name}_min": data.min().item(),
+                            f"activations/{module.name}_max": data.max().item(),
+                        }, 
+                        step=step
+                    )
+                except RuntimeError:
+                    # Skip logging for tensors without storage (e.g. inside torch.func.grad)
+                    pass
 
         return hook
     
@@ -1470,7 +1481,11 @@ class ModelTrainer(LightningModule):
             #     self.logger.experiment.log({f'{phase}_{key}': wandb_video})
 
             if isinstance(value, torch.Tensor) and value.numel() > 1: # histogram
-                self.logger.experiment.log({f"{phase}_{key}": wandb.Histogram(value.detach().cpu())})
+                # Optimize: Log stats instead of Histogram to avoid CPU sync/copy
+                self.logger.experiment.log({
+                    f"{phase}_{key}_mean": value.detach().mean(),
+                    f"{phase}_{key}_std": value.detach().std(),
+                })
 
             elif isinstance(value, torch.Tensor) and value.dim() == 0: # two types of scalar, tensor (here) and int/float (below)
                 scalar_metrics[f"{phase}_{key}"] = value.detach()
