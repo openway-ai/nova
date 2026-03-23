@@ -30,8 +30,7 @@ class EBT_NLP(LightningModule):
         self.tokenizer_pad_token_id = None # Nanochat doesn't have <|pad|> or <|eos|> # self.tokenizer.eos_token_id
 
         self.vocab_size = self.tokenizer.get_vocab_size() # len(self.tokenizer) # self.vocab_size = self.tokenizer.vocab_size caused errors since is smaller than len(self.tokenizer), is 50254 for neox-20b, len tokenizer is 50277 so decided to use that
-        self.hparams.vocab_size = self.vocab_size
-
+        
         self.alpha = nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size)), requires_grad=self.hparams.mcmc_step_size_learnable)
         self.langevin_dynamics_noise_std = nn.Parameter(torch.tensor(float(self.hparams.langevin_dynamics_noise)), requires_grad=False) # if using self.hparams.langevin_dynamics_noise_learnable this will be turned on in warm_up_finished func
 
@@ -255,7 +254,7 @@ class EBT_NLP(LightningModule):
             'contrastive_loss' : contrastive_loss,
             'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
             'perplexity': ppl_loss,
-            'bpb_loss': bpb_loss
+            'bpb': bpb_loss  # Renamed from 'bpb_loss' for cleaner logging
         }
         return log_dict
     

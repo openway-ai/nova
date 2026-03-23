@@ -1,9 +1,9 @@
 #!/bin/bash
 ################################################################################
-# NanoChat 分片评估脚本
+# EBT 模型评估脚本
 #
 # 接收来自父脚本的环境变量，无需重复配置
-# 可独立运行：CKPT_PATH=/path/to/ckpt bash runs/eval_nanochat_shards.sh
+# 可独立运行：CKPT_PATH=/path/to/ckpt EVAL_TASK=gsm8k bash runs/eval_ebt.sh
 ################################################################################
 
 # 获取脚本所在目录的绝对路径
@@ -29,13 +29,7 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 LIMIT_TEST_BATCHES="${LIMIT_TEST_BATCHES:-100}"
 USE_WANDB="${USE_WANDB:-false}"
 WANDB_API_KEY="${WANDB_API_KEY:-}"
-
-# 分片评估特定参数
-EVAL_SHARD_INDICES="${EVAL_SHARD_INDICES:-0,15}"
-MAX_SAMPLES_PER_SHARD="${MAX_SAMPLES_PER_SHARD:-50}"
-ENABLE_GENERATION="${ENABLE_GENERATION:-true}"
-GENERATION_SPLIT_RATIO="${GENERATION_SPLIT_RATIO:-0.5}"
-MIN_GENERATION_LENGTH="${MIN_GENERATION_LENGTH:-64}"
+EVAL_TASK="${EVAL_TASK:-nanochat}"
 
 ################################################################################
 # 参数验证
@@ -43,7 +37,7 @@ MIN_GENERATION_LENGTH="${MIN_GENERATION_LENGTH:-64}"
 
 if [ -z "$CKPT_PATH" ]; then
     echo "❌ 错误: 必须指定 checkpoint 路径"
-    echo "用法: CKPT_PATH=/path/to/checkpoint.ckpt bash runs/eval_nanochat_shards.sh"
+    echo "用法: CKPT_PATH=/path/to/checkpoint.ckpt EVAL_TASK=gsm8k bash runs/eval_ebt.sh"
     exit 1
 fi
 
@@ -53,34 +47,74 @@ if [ ! -f "$CKPT_PATH" ]; then
 fi
 
 ################################################################################
+# 任务配置
+################################################################################
+
+case $EVAL_TASK in
+    "nanochat")
+        DATASET_NAME="nanochat"
+        EXECUTION_MODE="inference"
+        TASK_DESC="NanoChat 数据集 (PPL 测试)"
+        ;;
+    "gsm8k")
+        DATASET_NAME="gsm8k"
+        EXECUTION_MODE="inference"
+        TASK_DESC="GSM8K (数学推理)"
+        ;;
+    "arc")
+        DATASET_NAME="arc"
+        EXECUTION_MODE="inference"
+        TASK_DESC="ARC (科学问答)"
+        ;;
+    "humaneval")
+        DATASET_NAME="humaneval"
+        EXECUTION_MODE="inference"
+        TASK_DESC="HumanEval (代码生成)"
+        ;;
+    "mmlu")
+        DATASET_NAME="mmlu"
+        EXECUTION_MODE="inference"
+        TASK_DESC="MMLU (多任务理解)"
+        ;;
+    "smoltalk")
+        DATASET_NAME="smoltalk"
+        EXECUTION_MODE="inference"
+        TASK_DESC="SmolTalk (对话)"
+        ;;
+    "spellingbee")
+        DATASET_NAME="spellingbee"
+        EXECUTION_MODE="inference"
+        TASK_DESC="SpellingBee"
+        ;;
+    *)
+        echo "❌ 错误: 未知任务类型: $EVAL_TASK"
+        exit 1
+        ;;
+esac
+
+################################################################################
 # 输出目录设置
 ################################################################################
 
 RUN_NAME=$(basename $(dirname "$CKPT_PATH"))
 CKPT_FILENAME=$(basename "$CKPT_PATH" .ckpt)
-OUTPUT_DIR="$EBT_DIR/logs/eval/inference/nanochat_shards/${RUN_NAME}/${CKPT_FILENAME}"
+OUTPUT_DIR="$EBT_DIR/logs/eval/inference/${DATASET_NAME}/${RUN_NAME}/${CKPT_FILENAME}"
 mkdir -p "$OUTPUT_DIR"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="$EBT_DIR/logs/eval_nanochat_shards_${TIMESTAMP}.log"
+LOG_FILE="$EBT_DIR/logs/eval/inference/${DATASET_NAME}/${RUN_NAME}/eval_${EVAL_TASK}_${TIMESTAMP}.log"
 
 ################################################################################
 # 打印评估信息
 ################################################################################
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "📊 评估任务: NanoChat 分片评估"
+echo "📊 评估任务: $TASK_DESC"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "📁 Checkpoint: $CKPT_PATH"
 echo "📁 Tokenizer: $TOKENIZER_PATH"
 echo "📁 输出目录: $OUTPUT_DIR"
-echo "📊 评估分片: $EVAL_SHARD_INDICES"
-echo "📊 每分片样本数: $MAX_SAMPLES_PER_SHARD"
-echo "🎯 文本生成: $ENABLE_GENERATION"
-if [ "$ENABLE_GENERATION" = "true" ]; then
-    echo "   - 分割比例: $GENERATION_SPLIT_RATIO"
-    echo "   - 最小长度: $MIN_GENERATION_LENGTH tokens"
-fi
+echo "📁 日志文件: $LOG_FILE"
 
 ################################################################################
 # WandB 配置
@@ -104,29 +138,21 @@ echo ""
 # 运行评估
 ################################################################################
 
-GENERATION_FLAGS=""
-if [ "$ENABLE_GENERATION" = "true" ]; then
-    GENERATION_FLAGS="--enable_nanochat_generation --generation_split_ratio $GENERATION_SPLIT_RATIO --min_generation_length $MIN_GENERATION_LENGTH"
-fi
-
 {
 python train.py \
     --only_test \
     --only_test_model_ckpt "$CKPT_PATH" \
-    --execution_mode "inference" \
-    --dataset_name "nanochat_shard_eval" \
+    --execution_mode "$EXECUTION_MODE" \
+    --dataset_name "$DATASET_NAME" \
     --context_length 256 \
     --tokenizer "$TOKENIZER_PATH" \
-    --eval_shard_indices "$EVAL_SHARD_INDICES" \
-    --max_samples_per_shard "$MAX_SAMPLES_PER_SHARD" \
-    $GENERATION_FLAGS \
     --infer_max_gen_len 256 \
     --infer_temp 0.6 \
     --infer_topp 0.9 \
     --gpus "$GPUS" \
     --batch_size_per_device "$BATCH_SIZE" \
     --limit_test_batches "$LIMIT_TEST_BATCHES" \
-    --num_workers 0 \
+    --num_workers 4 \
     --infer_output_dir "$EBT_DIR/logs/eval/inference" \
     $WANDB_FLAGS \
     --val_sanity 0 \
@@ -148,15 +174,20 @@ echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo "✅ 状态: 成功"
     echo ""
-    echo "📈 PPL 指标:"
-    grep -A 10 "TEST EPOCH SUMMARY" "$LOG_FILE" | tail -11 || echo "  未找到汇总指标"
+    if [ "$EVAL_TASK" = "nanochat" ]; then
+        echo "📈 PPL 指标:"
+        grep -A 5 "TEST EPOCH SUMMARY" "$LOG_FILE" | tail -6 || echo "  未找到汇总指标"
+    else
+        echo "📈 推理结果:"
+        grep -E "Accuracy|acc|score|result" "$LOG_FILE" | tail -5 || echo "  未找到评估指标"
+    fi
     echo ""
     echo "📁 输出文件:"
     if [ -f "${OUTPUT_DIR}/results.jsonl" ]; then
         RESULT_COUNT=$(wc -l < "${OUTPUT_DIR}/results.jsonl")
-        echo "  - 评估结果: ${OUTPUT_DIR}/results.jsonl ($RESULT_COUNT 条)"
+        echo "  - 生成轨迹: ${OUTPUT_DIR}/results.jsonl ($RESULT_COUNT 条)"
     else
-        echo "  - 评估结果: 未生成"
+        echo "  - 生成轨迹: 未生成"
     fi
     echo "  - 完整日志: $LOG_FILE"
 else

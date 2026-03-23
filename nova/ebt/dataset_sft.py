@@ -132,7 +132,7 @@ class SFTIterableDataset(_IterableDataset):
                         padded = True
                         break
 
-                row_lengths.append(len(row) - remaining if padded else row_capacity)
+                row_lengths.append(content_len if padded else row_capacity)
                 rows.append(row[:row_capacity])
 
             # 构建张量

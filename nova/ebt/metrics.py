@@ -1,11 +1,15 @@
 import torch
 import torchmetrics
-# import nltk
+import nltk
 import string
 from typing import List
 import torch.distributed as dist
 import ipdb
 import math
+
+custom_nltk_path = "/mnt/shared-storage-user/lixueyan/datasets/nltk_data"
+if custom_nltk_path not in nltk.data.path:
+    nltk.data.path.insert(0, custom_nltk_path)
 
 def get_torchmetrics(metric, metrics_average_type, num_classes, metrics_task):
     if 'accuracy' in metric:
