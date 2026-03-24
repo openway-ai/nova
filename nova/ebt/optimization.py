@@ -168,12 +168,22 @@ class WarmUpLinearWarmdownLR(_LRScheduler):
 class WarmUpCosineAnnealingLR(_LRScheduler):
     def __init__(self, optimizer, warm_up_steps, warm_up_base_lr_divider, cosine_scheduler,
                  warm_up_finished_func=None, total_steps=None, enable_wd_decay=False):
+    def __init__(self, optimizer, warm_up_steps, warm_up_base_lr_divider, cosine_scheduler,
+                 warm_up_finished_func=None, total_steps=None, enable_wd_decay=False):
         self.warm_up_steps = warm_up_steps
         self.cosine_scheduler = cosine_scheduler
         self.last_step = 0
         self.highest_lr = [group['lr'] for group in optimizer.param_groups]
         self.finished_warming_up = False
         self.warm_up_finished_func = warm_up_finished_func
+
+        # Option 2: 动态 Weight Decay
+        self.total_steps = total_steps
+        self.enable_wd_decay = enable_wd_decay
+        self.initial_weight_decays = [group.get('weight_decay', 0) for group in optimizer.param_groups]
+        if enable_wd_decay:
+            print(f"[Option 2] 动态 Weight Decay 已启用: 将从初始值线性衰减到 0")
+            print(f"  - 初始 WD 值: {self.initial_weight_decays}")
 
         # Option 2: 动态 Weight Decay
         self.total_steps = total_steps
@@ -196,6 +206,13 @@ class WarmUpCosineAnnealingLR(_LRScheduler):
         super().step()
 
     def get_lr(self):
+        # Option 2: 动态更新 weight decay (线性衰减到 0)
+        if self.enable_wd_decay and self.total_steps and self.total_steps > 0:
+            wd_multiplier = max(0.0, 1.0 - self.last_step / self.total_steps)
+            for i, group in enumerate(self.optimizer.param_groups):
+                if self.initial_weight_decays[i] > 0:
+                    group['weight_decay'] = self.initial_weight_decays[i] * wd_multiplier
+
         # Option 2: 动态更新 weight decay (线性衰减到 0)
         if self.enable_wd_decay and self.total_steps and self.total_steps > 0:
             wd_multiplier = max(0.0, 1.0 - self.last_step / self.total_steps)
