@@ -171,7 +171,10 @@ class EBTChatEngine:
         print_colored("正在加载模型...", Colors.YELLOW)
 
         # 加载 tokenizer
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        # 需要到达仓库根目录（nova/ebt/scripts -> nova/ebt -> nova -> nova(repo root)）
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        sys.path.insert(0, repo_root)
+
         from nanochat.tokenizer import get_tokenizer
         self.tokenizer = get_tokenizer()
         print(f"  Tokenizer vocab size: {self.tokenizer.get_vocab_size()}")
@@ -734,6 +737,9 @@ def main():
     # 初始化引擎
     dtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
 
+    # 性能优化: 启用 TF32 (H200/A100 Tensor Core 加速)
+    torch.set_float32_matmul_precision('medium')
+
     try:
         engine = EBTChatEngine(
             checkpoint_path=args.checkpoint,
@@ -772,6 +778,10 @@ def main():
     max_tokens = args.max_tokens
 
     # 对话循环
+    session_total_tokens = 0
+    session_total_time = 0.0
+    session_turns = 0
+
     while True:
         try:
             user_input = input(f'{Colors.BLUE}你:{Colors.RESET} ')
@@ -871,9 +881,17 @@ def main():
                 )
                 print()  # 换行
 
-                # 显示统计
+                # 累计会话统计
+                session_total_tokens += stats['tokens_generated']
+                session_total_time += stats['total_time']
+                session_turns += 1
+
+                # 始终显示简要统计 (verbose 时显示完整)
                 if engine.verbose or engine.show_mcmc:
                     print_generation_stats(stats)
+                else:
+                    print(f"{Colors.GRAY}  [{stats['tokens_generated']} tokens, {stats['total_time']:.1f}s, {stats['tokens_per_second']:.1f} tok/s]{Colors.RESET}")
+                    print()
 
             except Exception as e:
                 print()
@@ -887,6 +905,21 @@ def main():
         except EOFError:
             print_colored('\n\n检测到 EOF，退出...', Colors.YELLOW)
             break
+
+    # 会话汇总
+    if session_turns > 0:
+        avg_tps = session_total_tokens / session_total_time if session_total_time > 0 else 0
+        print()
+        print("=" * 50)
+        print(f"  会话汇总")
+        print("=" * 50)
+        print(f"  对话轮数:     {session_turns}")
+        print(f"  总生成 tokens: {session_total_tokens}")
+        print(f"  总生成时间:   {session_total_time:.2f}s")
+        print(f"  平均吞吐量:   {avg_tps:.2f} tokens/s")
+        print(f"  平均每轮:     {session_total_tokens/session_turns:.0f} tokens, {session_total_time/session_turns:.1f}s")
+        print("=" * 50)
+        print(f"[SESSION_SUMMARY] turns={session_turns} tokens={session_total_tokens} time={session_total_time:.1f}s throughput={avg_tps:.2f}tok/s")
 
     print_colored('\n对话已结束。', Colors.GREEN)
     return 0

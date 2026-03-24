@@ -17,13 +17,18 @@ from datetime import datetime
 # from nanolightning.torchlightning_function import ModelCheckpoint
 # from nanolightning.torchlightning_function import rank_zero_only
 
-from pytorch_lightning import Trainer
-from pytorch_lightning.strategies import DDPStrategy
-from pytorch_lightning import seed_everything
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
-from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.callbacks import ModelSummary
+try:
+    from lightning.pytorch import Trainer, seed_everything
+    from lightning.pytorch.strategies import DDPStrategy
+    from lightning.pytorch.utilities.rank_zero import rank_zero_only
+    from lightning.pytorch.loggers import WandbLogger
+    from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary
+except ImportError:
+    from pytorch_lightning import Trainer, seed_everything
+    from pytorch_lightning.strategies import DDPStrategy
+    from pytorch_lightning.utilities.rank_zero import rank_zero_only
+    from pytorch_lightning.loggers import WandbLogger
+    from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
 
 import sys
 import wandb

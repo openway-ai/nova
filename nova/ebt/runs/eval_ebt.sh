@@ -10,13 +10,23 @@
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 
-# 激活虚拟环境并设置环境
-source "$EBT_DIR/../../.venv/bin/activate" 2>/dev/null || true
+# 切换到 EBT 目录
 cd "$EBT_DIR"
+
+# 确定 Python 路径：优先使用 conda 环境的 python，避免误用系统 python
+if [ -n "$CONDA_PREFIX" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
+    PYTHON="$CONDA_PREFIX/bin/python"
+elif [ -x "$(command -v python3)" ]; then
+    PYTHON="python3"
+else
+    PYTHON="python"
+fi
+echo "🐍 Python: $PYTHON ($($PYTHON --version 2>&1))"
 
 export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
 export OMP_NUM_THREADS=1
 export NANOCHAT_OFFLINE_MODE=1
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
 
 ################################################################################
 # 参数 (优先使用环境变量，否则使用默认值)
@@ -96,13 +106,27 @@ esac
 # 输出目录设置
 ################################################################################
 
-RUN_NAME=$(basename $(dirname "$CKPT_PATH"))
-CKPT_FILENAME=$(basename "$CKPT_PATH" .ckpt)
-OUTPUT_DIR="$EBT_DIR/logs/eval/inference/${DATASET_NAME}/${RUN_NAME}/${CKPT_FILENAME}"
-mkdir -p "$OUTPUT_DIR"
+# 推理输出目录: 优先使用父脚本传入的 EVAL_RUN_DIR，否则自行生成
+if [ -n "$EVAL_RUN_DIR" ]; then
+    INFER_OUTPUT_DIR="$EVAL_RUN_DIR"
+else
+    RUN_NAME=$(basename $(dirname "$CKPT_PATH"))
+    CKPT_FILENAME=$(basename "$CKPT_PATH" .ckpt)
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    RUN_SHORT=$(echo "$RUN_NAME" | sed 's/_[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}-[0-9]\{2\}_\?$//')
+    INFER_OUTPUT_DIR="$EBT_DIR/logs/eval/${RUN_SHORT}_${TIMESTAMP}"
+fi
+mkdir -p "$INFER_OUTPUT_DIR"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="$EBT_DIR/logs/eval/inference/${DATASET_NAME}/${RUN_NAME}/eval_${EVAL_TASK}_${TIMESTAMP}.log"
+
+# 日志路径: 优先使用父脚本传入的 GSM8K_EVAL_LOG，否则自行生成
+if [ -n "$GSM8K_EVAL_LOG" ] && [ "$EVAL_TASK" = "gsm8k" ]; then
+    LOG_FILE="$GSM8K_EVAL_LOG"
+    mkdir -p "$(dirname "$LOG_FILE")"
+else
+    LOG_FILE="$INFER_OUTPUT_DIR/${EVAL_TASK}.log"
+fi
 
 ################################################################################
 # 打印评估信息
@@ -113,7 +137,7 @@ echo "📊 评估任务: $TASK_DESC"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "📁 Checkpoint: $CKPT_PATH"
 echo "📁 Tokenizer: $TOKENIZER_PATH"
-echo "📁 输出目录: $OUTPUT_DIR"
+echo "📁 输出目录: $INFER_OUTPUT_DIR"
 echo "📁 日志文件: $LOG_FILE"
 
 ################################################################################
@@ -139,7 +163,7 @@ echo ""
 ################################################################################
 
 {
-python train.py \
+$PYTHON train.py \
     --only_test \
     --only_test_model_ckpt "$CKPT_PATH" \
     --execution_mode "$EXECUTION_MODE" \
@@ -153,7 +177,8 @@ python train.py \
     --batch_size_per_device "$BATCH_SIZE" \
     --limit_test_batches "$LIMIT_TEST_BATCHES" \
     --num_workers 4 \
-    --infer_output_dir "$EBT_DIR/logs/eval/inference" \
+    --infer_output_dir "$INFER_OUTPUT_DIR" \
+    --set_matmul_precision "medium" \
     $WANDB_FLAGS \
     --val_sanity 0 \
     --val_every_n_step 1000
@@ -183,9 +208,11 @@ if [ $EXIT_CODE -eq 0 ]; then
     fi
     echo ""
     echo "📁 输出文件:"
-    if [ -f "${OUTPUT_DIR}/results.jsonl" ]; then
-        RESULT_COUNT=$(wc -l < "${OUTPUT_DIR}/results.jsonl")
-        echo "  - 生成轨迹: ${OUTPUT_DIR}/results.jsonl ($RESULT_COUNT 条)"
+    # Python 实际输出路径: $INFER_OUTPUT_DIR/NLP/<dataset>/<run_name>/<ckpt_name>/
+    RESULT_FILE=$(find "$INFER_OUTPUT_DIR" -name "results.jsonl" -path "*/${DATASET_NAME}/*" 2>/dev/null | head -1)
+    if [ -n "$RESULT_FILE" ]; then
+        RESULT_COUNT=$(wc -l < "$RESULT_FILE")
+        echo "  - 生成轨迹: $RESULT_FILE ($RESULT_COUNT 条)"
     else
         echo "  - 生成轨迹: 未生成"
     fi
