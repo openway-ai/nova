@@ -23,7 +23,7 @@ HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
 # export WANDB_API_KEY="<Your Wandb API>"
-export WANDB_API_KEY="968275bc822c87ac741ecce2f06cdfb54dbc1608"  # Replace with your key
+export WANDB_API_KEY="Your WandB API Key"  # Replace with your key
 export WANDB_MODE="offline"  # Set to "online" if you want real-time logging
 
 mkdir -p logs/slurm/nlp/

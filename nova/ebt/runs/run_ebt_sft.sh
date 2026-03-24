@@ -23,7 +23,7 @@ export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export NANOCHAT_SFT_DATA_DIR="$NANOCHAT_BASE_DIR/sft_data"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
-export WANDB_API_KEY="968275bc822c87ac741ecce2f06cdfb54dbc1608"
+export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"
 
 mkdir -p logs/slurm/nlp/
