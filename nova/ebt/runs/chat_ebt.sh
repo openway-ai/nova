@@ -192,8 +192,12 @@ OVERRIDE_FLAGS=""
 # 切换到 EBT 目录
 cd "$EBT_DIR"
 
-# 运行 Python 脚本
-python -m scripts.chat_ebt \
+# 运行 Python 脚本（显式使用 conda 环境的 Python）
+PYTHON="${CONDA_ENV_PATH}/bin/python"
+if [ ! -x "$PYTHON" ]; then
+    PYTHON="python"
+fi
+$PYTHON -m scripts.chat_ebt \
     --checkpoint "$CKPT_PATH" \
     --tokenizer "$TOKENIZER_PATH" \
     --temperature "$TEMPERATURE" \

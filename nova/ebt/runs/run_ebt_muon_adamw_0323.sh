@@ -86,9 +86,8 @@ NO_MCMC_DETACH=false
 DEVICE_BATCH_SIZE=4
 GRAD_ACCUM=8
 CONTEXT_LENGTH=512
-NUM_GPUS=4
-
-# NUM_GPUS=8
+# NUM_GPUS=4
+NUM_GPUS=6
 
 # DEVICE_BATCH_SIZE=1
 # GRAD_ACCUM=64
@@ -204,7 +203,7 @@ NUM_WORKERS=8
 ################################################################################
 
 # === Baseline: 纯 AdamW, 不启用任何高级优化 ===
-# OPTION_FLAGS=""
+OPTION_FLAGS=""
 
 # === 纯 AdamW + 分层学习率 ===
 # OPTION_FLAGS="--layered_lr"
@@ -221,9 +220,10 @@ NUM_WORKERS=8
 #   alpha:           保持 PEAK_LR × MCMC_LR_MULT = 0.375 (EBT 特有, 不变)
 # --adamw_dmodel_lr_scaling: 对 AdamW LR 做 (dim/768)^-0.5 缩放 (对齐 gpt.py:362)
 #   d26 dim=1664: scale = (1664/768)^-0.5 ≈ 0.679
+
 #   实际 embedding LR = 0.3 × 0.679 = 0.204
 #   实际 scalar LR = 0.04 × 0.679 = 0.027
-OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
+# OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
 
 
 ################################################################################

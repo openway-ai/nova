@@ -171,7 +171,9 @@ class EBTChatEngine:
         print_colored("正在加载模型...", Colors.YELLOW)
 
         # 加载 tokenizer
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        # 需要到达仓库根目录（nova/ebt/scripts -> nova/ebt -> nova -> nova(repo root)）
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        sys.path.insert(0, repo_root)
         from nanochat.tokenizer import get_tokenizer
         self.tokenizer = get_tokenizer()
         print(f"  Tokenizer vocab size: {self.tokenizer.get_vocab_size()}")
