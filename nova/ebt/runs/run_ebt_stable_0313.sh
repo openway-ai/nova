@@ -185,10 +185,10 @@ OPTION_FLAGS=""
 # 推荐: transformer_only 模式,仅编译 transformer 部分
 
 # 暂时禁用,确保稳定性优先
-# COMPILE_FLAGS=""
+COMPILE_FLAGS="--compile_model --compile_mode disabled"
 
-# 稳定后可尝试启用
-COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
+# 可尝试启用
+# COMPILE_FLAGS="--compile_model --compile_mode full"
 
 ################################################################################
 # 日志配置
