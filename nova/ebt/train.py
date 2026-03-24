@@ -281,7 +281,8 @@ def main(args):
 def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train"):
     torch.autograd.set_detect_anomaly(args.detect_anomaly) #NOTE seems pl detect anomaly is not working so manually set it here
 
-    if args.find_unused_parameters: #for if ever need more manipulation
+    if args.find_unused_parameters or args.distributed_strategy == "ddp": 
+            # Enable find_unused_parameters=True by default for DDP to handle conditional parameters in EBT
             args.distributed_strategy = DDPStrategy(find_unused_parameters = True)
         # else:
         #     pass
@@ -840,7 +841,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--overfit_batches", help="if nonzero will overfit to specified num/percent of batches", type=float, default=0.0)
 
-    parser.add_argument("--profiler", choices=["simple", "advanced"], type=str, default="")
+    parser.add_argument("--profiler", choices=["simple", "advanced", "pytorch"], type=str, default="")
 
     parser.add_argument("--no_shuffle", help="stops shuffling - helpful for debugging", action="store_true", default=False)
 

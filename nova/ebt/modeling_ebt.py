@@ -67,6 +67,72 @@ class EBT_NLP(LightningModule):
             self.used_parameters = set()
             self.parameters_not_to_check = set() # dont check these since may be frozen or dont want them to update
         
+    @torch.compiler.disable
+    def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps, 
+                      langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits):
+        batch_size = predicted_tokens.shape[0]
+        seq_length = predicted_tokens.shape[1]
+        
+        if self.hparams.no_mcmc_detach:
+            predicted_tokens.requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
+        else: # default, do detach
+            predicted_tokens = predicted_tokens.detach().requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
+
+        if self.hparams.langevin_dynamics_noise != 0:
+            ld_noise = torch.randn_like(predicted_tokens.detach()) * langevin_dynamics_noise_std # langevin dynamics
+            predicted_tokens = predicted_tokens + ld_noise
+
+        if self.hparams.normalize_initial_condition:
+            if self.hparams.normalize_initial_condition_only_first_step:
+                if mcmc_step == 0:
+                    predicted_tokens = self.softmax(predicted_tokens)
+            else:
+                predicted_tokens = self.softmax(predicted_tokens)
+                
+            if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
+                predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
+            else:
+                predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
+        else:
+            predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
+        
+        all_embeddings = torch.cat((real_embeddings_input.detach(), predicted_embeddings), dim = 1) # B, 2*S, D
+        
+        energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+        energy_preds = energy_preds.reshape(-1, 1)
+        
+        if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
+            if i == (num_mcmc_steps - 1):
+                predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+            else:
+                predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=False)[0]
+        else:
+            predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+        # predicted_tokens_grad has shape B, S, V
+        
+        if self.hparams.clamp_futures_grad:
+            min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
+            # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
+            predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
+            
+        if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
+            raise ValueError("NaN or Inf gradients detected during MCMC.")
+        
+        predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after  
+        
+        if self.hparams.absolute_clamp != 0.0:
+            predicted_tokens = torch.clamp(predicted_tokens, min = -self.hparams.absolute_clamp, max = self.hparams.absolute_clamp)
+        
+        if self.hparams.sharpen_predicted_distribution != 0.0:
+            predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
+
+        if return_raw_logits:
+            predicted_tokens_for_loss = predicted_tokens # BS, S, V
+        else:
+            predicted_tokens_for_loss = self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size) # BS*S, V
+            
+        return predicted_tokens, energy_preds, predicted_tokens_for_loss
+
     def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
         predicted_distributions = []
         predicted_energies = []
@@ -116,64 +182,11 @@ class EBT_NLP(LightningModule):
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
                 
-                if self.hparams.no_mcmc_detach:
-                    predicted_tokens.requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
-                else: # default, do detach
-                    predicted_tokens = predicted_tokens.detach().requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
-
-                if self.hparams.langevin_dynamics_noise != 0:
-                    ld_noise = torch.randn_like(predicted_tokens.detach()) * langevin_dynamics_noise_std # langevin dynamics
-                    predicted_tokens = predicted_tokens + ld_noise
-
-                if self.hparams.normalize_initial_condition:
-                    if self.hparams.normalize_initial_condition_only_first_step:
-                        if mcmc_step == 0:
-                            predicted_tokens = self.softmax(predicted_tokens)
-                    else:
-                        predicted_tokens = self.softmax(predicted_tokens)
-                        
-                    if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
-                        predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
-                    else:
-                        predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
-                else:
-                    predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
-                
-                all_embeddings = torch.cat((real_embeddings_input, predicted_embeddings), dim = 1) # B, 2*S, D
-                
-                energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
-                energy_preds = energy_preds.reshape(-1, 1)
+                predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
+                    predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
+                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits
+                )
                 predicted_energies.append(energy_preds)
-                
-                if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
-                    if i == (len(mcmc_steps) - 1):
-                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
-                    else:
-                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=False)[0]
-                else:
-                    predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
-                # predicted_tokens_grad has shape B, S, V
-                
-                if self.hparams.clamp_futures_grad:
-                    min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
-                    # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
-                    predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
-                    
-                if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
-                    raise ValueError("NaN or Inf gradients detected during MCMC.")
-                
-                predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after  
-                
-                if self.hparams.absolute_clamp != 0.0:
-                    predicted_tokens = torch.clamp(predicted_tokens, min = -self.hparams.absolute_clamp, max = self.hparams.absolute_clamp)
-                
-                if self.hparams.sharpen_predicted_distribution != 0.0:
-                    predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
-
-                if return_raw_logits:
-                    predicted_tokens_for_loss = predicted_tokens # BS, S, V
-                else:
-                    predicted_tokens_for_loss = self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size) # BS*S, V
                 predicted_distributions.append(predicted_tokens_for_loss)        
 
         return predicted_distributions, predicted_energies
