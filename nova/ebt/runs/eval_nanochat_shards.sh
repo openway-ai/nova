@@ -10,13 +10,23 @@
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 
-# 激活虚拟环境并设置环境
-source "$EBT_DIR/../../.venv/bin/activate" 2>/dev/null || true
+# 切换到 EBT 目录
 cd "$EBT_DIR"
+
+# 确定 Python 路径：优先使用 conda 环境的 python，避免误用系统 python
+if [ -n "$CONDA_PREFIX" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
+    PYTHON="$CONDA_PREFIX/bin/python"
+elif [ -x "$(command -v python3)" ]; then
+    PYTHON="python3"
+else
+    PYTHON="python"
+fi
+echo "🐍 Python: $PYTHON ($($PYTHON --version 2>&1))"
 
 export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
 export OMP_NUM_THREADS=1
 export NANOCHAT_OFFLINE_MODE=1
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
 
 ################################################################################
 # 参数 (优先使用环境变量，否则使用默认值)
@@ -53,16 +63,27 @@ if [ ! -f "$CKPT_PATH" ]; then
 fi
 
 ################################################################################
-# 输出目录设置
+# 输出目录与日志
 ################################################################################
 
-RUN_NAME=$(basename $(dirname "$CKPT_PATH"))
-CKPT_FILENAME=$(basename "$CKPT_PATH" .ckpt)
-OUTPUT_DIR="$EBT_DIR/logs/eval/inference/nanochat_shards/${RUN_NAME}/${CKPT_FILENAME}"
-mkdir -p "$OUTPUT_DIR"
+# 推理输出目录: 优先使用父脚本传入的 EVAL_RUN_DIR，否则自行生成
+if [ -n "$EVAL_RUN_DIR" ]; then
+    INFER_OUTPUT_DIR="$EVAL_RUN_DIR"
+else
+    RUN_NAME=$(basename $(dirname "$CKPT_PATH"))
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    RUN_SHORT=$(echo "$RUN_NAME" | sed 's/_[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}-[0-9]\{2\}_\?$//')
+    INFER_OUTPUT_DIR="$EBT_DIR/logs/eval/${RUN_SHORT}_${TIMESTAMP}"
+fi
+mkdir -p "$INFER_OUTPUT_DIR"
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="$EBT_DIR/logs/eval_nanochat_shards_${TIMESTAMP}.log"
+# 日志路径: 优先使用父脚本传入的 NANOCHAT_EVAL_LOG，否则自行生成
+if [ -n "$NANOCHAT_EVAL_LOG" ]; then
+    LOG_FILE="$NANOCHAT_EVAL_LOG"
+    mkdir -p "$(dirname "$LOG_FILE")"
+else
+    LOG_FILE="$INFER_OUTPUT_DIR/nanochat_shards.log"
+fi
 
 ################################################################################
 # 打印评估信息
@@ -73,7 +94,8 @@ echo "📊 评估任务: NanoChat 分片评估"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "📁 Checkpoint: $CKPT_PATH"
 echo "📁 Tokenizer: $TOKENIZER_PATH"
-echo "📁 输出目录: $OUTPUT_DIR"
+echo "📁 输出目录: $INFER_OUTPUT_DIR"
+echo "📁 日志文件: $LOG_FILE"
 echo "📊 评估分片: $EVAL_SHARD_INDICES"
 echo "📊 每分片样本数: $MAX_SAMPLES_PER_SHARD"
 echo "🎯 文本生成: $ENABLE_GENERATION"
@@ -110,7 +132,7 @@ if [ "$ENABLE_GENERATION" = "true" ]; then
 fi
 
 {
-python train.py \
+$PYTHON train.py \
     --only_test \
     --only_test_model_ckpt "$CKPT_PATH" \
     --execution_mode "inference" \
@@ -127,7 +149,8 @@ python train.py \
     --batch_size_per_device "$BATCH_SIZE" \
     --limit_test_batches "$LIMIT_TEST_BATCHES" \
     --num_workers 0 \
-    --infer_output_dir "$EBT_DIR/logs/eval/inference" \
+    --infer_output_dir "$INFER_OUTPUT_DIR" \
+    --set_matmul_precision "medium" \
     $WANDB_FLAGS \
     --val_sanity 0 \
     --val_every_n_step 1000
@@ -141,7 +164,7 @@ EXIT_CODE=${PIPESTATUS[0]}
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "📊 评估结果摘要"
+echo "📊 NanoChat 评估结果"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
@@ -152,9 +175,11 @@ if [ $EXIT_CODE -eq 0 ]; then
     grep -A 10 "TEST EPOCH SUMMARY" "$LOG_FILE" | tail -11 || echo "  未找到汇总指标"
     echo ""
     echo "📁 输出文件:"
-    if [ -f "${OUTPUT_DIR}/results.jsonl" ]; then
-        RESULT_COUNT=$(wc -l < "${OUTPUT_DIR}/results.jsonl")
-        echo "  - 评估结果: ${OUTPUT_DIR}/results.jsonl ($RESULT_COUNT 条)"
+    # Python 实际输出路径: $INFER_OUTPUT_DIR/NLP/nanochat_shard_eval/<run_name>/<ckpt_name>/
+    RESULT_FILE=$(find "$INFER_OUTPUT_DIR" -name "results.jsonl" -path "*/nanochat_shard_eval/*" 2>/dev/null | head -1)
+    if [ -n "$RESULT_FILE" ]; then
+        RESULT_COUNT=$(wc -l < "$RESULT_FILE")
+        echo "  - 评估结果: $RESULT_FILE ($RESULT_COUNT 条)"
     else
         echo "  - 评估结果: 未生成"
     fi

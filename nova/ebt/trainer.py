@@ -45,7 +45,10 @@ from modeling_ebt import EBT_NLP
 # from nanolightning.torchlightning_module import LightningModule
 # from nanolightning.iteratabledataset import generate_dataloader, IterableDataset
 
-from pytorch_lightning import LightningModule
+try:
+    from lightning.pytorch import LightningModule
+except ImportError:
+    from pytorch_lightning import LightningModule
 from dataset import IterableDataset, generate_dataloader
 from dataset_sft import generate_sft_dataloader
 
@@ -386,6 +389,7 @@ class ModelTrainer(LightningModule):
         self.test_perplexities = []
         self.test_energies = {}
         self.test_start_time = time.time()
+        self.test_generation_count = 0  # track generated samples for GSM8K etc.
 
         # Print header
         import sys
@@ -400,6 +404,7 @@ class ModelTrainer(LightningModule):
                 # For GSM8K and other generation tasks that use DataLoader with collate_fn
                 if self.hparams.dataset_name == "gsm8k":
                     outputs = generate_text(self.model, batch, self.hparams)
+                    self.test_generation_count += len(outputs)
                     for output in outputs:
                         self.infer_logger.log_data(output)
 
@@ -666,15 +671,56 @@ class ModelTrainer(LightningModule):
 
     def on_test_epoch_end(self):
         """Print comprehensive summary statistics at the end of test epoch"""
-        if len(self.test_losses) > 0:
-            import sys
-            import numpy as np
-            import time
+        import sys
+        import numpy as np
+        import time
 
-            # Calculate timing
-            total_time = time.time() - self.test_start_time
+        total_time = time.time() - self.test_start_time
+        has_ppl = len(self.test_losses) > 0
+        has_generation = getattr(self, 'test_generation_count', 0) > 0
+
+        if not has_ppl and not has_generation:
+            return
+
+        sys.stdout.write(f"\n\n")
+        sys.stdout.write(f"{'='*100}\n")
+        sys.stdout.write(f"{'EVALUATION RESULTS SUMMARY':^100}\n")
+        sys.stdout.write(f"{'='*100}\n\n")
+
+        # Dataset info
+        sys.stdout.write(f"Dataset Information:\n")
+        sys.stdout.write(f"   Dataset:           {self.hparams.dataset_name}\n")
+        if has_ppl:
+            sys.stdout.write(f"   Total Batches:     {len(self.test_losses)}\n")
+            sys.stdout.write(f"   Total Samples:     ~{len(self.test_losses) * self.hparams.batch_size_per_device}\n")
+        if has_generation:
+            sys.stdout.write(f"   Generated Samples: {self.test_generation_count}\n")
+        sys.stdout.write(f"   Batch Size:        {self.hparams.batch_size_per_device}\n")
+        sys.stdout.write(f"   Context Length:    {self.hparams.context_length}\n\n")
+
+        # Model info
+        sys.stdout.write(f"Model Information:\n")
+        sys.stdout.write(f"   Model Type:        {self.hparams.model_name.upper()}\n")
+        sys.stdout.write(f"   Model Size:        {self.hparams.model_size}\n")
+        if self.hparams.model_name == "ebt":
+            sys.stdout.write(f"   MCMC Steps:        {self.hparams.mcmc_num_steps}\n")
+            sys.stdout.write(f"   MCMC Step Size:    {self.hparams.mcmc_step_size}\n")
+            sys.stdout.write(f"   EBT Type:          {self.hparams.ebt_type}\n")
+        sys.stdout.write(f"\n")
+
+        # Timing info
+        sys.stdout.write(f"Performance:\n")
+        sys.stdout.write(f"   Total Time:        {total_time:.2f}s\n")
+        if has_ppl:
             samples_per_sec = len(self.test_losses) * self.hparams.batch_size_per_device / total_time
+            sys.stdout.write(f"   Time per Batch:    {total_time/len(self.test_losses):.3f}s\n")
+            sys.stdout.write(f"   Throughput:        {samples_per_sec:.2f} samples/s\n")
+        if has_generation:
+            gen_per_sec = self.test_generation_count / total_time
+            sys.stdout.write(f"   Generation Speed:  {gen_per_sec:.2f} samples/s\n")
+        sys.stdout.write(f"\n")
 
+        if has_ppl:
             # Calculate statistics
             avg_loss = np.mean(self.test_losses)
             avg_ppl = np.mean(self.test_perplexities)
@@ -686,42 +732,11 @@ class ModelTrainer(LightningModule):
             max_ppl = np.max(self.test_perplexities)
             median_loss = np.median(self.test_losses)
             median_ppl = np.median(self.test_perplexities)
-
-            # Calculate percentiles
             p25_loss, p75_loss = np.percentile(self.test_losses, [25, 75])
             p25_ppl, p75_ppl = np.percentile(self.test_perplexities, [25, 75])
 
-            sys.stdout.write(f"\n\n")
-            sys.stdout.write(f"{'='*100}\n")
-            sys.stdout.write(f"{'📊 EVALUATION RESULTS SUMMARY':^100}\n")
-            sys.stdout.write(f"{'='*100}\n\n")
-
-            # Dataset info
-            sys.stdout.write(f"📦 Dataset Information:\n")
-            sys.stdout.write(f"   Dataset:           {self.hparams.dataset_name}\n")
-            sys.stdout.write(f"   Total Batches:     {len(self.test_losses)}\n")
-            sys.stdout.write(f"   Batch Size:        {self.hparams.batch_size_per_device}\n")
-            sys.stdout.write(f"   Total Samples:     ~{len(self.test_losses) * self.hparams.batch_size_per_device}\n")
-            sys.stdout.write(f"   Context Length:    {self.hparams.context_length}\n\n")
-
-            # Model info
-            sys.stdout.write(f"🤖 Model Information:\n")
-            sys.stdout.write(f"   Model Type:        {self.hparams.model_name.upper()}\n")
-            sys.stdout.write(f"   Model Size:        {self.hparams.model_size}\n")
-            if self.hparams.model_name == "ebt":
-                sys.stdout.write(f"   MCMC Steps:        {self.hparams.mcmc_num_steps}\n")
-                sys.stdout.write(f"   MCMC Step Size:    {self.hparams.mcmc_step_size}\n")
-                sys.stdout.write(f"   EBT Type:          {self.hparams.ebt_type}\n")
-            sys.stdout.write(f"\n")
-
-            # Timing info
-            sys.stdout.write(f"⏱️  Performance:\n")
-            sys.stdout.write(f"   Total Time:        {total_time:.2f}s\n")
-            sys.stdout.write(f"   Time per Batch:    {total_time/len(self.test_losses):.3f}s\n")
-            sys.stdout.write(f"   Throughput:        {samples_per_sec:.2f} samples/s\n\n")
-
             # Loss statistics
-            sys.stdout.write(f"📉 Cross-Entropy Loss Statistics:\n")
+            sys.stdout.write(f"Cross-Entropy Loss Statistics:\n")
             sys.stdout.write(f"   Mean:              {avg_loss:.4f}\n")
             sys.stdout.write(f"   Median:            {median_loss:.4f}\n")
             sys.stdout.write(f"   Std Dev:           {std_loss:.4f}\n")
@@ -731,7 +746,7 @@ class ModelTrainer(LightningModule):
             sys.stdout.write(f"   75th Percentile:   {p75_loss:.4f}\n\n")
 
             # Perplexity statistics
-            sys.stdout.write(f"📈 Perplexity (PPL) Statistics:\n")
+            sys.stdout.write(f"Perplexity (PPL) Statistics:\n")
             sys.stdout.write(f"   Mean:              {avg_ppl:.2f}\n")
             sys.stdout.write(f"   Median:            {median_ppl:.2f}\n")
             sys.stdout.write(f"   Std Dev:           {std_ppl:.2f}\n")
@@ -742,55 +757,66 @@ class ModelTrainer(LightningModule):
 
             # Energy statistics if available
             if hasattr(self, 'test_energies') and self.test_energies:
-                sys.stdout.write(f"⚡ Energy Landscape Statistics:\n")
+                sys.stdout.write(f"Energy Landscape Statistics:\n")
                 for key, values in sorted(self.test_energies.items()):
                     avg_energy = np.mean(values)
                     std_energy = np.std(values)
                     min_energy = np.min(values)
                     max_energy = np.max(values)
                     sys.stdout.write(f"   {key}:\n")
-                    sys.stdout.write(f"      Mean: {avg_energy:.4f} ± {std_energy:.4f}\n")
+                    sys.stdout.write(f"      Mean: {avg_energy:.4f} +/- {std_energy:.4f}\n")
                     sys.stdout.write(f"      Range: [{min_energy:.4f}, {max_energy:.4f}]\n")
                 sys.stdout.write(f"\n")
 
             # ASCII histogram for PPL distribution
-            sys.stdout.write(f"📊 Perplexity Distribution (Histogram):\n")
+            sys.stdout.write(f"Perplexity Distribution (Histogram):\n")
             hist, bin_edges = np.histogram(self.test_perplexities, bins=10)
             max_count = max(hist)
             for i in range(len(hist)):
                 bar_length = int(40 * hist[i] / max_count) if max_count > 0 else 0
-                bar = '█' * bar_length
+                bar = '#' * bar_length
                 sys.stdout.write(f"   [{bin_edges[i]:6.2f}-{bin_edges[i+1]:6.2f}]: {bar} ({hist[i]})\n")
             sys.stdout.write(f"\n")
 
             # Quality assessment
-            sys.stdout.write(f"✅ Quality Assessment:\n")
+            sys.stdout.write(f"Quality Assessment:\n")
             if avg_ppl < 20:
                 quality = "Excellent"
-                emoji = "🎉"
             elif avg_ppl < 40:
                 quality = "Good"
-                emoji = "👍"
             elif avg_ppl < 60:
                 quality = "Fair"
-                emoji = "😐"
             else:
                 quality = "Needs Improvement"
-                emoji = "⚠️"
-            sys.stdout.write(f"   Overall: {emoji} {quality} (PPL={avg_ppl:.2f})\n\n")
+            sys.stdout.write(f"   Overall: {quality} (PPL={avg_ppl:.2f})\n\n")
 
-            # Output files
-            if hasattr(self.hparams, 'save_generation_logs_dir'):
-                import os
-                results_file = os.path.join(self.hparams.save_generation_logs_dir, "results.jsonl")
-                if os.path.exists(results_file):
-                    num_samples = sum(1 for _ in open(results_file))
-                    sys.stdout.write(f"📁 Output Files:\n")
-                    sys.stdout.write(f"   Results:           {results_file}\n")
-                    sys.stdout.write(f"   Num Samples:       {num_samples}\n\n")
+        # GSM8K / generation-only summary
+        if has_generation and not has_ppl:
+            sys.stdout.write(f"Generation Summary:\n")
+            sys.stdout.write(f"   Total Generated:   {self.test_generation_count}\n")
+            sys.stdout.write(f"   Total Time:        {total_time:.2f}s\n")
+            sys.stdout.write(f"   Avg Time/Sample:   {total_time/self.test_generation_count:.2f}s\n\n")
 
-            sys.stdout.write(f"{'='*100}\n\n")
-            sys.stdout.flush()
+        # Output files
+        if hasattr(self.hparams, 'save_generation_logs_dir'):
+            import os
+            results_file = os.path.join(self.hparams.save_generation_logs_dir, "results.jsonl")
+            if os.path.exists(results_file):
+                num_samples = sum(1 for _ in open(results_file))
+                sys.stdout.write(f"Output Files:\n")
+                sys.stdout.write(f"   Results:           {results_file}\n")
+                sys.stdout.write(f"   Num Samples:       {num_samples}\n\n")
+
+        # Machine-parseable summary block for bash grep
+        sys.stdout.write(f"{'='*100}\n")
+        sys.stdout.write(f"[EVAL_SUMMARY] dataset={self.hparams.dataset_name}")
+        if has_ppl:
+            sys.stdout.write(f" loss={avg_loss:.4f} ppl={avg_ppl:.2f}")
+        if has_generation:
+            sys.stdout.write(f" generated={self.test_generation_count}")
+        sys.stdout.write(f" time={total_time:.1f}s\n")
+        sys.stdout.write(f"{'='*100}\n\n")
+        sys.stdout.flush()
 
     def eval_step(self, batch, phase, token_bytes=None):
         things_to_log = self.model.forward_loss_wrapper(batch, phase, token_bytes=token_bytes) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop

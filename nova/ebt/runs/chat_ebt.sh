@@ -157,6 +157,7 @@ fi
 export NANOCHAT_OFFLINE_MODE=1
 export HF_HUB_OFFLINE=1
 export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
 
 # 清除分布式训练环境变量
 unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
@@ -192,8 +193,12 @@ OVERRIDE_FLAGS=""
 # 切换到 EBT 目录
 cd "$EBT_DIR"
 
-# 运行 Python 脚本
-python -m scripts.chat_ebt \
+# 运行 Python 脚本（显式使用 conda 环境的 Python）
+PYTHON="${CONDA_ENV_PATH}/bin/python"
+if [ ! -x "$PYTHON" ]; then
+    PYTHON="python"
+fi
+$PYTHON -m scripts.chat_ebt \
     --checkpoint "$CKPT_PATH" \
     --tokenizer "$TOKENIZER_PATH" \
     --temperature "$TEMPERATURE" \

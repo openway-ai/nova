@@ -396,6 +396,9 @@ def main():
     print(f"Using device: {device}")
     print()
 
+    # 性能优化: 启用 TF32 (H200/A100 Tensor Core 加速)
+    torch.set_float32_matmul_precision('medium')
+
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -446,6 +449,11 @@ def main():
                 ])
             writer.writerow(['OVERALL', '', '', f"{core_results['core_metric']:.4f}"])
         print(f"✓ CSV saved to: {csv_file}")
+
+        # 机器可解析汇总行
+        num_tasks = len(core_results['results'])
+        avg_acc = np.mean(list(core_results['results'].values()))
+        print(f"\n[EVAL_SUMMARY] dataset=core core_metric={core_results['core_metric']:.4f} avg_accuracy={avg_acc:.4f} num_tasks={num_tasks}")
 
     print("\n" + "="*80)
     print("Evaluation Complete!")

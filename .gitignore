@@ -26,6 +26,28 @@ nova/mdlm/outputs/
 # Logs
 wandb/
 nova/ebt/logs/
+nova/ebt/lightning_logs/
+*.log
+logs/
+
+# Temporary / Backup files
+tmp/
+tmp_*/
+**/tmp/
+**/tmp_*/
+**/backup/
+**/bkp/
+*.bak
+*.bkp
+*.tmp
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.png
+*.jpg
+*.jpeg
 
 # Externel code
 nanochat/external/
