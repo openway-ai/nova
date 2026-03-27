@@ -80,7 +80,7 @@ export GSM8K_EVAL_LOG="$EVAL_RUN_DIR/gsm8k.log"
 # 自动清理: 只保留最近 MAX_KEEP 个运行目录
 ################################################################################
 
-MAX_KEEP=5
+MAX_KEEP=10
 
 EVAL_BASE_DIR="$EBT_DIR/logs/eval"
 cleanup_old_run_dirs() {

@@ -8,6 +8,16 @@ import time
 import random
 from datetime import datetime
 
+# 允许加载旧 checkpoint 中的自定义类
+try:
+    from nanochat.tokenizer import RustBPETokenizer
+    torch.serialization.add_safe_globals([RustBPETokenizer])
+except:
+    pass
+
+# 抑制 CUDA stream 不匹配警告（恢复训练时的已知问题）
+torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+
 # from nanolightning.torchlightning_trainer import Trainer
 # from nanolightning.iteratabletrainer import IterableTrainer
 # from nanolightning.torchlightning_trainer import ModelSummary
@@ -29,6 +39,8 @@ except ImportError:
     from pytorch_lightning.utilities.rank_zero import rank_zero_only
     from pytorch_lightning.loggers import WandbLogger
     from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
+
+from disk_aware_checkpoint import DiskAwareCheckpoint
 
 import sys
 import wandb
@@ -200,8 +212,9 @@ def main(args):
     if args.set_matmul_precision is not None: #default is highest
         torch.set_float32_matmul_precision(args.set_matmul_precision)
     
-    checkpoint_filename = "epoch={epoch}-step={step}-" + args.checkpoint_monitor_string + "={"+args.checkpoint_monitor_string+":.4f}"
-    checkpoint_callback = ModelCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = True, dirpath=f"./logs/checkpoints/{args.run_name}_{dt_string}_", filename=checkpoint_filename, verbose=True)
+    opt_name = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
+    checkpoint_filename = f"e={{epoch}}-s={{step}}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
+    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = True, dirpath=f"./logs/checkpoints/{args.run_name}_{dt_string}_", filename=checkpoint_filename, verbose=True, min_free_gb=50)
     
     for name, param in model_trainer.model.named_parameters():
         if not param.requires_grad:
@@ -211,7 +224,7 @@ def main(args):
         print("$$$$$$$$$$  STARTED TRAINING  $$$$$$$$$$")
         trainer = set_trainer(args, wandb_logger, checkpoint_callback)
         resume_training_ckpt = None if args.resume_training_ckpt == "" else args.resume_training_ckpt
-        trainer.fit(model_trainer, ckpt_path=resume_training_ckpt)
+        trainer.fit(model_trainer, ckpt_path=resume_training_ckpt, weights_only=False)
         
         if args.run_testing_after_training:
             args.only_test_model_ckpt = checkpoint_callback.best_model_path
