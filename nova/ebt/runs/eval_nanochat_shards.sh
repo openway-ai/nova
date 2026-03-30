@@ -172,7 +172,7 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "✅ 状态: 成功"
     echo ""
     echo "📈 PPL 指标:"
-    grep -A 10 "TEST EPOCH SUMMARY" "$LOG_FILE" | tail -11 || echo "  未找到汇总指标"
+    grep -A 20 "EVALUATION RESULTS SUMMARY" "$LOG_FILE" | tail -21 || echo "  未找到日志汇总指标"
     echo ""
     echo "📁 输出文件:"
     # Python 实际输出路径: $INFER_OUTPUT_DIR/NLP/nanochat_shard_eval/<run_name>/<ckpt_name>/
@@ -180,6 +180,37 @@ if [ $EXIT_CODE -eq 0 ]; then
     if [ -n "$RESULT_FILE" ]; then
         RESULT_COUNT=$(wc -l < "$RESULT_FILE")
         echo "  - 评估结果: $RESULT_FILE ($RESULT_COUNT 条)"
+        echo "  - 统计信息 (from results.jsonl):"
+        python3 - <<'PY' "$RESULT_FILE" | sed 's/^/    /'
+import json
+import statistics
+import sys
+
+path = sys.argv[1]
+losses = []
+ppls = []
+with open(path, "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        if "loss" in rec:
+            losses.append(float(rec["loss"]))
+        if "ppl" in rec:
+            ppls.append(float(rec["ppl"]))
+
+def fmt_stats(name, vals):
+    if not vals:
+        print(f"{name}: N/A")
+        return
+    mean = statistics.fmean(vals)
+    std = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+    print(f"{name}: mean={mean:.4f} std={std:.4f} min={min(vals):.4f} max={max(vals):.4f} n={len(vals)}")
+
+fmt_stats("loss", losses)
+fmt_stats("ppl", ppls)
+PY
     else
         echo "  - 评估结果: 未生成"
     fi

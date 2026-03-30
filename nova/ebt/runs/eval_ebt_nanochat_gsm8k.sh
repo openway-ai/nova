@@ -192,11 +192,41 @@ main() {
             echo "    $NANOCHAT_SUMMARY"
             echo ""
         fi
-        # Also show PPL statistics if present
-        PPL_LINE=$(grep -E "Mean:.*[0-9]" "$NANOCHAT_EVAL_LOG" 2>/dev/null | head -4 || true)
-        if [ -n "$PPL_LINE" ]; then
-            echo "  NanoChat PPL/Loss 详情:"
-            echo "$PPL_LINE" | sed 's/^/    /'
+
+        # Prefer structured metrics from results.jsonl (more robust than grepping progress logs).
+        NANOCHAT_RESULT_FILE=$(find "$EVAL_RUN_DIR" -name "results.jsonl" -path "*/nanochat_shard_eval/*" 2>/dev/null | head -1 || true)
+        if [ -n "$NANOCHAT_RESULT_FILE" ] && [ -f "$NANOCHAT_RESULT_FILE" ]; then
+            echo "  NanoChat PPL/Loss 详情 (from results.jsonl):"
+            python3 - <<'PY' "$NANOCHAT_RESULT_FILE" | sed 's/^/    /'
+import json
+import statistics
+import sys
+
+path = sys.argv[1]
+losses = []
+ppls = []
+with open(path, "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        if "loss" in rec:
+            losses.append(float(rec["loss"]))
+        if "ppl" in rec:
+            ppls.append(float(rec["ppl"]))
+
+def fmt_stats(name, vals):
+    if not vals:
+        print(f"{name}: N/A")
+        return
+    mean = statistics.fmean(vals)
+    std = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+    print(f"{name}: mean={mean:.4f} std={std:.4f} min={min(vals):.4f} max={max(vals):.4f} n={len(vals)}")
+
+fmt_stats("loss", losses)
+fmt_stats("ppl", ppls)
+PY
             echo ""
         fi
     fi

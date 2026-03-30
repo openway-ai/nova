@@ -289,7 +289,12 @@ def main(args):
                 # Only compute EM/F1 for generation tasks (GSM8K, etc), not PPL tasks (nanochat)
                 if args.dataset_name in ["gsm8k", "arc", "humaneval", "mmlu", "smoltalk", "spellingbee"]:
                     em_score, f1_score = nlp_eval_acc(os.path.join(args.save_generation_logs_dir, "results.jsonl"))
-                    trainer.logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
+                    post_test_metrics = {"em_score": em_score, "f1_score": f1_score}
+                    if trainer.logger is not None and hasattr(trainer.logger, "log_metrics"):
+                        # Use Lightning logger API so this works across logger backends.
+                        trainer.logger.log_metrics(post_test_metrics)
+                    else:
+                        print(f"Post-test metrics: {post_test_metrics}")
                 else:
                     print(f"Skipping EM/F1 evaluation for PPL-only dataset: {args.dataset_name}")
         # elif args.modality == "VID":
