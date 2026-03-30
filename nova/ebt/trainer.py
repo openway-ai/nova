@@ -241,9 +241,19 @@ class ModelTrainer(LightningModule):
 
             if compile_mode == 'full':
                 # 编译整个模型 (可能与 autograd.grad 不兼容)
-                print(f"[torch.compile] 编译整个模型 (mode=full, backend={compile_backend}, dynamic={compile_dynamic})")
+                print(f"\n{'='*80}")
+                print(f"[torch.compile] 开始编译整个模型...")
+                print(f"[torch.compile] 模式: full | 后端: {compile_backend} | 动态: {compile_dynamic}")
                 print(f"[torch.compile] 警告: EBT 的 MCMC 循环使用 autograd.grad，可能导致编译失败")
+                print(f"[torch.compile] 首次编译可能需要 5-15 分钟，请耐心等待...")
+                print(f"{'='*80}\n")
+                import time
+                start_time = time.time()
                 self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
+                compile_time = time.time() - start_time
+                print(f"\n{'='*80}")
+                print(f"[torch.compile] ✓ 模型编译完成 (耗时: {compile_time:.1f}s)")
+                print(f"{'='*80}\n")
 
             elif compile_mode == 'transformer_only':
                 # 仅编译 transformer 部分 (推荐，避开 MCMC 循环)

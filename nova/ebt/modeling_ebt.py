@@ -221,10 +221,10 @@ class EBT_NLP(LightningModule):
                 else:
                     label_smoothing = ((total_mcmc_steps - 1) - mcmc_step) / (total_mcmc_steps - 1) * self.hparams.soften_target_prob_dist
                 predicted_distribution = predicted_distribution.reshape(-1, self.vocab_size)
-                cce_loss = F.cross_entropy(predicted_distribution, next_token_indices, label_smoothing=label_smoothing) # , ignore_index=self.tokenizer_pad_token_id
+                cce_loss = F.cross_entropy(predicted_distribution, next_token_indices, label_smoothing=label_smoothing, ignore_index=-1)
             else:
                 predicted_distribution = self.log_softmax(predicted_distribution).reshape(-1, self.vocab_size)
-                cce_loss = F.nll_loss(predicted_distribution, next_token_indices) # , ignore_index=self.tokenizer_pad_token_id)
+                cce_loss = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1)
             
             if self.hparams.truncate_mcmc:
                 if mcmc_step == (total_mcmc_steps - 1):
