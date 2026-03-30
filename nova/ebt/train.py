@@ -186,9 +186,12 @@ def main(args):
 
     model_trainer = ModelTrainer(args)
 
-    # if args.execution_mode == "finetune":
-    #     assert args.finetuning_model_ckpt != None and args.resume_training_ckpt == "", "Must provide a checkpoint when finetuning and cannot provide a resume_training_ckpt."
-    #     model_trainer.model = load_trained_pl_model(args.finetuning_model_ckpt, args)
+    # SFT: 加载预训练权重但不恢复训练状态
+    if args.finetuning_model_ckpt is not None and args.finetuning_model_ckpt != "":
+        print(f"[SFT] 加载预训练权重: {args.finetuning_model_ckpt}")
+        ckpt = torch.load(args.finetuning_model_ckpt, map_location='cpu', weights_only=False)
+        model_trainer.load_state_dict(ckpt['state_dict'], strict=False)
+        print(f"[SFT] 权重加载完成，训练从 step 0 开始")
 
     timestamp = int(time.time())
     dt_object = datetime.fromtimestamp(timestamp)

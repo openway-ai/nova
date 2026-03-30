@@ -1,160 +1,266 @@
 #!/bin/bash
+
 ################################################################################
-# EBT d26 SFT 训练脚本
-#
-# 加载预训练 checkpoint，在 NanoChat SFT 数据集上进行监督微调
-# 数据: SmolTalk + MMLU + GSM8K + CustomJSON + Spelling
-# 训练逻辑与 run_ebt_optimized_0313.sh 一致，仅更换数据集和学习率
+# EBT d26 SFT 训练脚本 (支持 Offline 模式)
+# 基于预训练模型进行监督微调
 ################################################################################
 
 set -e
 
 ### 基础配置 ###
 export RUN_NAME="ebt-d26-sft"
-export MODEL_NAME="ebt"
+export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
-### 环境变量 ###
+### 预训练权重 ###
+PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0318_20260324_164538_2026-03-24_16-46-34_/last.ckpt"
+
+### 环境变量 (对齐 resume_ebt_muon_adamw.sh + Offline 支持) ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-export NANOCHAT_OFFLINE_MODE=1
-export HF_DATASETS_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-export HF_HUB_OFFLINE=1
-export NANOCHAT_SFT_DATA_DIR="$NANOCHAT_BASE_DIR/sft_data"
+export NANOCHAT_SFT_DATA_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/sft_data"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
 export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"
 
-mkdir -p logs/slurm/nlp/
+# Offline 模式环境变量 (必须在 torchrun 前设置)
+export NANOCHAT_OFFLINE_MODE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+
+# mkdir -p logs/slurm/nlp/
+# module purge
 
 ################################################################################
-# 预训练 Checkpoint
-################################################################################
-PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt"
-
-if [ ! -f "$PRETRAIN_CKPT" ]; then
-    echo "❌ checkpoint 不存在: $PRETRAIN_CKPT"; exit 1
-fi
-
-################################################################################
-# SFT 数据检查
-################################################################################
-MISSING=()
-[ ! -d "$NANOCHAT_SFT_DATA_DIR/smol-smoltalk" ] && MISSING+=("smol-smoltalk")
-[ ! -d "$NANOCHAT_SFT_DATA_DIR/mmlu" ] && MISSING+=("mmlu")
-[ ! -d "$NANOCHAT_SFT_DATA_DIR/gsm8k" ] && MISSING+=("gsm8k")
-if [ ${#MISSING[@]} -gt 0 ]; then
-    echo "❌ 缺少 SFT 数据: ${MISSING[*]}"; exit 1
-fi
-echo "✓ SFT 数据就绪"
-
-################################################################################
-# EBT 核心参数 (与预训练一致)
+# EBT 核心超参数 (对齐预训练配置)
 ################################################################################
 MCMC_STEP_SIZE=500.0
 MCMC_STEP_SIZE_LR_MULTIPLIER=1500
 MCMC_NUM_STEPS=2
 EBT_TYPE="time_embed"
+NORMALIZE_INITIAL_CONDITION=true
 DENOISING_INITIAL_CONDITION="random_noise"
+MCMC_STEP_SIZE_LEARNABLE=true
+NO_MCMC_DETACH=false
 
 ################################################################################
-# SFT 训练参数
+# Batch 配置 (自动检测 GPU 数量)
 ################################################################################
-DEVICE_BATCH_SIZE=8
+NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)}
+NUM_GPUS=${NUM_GPUS:-8}
+DEVICE_BATCH_SIZE=4
 GRAD_ACCUM=8
-CONTEXT_LENGTH=256
-NUM_GPUS=8
+CONTEXT_LENGTH=512
 
-# SFT 数据 ~856K 条, 以 131k tokens/step 计, ~3000 步 ≈ 1 epoch
-MAX_STEPS=5000
-MAX_SCHEDULING_STEPS=5000
-
-# SFT 学习率: 预训练的 1/5, 防止灾难性遗忘
+################################################################################
+# SFT 学习率配置 (参考 chat_sft.py)
+################################################################################
+# SFT 使用较低学习率，防止灾难性遗忘
 PEAK_LR=0.00005
 WARM_UP_STEPS=250
 WARM_UP_BASE_LR_DIVIDER=10
-MIN_LR_SCALE=10
+MIN_LR_SCALE=50
 
-WEIGHT_DECAY=0.01
-BETA1=0.9
-BETA2=0.999
+################################################################################
+# 优化器配置 (对齐预训练)
+################################################################################
+WEIGHT_DECAY=0.2
+BETA1=0.8
+BETA2=0.95
 GRADIENT_CLIP_VAL=1.0
 
+################################################################################
+# SFT 训练步数
+################################################################################
+# SFT 数据 ~856K 条，根据实际需求调整
+MAX_STEPS=3000
+MAX_SCHEDULING_STEPS=3000
+
+################################################################################
+# 验证与数据加载配置
+################################################################################
 VAL_CHECK_INTERVAL=500
-LIMIT_VAL_BATCHES=30
+LIMIT_VAL_BATCHES=50
 NUM_WORKERS=8
 
 ################################################################################
-# 日志
+# 优化选项配置 (对齐预训练 Muon+AdamW)
+################################################################################
+OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
+
+################################################################################
+# torch.compile 配置 (对齐预训练)
+################################################################################
+COMPILE_FLAGS="--compile_model --compile_mode full"
+WANDB_FLAGS=""
+
+################################################################################
+# Checkpoint 管理配置
+################################################################################
+SAVE_TOP_K=2
+
+################################################################################
+# 数据集检查 (Offline 模式)
+################################################################################
+echo ""
+echo "=================================="
+echo "  检查 Offline 数据集"
+echo "=================================="
+echo "数据集路径: ${NANOCHAT_SFT_DATA_DIR}"
+
+MISSING_DATASETS=()
+
+# 检查必需的数据集
+[ ! -d "${NANOCHAT_SFT_DATA_DIR}/smol-smoltalk" ] && MISSING_DATASETS+=("smol-smoltalk")
+[ ! -d "${NANOCHAT_SFT_DATA_DIR}/mmlu" ] && MISSING_DATASETS+=("mmlu")
+[ ! -d "${NANOCHAT_SFT_DATA_DIR}/gsm8k" ] && MISSING_DATASETS+=("gsm8k")
+[ ! -f "${NANOCHAT_SFT_DATA_DIR}/words_alpha.txt" ] && MISSING_DATASETS+=("words_alpha.txt")
+
+if [ ${#MISSING_DATASETS[@]} -gt 0 ]; then
+    echo "✗ 缺少以下离线数据集:"
+    for dataset in "${MISSING_DATASETS[@]}"; do
+        echo "  - $dataset"
+    done
+    echo ""
+    echo "请先在联网环境下载数据集:"
+    echo "  cd /mnt/shared-storage-user/puyuan/code/nanochat"
+    echo "  python runs/download_sft_datasets.py"
+    echo ""
+    echo "或设置环境变量指向已下载的数据集:"
+    echo "  export NANOCHAT_SFT_DATA_DIR=/path/to/sft_data"
+    exit 1
+fi
+
+echo "✓ SmolTalk: ${NANOCHAT_SFT_DATA_DIR}/smol-smoltalk"
+echo "✓ MMLU: ${NANOCHAT_SFT_DATA_DIR}/mmlu"
+echo "✓ GSM8K: ${NANOCHAT_SFT_DATA_DIR}/gsm8k"
+echo "✓ words_alpha.txt: ${NANOCHAT_SFT_DATA_DIR}/words_alpha.txt"
+
+# 检查 checkpoint
+if [ ! -f "${PRETRAIN_CKPT}" ]; then
+    echo "✗ Checkpoint 不存在: ${PRETRAIN_CKPT}"
+    exit 1
+fi
+echo "✓ Checkpoint: ${PRETRAIN_CKPT}"
+echo ""
+
+################################################################################
+# 日志配置
 ################################################################################
 current_time=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="logs/${current_time}_ebt_d26_sft.log"
+LOG_FILE="logs/${current_time}_${MODEL_NAME}_${MODEL_SIZE}_sft.log"
 mkdir -p logs
 
+################################################################################
+# 显示配置
+################################################################################
+echo "=================================="
+echo "  EBT d26 SFT 训练"
+echo "=================================="
+echo "Pretrain ckpt: ${PRETRAIN_CKPT}"
+echo "Dataset:       nanochat_sft"
+echo "Peak LR:       ${PEAK_LR}"
+echo "Max steps:     ${MAX_STEPS}"
+echo "Log file:      ${LOG_FILE}"
 echo ""
-echo "════════════════════════════════════════════════════════════════"
-echo "  EBT d26 SFT (监督微调)"
-echo "════════════════════════════════════════════════════════════════"
-echo "  Checkpoint:  $PRETRAIN_CKPT"
-echo "  数据集:      nanochat_sft (SmolTalk+MMLU+GSM8K+Spelling)"
-echo "  Peak LR:     $PEAK_LR (预训练的 1/5)"
-echo "  Max Steps:   $MAX_STEPS"
-echo "  日志:        $LOG_FILE"
-echo "════════════════════════════════════════════════════════════════"
-echo ""
-read -p "按 Enter 开始，Ctrl+C 取消..."
+read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
 
 ################################################################################
-# 启动训练
+# 写入日志头
 ################################################################################
-set +e
-torchrun --standalone --nproc_per_node=${NUM_GPUS} \
-    /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
-    --run_name ${RUN_NAME}_${current_time} \
-    --modality "NLP" \
-    --model_name ${MODEL_NAME} \
-    --model_size ${MODEL_SIZE} \
-    --resume_training_ckpt "$PRETRAIN_CKPT" \
-    --dataset_name "nanochat_sft" \
-    --normalize_initial_condition \
-    --ebt_type ${EBT_TYPE} \
-    --denoising_initial_condition ${DENOISING_INITIAL_CONDITION} \
-    --mcmc_step_size_learnable \
-    --mcmc_step_size ${MCMC_STEP_SIZE} \
-    --mcmc_step_size_lr_multiplier ${MCMC_STEP_SIZE_LR_MULTIPLIER} \
-    --mcmc_num_steps ${MCMC_NUM_STEPS} \
-    --context_length ${CONTEXT_LENGTH} \
-    --gpus "-1" \
-    --peak_learning_rate ${PEAK_LR} \
-    --batch_size_per_device ${DEVICE_BATCH_SIZE} \
-    --accumulate_grad_batches ${GRAD_ACCUM} \
-    --gradient_clip_val ${GRADIENT_CLIP_VAL} \
-    --weight_decay ${WEIGHT_DECAY} \
-    --beta1 ${BETA1} \
-    --beta2 ${BETA2} \
-    --min_lr_scale ${MIN_LR_SCALE} \
-    --max_steps ${MAX_STEPS} \
-    --max_scheduling_steps ${MAX_SCHEDULING_STEPS} \
-    --warm_up_steps ${WARM_UP_STEPS} \
-    --warm_up_base_lr_divider ${WARM_UP_BASE_LR_DIVIDER} \
-    --num_workers ${NUM_WORKERS} \
-    --val_check_interval ${VAL_CHECK_INTERVAL} \
-    --limit_val_batches ${LIMIT_VAL_BATCHES} \
-    --val_sanity 1 \
-    --validation_split_pct 0.0027 \
-    --wandb_project 'nlp_sft' \
-    --log_model_archi \
-    --set_matmul_precision "medium" \
-    --wandb_watch \
-    2>&1 | tee -a "${LOG_FILE}"
+cat << LOG_HEADER > "${LOG_FILE}"
+################################################################################
+#                    EBT d26 SFT 训练日志
+################################################################################
+#
+# Run Name:        ${RUN_NAME}_${current_time}
+# Pretrain From:   ${PRETRAIN_CKPT}
+# Start Time:      $(date '+%Y-%m-%d %H:%M:%S')
+# Log File:        ${LOG_FILE}
+#
+################################################################################
+
+LOG_HEADER
+
+{
+echo "================================================================================"
+echo "[SYSTEM INFO]"
+echo "================================================================================"
+echo "Hostname:         $(hostname)"
+echo "User:             $(whoami)"
+echo "Python:           $(python3 --version 2>&1)"
+echo "PyTorch:          $(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'N/A')"
+echo "CUDA Available:   $(python3 -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo 'N/A')"
+echo "GPU Count:        $(python3 -c 'import torch; print(torch.cuda.device_count())' 2>/dev/null || echo '0')"
+echo ""
+echo "================================================================================"
+echo "[SFT 训练配置]"
+echo "================================================================================"
+echo "Pretrain Checkpoint: ${PRETRAIN_CKPT}"
+echo "Dataset:             nanochat_sft"
+echo "Peak LR:             ${PEAK_LR}"
+echo "Max Steps:           ${MAX_STEPS}"
+echo ""
+echo "================================================================================"
+echo "[开始训练]"
+echo "================================================================================"
+echo ""
+
+set -e
+
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
+--run_name ${RUN_NAME}_${current_time} \
+--modality "NLP" \
+--model_name ${MODEL_NAME} \
+--model_size ${MODEL_SIZE} \
+--pretokenize_dataset \
+--normalize_initial_condition \
+--ebt_type ${EBT_TYPE} \
+--denoising_initial_condition ${DENOISING_INITIAL_CONDITION} \
+--mcmc_step_size_learnable \
+--mcmc_step_size ${MCMC_STEP_SIZE} \
+--mcmc_step_size_lr_multiplier ${MCMC_STEP_SIZE_LR_MULTIPLIER} \
+--mcmc_num_steps ${MCMC_NUM_STEPS} \
+--context_length ${CONTEXT_LENGTH} \
+--gpus "-1" \
+--peak_learning_rate ${PEAK_LR} \
+--batch_size_per_device ${DEVICE_BATCH_SIZE} \
+--accumulate_grad_batches ${GRAD_ACCUM} \
+--gradient_clip_val ${GRADIENT_CLIP_VAL} \
+--weight_decay ${WEIGHT_DECAY} \
+--beta1 ${BETA1} \
+--beta2 ${BETA2} \
+--min_lr_scale ${MIN_LR_SCALE} \
+--max_steps ${MAX_STEPS} \
+--max_scheduling_steps ${MAX_SCHEDULING_STEPS} \
+--warm_up_steps ${WARM_UP_STEPS} \
+--warm_up_base_lr_divider ${WARM_UP_BASE_LR_DIVIDER} \
+--dataset_name "nanochat_sft" \
+--num_workers ${NUM_WORKERS} \
+--val_check_interval ${VAL_CHECK_INTERVAL} \
+--limit_val_batches ${LIMIT_VAL_BATCHES} \
+--val_sanity 1 \
+--validation_split_pct 0.0027 \
+--wandb_project 'nlp_sft' \
+--log_model_archi \
+--set_matmul_precision "medium" \
+--save_top_k_ckpts ${SAVE_TOP_K} \
+--finetuning_model_ckpt ${PRETRAIN_CKPT} \
+${WANDB_FLAGS} \
+${OPTION_FLAGS} \
+${COMPILE_FLAGS}
 
 TRAIN_EXIT_CODE=$?
 set -e
 
-echo ""
-if [[ $TRAIN_EXIT_CODE -eq 0 ]]; then
-    echo "✓ SFT 训练完成 | 日志: ${LOG_FILE}"
+if [ $TRAIN_EXIT_CODE -eq 0 ]; then
+    echo -e "\033[0;32m✓ SFT 训练成功完成\033[0m"
 else
-    echo "✗ SFT 训练失败 (exit=$TRAIN_EXIT_CODE) | 日志: ${LOG_FILE}"
+    echo -e "\033[0;31m✗ SFT 训练异常退出 (exit code: $TRAIN_EXIT_CODE)\033[0m"
 fi
+
+} 2>&1 | tee -a "${LOG_FILE}"
+
+echo ""
+echo "日志已保存到: ${LOG_FILE}"

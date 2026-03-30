@@ -18,6 +18,8 @@ class DiskAwareCheckpoint(ModelCheckpoint):
     def _check_disk_space(self):
         """检查磁盘剩余空间（GB）"""
         if self.dirpath:
+            # 确保目录存在
+            Path(self.dirpath).mkdir(parents=True, exist_ok=True)
             stat = shutil.disk_usage(self.dirpath)
             free_gb = stat.free / (1024**3)
             return free_gb

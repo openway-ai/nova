@@ -14,6 +14,7 @@ Working 50 minutes, she earned 0.2 x 50 = $<<0.2*50=10>>10.
 Notice that GSM8K uses tool calls inside << >> tags.
 """
 
+import os
 import re
 from datasets import load_dataset
 from tasks.common import Task
@@ -40,7 +41,24 @@ class GSM8K(Task):
         super().__init__(**kwargs)
         assert subset in ["main", "socratic"], "GSM8K subset must be main|socratic"
         assert split in ["train", "test"], "GSM8K split must be train|test"
-        self.ds = load_dataset("openai/gsm8k", subset, split=split).shuffle(seed=42)
+
+        # 支持离线数据集
+        cache_dir = None
+        download_mode = None
+        if os.environ.get("NANOCHAT_SFT_DATA_DIR"):
+            cache_dir = os.path.join(os.environ["NANOCHAT_SFT_DATA_DIR"], "gsm8k")
+            if os.path.exists(cache_dir):
+                download_mode = "reuse_cache_if_exists"
+            else:
+                cache_dir = None
+
+        self.ds = load_dataset(
+            "openai/gsm8k",
+            subset,
+            split=split,
+            cache_dir=cache_dir,
+            download_mode=download_mode
+        ).shuffle(seed=42)
 
     @property
     def eval_type(self):

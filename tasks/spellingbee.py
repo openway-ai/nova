@@ -28,6 +28,7 @@ python -m tasks.spellingbee
 
 import re
 import random
+import os
 from tasks.common import Task
 from nanochat.common import download_file_with_lock
 
@@ -37,6 +38,18 @@ LETTERS = "abcdefghijklmnopqrstuvwxyz"
 WORD_LIST_URL = "https://raw.githubusercontent.com/dwyl/english-words/refs/heads/master/words_alpha.txt"
 # A number bigger than 370K to separate train and test random seeds
 TEST_RANDOM_SEED_OFFSET = 10_000_000
+
+
+def get_word_list_path():
+    """获取 words_alpha.txt 路径，支持 offline 模式"""
+    # 优先使用离线数据集
+    if os.environ.get("NANOCHAT_SFT_DATA_DIR"):
+        offline_path = os.path.join(os.environ["NANOCHAT_SFT_DATA_DIR"], "words_alpha.txt")
+        if os.path.exists(offline_path):
+            return offline_path
+    # 回退到在线下载
+    filename = WORD_LIST_URL.split("/")[-1]
+    return download_file_with_lock(WORD_LIST_URL, filename)
 
 # Identical to gsm8k's answer extraction
 ANSWER_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
@@ -119,8 +132,7 @@ class SpellingBee(Task):
         assert split in ["train", "test"], "SpellingBee split must be train|test"
         self.size = size
         self.split = split
-        filename = WORD_LIST_URL.split("/")[-1]
-        word_list_path = download_file_with_lock(WORD_LIST_URL, filename)
+        word_list_path = get_word_list_path()
         with open(word_list_path, 'r', encoding='utf-8') as f:
             words = [line.strip() for line in f]
         self.words = words
@@ -238,8 +250,7 @@ class SimpleSpelling(Task):
         assert split in ["train", "test"], "SpellingBee split must be train|test"
         self.size = size
         self.split = split
-        filename = WORD_LIST_URL.split("/")[-1]
-        word_list_path = download_file_with_lock(WORD_LIST_URL, filename)
+        word_list_path = get_word_list_path()
         with open(word_list_path, 'r', encoding='utf-8') as f:
             words = [line.strip() for line in f]
         rng = random.Random(42)
