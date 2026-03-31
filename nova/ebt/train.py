@@ -765,6 +765,16 @@ if __name__ == '__main__':
     
     parser.add_argument("--infer_logprobs", help="[Inference] Return log probabilities of generated tokens", type=bool, default=False)
 
+    parser.add_argument("--infer_block_size", help="[Inference] Block decode size. 1 keeps legacy single-token decode path.", type=int, default=2)
+
+    parser.add_argument("--infer_block_use_refine", help="[Inference] When infer_block_size > 1, run EBT block MCMC refinement before committing.", type=bool, default=True)
+
+    parser.add_argument("--infer_block_refine_steps", help="[Inference] Number of MCMC refinement steps for block mode; <=0 skips block refinement.", type=int, default=1)
+
+    parser.add_argument("--infer_block_init_logit_scale", help="[Inference] Initial one-hot logit scale used to initialize block refinement logits.", type=float, default=8.0)
+
+    parser.add_argument("--infer_block_diagnose", help="[Inference] Print blockwise refine diagnostics (ids/logit delta/energy/grad norm).", action="store_true", default=False)
+
     # VID INFERENCE ########################################################################
 
     parser.add_argument("--infer_video_condition_frames", help="[Inference] number of frames to condition generation on", type=int, default=3)

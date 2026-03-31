@@ -90,6 +90,27 @@ def _get_tokenizer(hparams):
     return tokenizer
 
 
+def _draft_block_tokens(hparams, model, tokens, cur_pos, block_size, input_text_mask, temperature, top_p, bsz):
+    draft_tokens = []
+    draft_logits = []
+    for offset in range(block_size):
+        pos = cur_pos + offset
+        input_tokens = tokens[:, :pos]
+        logits = call_model_forward_decode(hparams, model, input_tokens, 0, bsz)
+        next_logits = logits[:, -1]
+        if temperature > 0:
+            probs = torch.softmax(next_logits / temperature, dim=-1)
+            next_token = sample_top_p(probs, top_p)
+        else:
+            next_token = torch.argmax(next_logits, dim=-1)
+        next_token = next_token.reshape(-1)
+        next_token = torch.where(input_text_mask[:, pos], tokens[:, pos], next_token)
+        tokens[:, pos] = next_token
+        draft_tokens.append(next_token.unsqueeze(1))
+        draft_logits.append(next_logits.unsqueeze(1))
+    return torch.cat(draft_tokens, dim=1), torch.cat(draft_logits, dim=1)
+
+
 def generate_text(model, batch, hparams):
     tokenizer = _get_tokenizer(hparams)
 
@@ -127,6 +148,12 @@ def generate_text(model, batch, hparams):
     top_p = hparams.infer_topp
     logprobs = hparams.infer_logprobs
     echo = hparams.infer_echo
+    infer_block_size = max(1, int(getattr(hparams, "infer_block_size", 1)))
+    infer_block_use_refine = bool(getattr(hparams, "infer_block_use_refine", True))
+    infer_block_refine_steps = int(getattr(hparams, "infer_block_refine_steps", 0))
+    infer_block_init_logit_scale = float(getattr(hparams, "infer_block_init_logit_scale", 8.0))
+    if infer_block_size > 1 and logprobs:
+        raise NotImplementedError("logprobs=True is not supported in block inference mode yet")
     # ppl = model.forward_loss_wrapper(questions, phase="test")['perplexity'].item() # just in case want to debug model PPL
 
     prompt_tokens = [] #NOTE this was to fix a bug where this generation code was not working for bs > 1 due to pad_token_id being same as eos_token_id and min_prompt_len being wrong
@@ -164,36 +191,94 @@ def generate_text(model, batch, hparams):
                 reduction="none",
                 ignore_index=pad_id,
             )
-        for cur_pos in range(min_prompt_len, total_len):
-            input_tokens = tokens[:, :cur_pos] # NOTE removed prev_pos since are not using start_pos in model forward for now, TODO eventually add back
-            logits = call_model_forward_decode(hparams, model, input_tokens, prev_pos, bsz)
-            if temperature > 0:
-                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                next_token = sample_top_p(probs, top_p)
-            else:
-                next_token = torch.argmax(logits[:, -1], dim=-1)
-            
-            next_token = next_token.reshape(-1)
-            # only replace token if prompt has already been generated
-            next_token = torch.where(
-                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
-            )
-            tokens[:, cur_pos] = next_token
-            if logprobs:
-                token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
-                    input=logits.transpose(1, 2),
-                    target=tokens[:, prev_pos + 1 : cur_pos + 1],
-                    reduction="none",
-                    ignore_index=pad_id,
+        if infer_block_size <= 1:
+            for cur_pos in range(min_prompt_len, total_len):
+                input_tokens = tokens[:, :cur_pos] # NOTE removed prev_pos since are not using start_pos in model forward for now, TODO eventually add back
+                logits = call_model_forward_decode(hparams, model, input_tokens, prev_pos, bsz)
+                if temperature > 0:
+                    probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                    next_token = sample_top_p(probs, top_p)
+                else:
+                    next_token = torch.argmax(logits[:, -1], dim=-1)
+                
+                next_token = next_token.reshape(-1)
+                # only replace token if prompt has already been generated
+                next_token = torch.where(
+                    input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
                 )
-            # Get EOS token ID safely (use the same logic as above)
-            eos_token_id = getattr(tokenizer, 'eos_token_id', getattr(tokenizer, 'bos_token_id', 0))
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                next_token == eos_token_id
-            )
-            prev_pos = cur_pos
-            if all(eos_reached):
-                break
+                tokens[:, cur_pos] = next_token
+                if logprobs:
+                    token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
+                        input=logits.transpose(1, 2),
+                        target=tokens[:, prev_pos + 1 : cur_pos + 1],
+                        reduction="none",
+                        ignore_index=pad_id,
+                    )
+                # Get EOS token ID safely (use the same logic as above)
+                eos_token_id = getattr(tokenizer, 'eos_token_id', getattr(tokenizer, 'bos_token_id', 0))
+                eos_reached |= (~input_text_mask[:, cur_pos]) & (
+                    next_token == eos_token_id
+                )
+                prev_pos = cur_pos
+                if all(eos_reached):
+                    break
+        else:
+            cur_pos = min_prompt_len
+            while cur_pos < total_len:
+                block_size = min(infer_block_size, total_len - cur_pos)
+                draft_block_ids, draft_block_logits = _draft_block_tokens(
+                    hparams=hparams,
+                    model=model,
+                    tokens=tokens,
+                    cur_pos=cur_pos,
+                    block_size=block_size,
+                    input_text_mask=input_text_mask,
+                    temperature=temperature,
+                    top_p=top_p,
+                    bsz=bsz,
+                )
+
+                commit_block_ids = draft_block_ids
+                commit_block_logits = draft_block_logits
+                if (
+                    hparams.model_name == "ebt"
+                    and infer_block_use_refine
+                    and infer_block_refine_steps > 0
+                    and hasattr(model, "ebt_refine_block_fast")
+                    and block_size > 0
+                ):
+                    refined_block_logits, refined_block_ids = model.ebt_refine_block_fast(
+                        context_ids=tokens[:, :cur_pos],
+                        draft_block_ids=draft_block_ids,
+                        refine_steps=infer_block_refine_steps,
+                        init_logit_scale=infer_block_init_logit_scale,
+                        start_pos=0,
+                        learning=False,
+                    )
+                    commit_block_ids = refined_block_ids
+                    commit_block_logits = refined_block_logits
+
+                eos_token_id = getattr(tokenizer, 'eos_token_id', getattr(tokenizer, 'bos_token_id', 0))
+                for offset in range(block_size):
+                    pos = cur_pos + offset
+                    next_token = commit_block_ids[:, offset].reshape(-1)
+                    next_token = torch.where(input_text_mask[:, pos], tokens[:, pos], next_token)
+                    tokens[:, pos] = next_token
+
+                    if logprobs:
+                        token_logprobs[:, pos] = -F.cross_entropy(
+                            input=commit_block_logits[:, offset, :],
+                            target=tokens[:, pos],
+                            reduction="none",
+                            ignore_index=pad_id,
+                        )
+
+                    eos_reached |= (~input_text_mask[:, pos]) & (next_token == eos_token_id)
+                    prev_pos = pos
+
+                if all(eos_reached):
+                    break
+                cur_pos += block_size
 
     if logprobs:
         token_logprobs = token_logprobs.tolist()

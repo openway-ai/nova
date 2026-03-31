@@ -27,6 +27,7 @@ export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/n
 export OMP_NUM_THREADS=1
 export NANOCHAT_OFFLINE_MODE=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+export PYTHONNOUSERSITE=1
 
 ################################################################################
 # 参数 (优先使用环境变量，否则使用默认值)
@@ -39,6 +40,11 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 LIMIT_TEST_BATCHES="${LIMIT_TEST_BATCHES:-100}"
 USE_WANDB="${USE_WANDB:-false}"
 WANDB_API_KEY="${WANDB_API_KEY:-}"
+INFER_BLOCK_SIZE="${INFER_BLOCK_SIZE:-1}"
+INFER_BLOCK_USE_REFINE="${INFER_BLOCK_USE_REFINE:-true}"
+INFER_BLOCK_REFINE_STEPS="${INFER_BLOCK_REFINE_STEPS:-0}"
+INFER_BLOCK_INIT_LOGIT_SCALE="${INFER_BLOCK_INIT_LOGIT_SCALE:-8.0}"
+INFER_BLOCK_DIAGNOSE="${INFER_BLOCK_DIAGNOSE:-false}"
 
 # 分片评估特定参数
 EVAL_SHARD_INDICES="${EVAL_SHARD_INDICES:-0,15}"
@@ -96,6 +102,7 @@ echo "📁 Checkpoint: $CKPT_PATH"
 echo "📁 Tokenizer: $TOKENIZER_PATH"
 echo "📁 输出目录: $INFER_OUTPUT_DIR"
 echo "📁 日志文件: $LOG_FILE"
+echo "🧱 Block推理: size=$INFER_BLOCK_SIZE | refine=$INFER_BLOCK_USE_REFINE | steps=$INFER_BLOCK_REFINE_STEPS | init_scale=$INFER_BLOCK_INIT_LOGIT_SCALE"
 echo "📊 评估分片: $EVAL_SHARD_INDICES"
 echo "📊 每分片样本数: $MAX_SAMPLES_PER_SHARD"
 echo "🎯 文本生成: $ENABLE_GENERATION"
@@ -131,6 +138,11 @@ if [ "$ENABLE_GENERATION" = "true" ]; then
     GENERATION_FLAGS="--enable_nanochat_generation --generation_split_ratio $GENERATION_SPLIT_RATIO --min_generation_length $MIN_GENERATION_LENGTH"
 fi
 
+BLOCK_DIAG_FLAG=""
+if [ "$INFER_BLOCK_DIAGNOSE" = "true" ]; then
+    BLOCK_DIAG_FLAG="--infer_block_diagnose"
+fi
+
 {
 $PYTHON train.py \
     --only_test \
@@ -145,7 +157,13 @@ $PYTHON train.py \
     --infer_max_gen_len 256 \
     --infer_temp 0.6 \
     --infer_topp 0.9 \
+    --infer_block_size "$INFER_BLOCK_SIZE" \
+    --infer_block_use_refine "$INFER_BLOCK_USE_REFINE" \
+    --infer_block_refine_steps "$INFER_BLOCK_REFINE_STEPS" \
+    --infer_block_init_logit_scale "$INFER_BLOCK_INIT_LOGIT_SCALE" \
+    $BLOCK_DIAG_FLAG \
     --gpus "$GPUS" \
+    --distributed_strategy "auto" \
     --batch_size_per_device "$BATCH_SIZE" \
     --limit_test_batches "$LIMIT_TEST_BATCHES" \
     --num_workers 0 \
