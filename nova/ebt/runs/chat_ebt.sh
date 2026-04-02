@@ -26,15 +26,26 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 
 # 默认配置
-DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt"
+# DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt"
+
+# base_train bpb 0.81
+# DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
+DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
+
+# base_train bpb 0.85 sft_train 'valid_loss' reached 8.15313 
+# DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-sft_20260331_001308_2026-03-31_00-13-29_/e=epoch=0-s=step=2312-lr5e-05-bs4x8-muon_adamw-valid_loss=valid_loss=8.1531.ckpt"
+# DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-sft_20260331_001308_2026-03-31_00-13-29_/last.ckpt"
+
 DEFAULT_TOKENIZER="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer"
 
 # 从环境变量读取配置
 CKPT_PATH="${CKPT_PATH:-$DEFAULT_CKPT}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$DEFAULT_TOKENIZER}"
 TEMPERATURE="${TEMPERATURE:-0.8}"
+# TEMPERATURE="${TEMPERATURE:-0.6}"
 TOP_P="${TOP_P:-0.9}"
-MAX_TOKENS="${MAX_TOKENS:-256}"
+MAX_TOKENS="${MAX_TOKENS:-512}"
+# MAX_TOKENS="${MAX_TOKENS:-256}"
 DTYPE="${DTYPE:-bfloat16}"
 DEVICE="${DEVICE:-cuda}"
 

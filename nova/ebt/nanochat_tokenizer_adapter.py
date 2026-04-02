@@ -160,8 +160,14 @@ class NanoChatTokenizerWrapper:
 
         # Filter out special tokens if requested
         if skip_special_tokens:
-            # Remove BOS, EOS, PAD tokens (they're all the same ID)
+            # 过滤所有 nanochat special tokens（bos/eos/pad 以及 chat 模板 token）
             special_token_ids = {self.bos_token_id, self.eos_token_id, self.pad_token_id, self.unk_token_id}
+            # 动态加入所有 chat 模板 special token（<|user_start|> 等）
+            for name in ["<|user_start|>", "<|user_end|>", "<|assistant_start|>", "<|assistant_end|>",
+                         "<|python_start|>", "<|python_end|>", "<|output_start|>", "<|output_end|>"]:
+                tid = self.tokenizer.encode_special(name) if hasattr(self.tokenizer, 'encode_special') else None
+                if tid is not None:
+                    special_token_ids.add(tid)
             token_ids = [tid for tid in token_ids if tid not in special_token_ids]
 
         return self.tokenizer.decode(token_ids)
@@ -180,6 +186,11 @@ class NanoChatTokenizerWrapper:
             # Filter out special tokens if requested
             if skip_special_tokens:
                 special_token_ids = {self.bos_token_id, self.eos_token_id, self.pad_token_id, self.unk_token_id}
+                for name in ["<|user_start|>", "<|user_end|>", "<|assistant_start|>", "<|assistant_end|>",
+                             "<|python_start|>", "<|python_end|>", "<|output_start|>", "<|output_end|>"]:
+                    tid = self.tokenizer.encode_special(name) if hasattr(self.tokenizer, 'encode_special') else None
+                    if tid is not None:
+                        special_token_ids.add(tid)
                 seq = [tid for tid in seq if tid not in special_token_ids]
 
             result.append(self.tokenizer.decode(seq))

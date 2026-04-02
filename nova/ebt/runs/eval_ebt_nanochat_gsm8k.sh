@@ -18,7 +18,10 @@ EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 ################################################################################
 
 # Checkpoint 路径
-export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt}"
+# export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt}"
+# base_train bpb 0.81
+export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt}"
+
 
 if [ ! -f "$CKPT_PATH" ]; then
     echo "❌ 未找到 checkpoint: $CKPT_PATH"
