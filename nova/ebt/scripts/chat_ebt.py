@@ -10,17 +10,6 @@ EBT 交互式对话脚本 - 与训练好的 EBT 模型进行交互式对话
     python -m scripts.chat_ebt --show-mcmc               # 展示 MCMC 步骤
     python -m scripts.chat_ebt --show-mcmc --verbose     # 详细展示每步信息
     python -m scripts.chat_ebt -c /path/to/checkpoint    # 指定 checkpoint
-
-参数:
-    -c, --checkpoint      Checkpoint 路径
-    --tokenizer           Tokenizer 路径
-    -t, --temperature     生成温度 (默认: 0.8)
-    --top-p               Top-P 采样 (默认: 0.9)
-    -m, --max-tokens      最大生成 tokens (默认: 256)
-    --show-mcmc           展示 MCMC 步骤过程
-    --verbose             详细模式，展示更多指标
-    --show-energy         展示能量值变化
-    --show-distribution   展示概率分布变化
 """
 
 import argparse
@@ -32,6 +21,14 @@ import torch.nn.functional as F
 from contextlib import nullcontext
 from typing import Optional, List, Dict, Any, Tuple
 import numpy as np
+
+# 导入 generate.py 的函数
+repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, repo_root)
+sys.path.insert(0, os.path.join(repo_root, 'nova', 'ebt'))
+
+# 从 generate.py 导入核心逻辑，保证行为 100% 一致
+from generate import call_model_forward_decode, _get_tokenizer, sample_top_p
 
 # 清除分布式训练环境变量
 for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT']:
@@ -89,50 +86,6 @@ def print_banner():
     print_colored(banner, Colors.CYAN)
 
 
-def format_energy(energy: float, width: int = 10) -> str:
-    """格式化能量值显示"""
-    if energy > 0:
-        return f"{Colors.RED}+{energy:>{width-1}.6f}{Colors.RESET}"
-    else:
-        return f"{Colors.GREEN}{energy:>{width}.6f}{Colors.RESET}"
-
-
-def format_energy_bar(energy: float, min_energy: float, max_energy: float, width: int = 20) -> str:
-    """生成能量条形图"""
-    if max_energy == min_energy:
-        ratio = 0.5
-    else:
-        ratio = (energy - min_energy) / (max_energy - min_energy)
-    ratio = max(0, min(1, ratio))
-
-    filled = int(ratio * width)
-    empty = width - filled
-
-    # 使用渐变色
-    if ratio < 0.3:
-        color = Colors.GREEN
-    elif ratio < 0.7:
-        color = Colors.YELLOW
-    else:
-        color = Colors.RED
-
-    bar = f"{color}{'█' * filled}{Colors.GRAY}{'░' * empty}{Colors.RESET}"
-    return bar
-
-
-def format_top_tokens(probs: torch.Tensor, tokenizer, top_k: int = 5) -> str:
-    """格式化显示 top-k tokens"""
-    top_probs, top_indices = torch.topk(probs, min(top_k, probs.shape[-1]))
-    tokens_str = []
-    for prob, idx in zip(top_probs.tolist(), top_indices.tolist()):
-        token_text = tokenizer.decode([idx])
-        token_text = repr(token_text)[1:-1]  # 显示特殊字符
-        if len(token_text) > 10:
-            token_text = token_text[:10] + "..."
-        tokens_str.append(f"'{token_text}':{prob:.3f}")
-    return " | ".join(tokens_str)
-
-
 class EBTChatEngine:
     """EBT 对话引擎"""
 
@@ -170,15 +123,6 @@ class EBTChatEngine:
         """加载模型和 tokenizer"""
         print_colored("正在加载模型...", Colors.YELLOW)
 
-        # 加载 tokenizer
-        # 需要到达仓库根目录（nova/ebt/scripts -> nova/ebt -> nova -> nova(repo root)）
-        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-        sys.path.insert(0, repo_root)
-
-        from nanochat.tokenizer import get_tokenizer
-        self.tokenizer = get_tokenizer()
-        print(f"  Tokenizer vocab size: {self.tokenizer.get_vocab_size()}")
-
         # 加载 checkpoint
         print(f"  Loading checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
@@ -200,41 +144,62 @@ class EBTChatEngine:
         if isinstance(self.hparams, dict):
             self.hparams = HParamsNamespace(self.hparams)
 
-        # 设置 tokenizer_obj
+        # 【修复点 1】: 使用 generate.py 的 _get_tokenizer
+        self.tokenizer = _get_tokenizer(self.hparams)
+        
+        # 兼容性：如果 tokenizer 有 get_vocab_size 方法则调用，否则使用 len
+        vocab_size = self.tokenizer.get_vocab_size() if hasattr(self.tokenizer, 'get_vocab_size') else len(self.tokenizer)
+        print(f"  Raw tokenizer vocab size: {vocab_size}")
+
+        # 【修复点 1.5】: 动态补齐 get_vocab_size 方法
+        if not hasattr(self.tokenizer, 'get_vocab_size'):
+            if hasattr(self.tokenizer, 'tokenizer_obj') and hasattr(self.tokenizer.tokenizer_obj, 'get_vocab_size'):
+                self.tokenizer.get_vocab_size = self.tokenizer.tokenizer_obj.get_vocab_size
+            else:
+                self.tokenizer.get_vocab_size = lambda: len(self.tokenizer)
+
         self.hparams.tokenizer_obj = self.tokenizer
 
         # 创建模型
         from modeling_ebt import EBT_NLP
         self.model = EBT_NLP(self.hparams)
 
-        # 加载权重
-        state_dict = checkpoint['state_dict']
-        # 移除 'model.' 前缀
+        # 【修复点 5】: 彻底清洗 state_dict 键名，解决 torch.compile 带来的 _orig_mod 前缀问题
+        state_dict = checkpoint.get('state_dict', checkpoint)
         new_state_dict = {}
         for k, v in state_dict.items():
-            if k.startswith('model.'):
-                new_state_dict[k[6:]] = v
-            else:
-                new_state_dict[k] = v
+            new_key = k
+            # 1. 剥离 PyTorch Lightning 或 DDP 可能带来的 'model.' 前缀
+            if new_key.startswith('model.'):
+                new_key = new_key[6:]
+            # 2. 剥离 torch.compile 带来的 '_orig_mod.' 前缀
+            if new_key.startswith('_orig_mod.'):
+                new_key = new_key[10:]
+            
+            new_state_dict[new_key] = v
 
-        self.model.load_state_dict(new_state_dict, strict=False)
-        self.model = self.model.to(self.device).to(self.dtype)
+        # 尝试加载权重，并强制要求严格匹配 (strict=True)，这样如果有遗漏能立刻发现
+        try:
+            self.model.load_state_dict(new_state_dict, strict=True)
+            print_colored("  ✓ 权重加载成功 (strict=True，所有参数完美匹配)", Colors.GREEN)
+        except Exception as e:
+            print_colored(f"  ⚠ 严格加载失败，正在回退到 strict=False。详细错误:\n{e}", Colors.YELLOW)
+            self.model.load_state_dict(new_state_dict, strict=False)
+
+        self.model = self.model.to(self.device)
         self.model.eval()
 
-        print_colored("✓ 模型加载完成", Colors.GREEN)
+        print_colored("✓ 模型加载与初始化完成", Colors.GREEN)
         self._print_model_info()
 
     def _print_model_info(self):
         """打印模型信息"""
-        # 使用 getattr 配合备用名称，防止因 Checkpoint 参数命名不一致导致崩溃
         embed_dim = getattr(self.hparams, 'embedding_dim', getattr(self.hparams, 'dim', '未知'))
         n_layers = getattr(self.hparams, 'num_layers', getattr(self.hparams, 'n_layers', '未知'))
         n_heads = getattr(self.hparams, 'num_heads', getattr(self.hparams, 'n_heads', '未知'))
         mcmc_steps = getattr(self.hparams, 'mcmc_num_steps', '未知')
         ctx_len = getattr(self.hparams, 'context_length', getattr(self.hparams, 'max_seq_len', '未知'))
         
-
-        # 安全获取模型内部的张量参数
         alpha_val = '未知'
         if hasattr(self.model, 'alpha'):
             alpha_val = self.model.alpha.item() if isinstance(self.model.alpha, torch.Tensor) else self.model.alpha
@@ -243,19 +208,9 @@ class EBTChatEngine:
         if hasattr(self.model, 'langevin_dynamics_noise_std'):
             noise_std_val = self.model.langevin_dynamics_noise_std.item() if isinstance(self.model.langevin_dynamics_noise_std, torch.Tensor) else self.model.langevin_dynamics_noise_std
 
-        # 使用训练时的参数,而不是硬编码覆盖
-        # NOTE: 保持推理与训练一致性至关重要!
-
-        # 应用用户指定的覆盖参数
         if self.override_mcmc_steps is not None:
             original_steps = getattr(self.hparams, 'mcmc_num_steps', 2)
-            original_steps_model = getattr(self.model.hparams, 'mcmc_num_steps', original_steps)
-
             if self.override_mcmc_steps > original_steps:
-                # 模型使用 time_embed 类型时，mcmc_num_steps 是能量景观的数量，不是迭代次数。
-                # 训练时只学习了 original_steps 个能量景观（time embeddings），
-                # 不能简单增加景观数。正确做法是保持景观数不变，
-                # 通过 randomize_mcmc_num_steps 在最终景观上多做迭代。
                 extra = self.override_mcmc_steps - original_steps
                 self.hparams.randomize_mcmc_num_steps = extra
                 self.model.hparams.randomize_mcmc_num_steps = extra
@@ -265,52 +220,24 @@ class EBTChatEngine:
                 self.model.hparams.randomize_mcmc_num_steps_min = extra + 1
                 mcmc_steps = self.override_mcmc_steps
 
-                # 当扩展步数超过训练景观数时，自动启用 Langevin 噪声，
-                # 否则重复的最终景观迭代因梯度为零而完全无效。
-                # 仅当用户未显式指定 --override-noise-std 时才自动启用。
                 trained_noise = getattr(self.hparams, 'langevin_dynamics_noise', 0.0)
                 if self.override_noise_std is None and trained_noise == 0:
-                    # 推理使用 float32 autocast，σ=0.01 的噪声不会被量化截断。
-                    # auto_noise = 0.01
                     auto_noise = 0.0
                     self.hparams.langevin_dynamics_noise = auto_noise
                     self.model.hparams.langevin_dynamics_noise = auto_noise
                     if hasattr(self.model, 'langevin_dynamics_noise_std'):
                         self.model.langevin_dynamics_noise_std.data.fill_(auto_noise)
                     noise_std_val = auto_noise
-
-                print()
-                print(f"    {Colors.YELLOW}{'='*60}")
-                print(f"    ⚠ MCMC 步数覆盖: {original_steps} → {self.override_mcmc_steps}")
-                print(f"    {'='*60}{Colors.RESET}")
-                print(f"    {Colors.CYAN}模型训练时使用 {original_steps} 个能量景观 (time embeddings)。")
-                print(f"    无法创建新的景观，改为在最终景观上重复迭代 {extra + 1} 次。")
-                print(f"    步骤序列: {list(range(original_steps - 1))} + [{original_steps - 1}] × {extra + 1}{Colors.RESET}")
-                if self.override_noise_std is None and trained_noise == 0:
-                    print(f"    {Colors.GREEN}✓ 已自动启用 Langevin 噪声 (σ={auto_noise})，")
-                    print(f"      使重复迭代能通过随机扰动继续优化能量。")
-                    print(f"      可通过 --override-noise-std 手动调整。{Colors.RESET}")
-                print(f"    {Colors.GRAY}注意: 推理使用 float32 精度以保证 MCMC 梯度和噪声的有效性。")
-                print(f"    超出训练景观数的额外步骤效果有限，")
-                print(f"    建议训练时增加 mcmc_num_steps 以获得更好效果。{Colors.RESET}")
-                print()
             elif self.override_mcmc_steps < original_steps:
-                # 减少步数：直接修改 mcmc_num_steps
                 self.hparams.mcmc_num_steps = mcmc_steps = self.override_mcmc_steps
                 self.model.hparams.mcmc_num_steps = self.override_mcmc_steps
-                print(f"    {Colors.YELLOW}⚠ 覆盖 MCMC 步数: {original_steps} → {self.override_mcmc_steps}{Colors.RESET}")
-            else:
-                mcmc_steps = original_steps
-                print(f"    {Colors.GRAY}MCMC 步数已是 {original_steps}，无需覆盖{Colors.RESET}")
 
         if self.override_noise_std is not None:
             if hasattr(self.model, 'langevin_dynamics_noise_std'):
                 self.model.langevin_dynamics_noise_std.data.fill_(self.override_noise_std)
-                # 同时更新 hparam，否则 modeling_ebt.py:124 的条件检查不通过
                 self.hparams.langevin_dynamics_noise = self.override_noise_std
                 self.model.hparams.langevin_dynamics_noise = self.override_noise_std
                 noise_std_val = self.override_noise_std
-                print(f"    {Colors.YELLOW}⚠ 覆盖 Langevin 噪声: {self.override_noise_std:.6f}{Colors.RESET}")
 
         if self.override_alpha is not None:
             if hasattr(self.model, 'alpha'):
@@ -320,7 +247,6 @@ class EBTChatEngine:
                     device=self.model.alpha.device
                 )
                 alpha_val = self.override_alpha
-                print(f"    {Colors.YELLOW}⚠ 覆盖 Alpha 步长: {self.override_alpha:.6f}{Colors.RESET}")
 
         print()
         print(f"  {Colors.BOLD}模型配置:{Colors.RESET}")
@@ -342,223 +268,6 @@ class EBTChatEngine:
         print(f"    - 上下文长度: {ctx_len}")
         print()
 
-    def _run_mcmc_with_tracking(
-        self,
-        input_ids: torch.Tensor,
-        return_all_steps: bool = True
-    ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-        """运行 MCMC 推理并追踪每一步的状态
-
-        直接调用 model.forward() 以保证与训练/评估时完全一致的 MCMC 逻辑。
-        """
-
-        mcmc_history = []
-        start_time = time.time()
-
-        # 使用 float32 autocast：模型权重是 bfloat16，但 autocast(float32) 会将
-        # 中间计算提升到 float32，避免 bfloat16 精度不足导致：
-        # 1. Langevin 噪声 (σ~0.1) 被量化截断
-        # 2. 能量值变化 (~0.01) 无法区分
-        # 3. 梯度更新被吞掉
-        with torch.amp.autocast('cuda', dtype=torch.float32):
-            predicted_distributions, predicted_energies = self.model.forward(
-                input_ids, start_pos=0, learning=False, return_raw_logits=True, no_randomness=True
-            )
-
-        total_time = time.time() - start_time
-
-        # 从 forward 返回的结果构建 mcmc_history 用于显示
-        num_steps = len(predicted_distributions)
-        step_time = total_time / max(num_steps, 1)
-
-        for step_idx in range(num_steps):
-            logits = predicted_distributions[step_idx]  # (B, S, V)
-            energy = predicted_energies[step_idx].float()  # (B*S, 1) → float32 避免 bfloat16 精度不足
-
-            probs = F.softmax(logits.detach().float(), dim=-1)
-            step_info = {
-                'step': step_idx,
-                'energy_mean': energy.mean().item(),
-                'energy_std': energy.std().item(),
-                'energy_min': energy.min().item(),
-                'energy_max': energy.max().item(),
-                'grad_norm': 0.0,  # 不再单独追踪梯度
-                'prob_entropy': -(probs * (probs + 1e-10).log()).sum(-1).mean().item(),
-                'prob_max': probs.max(-1).values.mean().item(),
-                'step_time': step_time,
-            }
-
-            if return_all_steps:
-                step_info['logits'] = logits.detach().clone()
-                step_info['energies'] = energy.detach().clone()
-
-            mcmc_history.append(step_info)
-
-        # 返回最终步骤的 logits
-        final_logits = predicted_distributions[-1]  # (B, S, V)
-        return final_logits, mcmc_history
-
-    def _display_mcmc_progress(self, history: List[Dict[str, Any]], position: int = 0):
-        """展示 MCMC 迭代过程"""
-        if not self.show_mcmc:
-            return
-
-        num_steps = len(history)
-        trained_landscapes = getattr(self.hparams, 'mcmc_num_steps', num_steps)
-
-        # 重建 mcmc_steps 列表以了解每步对应的景观索引
-        # 与 modeling_ebt.py forward() 中的逻辑对应
-        landscape_indices = []
-        extra_steps = getattr(self.model.hparams, 'randomize_mcmc_num_steps', 0)
-        if extra_steps > 0:
-            for s in range(trained_landscapes):
-                if s == trained_landscapes - 1:
-                    landscape_indices.extend([s] * (extra_steps + 1))
-                else:
-                    landscape_indices.append(s)
-        else:
-            landscape_indices = list(range(trained_landscapes))
-        # 截断/填充到实际步数
-        while len(landscape_indices) < num_steps:
-            landscape_indices.append(landscape_indices[-1] if landscape_indices else 0)
-
-        print()
-        print(f"  {Colors.BOLD}═══ MCMC 迭代过程 (位置 {position}, {num_steps} 步, "
-              f"{trained_landscapes} 个能量景观) ═══{Colors.RESET}")
-
-        # 收集能量范围
-        all_energies = [h['energy_mean'] for h in history]
-        min_e, max_e = min(all_energies), max(all_energies)
-
-        for i, step_info in enumerate(history):
-            color_idx = i % len(Colors.MCMC_COLORS)
-            step_color = Colors.MCMC_COLORS[color_idx]
-
-            energy_bar = format_energy_bar(step_info['energy_mean'], min_e, max_e)
-            energy_str = format_energy(step_info['energy_mean'])
-
-            # 景观标识
-            li = landscape_indices[i] if i < len(landscape_indices) else '?'
-            landscape_tag = f"L{li}"
-
-            # Per-step energy delta
-            if i > 0:
-                energy_delta = step_info['energy_mean'] - history[i-1]['energy_mean']
-                delta_color = Colors.GREEN if energy_delta < 0 else (Colors.GRAY if abs(energy_delta) < 1e-7 else Colors.RED)
-                delta_str = f"{delta_color}ΔE={energy_delta:+.6f}{Colors.RESET}"
-            else:
-                delta_str = f"{Colors.GRAY}ΔE=  ------{Colors.RESET}"
-
-            # 添加熵和最大概率显示以诊断问题
-            entropy = step_info['prob_entropy']
-            max_prob = step_info['prob_max']
-
-            # 熵值颜色: 使用 cyan (信息性指标，不直接表示好/坏)
-            entropy_color = Colors.CYAN
-
-            # 最大概率颜色: 高概率(好) = 绿色, 低概率(差) = 红色
-            if max_prob > 0.5:
-                prob_color = Colors.GREEN
-            elif max_prob > 0.1:
-                prob_color = Colors.YELLOW
-            else:
-                prob_color = Colors.RED
-
-            print(f"  {step_color}Step {i:2d}{Colors.RESET} {Colors.GRAY}[{landscape_tag}]{Colors.RESET} │ "
-                  f"E={energy_str} │ {energy_bar} │ "
-                  f"{delta_str} │ "
-                  f"{entropy_color}H={entropy:.2f}{Colors.RESET} │ "
-                  f"{prob_color}P_max={max_prob:.3f}{Colors.RESET} │ "
-                  f"t={step_info['step_time']*1000:.1f}ms")
-
-            if self.verbose and 'logits' in step_info:
-                probs = F.softmax(step_info['logits'][0, position], dim=-1)
-                top_tokens = format_top_tokens(probs, self.tokenizer, top_k=5)
-                print(f"         └─ Top tokens: {top_tokens}")
-
-        # 显示能量和熵的变化
-        if len(history) > 1:
-            energy_change = history[-1]['energy_mean'] - history[0]['energy_mean']
-            entropy_change = history[-1]['prob_entropy'] - history[0]['prob_entropy']
-            prob_change = history[-1]['prob_max'] - history[0]['prob_max']
-
-            change_color = Colors.GREEN if energy_change < 0 else Colors.RED
-            prob_change_color = Colors.GREEN if prob_change > 0 else Colors.RED
-
-            print(f"  {Colors.BOLD}收敛统计:{Colors.RESET}")
-            print(f"    能量变化 (↓好): {change_color}{energy_change:+.6f}{Colors.RESET} "
-                  f"({history[0]['energy_mean']:.6f} → {history[-1]['energy_mean']:.6f})")
-            print(f"    熵值变化 (信息): {Colors.CYAN}{entropy_change:+.2f}{Colors.RESET} "
-                  f"({history[0]['prob_entropy']:.2f} → {history[-1]['prob_entropy']:.2f})")
-            print(f"    最大概率 (↑好): {prob_change_color}{prob_change:+.3f}{Colors.RESET} "
-                  f"({history[0]['prob_max']:.3f} → {history[-1]['prob_max']:.3f})")
-
-            # 当使用扩展步数时，显示额外诊断信息
-            extra_steps = getattr(self.model.hparams, 'randomize_mcmc_num_steps', 0)
-            if extra_steps > 0 and num_steps > trained_landscapes:
-                # 计算前 N 个景观阶段和扩展阶段的能量变化
-                landscape_phase_end = trained_landscapes - 1  # 最后一个景观首次出现的位置
-                if landscape_phase_end < num_steps:
-                    landscape_energy_change = history[landscape_phase_end]['energy_mean'] - history[0]['energy_mean']
-                    repeat_energy_change = history[-1]['energy_mean'] - history[landscape_phase_end]['energy_mean']
-                    print(f"    {Colors.GRAY}--- 分阶段分析 ---{Colors.RESET}")
-                    print(f"    景观切换阶段 (Step 0→{landscape_phase_end}): ΔE={landscape_energy_change:+.6f}")
-                    print(f"    最终景观重复 (Step {landscape_phase_end}→{num_steps-1}): ΔE={repeat_energy_change:+.6f}")
-                    noise_val = getattr(self.model.hparams, 'langevin_dynamics_noise', 0)
-                    if noise_val > 0:
-                        print(f"    Langevin 噪声: σ={noise_val} (启用随机扰动)")
-                    else:
-                        print(f"    {Colors.YELLOW}Langevin 噪声: 0 (无随机扰动，重复步骤可能无效){Colors.RESET}")
-        print()
-
-    def generate_token(
-        self,
-        input_ids: torch.Tensor,
-        temperature: float = 0.8,
-        top_p: float = 0.9,
-        show_position: bool = True
-    ) -> Tuple[int, Dict[str, Any]]:
-        """生成下一个 token"""
-
-        # 运行 MCMC
-        final_logits, mcmc_history = self._run_mcmc_with_tracking(input_ids, return_all_steps=self.show_mcmc)
-
-        # 获取最后一个位置的 logits
-        last_logits = final_logits[0, -1]  # (V,)
-
-        # 应用温度
-        if temperature > 0:
-            probs = F.softmax(last_logits / temperature, dim=-1)
-        else:
-            probs = F.softmax(last_logits, dim=-1)
-
-        # Top-p 采样
-        if top_p < 1.0:
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cumsum = torch.cumsum(sorted_probs, dim=-1)
-            mask = cumsum - sorted_probs > top_p
-            sorted_probs[mask] = 0.0
-            sorted_probs = sorted_probs / sorted_probs.sum()
-            next_token_idx = torch.multinomial(sorted_probs, num_samples=1)
-            next_token = sorted_indices[next_token_idx].item()
-        else:
-            next_token = torch.multinomial(probs, num_samples=1).item()
-
-        # 展示 MCMC 过程
-        if show_position and self.show_mcmc:
-            self._display_mcmc_progress(mcmc_history, position=input_ids.shape[1]-1)
-
-        # 返回生成信息
-        gen_info = {
-            'token': next_token,
-            'token_prob': probs[next_token].item(),
-            'final_energy': mcmc_history[-1]['energy_mean'] if mcmc_history else 0,
-            'energy_change': (mcmc_history[-1]['energy_mean'] - mcmc_history[0]['energy_mean']) if len(mcmc_history) > 1 else 0,
-            'mcmc_steps': len(mcmc_history),
-        }
-
-        return next_token, gen_info
-
     def generate(
         self,
         prompt: str,
@@ -568,77 +277,135 @@ class EBTChatEngine:
         stop_tokens: Optional[List[int]] = None,
         stream: bool = True,
     ) -> Tuple[str, Dict[str, Any]]:
-        """生成文本"""
+        """生成文本 - 完全复用 generate.py 的逻辑"""
+        
+        # 使用 nanochat 的 render_conversation 格式构建 prompt
+        # 格式: <|bos|> <|user_start|> {text} <|user_end|> <|assistant_start|>
+        # 这与 SFT 训练时 dataset_sft.py -> render_conversation() 的格式完全一致
+        inner_tok = getattr(self.tokenizer, 'tokenizer', None)  # NanoChatTokenizerWrapper.tokenizer = RustBPETokenizer
+        if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
+            bos_id       = inner_tok.get_bos_token_id()
+            user_start   = inner_tok.encode_special("<|user_start|>")
+            user_end     = inner_tok.encode_special("<|user_end|>")
+            asst_start   = inner_tok.encode_special("<|assistant_start|>")
+            content_ids  = inner_tok.encode(prompt)
+            prompt_tokens_list = [bos_id, user_start] + content_ids + [user_end, asst_start]
+        else:
+            # Fallback: 直接 encode（base model 场景，无 chat template）
+            encoded = self.tokenizer.encode(prompt)
+            prompt_tokens_list = encoded if isinstance(encoded, list) else encoded.tolist()
+            bos_id = getattr(self.tokenizer, 'bos_token_id', None)
+            if bos_id is not None and (not prompt_tokens_list or prompt_tokens_list[0] != bos_id):
+                prompt_tokens_list = [bos_id] + prompt_tokens_list
 
-        # Encode prompt
-        prompt_tokens = self.tokenizer.encode(prompt)
-        if len(prompt_tokens) == 0:
-            prompt_tokens = [self.tokenizer.get_bos_token_id()]
+        # pad_id 仅用于填充 tokens 张量，不作为停止 token
+        # NanoChatTokenizerWrapper 把 eos/pad 都设为 bos_id，但 bos_id 不应是停止 token
+        # （SFT packed 序列里 assistant_end 后紧跟 bos，模型可能在 assistant_start 后生成 bos，
+        #  若把 bos 加入 stop_token_ids 会导致立即停止、输出为空）
+        if hasattr(self.tokenizer, 'bos_token_id') and self.tokenizer.bos_token_id is not None:
+            pad_id = self.tokenizer.bos_token_id
+        elif hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
+            pad_id = self.tokenizer.eos_token_id
+        else:
+            pad_id = 0
 
-        input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
+        bsz = 1
+        min_prompt_len = len(prompt_tokens_list)
+        max_prompt_len = len(prompt_tokens_list)
 
-        # 生成统计
-        stats = {
-            'tokens_generated': 0,
-            'total_time': 0,
-            'avg_energy_change': [],
-            'token_probs': [],
-        }
+        # 安全获取 context_length
+        ctx_len = getattr(self.hparams, 'context_length', getattr(self.hparams, 'max_seq_len', 2048))
+        total_len = min(ctx_len, max_tokens + max_prompt_len)
 
-        generated_tokens = []
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=self.device)
+        tokens[0, :len(prompt_tokens_list)] = torch.tensor(prompt_tokens_list, dtype=torch.long, device=self.device)
+
+        # 【修复】用位置掩码而非 token 值掩码，避免 bos_id == pad_id 导致 prompt 第一个 token 被误判为 padding
+        input_text_mask = torch.zeros(bsz, total_len, dtype=torch.bool, device=self.device)
+        input_text_mask[0, :len(prompt_tokens_list)] = True
+
+        prev_pos = 0
+        eos_reached = torch.tensor([False] * bsz, device=self.device)
         start_time = time.time()
 
-        # 获取 EOS token
-        try:
-            eos_token_id = self.tokenizer.encode_special("<|eos|>")
-        except:
-            eos_token_id = None
+        # 【修复】stop_token_ids 只包含 <|assistant_end|>，不包含 bos_id/pad_id
+        # 原因：bos_id == pad_id，若加入 stop_token_ids，SFT 模型生成 bos 时会立即停止输出为空
+        stop_token_ids = set()
+        inner_tok = getattr(self.tokenizer, 'tokenizer', None)
+        if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
+            asst_end_id = inner_tok.encode_special("<|assistant_end|>")
+            if asst_end_id is not None:
+                stop_token_ids.add(asst_end_id)
+        # fallback：若无 <|assistant_end|>，用 pad_id 兜底
+        if not stop_token_ids:
+            stop_token_ids.add(pad_id)
 
-        if stop_tokens is None:
-            stop_tokens = [eos_token_id] if eos_token_id else []
+        with torch.no_grad():
+            if min_prompt_len == total_len:
+                logits = call_model_forward_decode(self.hparams, self.model, tokens, prev_pos, bsz)
 
-        for i in range(max_tokens):
-            # 检查上下文长度
-            if input_ids.shape[1] >= self.hparams.context_length - 1:
-                print_colored(f"\n[达到最大上下文长度 {self.hparams.context_length}]", Colors.YELLOW)
-                break
+            for cur_pos in range(min_prompt_len, total_len):
+                input_tokens = tokens[:, :cur_pos]
 
-            # 生成下一个 token
-            # 第一个 token 展示完整 MCMC 过程; verbose 模式下每 10 个 token 也展示
-            show_pos = self.show_mcmc and (i == 0 or (self.verbose and i % 10 == 0))
-            next_token, gen_info = self.generate_token(
-                input_ids,
-                temperature=temperature,
-                top_p=top_p,
-                show_position=show_pos
-            )
+                logits = call_model_forward_decode(self.hparams, self.model, input_tokens, prev_pos, bsz)
 
-            # 检查停止条件
-            if next_token in stop_tokens:
-                break
+                if temperature > 0:
+                    probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                    next_token = sample_top_p(probs, top_p)
+                else:
+                    next_token = torch.argmax(logits[:, -1], dim=-1)
 
-            generated_tokens.append(next_token)
-            stats['token_probs'].append(gen_info['token_prob'])
-            stats['avg_energy_change'].append(gen_info['energy_change'])
+                next_token = next_token.reshape(-1)
 
-            # 更新输入
-            input_ids = torch.cat([
-                input_ids,
-                torch.tensor([[next_token]], dtype=torch.long, device=self.device)
-            ], dim=1)
+                # ===== 调试打印：加在这里 =====
+                # tok_id = next_token.item()
+                # tok_str = self.tokenizer.decode([tok_id], skip_special_tokens=False)
+                # print(f"\n[DEBUG] pos={cur_pos} token_id={tok_id} repr={repr(tok_str)} "
+                #     f"is_stop={tok_id in stop_token_ids} "
+                #     f"top5_probs={torch.topk(probs[0], 5)}")
+                # ===== 调试打印结束 =====
 
-            # 流式输出
-            if stream:
-                token_text = self.tokenizer.decode([next_token])
-                print(token_text, end='', flush=True)
+                next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+                tokens[:, cur_pos] = next_token
 
-        stats['tokens_generated'] = len(generated_tokens)
-        stats['total_time'] = time.time() - start_time
-        stats['avg_energy_change'] = np.mean(stats['avg_energy_change']) if stats['avg_energy_change'] else 0
-        stats['avg_token_prob'] = np.mean(stats['token_probs']) if stats['token_probs'] else 0
-        stats['tokens_per_second'] = stats['tokens_generated'] / stats['total_time'] if stats['total_time'] > 0 else 0
+                # 流式输出 (Streaming)
+                if stream and cur_pos >= min_prompt_len:
+                    token_text = self.tokenizer.decode([next_token.item()], skip_special_tokens=True)
+                    print(token_text, end='', flush=True)
 
-        generated_text = self.tokenizer.decode(generated_tokens)
+                # EOS 检查：<|assistant_end|>（不含 bos/pad，避免 SFT 模型生成 bos 时误停）
+                is_stop = torch.zeros(bsz, dtype=torch.bool, device=self.device)
+                for sid in stop_token_ids:
+                    is_stop |= (next_token == sid)
+                eos_reached |= (~input_text_mask[:, cur_pos]) & is_stop
+                prev_pos = cur_pos
+
+                if all(eos_reached):
+                    break
+
+        # 提取生成的 tokens
+        toks = tokens[0].tolist()
+        start = len(prompt_tokens_list)
+        toks = toks[start : len(prompt_tokens_list) + max_tokens]
+
+        # cut to first stop token
+        for sid in stop_token_ids:
+            if sid in toks:
+                toks = toks[:toks.index(sid)]
+
+        generated_text = self.tokenizer.decode(toks, skip_special_tokens=True)
+
+        # print(f"[DEBUG] prompt_tokens_list = {prompt_tokens_list}")
+        # print(f"[DEBUG] prompt decoded = {repr(self.tokenizer.decode(prompt_tokens_list, skip_special_tokens=False))}")
+        # print(f"[DEBUG] pad_id={pad_id} stop_token_ids={stop_token_ids}")
+
+        stats = {
+            'tokens_generated': len(toks),
+            'total_time': time.time() - start_time,
+            'tokens_per_second': len(toks) / (time.time() - start_time) if (time.time() - start_time) > 0 else 0,
+            'avg_energy_change': 0,
+            'avg_token_prob': 0,
+        }
 
         return generated_text, stats
 

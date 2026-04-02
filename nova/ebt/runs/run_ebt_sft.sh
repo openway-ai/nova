@@ -13,7 +13,11 @@ export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
 ### 预训练权重 ###
-PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0318_20260324_164538_2026-03-24_16-46-34_/last.ckpt"
+# base_train bpb 0.81
+# PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0318_20260324_164538_2026-03-24_16-46-34_/last.ckpt"
+# base_train bpb 0.81
+# PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
+PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
 
 ### 环境变量 (对齐 resume_ebt_muon_adamw.sh + Offline 支持) ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -51,7 +55,9 @@ NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/
 NUM_GPUS=${NUM_GPUS:-8}
 DEVICE_BATCH_SIZE=4
 GRAD_ACCUM=8
+# CONTEXT_LENGTH=2048
 CONTEXT_LENGTH=512
+
 
 ################################################################################
 # SFT 学习率配置 (参考 chat_sft.py)
@@ -65,7 +71,7 @@ MIN_LR_SCALE=50
 ################################################################################
 # 优化器配置 (对齐预训练)
 ################################################################################
-WEIGHT_DECAY=0.2
+WEIGHT_DECAY=0.0
 BETA1=0.8
 BETA2=0.95
 GRADIENT_CLIP_VAL=1.0
@@ -76,6 +82,9 @@ GRADIENT_CLIP_VAL=1.0
 # SFT 数据 ~856K 条，根据实际需求调整
 MAX_STEPS=3000
 MAX_SCHEDULING_STEPS=3000
+# todo
+MAX_STEPS=300000
+MAX_SCHEDULING_STEPS=300000
 
 ################################################################################
 # 验证与数据加载配置
@@ -87,7 +96,7 @@ NUM_WORKERS=8
 ################################################################################
 # 优化选项配置 (对齐预训练 Muon+AdamW)
 ################################################################################
-OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
+OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.2 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.004 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
 
 ################################################################################
 # torch.compile 配置 (对齐预训练)
