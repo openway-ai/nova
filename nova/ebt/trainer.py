@@ -109,6 +109,10 @@ class ModelTrainer(LightningModule):
         self.test_losses = []
         self.test_perplexities = []
 
+        # Training throughput tracking
+        self._train_step_start_time = None
+        self._train_start_time = None  # wall-clock start for ETA
+
         if self.hparams.modality == "NLP":
             if "execution_mode" in self.hparams and "save_generation_logs_dir" in self.hparams and self.hparams.execution_mode == "inference": # two of these are sanity check for loading pretrained ckpt that may not have newer params
                 print("setting up infer logger")
@@ -379,17 +383,28 @@ class ModelTrainer(LightningModule):
         if self.hparams.debug_unused_parameters:
             all_parameters = {name for name, _ in self.model.named_parameters()}
             unused_parameters = all_parameters - self.model.used_parameters - self.model.parameters_not_to_check
-            
+
             print(f"number of parameters total: {len(all_parameters)}")
             print(f"number of unused_parameters: {len(unused_parameters)}")
             print(f"Unused parameters: {unused_parameters}")
             print(f"Used parameters: {self.model.used_parameters}")
-        
+
         if self.hparams.manual_gc_collect_every_n_steps != -1:
             if self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
                 print("calling GC manually")
-                gc.collect()            
-           
+                gc.collect()
+
+        # Record step end time for dt calculation
+        import time as _time
+        now = _time.time()
+        if self._train_step_start_time is not None:
+            self._last_dt = now - self._train_step_start_time
+        else:
+            self._last_dt = None
+        self._train_step_start_time = now
+        if self._train_start_time is None:
+            self._train_start_time = now
+
     # def on_train_epoch_end(self): ## not effective for EBT
     #     if self.hparams.optimizer != "adamw": # e.g. for lars need to manually update epoch
     #         optimizer = self.trainer.optimizers[0]
@@ -1561,11 +1576,10 @@ class ModelTrainer(LightningModule):
         if self.hparams.langevin_dynamics_noise_learnable:
             self.log("Langevin_dynamics_noise", self.model.langevin_dynamics_noise_std.detach())
 
-        # 训练进度信息 (仅在训练阶段)
+        # 训练进度信息 (仅在训练阶段, 仅 rank 0 打印)
         if phase == "train" and hasattr(self, 'trainer') and self.trainer is not None:
-            # 当前步数和进度
-            # global_step 是 optimizer step 计数 (不是 micro-batch/forward 计数)
-            # 与 NanoChat base_train.py 的 step 变量语义一致, 方便对比
+            import time as _time
+
             current_step = self.global_step
             max_steps = self.hparams.max_steps
             progress_pct = 100.0 * current_step / max_steps if max_steps > 0 else 0
@@ -1578,3 +1592,77 @@ class ModelTrainer(LightningModule):
                 gpu_mem_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
                 self.log("gpu_mem_allocated_gb", gpu_mem_allocated, prog_bar=False)
                 self.log("gpu_mem_reserved_gb", gpu_mem_reserved, prog_bar=False)
+
+            # === 丰富训练日志 (仅 rank 0 打印, 避免 DDP 重复) ===
+            if self.trainer.is_global_zero:
+                # --- 时间统计 ---
+                dt_ms = (getattr(self, '_last_dt', None) or 0.0) * 1000.0
+                wall_elapsed = 0.0
+                if self._train_start_time is not None:
+                    wall_elapsed = _time.time() - self._train_start_time
+                total_min = wall_elapsed / 60.0
+
+                # --- LR ratio (相对于 peak_lr) ---
+                lrm = 1.0
+                if len(self.trainer.optimizers) > 0:
+                    opt = self.trainer.optimizers[0]
+                    # 取最后一个参数组（通常是 transformer/muon 主参数组）的 lr
+                    cur_lr = opt.param_groups[-1]['lr']
+                    peak_lr = self.hparams.peak_learning_rate
+                    lrm = cur_lr / peak_lr if peak_lr > 0 else 1.0
+
+                # --- tok/sec: tokens processed per second (全局) ---
+                # 每个 optimizer step 消耗 tokens = num_gpus × batch_per_device × context_length × grad_accum
+                num_gpus = getattr(self.hparams, 'num_gpus', 1)
+                tokens_per_step = (num_gpus
+                                   * self.hparams.batch_size_per_device
+                                   * self.hparams.context_length
+                                   * self.hparams.accumulate_grad_batches)
+                tok_per_sec = tokens_per_step / (dt_ms / 1000.0) if dt_ms > 0 else 0.0
+
+                # --- MFU (Model FLOP Utilization) ---
+                # 参考 PaLM / nanoGPT 计算方式:
+                # FLOPs per token ≈ 6 × num_params（前向 + 反向）
+                # MFU = actual_tok_per_sec × flops_per_token / peak_flops_per_sec
+                # H200 peak bfloat16 FLOPS ≈ 989 TFLOPS per GPU
+                try:
+                    num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                    flops_per_token = 6 * num_params  # forward + backward
+                    # Peak FLOPS: H200=989T, A100=312T; 这里保守用 312T/GPU (A100)
+                    peak_flops_per_gpu = 312e12
+                    gpu_peak_flops = num_gpus * peak_flops_per_gpu
+                    actual_flops_per_sec = tok_per_sec * flops_per_token
+                    mfu = 100.0 * actual_flops_per_sec / gpu_peak_flops if gpu_peak_flops > 0 else 0.0
+                except Exception:
+                    mfu = 0.0
+
+                # --- Epoch ---
+                epoch = self.current_epoch + 1
+
+                # --- ETA ---
+                if current_step > 0 and wall_elapsed > 0 and max_steps > 0:
+                    steps_remaining = max_steps - current_step
+                    sec_per_step = wall_elapsed / current_step
+                    eta_min = steps_remaining * sec_per_step / 60.0
+                    eta_str = f" | eta: {eta_min:.1f}m"
+                else:
+                    eta_str = ""
+
+                # --- 当前 loss ---
+                loss_val = metrics_dict.get('loss', 0.0)
+                if isinstance(loss_val, torch.Tensor):
+                    loss_val = loss_val.item()
+
+                # --- 打印 ---
+                print(
+                    f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
+                    f"loss: {loss_val:.6f} | "
+                    f"lrm: {lrm:.2f} | "
+                    f"dt: {dt_ms:.2f}ms | "
+                    f"tok/sec: {tok_per_sec:,.0f} | "
+                    f"mfu: {mfu:.2f} | "
+                    f"epoch: {epoch} | "
+                    f"total time: {total_min:.2f}m"
+                    f"{eta_str}",
+                    flush=True,
+                )
