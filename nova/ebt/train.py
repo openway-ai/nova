@@ -3,10 +3,8 @@
 import torch
 import os
 from argparse import ArgumentParser
-import time
 
 import random
-from datetime import datetime
 
 # 允许加载旧 checkpoint 中的自定义类
 try:
@@ -193,10 +191,6 @@ def main(args):
         model_trainer.load_state_dict(ckpt['state_dict'], strict=False)
         print(f"[SFT] 权重加载完成，训练从 step 0 开始")
 
-    timestamp = int(time.time())
-    dt_object = datetime.fromtimestamp(timestamp)
-    dt_string = dt_object.strftime("%Y-%m-%d_%H-%M-%S")
-
     # if args.debug_dataloader:
     #     debug_dataloader(args, model_trainer)
     #     return
@@ -217,7 +211,7 @@ def main(args):
     
     opt_name = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
     checkpoint_filename = f"e={{epoch}}-s={{step}}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
-    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = True, dirpath=f"./logs/checkpoints/{args.run_name}_{dt_string}_", filename=checkpoint_filename, verbose=True, min_free_gb=50)
+    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = True, dirpath=f"./logs/checkpoints/{args.run_name}", filename=checkpoint_filename, verbose=True, min_free_gb=50)
     
     for name, param in model_trainer.model.named_parameters():
         if not param.requires_grad:
