@@ -94,33 +94,29 @@ class SFTIterableDataset(_IterableDataset):
         conv_buffer = []
         cursor = ddp_rank
         consumed = ddp_rank
-        buffer_size = 100
+        buffer_size = 1000
         epoch = 1
 
         def refill_buffer():
             nonlocal cursor, epoch
             while len(conv_buffer) < buffer_size:
                 conversation = dataset[cursor]
-                ids, mask = self.tokenizer.render_conversation(conversation)
-                # 截断超长对话：保留尾部（assistant 回复通常在末尾）
-                # 这样超过 row_capacity 的对话也能参与 packing，减少 padding 浪费
-                if len(ids) > row_capacity:
-                    ids = ids[-row_capacity:]
-                    mask = mask[-row_capacity:]
-                conv_buffer.append((ids, mask))
+                ids, _ = self.tokenizer.render_conversation(conversation)
                 cursor += ddp_world_size
                 if cursor >= dataset_size:
                     cursor = cursor % dataset_size
                     epoch += 1
+                # 跳过超长对话，只保留能放入 row_capacity 的
+                if len(ids) <= row_capacity:
+                    conv_buffer.append(ids)
 
         it = 0
         while True:
             rows = []
-            row_masks = []  # SFT mask: 1 = train on this token (assistant), 0 = ignore (user/padding)
+            row_lengths = []  # 每行实际内容长度（不含 padding）
 
             for _ in range(self.B):
                 row = []
-                row_mask = []
                 padded = False
                 while len(row) < row_capacity:
                     while len(conv_buffer) < buffer_size:
@@ -129,37 +125,36 @@ class SFTIterableDataset(_IterableDataset):
 
                     best_idx = -1
                     best_len = 0
-                    for i, (conv, _) in enumerate(conv_buffer):
+                    for i, conv in enumerate(conv_buffer):
                         conv_len = len(conv)
                         if conv_len <= remaining and conv_len > best_len:
                             best_idx = i
                             best_len = conv_len
 
                     if best_idx >= 0:
-                        conv, mask = conv_buffer.pop(best_idx)
+                        conv = conv_buffer.pop(best_idx)
                         row.extend(conv)
-                        row_mask.extend(mask)
                         consumed += ddp_world_size
                     else:
-                        # 没有对话能放进剩余空间，用 bos padding 填满
+                        content_len = len(row)
                         remaining = row_capacity - len(row)
                         row.extend([bos_token] * remaining)
-                        row_mask.extend([0] * remaining)  # padding 位置不训练
                         padded = True
                         break
 
+                if padded:
+                    row_lengths.append(content_len)
+                else:
+                    row_lengths.append(row_capacity)
                 rows.append(row[:row_capacity])
-                row_masks.append(row_mask[:row_capacity])
 
             batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
-            mask_tensor = torch.tensor(row_masks, dtype=torch.bool)  # (B, T+1)
             inputs = batch_tensor[:, :-1].to(device=self.device, dtype=torch.int64, non_blocking=use_cuda)
             targets = batch_tensor[:, 1:].to(device=self.device, dtype=torch.int64, non_blocking=use_cuda)
-            # targets mask: 对 mask=0 的位置（user tokens 和 padding）设为 ignore_index=-1
-            # mask_tensor[:, 1:] 对应 targets（shifted by 1）
-            # 只训练 assistant 回复 token，忽略 user 问题 token 和 padding token
-            targets_mask = mask_tensor[:, 1:].to(device=self.device, non_blocking=use_cuda)
-            targets[~targets_mask] = -1
+            # 只 mask padding 位置（对齐 chat_sft.py），user + assistant token 都参与 loss
+            for i, content_len in enumerate(row_lengths):
+                if content_len < row_capacity:
+                    targets[i, content_len-1:] = -1
 
             yield inputs, targets
 
