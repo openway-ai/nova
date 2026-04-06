@@ -31,6 +31,8 @@ class EBTModelArgs:
     n_layers: int = 12
     n_heads: int = 12
     n_kv_heads: Optional[int] = None
+    vocab_size: int = 32768  # VE 需要用到
+    use_ve: bool = False     # 是否启用 Value Embedding
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
     dyt_alpha_init: float = 0.5
@@ -441,11 +443,16 @@ def analyse_tokens(input_tensor, tokenizer):
 def setup_ebt(hparams): # specifically for EBT not for baseline transformer
     # to prevent circular import
 
-    max_seq_len = hparams.context_length+1 # for next pred in context 
+    max_seq_len = hparams.context_length+1 # for next pred in context
     max_seq_len = max_seq_len + 1 if hparams.ebt_type == "time_embed" else max_seq_len # need +1 since cat time embed on sequence dim
 
     adaln_zero_init = True if hparams.ebt_type == "adaln_zero" else False
-    transformer_args = EBTModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=max_seq_len, weight_initialization = hparams.weight_initialization_method, adaln_zero_init=adaln_zero_init, ebt_norm=hparams.ebt_norm, ffn_dim_multiplier=hparams.ffn_dim_multiplier, ebt_act_func=hparams.ebt_act_func, weight_initialization_gain=hparams.weight_initialization_gain, dyt_alpha_init=hparams.dyt_alpha_init)
+
+    # VE 相关参数
+    vocab_size = getattr(hparams, 'vocab_size', 32768)
+    use_ve = getattr(hparams, 'use_ve', False)
+
+    transformer_args = EBTModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=max_seq_len, weight_initialization = hparams.weight_initialization_method, adaln_zero_init=adaln_zero_init, ebt_norm=hparams.ebt_norm, ffn_dim_multiplier=hparams.ffn_dim_multiplier, ebt_act_func=hparams.ebt_act_func, weight_initialization_gain=hparams.weight_initialization_gain, dyt_alpha_init=hparams.dyt_alpha_init, vocab_size=vocab_size, use_ve=use_ve)
     
     if hparams.ebt_type == "default": # causal decoder trans for ebm https://arxiv.org/abs/2406.08862
         from ar_ebt_default import EBTDefault

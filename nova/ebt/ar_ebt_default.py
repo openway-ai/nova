@@ -8,6 +8,14 @@ from typing import Optional, Tuple
 
 from utils import init_whole_model_weights, EBTModelArgs
 
+# VE 模块导入（条件导入保证兼容性）
+try:
+    from ve import build_layer_ve, build_value_embeds, has_ve
+except ImportError:
+    has_ve = None
+    build_value_embeds = None
+    build_layer_ve = None
+
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         """
@@ -152,11 +160,12 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """Multi-head attention module."""
-    def __init__(self, args: EBTModelArgs):
+    def __init__(self, layer_id: int, args: EBTModelArgs):
         """
         Initialize the Attention module.
 
         Args:
+            layer_id (int): Identifier for the layer.
             args (EBTModelArgs): Model configuration parameters.
 
         Attributes:
@@ -180,17 +189,26 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
-        
+
+        # VE 相关属性
+        self.use_ve = args.use_ve and has_ve is not None and has_ve(layer_id, args.n_layers)
+        if self.use_ve:
+            self.ve_gate_channels = min(32, args.dim)
+            self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_local_kv_heads, bias=False)
+            nn.init.zeros_(self.ve_gate.weight)  # 零初始化
+        else:
+            self.ve_gate = None
+
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         init_whole_model_weights(self.wq, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
-        
-        
+
+
         self.wk = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         init_whole_model_weights(self.wk, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
-        
+
         self.wv = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         init_whole_model_weights(self.wv, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
-        
+
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
         init_whole_model_weights(self.wo, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
         # self.wq = ColumnParallelLinear(
@@ -245,6 +263,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        ve: Optional[torch.Tensor] = None,
     ):
         """
         Forward pass of the attention module.
@@ -254,6 +273,7 @@ class Attention(nn.Module):
             start_pos (int): Starting position for caching.
             freqs_cis (torch.Tensor): Precomputed frequency tensor.
             mask (torch.Tensor, optional): Attention mask tensor.
+            ve (torch.Tensor, optional): Value embedding tensor for VE.
 
         Returns:
             torch.Tensor: Output tensor after attention.
@@ -268,7 +288,13 @@ class Attention(nn.Module):
         xq = xq.view(bsz, full_seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
-        
+
+        # VE 注入：将 value embedding 加到 xv 上
+        if ve is not None and self.ve_gate is not None:
+            ve = ve.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
+            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            xv = xv + gate.unsqueeze(-1) * ve
+
         # _o is for original attention stuff
         xq_o = xq[:, :original_seqlen, :, :] #B, S-1, N, H (N and H are num head and head dim respectively)
         xk_o = xk[:, :original_seqlen, :, :]
@@ -447,7 +473,7 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        self.attention = Attention(layer_id, args)
         self.feed_forward = FeedForward(
             dim=args.dim,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
@@ -464,6 +490,7 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        ve: Optional[torch.Tensor] = None,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -473,6 +500,7 @@ class TransformerBlock(nn.Module):
             start_pos (int): Starting position for attention caching.
             freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
             mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
+            ve (torch.Tensor, optional): Value embedding tensor for VE.
 
         Returns:
             torch.Tensor: Output tensor after applying attention and feedforward layers.
@@ -480,7 +508,7 @@ class TransformerBlock(nn.Module):
         """
         # x has shape B, 2*(S-1), D?
         h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask
+            self.attention_norm(x), start_pos, freqs_cis, mask, ve
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -507,6 +535,19 @@ class EBTDefault(nn.Module):
         self.params = params
         self.n_layers = params.n_layers
 
+        # VE 相关：构建 value_embeds
+        self.use_ve = params.use_ve and build_value_embeds is not None
+        if self.use_ve:
+            n_kv_heads = params.n_heads if params.n_kv_heads is None else params.n_kv_heads
+            self.kv_dim = n_kv_heads * (params.dim // params.n_heads)
+            self.value_embeds = build_value_embeds(params.n_layers, params.vocab_size, self.kv_dim)
+            # Xavier 初始化
+            for ve in self.value_embeds.values():
+                nn.init.xavier_normal_(ve.weight)
+        else:
+            self.value_embeds = None
+            self.kv_dim = None
+
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
@@ -521,13 +562,23 @@ class EBTDefault(nn.Module):
         init_whole_model_weights(self.final_layer, self.params.weight_initialization)
 
 
-    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = None):  # NOTE mcmc_step not used here
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        start_pos: int,
+        mcmc_step = None,
+        real_token_ids: Optional[torch.Tensor] = None,
+        predicted_tokens: Optional[torch.Tensor] = None,
+    ):  # NOTE mcmc_step not used here
         """
         Perform a forward pass through the Transformer model.
 
         Args:
-            embeds (torch.Tensor): Embeddings (instead of tokens since is for vision).
+            embeddings (torch.Tensor): Embeddings (instead of tokens since is for vision).
             start_pos (int): Starting position for attention caching.
+            mcmc_step: MCMC step index (not used in default EBT).
+            real_token_ids (torch.Tensor, optional): Real token IDs for VE.
+            predicted_tokens (torch.Tensor, optional): Predicted token logits for VE.
 
         Returns:
             torch.Tensor: Output energies after applying the Transformer model.
@@ -568,11 +619,15 @@ class EBTDefault(nn.Module):
             # causal mask is like this by default 0, -inf, -inf
             #                         0, 0,    -inf
             #                         0, 0,    0
-                
+
 
 
             for i, layer in enumerate(self.layers):
-                embeddings = layer(embeddings, start_pos, freqs_cis, mask)
+                # VE：为每层构建 value embedding
+                ve = None
+                if self.use_ve and real_token_ids is not None and predicted_tokens is not None:
+                    ve = build_layer_ve(self.value_embeds, i, real_token_ids, predicted_tokens)
+                embeddings = layer(embeddings, start_pos, freqs_cis, mask, ve)
             embeddings = self.norm(embeddings)
             energies = self.final_layer(embeddings)
 

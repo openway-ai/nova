@@ -68,11 +68,12 @@ class EBT_NLP(LightningModule):
             self.parameters_not_to_check = set() # dont check these since may be frozen or dont want them to update
         
     @torch.compiler.disable
-    def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps, 
-                      langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits):
+    def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps,
+                      langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
+                      real_token_ids=None):
         batch_size = predicted_tokens.shape[0]
         seq_length = predicted_tokens.shape[1]
-        
+
         if self.hparams.no_mcmc_detach:
             predicted_tokens.requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
         else: # default, do detach
@@ -88,17 +89,23 @@ class EBT_NLP(LightningModule):
                     predicted_tokens = self.softmax(predicted_tokens)
             else:
                 predicted_tokens = self.softmax(predicted_tokens)
-                
+
             if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
                 predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
             else:
                 predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
         else:
             predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
-        
+
         all_embeddings = torch.cat((real_embeddings_input.detach(), predicted_embeddings), dim = 1) # B, 2*S, D
-        
-        energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+
+        energy_preds = self.transformer(
+            all_embeddings,
+            start_pos=start_pos,
+            mcmc_step=mcmc_step,
+            real_token_ids=real_token_ids,
+            predicted_tokens=predicted_tokens,
+        ) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
         energy_preds = energy_preds.reshape(-1, 1)
         
         if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
@@ -181,13 +188,14 @@ class EBT_NLP(LightningModule):
 
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
-                
+
                 predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
-                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits
+                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
+                    real_token_ids=x
                 )
                 predicted_energies.append(energy_preds)
-                predicted_distributions.append(predicted_tokens_for_loss)        
+                predicted_distributions.append(predicted_tokens_for_loss)
 
         return predicted_distributions, predicted_energies
 
@@ -322,8 +330,20 @@ class EBT_NLP(LightningModule):
                 true_embeddings = self.vocab_to_embed(true_token_one_hot)
 
         all_true_embeddings = torch.cat((real_embeddings_input, true_embeddings), dim=1)
-        
-        real_energies = self.transformer(all_true_embeddings, start_pos=0, mcmc_step=self.hparams.mcmc_num_steps - 1) # NOTE if want to use this maybe check in better detail what ired does
+
+        # 为 contrastive loss 构建 true_pred_tokens
+        if self.hparams.discrete_contrastive_loss_true_logit_val != 0:
+            true_pred_tokens = true_token_logits
+        else:
+            true_pred_tokens = true_token_one_hot
+
+        real_energies = self.transformer(
+            all_true_embeddings,
+            start_pos=0,
+            mcmc_step=self.hparams.mcmc_num_steps - 1,
+            real_token_ids=input_ids,
+            predicted_tokens=true_pred_tokens,
+        ) # NOTE if want to use this maybe check in better detail what ired does
         real_energies = real_energies.reshape(-1, 1) # BS, 1
         fake_energies = predicted_energies[-1] # B*S, 1
         energy_stack = torch.cat([real_energies, fake_energies], dim=1)
@@ -381,9 +401,13 @@ class EBT_NLP(LightningModule):
             chunk_pred = repeated_pred[start:end]           # shape: (chunk_size, S, V)
             chunk_real_embeds = repeated_real_embeds[start:end]  # shape: (chunk_size, S, D)
 
+            # 获取对应的 real_token_ids chunk
+            chunk_real_ids = original_real_input_ids.repeat_interleave(G, dim=0)[start:end] if G > 1 else original_real_input_ids[start:end]
+
             final_pred_chunk, energies_list_chunk, predicted_distributions_chunk = self._run_ebt_inference_steps(
                 chunk_pred, chunk_real_embeds,
-                alpha, noise, start_pos, learning
+                alpha, noise, start_pos, learning,
+                real_token_ids=chunk_real_ids
             )
             all_final_pred[start:end] = final_pred_chunk
 
@@ -461,7 +485,8 @@ class EBT_NLP(LightningModule):
         adjusted_alpha,
         noise,
         start_pos,
-        learning
+        learning,
+        real_token_ids=None
     ):
         energies_list = []
         pred_states_list = []
@@ -485,7 +510,7 @@ class EBT_NLP(LightningModule):
                             cur_pred_tokens = self.softmax(cur_pred_tokens)
                     else:
                         cur_pred_tokens = self.softmax(cur_pred_tokens)
-                            
+
                     if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
                         pred_embeds = torch.matmul(cur_pred_tokens, self.embeddings.weight) #BS, S, D
                     else:
@@ -494,7 +519,13 @@ class EBT_NLP(LightningModule):
                     pred_embeds = self.vocab_to_embed(cur_pred_tokens)
 
                 combined_embeddings = torch.cat([real_embeds, pred_embeds], dim=1)  # (chunk_size, 2S, D)
-                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx)
+                energies = self.transformer(
+                    combined_embeddings,
+                    start_pos=start_pos,
+                    mcmc_step=step_idx,
+                    real_token_ids=real_token_ids,
+                    predicted_tokens=cur_pred_tokens,
+                )
                 energies = energies.reshape(-1)
                 energies_list.append(energies.detach())
 
@@ -526,7 +557,7 @@ class EBT_NLP(LightningModule):
                             cur_pred_tokens = self.softmax(cur_pred_tokens)
                     else:
                         cur_pred_tokens = self.softmax(cur_pred_tokens)
-                            
+
                     if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
                         pred_embeds = torch.matmul(cur_pred_tokens, self.embeddings.weight) #BS, S, D
                     else:
@@ -534,7 +565,13 @@ class EBT_NLP(LightningModule):
                 else:
                     pred_embeds = self.vocab_to_embed(cur_pred_tokens)
                 combined_embeddings = torch.cat([real_embeds, pred_embeds], dim=1)  # (chunk_size, 2S, D)
-                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx)
+                energies = self.transformer(
+                    combined_embeddings,
+                    start_pos=start_pos,
+                    mcmc_step=step_idx,
+                    real_token_ids=real_token_ids,
+                    predicted_tokens=cur_pred_tokens,
+                )
                 energies = energies.reshape(-1)
                 return energies
 
