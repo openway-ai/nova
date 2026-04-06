@@ -8,7 +8,7 @@
 set -e
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-sft"
+export RUN_NAME="ebt-d26-sft-0406-from0327"
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
@@ -17,7 +17,8 @@ export MODEL_SIZE="d26"
 # PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0318_20260324_164538_2026-03-24_16-46-34_/last.ckpt"
 # base_train bpb 0.81
 # PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
-PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
+# PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
+PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/e=epoch=0-s=step=55999-lr0.00025-bs4x8-muon_adamw-valid_loss=valid_loss=2.6877.ckpt"
 
 ### 环境变量 (对齐 resume_ebt_muon_adamw.sh + Offline 支持) ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -55,18 +56,25 @@ NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/
 NUM_GPUS=${NUM_GPUS:-8}
 DEVICE_BATCH_SIZE=4
 GRAD_ACCUM=8
-# CONTEXT_LENGTH=2048
-CONTEXT_LENGTH=512
+CONTEXT_LENGTH=512  # 受限于 base_train 阶段的上下文长度
 
 
 ################################################################################
-# SFT 学习率配置 (参考 chat_sft.py)
+# SFT 学习率配置
 ################################################################################
 # SFT 使用较低学习率，防止灾难性遗忘
+# 预训练 PEAK_LR=0.00025，SFT 降 5x
 PEAK_LR=0.00005
-WARM_UP_STEPS=250
-WARM_UP_BASE_LR_DIVIDER=10
-MIN_LR_SCALE=50
+# 注意: 使用 --linear_warmdown 调度时 --warm_up_steps / --warm_up_base_lr_divider / --min_lr_scale
+# 均不生效 (WarmUpLinearWarmdownLR 只接受 warmup_ratio)。warmup 由 --warmup_ratio 控制。
+#
+# 重要: --muon_lr / --adamw_*_lr 是绝对值，不受 PEAK_LR 缩放！
+# 预训练值: muon_lr=0.02, embedding_lr=0.3, vocab_to_embed_lr=0.01, scalar_lr=0.04
+# SFT 需要同比例降低 (÷5)，否则会导致梯度爆炸 → loss NaN
+SFT_MUON_LR=0.004           # 预训练 0.02 ÷ 5
+SFT_EMBEDDING_LR=0.06       # 预训练 0.3 ÷ 5
+SFT_VOCAB_TO_EMBED_LR=0.002 # 预训练 0.01 ÷ 5 (注: 预训练用 0.01 非 0.004)
+SFT_SCALAR_LR=0.008         # 预训练 0.04 ÷ 5
 
 ################################################################################
 # 优化器配置 (对齐预训练)
@@ -80,11 +88,10 @@ GRADIENT_CLIP_VAL=1.0
 # SFT 训练步数
 ################################################################################
 # SFT 数据 ~856K 条，根据实际需求调整
+# MAX_STEPS=30000
+# MAX_SCHEDULING_STEPS=30000
 MAX_STEPS=3000
 MAX_SCHEDULING_STEPS=3000
-# todo
-MAX_STEPS=300000
-MAX_SCHEDULING_STEPS=300000
 
 ################################################################################
 # 验证与数据加载配置
@@ -94,9 +101,9 @@ LIMIT_VAL_BATCHES=50
 NUM_WORKERS=8
 
 ################################################################################
-# 优化选项配置 (对齐预训练 Muon+AdamW)
+# 优化选项配置 (SFT: 所有绝对 LR 同比降低)
 ################################################################################
-OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.2 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.004 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
+OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.05 --warmdown_ratio 0.2 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr ${SFT_MUON_LR} --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr ${SFT_EMBEDDING_LR} --adamw_vocab_to_embed_lr ${SFT_VOCAB_TO_EMBED_LR} --adamw_scalar_lr ${SFT_SCALAR_LR} --adamw_dmodel_lr_scaling"
 
 ################################################################################
 # torch.compile 配置 (对齐预训练)
@@ -240,11 +247,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --weight_decay ${WEIGHT_DECAY} \
 --beta1 ${BETA1} \
 --beta2 ${BETA2} \
---min_lr_scale ${MIN_LR_SCALE} \
 --max_steps ${MAX_STEPS} \
 --max_scheduling_steps ${MAX_SCHEDULING_STEPS} \
---warm_up_steps ${WARM_UP_STEPS} \
---warm_up_base_lr_divider ${WARM_UP_BASE_LR_DIVIDER} \
 --dataset_name "nanochat_sft" \
 --num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
@@ -255,6 +259,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --log_model_archi \
 --set_matmul_precision "medium" \
 --save_top_k_ckpts ${SAVE_TOP_K} \
+--float_precision "bf16-mixed" \
 --finetuning_model_ckpt ${PRETRAIN_CKPT} \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
@@ -269,7 +274,7 @@ else
     echo -e "\033[0;31m✗ SFT 训练异常退出 (exit code: $TRAIN_EXIT_CODE)\033[0m"
 fi
 
-} 2>&1 | tee -a "${LOG_FILE}"
+} 2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush() }' | tee -a "${LOG_FILE}"
 
 echo ""
 echo "日志已保存到: ${LOG_FILE}"
