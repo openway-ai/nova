@@ -417,6 +417,14 @@ class ModelTrainer(LightningModule):
             token_bytes = token_bytes.to(self.device)
         eval_step_dict = self.eval_step(batch, "valid", token_bytes)
         self.log_metrics(eval_step_dict, "valid")
+        # 缓存最新 valid 指标，供 train 进度条显示
+        if not hasattr(self, '_last_valid_metrics'):
+            self._last_valid_metrics = {}
+        for k, v in eval_step_dict.items():
+            if isinstance(v, torch.Tensor) and v.dim() == 0:
+                self._last_valid_metrics[k] = v.detach().item()
+            elif isinstance(v, (int, float)):
+                self._last_valid_metrics[k] = v
 
     def on_test_epoch_start(self):
         """Reset test metrics at the start of test epoch"""
@@ -1546,35 +1554,54 @@ class ModelTrainer(LightningModule):
                 raise ValueError(f"unsupported type/format in log_metrics, type:, {type(value)}, key: {key}")
 
         if scalar_metrics:
-            self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True)
+            if phase == "train":
+                # 训练阶段：on_step=True, on_epoch=False
+                # 每个 train step 独立上报，不跨 step 累积。
+                self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True,
+                              on_step=True, on_epoch=False)
+            else:
+                # 验证/测试阶段：on_step=False, on_epoch=True
+                # Lightning 保证每次 val_loop 是独立的 validation epoch，
+                # on_epoch=True 只在当次 val 的 batch 内累积均值，
+                # 不会跨多次 val_check_interval 累积（不存在"280次val被平均"的问题）。
+                # ModelCheckpoint 在 on_validation_end 查询 epoch-level 指标，
+                # 必须用 on_epoch=True 才能让 valid_loss 出现在 returned metrics 里。
+                self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True,
+                              on_step=False, on_epoch=True)
 
-        # === 增强的调试日志 ===
-        if len(self.trainer.optimizers) > 0:
+        # === 增强的调试日志 (仅 train 阶段) ===
+        # lr/wd/Alpha 等只在训练步骤记录，避免在 validation 阶段触发
+        # "log on epoch level in distributed setting" 的 warning
+        if phase == "train" and len(self.trainer.optimizers) > 0:
             optimizer = self.trainer.optimizers[0]
 
             # 记录所有参数组的学习率
             for i, group in enumerate(optimizer.param_groups):
                 group_lr = group['lr']
                 group_wd = group.get('weight_decay', 0)
-                self.log(f"lr/param_group_{i}", group_lr, prog_bar=False)
-                self.log(f"wd/param_group_{i}", group_wd, prog_bar=False)
+                self.log(f"lr/param_group_{i}", group_lr, prog_bar=False,
+                         on_step=True, on_epoch=False)
+                self.log(f"wd/param_group_{i}", group_wd, prog_bar=False,
+                         on_step=True, on_epoch=False)
 
             # 主学习率 (最后一个参数组，通常是 transformer 参数)
             current_lr = optimizer.param_groups[-1]['lr']
-            self.log("Global_LR", current_lr)
+            self.log("Global_LR", current_lr, on_step=True, on_epoch=False)
 
             # Alpha 参数的学习率 (第一个参数组)
             if len(optimizer.param_groups) > 1:
                 alpha_lr = optimizer.param_groups[0]['lr']
-                self.log("Alpha_LR", alpha_lr)
+                self.log("Alpha_LR", alpha_lr, on_step=True, on_epoch=False)
 
-        # Alpha (MCMC step size) 值
-        if self.hparams.mcmc_step_size_learnable:
-            self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach())
+        # Alpha (MCMC step size) 值 (仅 train 阶段，避免 validation 阶段 warning)
+        if phase == "train" and self.hparams.mcmc_step_size_learnable:
+            self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach(),
+                     on_step=True, on_epoch=False)
 
-        # Langevin dynamics noise
-        if self.hparams.langevin_dynamics_noise_learnable:
-            self.log("Langevin_dynamics_noise", self.model.langevin_dynamics_noise_std.detach())
+        # Langevin dynamics noise (仅 train 阶段)
+        if phase == "train" and self.hparams.langevin_dynamics_noise_learnable:
+            self.log("Langevin_dynamics_noise", self.model.langevin_dynamics_noise_std.detach(),
+                     on_step=True, on_epoch=False)
 
         # 训练进度信息 (仅在训练阶段, 仅 rank 0 打印)
         if phase == "train" and hasattr(self, 'trainer') and self.trainer is not None:
@@ -1583,15 +1610,17 @@ class ModelTrainer(LightningModule):
             current_step = self.global_step
             max_steps = self.hparams.max_steps
             progress_pct = 100.0 * current_step / max_steps if max_steps > 0 else 0
-            self.log("step", float(current_step), prog_bar=True)
-            self.log("progress_pct", progress_pct, prog_bar=False)
+            self.log("step", float(current_step), prog_bar=True, on_step=True, on_epoch=False)
+            self.log("progress_pct", progress_pct, prog_bar=False, on_step=True, on_epoch=False)
 
             # GPU 内存使用 (如果可用)
             if torch.cuda.is_available():
                 gpu_mem_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
                 gpu_mem_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
-                self.log("gpu_mem_allocated_gb", gpu_mem_allocated, prog_bar=False)
-                self.log("gpu_mem_reserved_gb", gpu_mem_reserved, prog_bar=False)
+                self.log("gpu_mem_allocated_gb", gpu_mem_allocated, prog_bar=False,
+                         on_step=True, on_epoch=False)
+                self.log("gpu_mem_reserved_gb", gpu_mem_reserved, prog_bar=False,
+                         on_step=True, on_epoch=False)
 
             # === 丰富训练日志 (仅 rank 0 打印, 避免 DDP 重复) ===
             if self.trainer.is_global_zero:
@@ -1629,7 +1658,8 @@ class ModelTrainer(LightningModule):
                     num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
                     flops_per_token = 6 * num_params  # forward + backward
                     # Peak FLOPS: H200=989T, A100=312T; 这里保守用 312T/GPU (A100)
-                    peak_flops_per_gpu = 312e12
+                    # peak_flops_per_gpu = 312e12
+                    peak_flops_per_gpu = 989e12
                     gpu_peak_flops = num_gpus * peak_flops_per_gpu
                     actual_flops_per_sec = tok_per_sec * flops_per_token
                     mfu = 100.0 * actual_flops_per_sec / gpu_peak_flops if gpu_peak_flops > 0 else 0.0
@@ -1653,10 +1683,21 @@ class ModelTrainer(LightningModule):
                 if isinstance(loss_val, torch.Tensor):
                     loss_val = loss_val.item()
 
+                # --- 最新 valid 指标 ---
+                last_valid = getattr(self, '_last_valid_metrics', {})
+                valid_loss_val = last_valid.get('loss', None)
+                valid_ppl_val = last_valid.get('perplexity', None)
+                valid_str = ""
+                if valid_loss_val is not None:
+                    valid_str += f" | valid_loss: {valid_loss_val:.4f}"
+                if valid_ppl_val is not None:
+                    valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
+
                 # --- 打印 ---
                 print(
                     f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
-                    f"loss: {loss_val:.6f} | "
+                    f"loss: {loss_val:.6f}"
+                    f"{valid_str} | "
                     f"lrm: {lrm:.2f} | "
                     f"dt: {dt_ms:.2f}ms | "
                     f"tok/sec: {tok_per_sec:,.0f} | "

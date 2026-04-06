@@ -1,17 +1,20 @@
 #!/bin/bash
 
 ################################################################################
-# EBT d26 稳定训练脚本 - 基于官方推荐参数修复版
+# EBT d26 训练脚本 - Muon+AdamW 混合优化器 (对齐 NanoChat)
 #
-# 修复日期: 2026-03-13
-# 修复内容:
-#   1. 降低 MCMC LR Multiplier (2000 → 1500, 遵循官方3x建议)
-#   2. 禁用所有不稳定的优化选项
-#   3. 恢复保守的 Adam Beta 参数
-#   4. 降低 Weight Decay 避免过度正则化
-#   5. 使用标准 Cosine Annealing LR 调度
+# 日期: 2026-03-19
+# 策略:
+#   1. 优化器: Muon+AdamW (复用 nanochat/optim.py)
+#      - Transformer 矩阵参数 → Muon (LR=0.02)
+#      - Embedding/Scalar/Alpha → AdamW (beta1=0.8, beta2=0.95)
+#   2. Weight Decay: 0.2 + 动态衰减到 0 (对齐 base_train.py)
+#   3. LR 调度: Linear Warmdown (后50%衰减到0, 对齐 base_train.py)
+#   4. EBT 特有参数保持官方推荐 (MCMC step_size, alpha LR 等)
 #
-# 参考: https://github.com/alexiglad/EBT/blob/main/example_code/minimal_nlp_training_loop.py
+# 参考:
+#   - NanoChat: scripts/base_train.py, nanochat/optim.py, nanochat/gpt.py
+#   - EBT 官方: https://github.com/alexiglad/EBT/blob/main/example_code/minimal_nlp_training_loop.py
 ################################################################################
 
 ### SLURM 配置 ###
@@ -23,7 +26,7 @@
 #SBATCH --output=logs/slurm/nlp/ebt-d26-stable_%A-%a.log
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-stable"
+export RUN_NAME="ebt-d26-muon-adamw-0403"
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
@@ -72,27 +75,42 @@ NO_MCMC_DETACH=false
 # 均保持代码默认值,不在命令行覆盖
 
 ################################################################################
-# Batch 配置 - 针对 d26 模型优化
+# Batch 配置与训练步数自动计算 - 针对 d26 模型优化
 ################################################################################
 
-DEVICE_BATCH_SIZE=8
-GRAD_ACCUM=8
-CONTEXT_LENGTH=256
+# 1. 硬件与 Batch 基础配置
 NUM_GPUS=8
+DEVICE_BATCH_SIZE=4
+GRAD_ACCUM=8
+CONTEXT_LENGTH=512
 
+NUM_GPUS=8
+DEVICE_BATCH_SIZE=2
+GRAD_ACCUM=16
+CONTEXT_LENGTH=1024
+
+# 2. 计算每步的有效 Token 数 (Tokens per step)
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENGTH))
-# 131,072 tokens/step
+# 当前配置: 8 × 4 × 8 × 512 = 131,072 tokens/step
 
-################################################################################
-# 训练步数计算
-################################################################################
+# 3. 设置目标总 Token 数
+# NanoChat d26 (speedrun.sh --depth=26):
+#   tokens/step = 16 × 2048 × 4(accum) × 8(GPUs) = 1,048,576
+#   7000 step × 1,048,576 = 7,340,032,000 ≈ 7.34B tokens → bpb=0.747
+TARGET_TOTAL_TOKENS=7340032000 # 约 7.34B tokens
 
-# d26 模型规模: 26层, 13头, 1664维 ≈ 400M 参数
-# 目标训练量: ~10B tokens
-# 131k tokens/step × 75,400 steps ≈ 9.88B tokens
+# 注意: 由于EBT训练时显存消耗更多，目前 NanoChat 的 batch size 更大 ,
+# 大 batch 梯度噪声更低, 每步更新更有效,
+# 所以即使 token 总量相同, EBT 可能需要更多步才能达到同等效果
 
-MAX_STEPS=75400 # 对应模型实际优化步数，而不是梯度累计步数
-MAX_SCHEDULING_STEPS=75400
+# 4. 自动计算总 Steps 数 (向下取整)
+MAX_STEPS=$(( TARGET_TOTAL_TOKENS / EFFECTIVE_BATCH_SIZE ))
+MAX_SCHEDULING_STEPS=$MAX_STEPS
+
+echo "自动计算的训练步数信息："
+echo "  - 每步有效 Token 数: ${EFFECTIVE_BATCH_SIZE}"
+echo "  - 目标总 Token 数:   ${TARGET_TOTAL_TOKENS}"
+echo "  - 计算得出总 Steps:  ${MAX_STEPS}"
 
 ################################################################################
 # 学习率配置 (基于模型规模推荐)
@@ -119,27 +137,30 @@ MAX_SCHEDULING_STEPS=75400
 
 PEAK_LR=0.00025  # 与 large 一致 (d26 参数量更接近 large 而非 small)
 
-# Warmup 配置: 5% (较保守,有助于稳定 EBT 初期)
-WARM_UP_STEPS=3770  # 5% of 75400
+# Warmup 配置: 无 warmup (对齐 NanoChat warmup_ratio=0.0)
+# 注意: 使用 --linear_warmdown 时, WARM_UP_STEPS 和 MIN_LR_SCALE 不生效
+# 实际由 --warmup_ratio 和 --warmdown_ratio 控制
+WARM_UP_STEPS=0
 WARM_UP_BASE_LR_DIVIDER=10
 
-# LR 衰减: 使用标准 Cosine Annealing
-# 避免 linear_warmdown 的突变
-MIN_LR_SCALE=50  # peak_lr / 50 作为最终 LR (0.00025/50 = 0.000005)
-                 # 适中的衰减,不过于激进
+# LR 衰减: 由 --linear_warmdown 控制 (后 50% 线性衰减到 0)
+# 以下参数仅在不使用 --linear_warmdown 时生效 (cosine annealing fallback)
+MIN_LR_SCALE=50
 
 ################################################################################
-# 优化器配置 (保守稳定)
+# 优化器配置 (Muon+AdamW 模式, 对齐 NanoChat base_train.py)
 ################################################################################
 
-# Weight Decay: 适度正则化
-# 原 0.05 可能对 400M 模型过强,降低到 0.02
-WEIGHT_DECAY=0.02
+# Weight Decay: NanoChat 默认 0.2, 配合 --dynamic_wd 线性衰减到 0
+# 参考 base_train.py:63: --weight-decay 0.2
+# 参考 base_train.py:366: weight_decay_scaled * (1 - it / num_iterations)
+WEIGHT_DECAY=0.2
 
-# Adam Beta 参数: 使用 PyTorch 标准值
-# 不采用 NanoChat 的激进设置 (那是针对 Muon 优化器的)
-BETA1=0.9      # 标准动量
-BETA2=0.999    # 标准二阶矩估计
+# Adam Beta 参数: 对齐 NanoChat (用于 AdamW 部分: embedding/scalar/alpha)
+# 参考 base_train.py:66-67: --adam-beta1 0.8, --adam-beta2 0.95
+# 注意: 这些 beta 是 NanoChat 配合 Muon 验证过的组合
+BETA1=0.8
+BETA2=0.95
 
 # 梯度裁剪: 标准设置
 GRADIENT_CLIP_VAL=1.0
@@ -157,26 +178,42 @@ NUM_WORKERS=8
 # 优化选项配置
 ################################################################################
 #
-# 策略: 先使用 Baseline 验证稳定性
+# 当前启用: Muon+AdamW 混合优化器 + 动态 Weight Decay + Linear Warmdown
 #
 # 可选优化 (逐个测试):
-#   1. --layered_lr: 分层学习率 (embedding, transformer, scalar)
-#   2. --dynamic_wd: 动态 Weight Decay (线性衰减到0)
-#   3. --linear_warmdown: NanoChat 风格 LR 调度
+#   1. --layered_lr: 分层学习率 (仅用于纯 AdamW 模式, muon_adamw 已内置分层)
+#   2. --dynamic_wd: 动态 Weight Decay (线性衰减到0, 对齐 NanoChat base_train.py:366)
+#   3. --linear_warmdown: NanoChat 风格 LR 调度 (对齐 base_train.py:347)
+#   4. --optimizer muon_adamw: Muon+AdamW 混合优化器 (复用 nanochat/optim.py)
+#      Muon 处理 transformer 矩阵参数 (LR=0.02), AdamW 处理 embedding/scalar/alpha
 #
 # 注意:
-#   - 这些优化可能与 EBT 的 MCMC 机制冲突
-#   - 建议在 baseline 稳定后,单独测试每个选项
-#   - 避免多个优化同时启用造成干扰
+#   - --layered_lr 与 --optimizer muon_adamw 不要同时使用 (muon_adamw 已内置分层)
+#   - --dynamic_wd 和 --linear_warmdown 可以与 muon_adamw 组合使用
 ################################################################################
 
-# === Baseline: 不启用任何高级优化 (推荐) ===
-OPTION_FLAGS=""
+# === Baseline: 纯 AdamW, 不启用任何高级优化 ===
+# OPTION_FLAGS=""
 
-# === 如果 Baseline 稳定,可尝试逐个测试以下选项 ===
+# === 纯 AdamW + 分层学习率 ===
 # OPTION_FLAGS="--layered_lr"
-# OPTION_FLAGS="--dynamic_wd"
-# OPTION_FLAGS="--linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0"
+
+# === Muon+AdamW 全套优化 (对齐 NanoChat) ===
+# --optimizer muon_adamw: Muon 处理 transformer 矩阵, AdamW 处理其余
+# --dynamic_wd: Weight Decay 线性衰减到 0 (对齐 base_train.py:366)
+# --linear_warmdown: 线性 warmdown LR 调度 (对齐 base_train.py:347)
+#
+# AdamW 独立绝对 LR (对齐 NanoChat, 不再从 peak_lr 派生):
+#   embedding:       0.3 (对齐 NanoChat base_train.py:61, 不在 MCMC 循环内, 可用高 LR)
+#   vocab_to_embed:  0.01 (EBT 特有, 在 MCMC 循环内有二阶梯度, 需保守)
+#   scalar:          0.04 (RMSNorm 等, 在 MCMC 循环内, 适度保守)
+#   alpha:           保持 PEAK_LR × MCMC_LR_MULT = 0.375 (EBT 特有, 不变)
+# --adamw_dmodel_lr_scaling: 对 AdamW LR 做 (dim/768)^-0.5 缩放 (对齐 gpt.py:362)
+#   d26 dim=1664: scale = (1664/768)^-0.5 ≈ 0.679
+#   实际 embedding LR = 0.3 × 0.679 = 0.204
+#   实际 scalar LR = 0.04 × 0.679 = 0.027
+OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
+
 
 ################################################################################
 # torch.compile 配置
@@ -184,18 +221,38 @@ OPTION_FLAGS=""
 # EBT 使用 autograd.grad 进行 MCMC 更新,与 fullgraph 模式不兼容
 # 推荐: transformer_only 模式,仅编译 transformer 部分
 
-# 暂时禁用,确保稳定性优先
-COMPILE_FLAGS="--compile_model --compile_mode disabled"
+# 目前这个会报错
+# COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
 
-# 可尝试启用
-# COMPILE_FLAGS="--compile_model --compile_mode full"
+# 不使用 compile，steps 较少时适用
+# COMPILE_FLAGS="--compile_model --compile_mode disabled" 
+# 启用 compile，steps 较多时适用
+COMPILE_FLAGS="--compile_model --compile_mode full"
 
 ################################################################################
-# 日志配置
+# WandB 配置 (训练参数)
+################################################################################
+# 默认: 只记录 loss 等基础 metric, 不记录 gradients/activations
+# 如需 debug 梯度, 取消下面注释切换到全量记录
+#
+# 选项说明:
+#   不传 --wandb_watch        → 只记录 scalar metrics (最快, 默认)
+#   --wandb_watch              → 记录 parameters only (中等开销)
+#   --wandb_watch --wandb_watch_level all → 记录 gradients+parameters+activations (最慢, debug 用)
+#   --disable_wandb            → 完全关闭 wandb
+#
+WANDB_FLAGS=""
+# WANDB_FLAGS="--disable_wandb"
+# WANDB_FLAGS="--wandb_watch --wandb_watch_level parameters"
+# WANDB_FLAGS="--wandb_watch --wandb_watch_level all"
+
+################################################################################
+# 日志配置 - 自动路由 stdout/stderr 到日志文件
 ################################################################################
 
 current_time=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="logs/${current_time}_ebt_d26_stable.log"
+# 日志文件名包含: 日期时间_模型名_层数_上下文长度_优化器_GPU数
+LOG_FILE="logs/${current_time}_${MODEL_NAME}_${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_muon-adamw_gpu${NUM_GPUS}.log"
 mkdir -p logs
 
 # 定义颜色
@@ -236,18 +293,17 @@ print_kv() {
 # 显示配置
 ################################################################################
 
-print_header "EBT d26 稳定训练配置 (官方推荐参数)"
+print_header "EBT d26 Muon+AdamW 训练配置"
 
 echo ""
-echo -e "${CYAN}▶ 关键修复${NC}"
+echo -e "${CYAN}▶ 优化器策略 (对齐 NanoChat)${NC}"
 print_separator "─" 60
-echo "  ${GREEN}✓${NC} MCMC LR Multiplier: 2000 → ${BOLD}1500${NC} (遵循官方3x建议)"
-echo "  ${GREEN}✓${NC} Peak LR: 0.0006 → ${BOLD}0.00025${NC} (d26应使用large的LR,非small)"
-echo "  ${GREEN}✓${NC} Alpha 实际 LR: 1.2 → ${BOLD}0.375${NC} (降低69%!)"
-echo "  ${GREEN}✓${NC} 禁用所有高级优化选项 (避免干扰)"
-echo "  ${GREEN}✓${NC} Adam Beta: 恢复标准值 (beta1=0.9, beta2=0.999)"
-echo "  ${GREEN}✓${NC} Weight Decay: 0.05 → ${BOLD}0.02${NC} (适度正则化)"
-echo "  ${GREEN}✓${NC} LR 调度: 使用 Cosine Annealing (避免突变)"
+echo "  ${GREEN}✓${NC} Muon+AdamW 混合优化器 (nanochat/optim.py)"
+echo "  ${GREEN}✓${NC} Transformer 矩阵参数 → Muon (LR=0.02)"
+echo "  ${GREEN}✓${NC} Embedding/Scalar/Alpha → AdamW"
+echo "  ${GREEN}✓${NC} Adam Beta: (${BOLD}${BETA1}, ${BETA2}${NC}) (对齐 NanoChat)"
+echo "  ${GREEN}✓${NC} Weight Decay: ${BOLD}${WEIGHT_DECAY}${NC} + 动态衰减到 0"
+echo "  ${GREEN}✓${NC} LR 调度: Linear Warmdown (后50%衰减到0)"
 
 echo ""
 echo -e "${CYAN}▶ EBT 核心参数 (官方推荐)${NC}"
@@ -296,9 +352,12 @@ print_kv "Gradient Clip" "${GRADIENT_CLIP_VAL}"
 echo ""
 echo -e "${CYAN}▶ 训练进度${NC}"
 print_separator "─" 60
-print_kv "Max Steps" "${MAX_STEPS}"
-local total_tokens=$(awk "BEGIN {printf \"%.2f\", ${MAX_STEPS} * ${EFFECTIVE_BATCH_SIZE} / 1000000000}")
-print_kv "Total Tokens" "~${total_tokens}B"
+print_kv "Target Tokens" "7.34B"
+print_kv "Max Steps" "${MAX_STEPS} (自适应计算)"
+print_kv "Max Sched Steps" "${MAX_SCHEDULING_STEPS}"
+# 注意：在 bash 脚本的全局作用域中不应使用 local 关键字，直接赋值即可
+total_tokens_b=$(awk "BEGIN {printf \"%.2f\", ${MAX_STEPS} * ${EFFECTIVE_BATCH_SIZE} / 1000000000}")
+print_kv "Actual Total Tokens" "~${total_tokens_b}B"
 print_kv "Val Check Interval" "${VAL_CHECK_INTERVAL}"
 
 echo ""
@@ -310,9 +369,9 @@ print_kv "WandB Mode" "${WANDB_MODE}"
 
 echo ""
 echo -e "${YELLOW}⚠ 重要说明${NC}"
-echo "  1. 本配置严格遵循 EBT 官方推荐参数"
-echo "  2. 使用 Baseline 模式,不启用任何高级优化"
-echo "  3. 如需启用优化,请在验证 Baseline 稳定后逐个测试"
+echo "  1. EBT 核心参数 (MCMC) 保持官方推荐值不变"
+echo "  2. 优化器/LR调度/Weight Decay 对齐 NanoChat base_train.py"
+echo "  3. Alpha LR 仍由 MCMC_STEP_SIZE_LR_MULTIPLIER × PEAK_LR 控制 (EBT 特有)"
 echo "  4. 监控关键指标: train_loss, Alpha_MCMC, Global_LR"
 
 echo ""
@@ -324,20 +383,19 @@ read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
 
 cat << LOG_HEADER > "${LOG_FILE}"
 ################################################################################
-#                    EBT d26 稳定训练日志
+#                    EBT d26 Muon+AdamW 训练日志
 ################################################################################
 #
 # Run Name:        ${RUN_NAME}_${current_time}
 # Start Time:      $(date '+%Y-%m-%d %H:%M:%S')
 # Log File:        ${LOG_FILE}
 #
-# 关键修复:
-#   1. MCMC LR Multiplier: 2000 → 1500 (官方3x建议)
-#   2. Peak LR: 0.0006 → 0.00025 (d26应使用large的LR)
-#   3. Alpha Effective LR: 1.2 → 0.375 (降低69%!)
-#   4. 禁用所有高级优化选项
-#   5. 恢复保守 Adam Beta 参数
-#   6. Weight Decay: 0.05 → 0.02
+# 优化器策略 (对齐 NanoChat base_train.py):
+#   1. Muon+AdamW 混合优化器 (nanochat/optim.py)
+#   2. Adam Beta: (${BETA1}, ${BETA2})
+#   3. Weight Decay: ${WEIGHT_DECAY} + 动态衰减到 0
+#   4. LR 调度: Linear Warmdown (后50%衰减到0)
+#   5. EBT 特有: Alpha LR = PEAK_LR × MCMC_LR_MULT (保持不变)
 #
 ################################################################################
 
@@ -375,7 +433,7 @@ Weight Decay:             ${WEIGHT_DECAY}
 Beta1/Beta2:              ${BETA1} / ${BETA2}
 Warmup Steps:             ${WARM_UP_STEPS}
 Max Steps:                ${MAX_STEPS}
-Total Tokens:             ~${total_tokens}B
+Total Tokens:             ${total_tokens_b}
 
 Option Flags:             ${OPTION_FLAGS:-"None (Baseline)"}
 Compile Flags:            ${COMPILE_FLAGS:-"None"}
@@ -385,6 +443,11 @@ Compile Flags:            ${COMPILE_FLAGS:-"None"}
 ================================================================================
 
 LOG_HEADER
+
+################################################################################
+# 自动重定向所有输出到日志文件 (替代手动 tee)
+################################################################################
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
 ################################################################################
 # 启动训练
@@ -439,9 +502,9 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
 --set_matmul_precision "medium" \
+${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
-${COMPILE_FLAGS} \
-2>&1 | tee -a "${LOG_FILE}"
+${COMPILE_FLAGS}
 
 TRAIN_EXIT_CODE=$?
 set -e

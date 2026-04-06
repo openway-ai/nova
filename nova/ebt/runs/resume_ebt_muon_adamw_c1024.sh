@@ -8,6 +8,8 @@
 
 ### 基础配置 ###
 export RUN_NAME="ebt-d26-muon-adamw-0405-from0327"
+export RUN_NAME="ebt-d26-muon-adamw-0406-from0403"
+
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
@@ -15,11 +17,15 @@ export MODEL_SIZE="d26"
 # RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0318_20260324_164538_2026-03-24_16-46-34_/last.ckpt"
 # RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
 RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/e=epoch=0-s=step=55999-lr0.00025-bs4x8-muon_adamw-valid_loss=valid_loss=2.6877.ckpt"
+# 1024
+RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0403_20260403_141607/last.ckpt"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:1024"
+
 export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"
 
@@ -45,6 +51,12 @@ NUM_GPUS=8
 DEVICE_BATCH_SIZE=4
 GRAD_ACCUM=8
 CONTEXT_LENGTH=512
+
+NUM_GPUS=8
+DEVICE_BATCH_SIZE=2
+GRAD_ACCUM=16
+CONTEXT_LENGTH=1024
+
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENGTH))
 TARGET_TOTAL_TOKENS=7340032000
 MAX_STEPS=$(( TARGET_TOTAL_TOKENS / EFFECTIVE_BATCH_SIZE ))

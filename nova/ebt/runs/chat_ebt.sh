@@ -36,6 +36,7 @@ DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-
 # DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-sft_20260331_001308_2026-03-31_00-13-29_/e=epoch=0-s=step=2312-lr5e-05-bs4x8-muon_adamw-valid_loss=valid_loss=8.1531.ckpt"
 # DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-sft_20260331_001308_2026-03-31_00-13-29_/last.ckpt"
 
+
 DEFAULT_TOKENIZER="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer"
 
 # 从环境变量读取配置
