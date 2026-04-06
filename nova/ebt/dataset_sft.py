@@ -102,7 +102,12 @@ class SFTIterableDataset(_IterableDataset):
             while len(conv_buffer) < buffer_size:
                 conversation = dataset[cursor]
                 ids, mask = self.tokenizer.render_conversation(conversation)
-                conv_buffer.append((ids, mask))  # 保留 mask 以实现 SFT 监督（只训练 assistant token）
+                # 截断超长对话：保留尾部（assistant 回复通常在末尾）
+                # 这样超过 row_capacity 的对话也能参与 packing，减少 padding 浪费
+                if len(ids) > row_capacity:
+                    ids = ids[-row_capacity:]
+                    mask = mask[-row_capacity:]
+                conv_buffer.append((ids, mask))
                 cursor += ddp_world_size
                 if cursor >= dataset_size:
                     cursor = cursor % dataset_size
