@@ -8,7 +8,7 @@
 set -e
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-sft-0406-from0327"
+export RUN_NAME="ebt-d26-sft-0406-from0327-v2"
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
@@ -41,7 +41,7 @@ export HF_HUB_OFFLINE=1
 # EBT 核心超参数 (对齐预训练配置)
 ################################################################################
 MCMC_STEP_SIZE=500.0
-MCMC_STEP_SIZE_LR_MULTIPLIER=1500
+MCMC_STEP_SIZE_LR_MULTIPLIER=750
 MCMC_NUM_STEPS=2
 EBT_TYPE="time_embed"
 NORMALIZE_INITIAL_CONDITION=true
@@ -55,7 +55,7 @@ NO_MCMC_DETACH=false
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)}
 NUM_GPUS=${NUM_GPUS:-8}
 DEVICE_BATCH_SIZE=4
-GRAD_ACCUM=8
+GRAD_ACCUM=16
 CONTEXT_LENGTH=512  # 受限于 base_train 阶段的上下文长度
 
 
@@ -70,11 +70,11 @@ PEAK_LR=0.00005
 #
 # 重要: --muon_lr / --adamw_*_lr 是绝对值，不受 PEAK_LR 缩放！
 # 预训练值: muon_lr=0.02, embedding_lr=0.3, vocab_to_embed_lr=0.01, scalar_lr=0.04
-# SFT 需要同比例降低 (÷5)，否则会导致梯度爆炸 → loss NaN
-SFT_MUON_LR=0.004           # 预训练 0.02 ÷ 5
-SFT_EMBEDDING_LR=0.06       # 预训练 0.3 ÷ 5
-SFT_VOCAB_TO_EMBED_LR=0.002 # 预训练 0.01 ÷ 5 (注: 预训练用 0.01 非 0.004)
-SFT_SCALAR_LR=0.008         # 预训练 0.04 ÷ 5
+# SFT 需要同比例降低 (÷10)，否则会导致梯度爆炸 → loss NaN
+SFT_MUON_LR=0.002           # 预训练 0.02 ÷ 10
+SFT_EMBEDDING_LR=0.03       # 预训练 0.3 ÷ 10
+SFT_VOCAB_TO_EMBED_LR=0.001 # 预训练 0.01 ÷ 10
+SFT_SCALAR_LR=0.004         # 预训练 0.04 ÷ 10
 
 ################################################################################
 # 优化器配置 (对齐预训练)
@@ -88,11 +88,8 @@ GRADIENT_CLIP_VAL=1.0
 # SFT 训练步数
 ################################################################################
 # SFT 数据 ~856K 条，根据实际需求调整
-# MAX_STEPS=30000
-# MAX_SCHEDULING_STEPS=30000
-MAX_STEPS=3000
-MAX_SCHEDULING_STEPS=3000
 
+MAX_STEPS=3000
 MAX_SCHEDULING_STEPS=3000
 
 ################################################################################

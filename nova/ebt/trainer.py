@@ -912,6 +912,7 @@ class ModelTrainer(LightningModule):
             warmup_ratio = getattr(self.hparams, 'warmup_ratio', 0.0)
             warmdown_ratio = getattr(self.hparams, 'warmdown_ratio', 0.5)
             final_lr_frac = getattr(self.hparams, 'final_lr_frac', 0.0)
+            resume_warmup_steps = getattr(self.hparams, 'resume_warmup_steps', 0)
 
             lr_scheduler = WarmUpLinearWarmdownLR(
                 optimizer,
@@ -920,7 +921,8 @@ class ModelTrainer(LightningModule):
                 final_lr_frac=final_lr_frac,
                 total_steps=self.hparams.max_scheduling_steps,
                 warm_up_finished_func=self.on_warm_up_finished,
-                enable_wd_decay=enable_wd_decay
+                enable_wd_decay=enable_wd_decay,
+                resume_warmup_steps=resume_warmup_steps
             )
         else:
             # 原始 Cosine Annealing 调度

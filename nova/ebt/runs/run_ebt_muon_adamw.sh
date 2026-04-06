@@ -26,7 +26,7 @@
 #SBATCH --output=logs/slurm/nlp/ebt-d26-stable_%A-%a.log
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-muon-adamw-0403"
+export RUN_NAME="ebt-d26-muon-adamw-0406-from0327"
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
@@ -84,10 +84,10 @@ DEVICE_BATCH_SIZE=4
 GRAD_ACCUM=8
 CONTEXT_LENGTH=512
 
-NUM_GPUS=8
-DEVICE_BATCH_SIZE=2
-GRAD_ACCUM=16
-CONTEXT_LENGTH=1024
+# NUM_GPUS=8
+# DEVICE_BATCH_SIZE=2
+# GRAD_ACCUM=16
+# CONTEXT_LENGTH=1024
 
 # 2. 计算每步的有效 Token 数 (Tokens per step)
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENGTH))

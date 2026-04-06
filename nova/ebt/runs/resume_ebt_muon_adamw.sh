@@ -7,7 +7,7 @@
 ################################################################################
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-muon-adamw-0405-from0327"
+export RUN_NAME="ebt-d26-muon-adamw-wu5000-0406-from0327"
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
@@ -131,7 +131,14 @@ cat << LOG_HEADER > "${LOG_FILE}"
 
 LOG_HEADER
 
-{
+################################################################################
+# 自动重定向所有输出到日志文件 (使用 exec 避免管道缓冲问题)
+################################################################################
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+# 强制 Python 子进程不缓冲 stdout/stderr
+export PYTHONUNBUFFERED=1
+
 echo "================================================================================"
 echo "[SYSTEM INFO]"
 echo "================================================================================"
@@ -153,7 +160,7 @@ echo "[开始训练]"
 echo "================================================================================"
 echo ""
 
-set -e
+set +e
 
 torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
 --run_name ${RUN_NAME}_${current_time} \
@@ -193,6 +200,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --set_matmul_precision "medium" \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --resume_training_ckpt ${RESUME_CKPT} \
+--resume_warmup_steps 5000 \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}
@@ -205,8 +213,6 @@ if [ $TRAIN_EXIT_CODE -eq 0 ]; then
 else
     echo -e "\033[0;31m✗ 训练异常退出 (exit code: $TRAIN_EXIT_CODE)\033[0m"
 fi
-
-} 2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush() }' | tee -a "${LOG_FILE}"
 
 echo ""
 echo "日志已保存到: ${LOG_FILE}"

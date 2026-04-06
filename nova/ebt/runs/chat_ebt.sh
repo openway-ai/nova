@@ -36,6 +36,8 @@ DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-
 # DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-sft_20260331_001308_2026-03-31_00-13-29_/e=epoch=0-s=step=2312-lr5e-05-bs4x8-muon_adamw-valid_loss=valid_loss=8.1531.ckpt"
 # DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-sft_20260331_001308_2026-03-31_00-13-29_/last.ckpt"
 
+# sft_train val_loss=2.0933
+DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260406_222136/e=epoch=0-s=step=62-lr5e-05-bs4x8-muon_adamw-valid_loss=valid_loss=0.5019.ckpt"
 
 DEFAULT_TOKENIZER="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer"
 

@@ -814,7 +814,10 @@ if __name__ == '__main__':
 
     # CHECKPOINTING ##################################################################
 
-    parser.add_argument("--resume_training_ckpt", help="checkpoint to resume training from, use absolute",type=str, default="")     
+    parser.add_argument("--resume_training_ckpt", help="checkpoint to resume training from, use absolute",type=str, default="")
+
+    parser.add_argument("--resume_warmup_steps", type=int, default=0,
+        help="Resume 后的 warmup 步数，LR 从 0 线性升到 schedule 值。0=不启用")     
 
     parser.add_argument("--checkpoint_monitor_string", help="string to use to monitor for saving checkpoint. supported by PL callback", type=str, default="valid_loss")
 
