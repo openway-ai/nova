@@ -41,6 +41,8 @@ class EBTModelArgs:
     ebt_norm: str = "rms"
     ebt_act_func: str = "silu"
     weight_initialization_gain: float = 1.0
+    vocab_size: int = None
+    window_pattern: str = "L"
 
 # nanochat depth-based auto-scaling
 # base_dim = depth * aspect_ratio # aspect_ratio = 64
@@ -110,6 +112,7 @@ model_sizes = { # small -> xl same as mamba https://arxiv.org/pdf/2312.00752; al
         "embedding_dim": 2048,
     },
 
+    "d6": nanochat_depth_scaling(6),
     "d26": nanochat_depth_scaling(26),
 }
 
@@ -453,6 +456,11 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
     elif hparams.ebt_type == "time_embed": # time embed
         from ar_ebt_time_embed import EBTTimeConcat
         ebt = EBTTimeConcat(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps)
+    elif hparams.ebt_type == "nanochat_time_embed":
+        from nanochat_ebt import NanoChatEBT
+        transformer_args.window_pattern = hparams.window_pattern
+        transformer_args.vocab_size = hparams.vocab_size
+        ebt = NanoChatEBT(params=transformer_args, max_mcmc_steps=hparams.mcmc_num_steps)
     else: # adaln or adaln_zero
         from ar_ebt_adaln import EBTAdaLN
         ebt = EBTAdaLN(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps)
