@@ -480,7 +480,7 @@ class ModelTrainer(LightningModule):
 
                     # 1. Always compute PPL on full sequence
                     batch_dict = batch  # Already a dict from DataLoader
-                    ppl_outputs = get_ppl(self.model, batch_dict, self.hparams)
+                    ppl_outputs = get_ppl(self.model, batch_dict, self.hparams, token_bytes=self.token_bytes)
 
                     # Track metrics for averaging
                     self.test_losses.append(ppl_outputs['loss'].item())
@@ -526,6 +526,8 @@ class ModelTrainer(LightningModule):
                             # Add PPL info and shard index
                             output['loss'] = ppl_outputs['loss'].item()
                             output['ppl'] = ppl_outputs['perplexity'].item()
+                            if 'bpb' in ppl_outputs:
+                                output['valid_bpb'] = float(ppl_outputs['bpb'])
                             output['shard_idx'] = batch['shard_indices'][i]
                             # Note: prompt and target are already in output from generate_text()
                             # No need to add duplicate fields
@@ -594,7 +596,7 @@ class ModelTrainer(LightningModule):
                         batch_dict = batch
 
                     # Compute PPL and save sample outputs
-                    ppl_outputs = get_ppl(self.model, batch_dict, self.hparams)
+                    ppl_outputs = get_ppl(self.model, batch_dict, self.hparams, token_bytes=self.token_bytes)
 
                     # Track metrics for averaging
                     self.test_losses.append(ppl_outputs['loss'].item())
@@ -670,6 +672,8 @@ class ModelTrainer(LightningModule):
                                     "loss": ppl_outputs['loss'].item(),
                                     "perplexity": ppl_outputs['perplexity'].item(),
                                 }
+                                if 'bpb' in ppl_outputs:
+                                    output_record["valid_bpb"] = float(ppl_outputs["bpb"])
                                 self.infer_logger.log_data(output_record)
 
                                 # Also print to console for first few samples

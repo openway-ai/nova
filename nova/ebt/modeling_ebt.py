@@ -133,22 +133,38 @@ class EBT_NLP(LightningModule):
             
         return predicted_tokens, energy_preds, predicted_tokens_for_loss
 
-    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
+    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True, block_size = None): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
         real_embeddings_input = self.embeddings(x)
         batch_size = x.shape[0]
         seq_length = x.shape[1]
+        if block_size is None:
+            block_size = getattr(self.hparams, "block_size", seq_length)
+        block_size = int(block_size)
+        if block_size <= 0:
+            raise ValueError(f"block_size must be > 0, got {block_size}")
+
+        if getattr(self.hparams, "ebt_type", "default") not in ("default", "time_embed") and block_size != seq_length:
+            raise NotImplementedError(
+                f"block_size != seq_length is currently only supported for ebt_type in [default, time_embed]; got ebt_type={self.hparams.ebt_type}, block_size={block_size}, seq_length={seq_length}"
+            )
 
         alpha = torch.clamp(self.alpha, min=0.0001)
         if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
-            expanded_alpha = alpha.expand(batch_size, seq_length, 1)
+            expanded_alpha = alpha.expand(batch_size, block_size, 1)
             scale = self.hparams.randomize_mcmc_step_size_scale
             low = alpha / scale
             high = alpha * scale
             alpha = low + torch.rand_like(expanded_alpha) * (high - low)
 
         langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
-        predicted_tokens = self.corrupt_embeddings(real_embeddings_input) # B, S, V
+        predicted_tokens = self.corrupt_embeddings(real_embeddings_input, target_length=block_size) # B, K, V
         if replay_buffer_logits is not None: # using replay buffer, use the logits instead of corruption
+            if block_size != seq_length:
+                raise NotImplementedError("replay_buffer_logits path only supports block_size == seq_length")
+            if replay_buffer_logits.shape[1] != block_size:
+                raise ValueError(
+                    f"replay_buffer_logits shape mismatch: expected second dim {block_size}, got {replay_buffer_logits.shape[1]}"
+                )
             predicted_tokens[batch_size - replay_buffer_logits.shape[0]:] = replay_buffer_logits # NOTE this assumes the fresh data is concatted first
 
         _, predicted_distributions, predicted_energies = self._run_mcmc_on_given_pred_tokens(
@@ -245,14 +261,14 @@ class EBT_NLP(LightningModule):
                 else:
                     predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
 
-                all_embeddings = torch.cat((real_embeddings_input, predicted_embeddings), dim = 1) # B, context_len + pred_len, D
+                all_embeddings = torch.cat((real_embeddings_input, predicted_embeddings), dim = 1) # B, S+K, D
                 energy_preds = self.transformer(
                     all_embeddings,
-                    start_pos=start_pos,
+                    start_pos = start_pos,
                     mcmc_step=mcmc_step,
                     context_len=real_embeddings_input.shape[1],
                     pred_len=predicted_embeddings.shape[1],
-                )
+                ) # checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
                 energy_preds = energy_preds.reshape(-1, 1)
                 predicted_energies.append(energy_preds)
 
@@ -384,7 +400,13 @@ class EBT_NLP(LightningModule):
                 block_embeds = self._logits_to_pred_embeddings(cur_block_logits, mcmc_step)
                 pred_embeddings = torch.cat([prefix_embeds, block_embeds], dim=1)
                 all_embeddings = torch.cat((real_embeddings_input, pred_embeddings), dim=1)
-                energy_preds = self.transformer(all_embeddings, start_pos=start_pos, mcmc_step=mcmc_step)
+                energy_preds = self.transformer(
+                    all_embeddings,
+                    start_pos=start_pos,
+                    mcmc_step=mcmc_step,
+                    context_len=real_embeddings_input.shape[1],
+                    pred_len=pred_embeddings.shape[1],
+                )
                 energy_block = energy_preds[:, -block_len:].reshape(-1, 1)
 
                 block_grad = torch.autograd.grad([energy_block.sum()], [cur_block_logits], create_graph=learning)[0]
@@ -511,13 +533,15 @@ class EBT_NLP(LightningModule):
         return log_dict
     
 
-    def corrupt_embeddings(self, embeddings):
+    def corrupt_embeddings(self, embeddings, target_length=None):
+        if target_length is None:
+            target_length = embeddings.shape[1]
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device) * self.hparams.gaussian_random_noise_scaling
+            predicted_tokens = torch.randn(size=(embeddings.shape[0], target_length, self.vocab_size), device = self.device) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
-            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device)
+            predicted_tokens = torch.zeros(size=(embeddings.shape[0], target_length, self.vocab_size), device = self.device)
         else:
             raise NotImplementedError(f"{self.hparams.denoising_initial_condition} denoising_initial_condition not yet supported")
         

@@ -3,6 +3,8 @@ import torch.nn.functional as F
 from tokenizer import AutoTokenizer
 import matplotlib.pyplot as plt
 import io
+import time
+import math
 # import base64
 # from PIL import Image
 import numpy as np
@@ -111,6 +113,20 @@ def _draft_block_tokens(hparams, model, tokens, cur_pos, block_size, input_text_
     return torch.cat(draft_tokens, dim=1), torch.cat(draft_logits, dim=1)
 
 
+def _decode_block_from_logits(block_logits, temperature, top_p):
+    block_size = block_logits.shape[1]
+    decoded = []
+    for offset in range(block_size):
+        step_logits = block_logits[:, offset, :]
+        if temperature > 0:
+            probs = torch.softmax(step_logits / temperature, dim=-1)
+            step_token = sample_top_p(probs, top_p).reshape(-1)
+        else:
+            step_token = torch.argmax(step_logits, dim=-1).reshape(-1)
+        decoded.append(step_token.unsqueeze(1))
+    return torch.cat(decoded, dim=1)
+
+
 def generate_text(model, batch, hparams):
     tokenizer = _get_tokenizer(hparams)
 
@@ -152,8 +168,22 @@ def generate_text(model, batch, hparams):
     infer_block_use_refine = bool(getattr(hparams, "infer_block_use_refine", True))
     infer_block_refine_steps = int(getattr(hparams, "infer_block_refine_steps", 0))
     infer_block_init_logit_scale = float(getattr(hparams, "infer_block_init_logit_scale", 8.0))
+    infer_block_mode = str(getattr(hparams, "infer_block_mode", "auto"))
+    if infer_block_mode not in ("auto", "sequential", "direct_block"):
+        raise ValueError(f"Unsupported infer_block_mode: {infer_block_mode}. Expected 'auto', 'sequential' or 'direct_block'.")
+    effective_block_mode = infer_block_mode
+    if infer_block_mode == "auto":
+        effective_block_mode = "direct_block" if infer_block_size > 1 else "sequential"
     if infer_block_size > 1 and logprobs:
         raise NotImplementedError("logprobs=True is not supported in block inference mode yet")
+    if infer_block_size > 1 and effective_block_mode == "direct_block" and hparams.model_name != "ebt":
+        raise NotImplementedError("direct_block inference mode is currently only supported for EBT models.")
+    if infer_block_size > 1 and effective_block_mode == "direct_block":
+        ebt_type = str(getattr(hparams, "ebt_type", "default"))
+        if ebt_type not in ("default", "time_embed"):
+            raise NotImplementedError(
+                f"direct_block inference currently requires ebt_type in [default, time_embed]; got ebt_type={ebt_type}."
+            )
     # ppl = model.forward_loss_wrapper(questions, phase="test")['perplexity'].item() # just in case want to debug model PPL
 
     prompt_tokens = [] #NOTE this was to fix a bug where this generation code was not working for bs > 1 due to pad_token_id being same as eos_token_id and min_prompt_len being wrong
@@ -182,6 +212,10 @@ def generate_text(model, batch, hparams):
     prev_pos = 0
     eos_reached = torch.tensor([False] * bsz, device="cuda")
     input_text_mask = tokens != pad_id
+    block_energy_before_accum = torch.zeros(bsz, device="cuda", dtype=torch.float32)
+    block_energy_after_accum = torch.zeros(bsz, device="cuda", dtype=torch.float32)
+    block_energy_count = torch.zeros(bsz, device="cuda", dtype=torch.float32)
+    gen_start = time.perf_counter()
     with torch.no_grad():
         if min_prompt_len == total_len:
             logits = call_model_forward_decode(hparams, model, tokens, prev_pos, bsz)
@@ -226,17 +260,40 @@ def generate_text(model, batch, hparams):
             cur_pos = min_prompt_len
             while cur_pos < total_len:
                 block_size = min(infer_block_size, total_len - cur_pos)
-                draft_block_ids, draft_block_logits = _draft_block_tokens(
-                    hparams=hparams,
-                    model=model,
-                    tokens=tokens,
-                    cur_pos=cur_pos,
-                    block_size=block_size,
-                    input_text_mask=input_text_mask,
-                    temperature=temperature,
-                    top_p=top_p,
-                    bsz=bsz,
-                )
+                if effective_block_mode == "direct_block":
+                    input_tokens = tokens[:, :cur_pos]
+                    ebt_outputs = model.forward(
+                        input_tokens,
+                        start_pos=0,
+                        learning=False,
+                        return_raw_logits=True,
+                        block_size=block_size,
+                    )
+                    draft_block_logits = ebt_outputs[0][-1]
+                    if draft_block_logits.shape[1] != block_size:
+                        raise RuntimeError(
+                            f"direct_block logits shape mismatch: expected block dim {block_size}, got {draft_block_logits.shape[1]}"
+                        )
+                    draft_block_ids = _decode_block_from_logits(draft_block_logits, temperature, top_p)
+
+                    if len(ebt_outputs[1]) > 0:
+                        step0 = ebt_outputs[1][0].reshape(bsz, -1).mean(dim=1)
+                        stepn = ebt_outputs[1][-1].reshape(bsz, -1).mean(dim=1)
+                        block_energy_before_accum += step0
+                        block_energy_after_accum += stepn
+                        block_energy_count += 1.0
+                else:
+                    draft_block_ids, draft_block_logits = _draft_block_tokens(
+                        hparams=hparams,
+                        model=model,
+                        tokens=tokens,
+                        cur_pos=cur_pos,
+                        block_size=block_size,
+                        input_text_mask=input_text_mask,
+                        temperature=temperature,
+                        top_p=top_p,
+                        bsz=bsz,
+                    )
 
                 commit_block_ids = draft_block_ids
                 commit_block_logits = draft_block_logits
@@ -279,6 +336,7 @@ def generate_text(model, batch, hparams):
                 if all(eos_reached):
                     break
                 cur_pos += block_size
+    gen_elapsed = time.perf_counter() - gen_start
 
     if logprobs:
         token_logprobs = token_logprobs.tolist()
@@ -307,19 +365,30 @@ def generate_text(model, batch, hparams):
                 "logprobs": logprobs_i,
                 "target": tokenizer.decode(gt_ans, skip_special_tokens=True),
                 "prompt": tokenizer.decode(question, skip_special_tokens=True),
+                "decode_time_sec": gen_elapsed / max(1, bsz),
+                "infer_block_mode": effective_block_mode,
+                "infer_block_size": infer_block_size,
             }
             for t, logprobs_i, gt_ans, question in zip(out_tokens, out_logprobs, answers['input_ids'], questions['input_ids'])
         ]
-    return [
-        {
+    outputs = []
+    for i, (t, gt_ans, question) in enumerate(zip(out_tokens, answers['input_ids'], questions['input_ids'])):
+        item = {
             "generation": tokenizer.decode(t, skip_special_tokens=True),
             "target": tokenizer.decode(gt_ans, skip_special_tokens=True),
             "prompt": tokenizer.decode(question, skip_special_tokens=True),
-        } for t, gt_ans, question in zip(out_tokens, answers['input_ids'], questions['input_ids'])
-    ]
+            "decode_time_sec": gen_elapsed / max(1, bsz),
+            "infer_block_mode": effective_block_mode,
+            "infer_block_size": infer_block_size,
+        }
+        if block_energy_count[i].item() > 0:
+            item["block_energy_before_refine"] = (block_energy_before_accum[i] / block_energy_count[i]).item()
+            item["block_energy_after_refine"] = (block_energy_after_accum[i] / block_energy_count[i]).item()
+        outputs.append(item)
+    return outputs
 
 
-def get_ppl(model, batch, hparams): # is very similar to model forward_loss_wrapper, just doesnt work on list for logits and calls advanced inference. mainly to avoid using inference_mode which generates tokens one at a time, this is for getting PPL over the entire sequence
+def get_ppl(model, batch, hparams, token_bytes=None): # is very similar to model forward_loss_wrapper, just doesnt work on list for logits and calls advanced inference. mainly to avoid using inference_mode which generates tokens one at a time, this is for getting PPL over the entire sequence
     batch_size = batch['input_ids'].shape[0]
     with torch.no_grad(): # by default no grad, although ebt will enable grad
         input_ids = batch['input_ids'].squeeze(dim=1)[:, :-1]
@@ -335,13 +404,39 @@ def get_ppl(model, batch, hparams): # is very similar to model forward_loss_wrap
     if pad_token_id is None:
         pad_token_id = -100  # Standard ignore index that won't match any actual token
 
-    cce_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), next_token_indices, ignore_index=pad_token_id)
+    per_token_loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        next_token_indices,
+        ignore_index=pad_token_id,
+        reduction="none",
+    )
+    cce_loss = per_token_loss.mean()
     perplexity = torch.exp(cce_loss).detach()
 
     outputs = {
         'loss': cce_loss,
         'perplexity': perplexity
     }
+
+    if token_bytes is not None:
+        if token_bytes.device != next_token_indices.device:
+            token_bytes = token_bytes.to(next_token_indices.device)
+
+        if (next_token_indices.int() < 0).any():
+            valid = next_token_indices >= 0
+            y_safe = torch.where(valid, next_token_indices, torch.zeros_like(next_token_indices))
+            num_bytes = torch.where(
+                valid,
+                token_bytes[y_safe],
+                torch.zeros_like(next_token_indices, dtype=token_bytes.dtype),
+            )
+        else:
+            num_bytes = token_bytes[next_token_indices]
+
+        total_nats = (per_token_loss * (num_bytes > 0)).sum()
+        total_bytes = num_bytes.sum().to(torch.int64)
+        bpb = total_nats.item() / (math.log(2) * total_bytes.item()) if total_bytes.item() > 0 else float('inf')
+        outputs["bpb"] = bpb
 
     if hparams.model_name == "ebt":
         energy_tensors = []

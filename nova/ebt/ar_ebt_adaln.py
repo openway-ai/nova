@@ -560,7 +560,7 @@ class EBTAdaLN(nn.Module):
         else:
             init_whole_model_weights(self.final_layer.linear, self.params.weight_initialization)
 
-    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0):
+    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0, context_len = None, pred_len = None):
         """
         Perform a forward pass through the Transformer model.
 
@@ -572,6 +572,10 @@ class EBTAdaLN(nn.Module):
             torch.Tensor: Output energies after applying the Transformer model.
 
         """
+        if context_len is not None and pred_len is not None and context_len != pred_len:
+            raise NotImplementedError(
+                f"ar_ebt_adaln currently expects context_len == pred_len, got context_len={context_len}, pred_len={pred_len}"
+            )
         _bsz, seqlen = embeddings.shape[:2]
         seqlen = (seqlen+2) // 2 # do this since passed in seqlen is 2(S-1) so add 2 div 2 = S
         self.freqs_cis = self.freqs_cis.to(embeddings.device)

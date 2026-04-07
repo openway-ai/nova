@@ -13,8 +13,12 @@ EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 # 切换到 EBT 目录
 cd "$EBT_DIR"
 
-# 确定 Python 路径：优先使用 conda 环境的 python，避免误用系统 python
-if [ -n "$CONDA_PREFIX" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
+# 确定 Python 路径：优先使用显式 PYTHON，其次 nanochat 环境，避免误用系统 python
+if [ -n "${PYTHON:-}" ] && [ -x "$PYTHON" ]; then
+    PYTHON="$PYTHON"
+elif [ -x "/mnt/shared-storage-user/lixueyan/miniconda3/envs/nanochat/bin/python" ]; then
+    PYTHON="/mnt/shared-storage-user/lixueyan/miniconda3/envs/nanochat/bin/python"
+elif [ -n "$CONDA_PREFIX" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
     PYTHON="$CONDA_PREFIX/bin/python"
 elif [ -x "$(command -v python3)" ]; then
     PYTHON="python3"
@@ -23,7 +27,7 @@ else
 fi
 echo "🐍 Python: $PYTHON ($($PYTHON --version 2>&1))"
 
-export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/mnt/shared-storage-user/lixueyan/nar}"
 export OMP_NUM_THREADS=1
 export NANOCHAT_OFFLINE_MODE=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
@@ -34,13 +38,14 @@ export PYTHONNOUSERSITE=1
 ################################################################################
 
 CKPT_PATH="${CKPT_PATH:-}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/lixueyan/nar/tokenizer}"
 GPUS="${GPUS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 LIMIT_TEST_BATCHES="${LIMIT_TEST_BATCHES:-100}"
 USE_WANDB="${USE_WANDB:-false}"
 WANDB_API_KEY="${WANDB_API_KEY:-}"
 INFER_BLOCK_SIZE="${INFER_BLOCK_SIZE:-1}"
+INFER_BLOCK_MODE="${INFER_BLOCK_MODE:-auto}"
 INFER_BLOCK_USE_REFINE="${INFER_BLOCK_USE_REFINE:-true}"
 INFER_BLOCK_REFINE_STEPS="${INFER_BLOCK_REFINE_STEPS:-0}"
 INFER_BLOCK_INIT_LOGIT_SCALE="${INFER_BLOCK_INIT_LOGIT_SCALE:-8.0}"
@@ -102,7 +107,7 @@ echo "📁 Checkpoint: $CKPT_PATH"
 echo "📁 Tokenizer: $TOKENIZER_PATH"
 echo "📁 输出目录: $INFER_OUTPUT_DIR"
 echo "📁 日志文件: $LOG_FILE"
-echo "🧱 Block推理: size=$INFER_BLOCK_SIZE | refine=$INFER_BLOCK_USE_REFINE | steps=$INFER_BLOCK_REFINE_STEPS | init_scale=$INFER_BLOCK_INIT_LOGIT_SCALE"
+echo "🧱 Block推理: mode=$INFER_BLOCK_MODE | size=$INFER_BLOCK_SIZE | refine=$INFER_BLOCK_USE_REFINE | steps=$INFER_BLOCK_REFINE_STEPS | init_scale=$INFER_BLOCK_INIT_LOGIT_SCALE"
 echo "📊 评估分片: $EVAL_SHARD_INDICES"
 echo "📊 每分片样本数: $MAX_SAMPLES_PER_SHARD"
 echo "🎯 文本生成: $ENABLE_GENERATION"
@@ -158,6 +163,7 @@ $PYTHON train.py \
     --infer_temp 0.6 \
     --infer_topp 0.9 \
     --infer_block_size "$INFER_BLOCK_SIZE" \
+    --infer_block_mode "$INFER_BLOCK_MODE" \
     --infer_block_use_refine "$INFER_BLOCK_USE_REFINE" \
     --infer_block_refine_steps "$INFER_BLOCK_REFINE_STEPS" \
     --infer_block_init_logit_scale "$INFER_BLOCK_INIT_LOGIT_SCALE" \
