@@ -173,6 +173,7 @@ GRADIENT_CLIP_VAL=1.0
 VAL_CHECK_INTERVAL=2000
 LIMIT_VAL_BATCHES=50
 NUM_WORKERS=8
+SAVE_TOP_K=2
 
 ################################################################################
 # 优化选项配置
@@ -502,6 +503,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
 --set_matmul_precision "medium" \
+--save_top_k_ckpts ${SAVE_TOP_K} \
+--save_periodic_steps 1000 \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}

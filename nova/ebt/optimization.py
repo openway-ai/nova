@@ -99,9 +99,10 @@ class WarmUpLinearWarmdownLR(_LRScheduler):
         self.finished_warming_up = False
         self.warm_up_finished_func = warm_up_finished_func
 
-        # Resume warmup: 从 checkpoint 恢复后，在 N 步内将 LR 从 0 线性升到 schedule 值
+        # Resume warmup: 从 checkpoint 恢复后，在 N 步内将 LR 从 ckpt_lr 线性升到 schedule 值
         self.resume_warmup_steps = resume_warmup_steps
         self.resume_start_step = None  # 在 load_state_dict 中设置
+        self.resume_base_lr = None  # ckpt 保存的 LR，作为 resume warmup 起点
 
         # Option 2 兼容: 动态 Weight Decay
         self.enable_wd_decay = enable_wd_decay
@@ -155,12 +156,14 @@ class WarmUpLinearWarmdownLR(_LRScheduler):
     def get_lr(self):
         target_lrs = self._compute_schedule_lr()
 
-        # Resume warmup: 在恢复后的 N 步内，将 LR 从 0 线性升到 schedule 值
+        # Resume warmup: 在恢复后的 N 步内，将 LR 从 ckpt_lr 线性插值到 schedule 值
         if self.resume_start_step is not None and self.resume_warmup_steps > 0:
             steps_since_resume = self.last_step - self.resume_start_step
             if steps_since_resume < self.resume_warmup_steps:
                 progress = steps_since_resume / self.resume_warmup_steps
-                self._last_lr = [lr * progress for lr in target_lrs]
+                base_lrs = self.resume_base_lr if self.resume_base_lr is not None else [0.0] * len(target_lrs)
+                self._last_lr = [base + progress * (target - base)
+                                 for base, target in zip(base_lrs, target_lrs)]
                 return self._last_lr
 
         self._last_lr = target_lrs
@@ -176,6 +179,7 @@ class WarmUpLinearWarmdownLR(_LRScheduler):
             'finished_warming_up': self.finished_warming_up,
             'resume_warmup_steps': self.resume_warmup_steps,
             'resume_start_step': self.resume_start_step,
+            'resume_base_lr': self.resume_base_lr,
         }
 
     def load_state_dict(self, state_dict):
@@ -183,14 +187,16 @@ class WarmUpLinearWarmdownLR(_LRScheduler):
         self._last_lr = state_dict['last_lr']
         self.finished_warming_up = state_dict['finished_warming_up']
 
-        # Resume warmup: 若启用，记录恢复点
+        # Resume warmup: 若启用，记录恢复点，并保存 ckpt LR 作为 warmup 起点
         if self.resume_warmup_steps > 0:
             self.resume_start_step = self.last_step
+            self.resume_base_lr = list(self._last_lr)  # ckpt 保存的 LR
             print(f"[Resume Warmup] 从 step={self.resume_start_step} 开始，"
-                  f"在 {self.resume_warmup_steps} 步内将 LR 从 0 线性升到 schedule 值")
+                  f"在 {self.resume_warmup_steps} 步内将 LR 从 {self.resume_base_lr} 线性升到 schedule 值")
         else:
             # 从 checkpoint 恢复已有字段 (若存在)
             self.resume_start_step = state_dict.get('resume_start_step', None)
+            self.resume_base_lr = state_dict.get('resume_base_lr', None)
 
 
 class WarmUpCosineAnnealingLR(_LRScheduler):

@@ -5,6 +5,8 @@ report.md
 eval_bundle/
 *.DS_Store
 
+**/docs/
+
 # Secrets
 .env
 
