@@ -481,10 +481,13 @@ class ModelTrainer(LightningModule):
                     # 1. Always compute PPL on full sequence
                     batch_dict = batch  # Already a dict from DataLoader
                     ppl_outputs = get_ppl(self.model, batch_dict, self.hparams, token_bytes=self.token_bytes)
+                    tf_loss = float(ppl_outputs.get('teacher_forced_loss', ppl_outputs['loss']))
+                    tf_ppl = float(ppl_outputs.get('teacher_forced_ppl', ppl_outputs['perplexity']))
+                    tf_bpb = float(ppl_outputs['teacher_forced_bpb']) if 'teacher_forced_bpb' in ppl_outputs else None
 
                     # Track metrics for averaging
-                    self.test_losses.append(ppl_outputs['loss'].item())
-                    self.test_perplexities.append(ppl_outputs['perplexity'].item())
+                    self.test_losses.append(tf_loss)
+                    self.test_perplexities.append(tf_ppl)
 
                     # Track energy metrics if available
                     if not hasattr(self, 'test_energies'):
@@ -524,10 +527,10 @@ class ModelTrainer(LightningModule):
                         # Log generation results with additional context
                         for i, output in enumerate(generation_outputs):
                             # Add PPL info and shard index
-                            output['loss'] = ppl_outputs['loss'].item()
-                            output['ppl'] = ppl_outputs['perplexity'].item()
-                            if 'bpb' in ppl_outputs:
-                                output['valid_bpb'] = float(ppl_outputs['bpb'])
+                            output['teacher_forced_loss'] = tf_loss
+                            output['teacher_forced_ppl'] = tf_ppl
+                            if tf_bpb is not None:
+                                output['teacher_forced_bpb'] = tf_bpb
                             output['shard_idx'] = batch['shard_indices'][i]
                             # Note: prompt and target are already in output from generate_text()
                             # No need to add duplicate fields
@@ -557,7 +560,10 @@ class ModelTrainer(LightningModule):
                         sys.stdout.write(f"\n{'─'*100}\n")
                         sys.stdout.write(f"📊 Batch {batch_idx:3d}/{batches_total} | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s\n")
                         sys.stdout.write(f"{'─'*100}\n")
-                        sys.stdout.write(f"  Current Batch:  Loss={ppl_outputs['loss'].item():.4f}  PPL={ppl_outputs['perplexity'].item():.2f}\n")
+                        if tf_bpb is None:
+                            sys.stdout.write(f"  Current Batch:  TF_Loss={tf_loss:.4f}  TF_PPL={tf_ppl:.2f}\n")
+                        else:
+                            sys.stdout.write(f"  Current Batch:  TF_Loss={tf_loss:.4f}  TF_PPL={tf_ppl:.2f}  TF_BPB={tf_bpb:.4f}\n")
                         sys.stdout.write(f"  Running Avg:    Loss={current_avg_loss:.4f} (±{current_std_loss:.4f})  PPL={current_avg_ppl:.2f} (±{current_std_ppl:.2f})\n")
 
                         # Show energy metrics if available
@@ -598,9 +604,13 @@ class ModelTrainer(LightningModule):
                     # Compute PPL and save sample outputs
                     ppl_outputs = get_ppl(self.model, batch_dict, self.hparams, token_bytes=self.token_bytes)
 
+                    tf_loss = float(ppl_outputs.get('teacher_forced_loss', ppl_outputs['loss']))
+                    tf_ppl = float(ppl_outputs.get('teacher_forced_ppl', ppl_outputs['perplexity']))
+                    tf_bpb = float(ppl_outputs['teacher_forced_bpb']) if 'teacher_forced_bpb' in ppl_outputs else None
+
                     # Track metrics for averaging
-                    self.test_losses.append(ppl_outputs['loss'].item())
-                    self.test_perplexities.append(ppl_outputs['perplexity'].item())
+                    self.test_losses.append(tf_loss)
+                    self.test_perplexities.append(tf_ppl)
 
                     # Track energy metrics if available
                     if not hasattr(self, 'test_energies'):
@@ -634,7 +644,10 @@ class ModelTrainer(LightningModule):
                         sys.stdout.write(f"\n{'─'*100}\n")
                         sys.stdout.write(f"📊 Batch {batch_idx:3d}/{batches_total} | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s\n")
                         sys.stdout.write(f"{'─'*100}\n")
-                        sys.stdout.write(f"  Current Batch:  Loss={ppl_outputs['loss'].item():.4f}  PPL={ppl_outputs['perplexity'].item():.2f}\n")
+                        if tf_bpb is None:
+                            sys.stdout.write(f"  Current Batch:  TF_Loss={tf_loss:.4f}  TF_PPL={tf_ppl:.2f}\n")
+                        else:
+                            sys.stdout.write(f"  Current Batch:  TF_Loss={tf_loss:.4f}  TF_PPL={tf_ppl:.2f}  TF_BPB={tf_bpb:.4f}\n")
                         sys.stdout.write(f"  Running Avg:    Loss={current_avg_loss:.4f} (±{current_std_loss:.4f})  PPL={current_avg_ppl:.2f} (±{current_std_ppl:.2f})\n")
 
                         # Show energy metrics if available
@@ -669,11 +682,11 @@ class ModelTrainer(LightningModule):
                                     "batch_idx": batch_idx,
                                     "sample_idx": i,
                                     "text": full_text[:500],  # First 500 chars
-                                    "loss": ppl_outputs['loss'].item(),
-                                    "perplexity": ppl_outputs['perplexity'].item(),
+                                    "teacher_forced_loss": tf_loss,
+                                    "teacher_forced_ppl": tf_ppl,
                                 }
-                                if 'bpb' in ppl_outputs:
-                                    output_record["valid_bpb"] = float(ppl_outputs["bpb"])
+                                if tf_bpb is not None:
+                                    output_record["teacher_forced_bpb"] = tf_bpb
                                 self.infer_logger.log_data(output_record)
 
                                 # Also print to console for first few samples
@@ -684,7 +697,10 @@ class ModelTrainer(LightningModule):
                                     sys.stdout.write(f"{'─'*100}\n")
                                     sys.stdout.write(f"{full_text[:300]}...\n")
                                     sys.stdout.write(f"{'─'*100}\n")
-                                    sys.stdout.write(f"   Loss: {ppl_outputs['loss'].item():.4f} | PPL: {ppl_outputs['perplexity'].item():.2f}\n")
+                                    if tf_bpb is None:
+                                        sys.stdout.write(f"   TF_Loss: {tf_loss:.4f} | TF_PPL: {tf_ppl:.2f}\n")
+                                    else:
+                                        sys.stdout.write(f"   TF_Loss: {tf_loss:.4f} | TF_PPL: {tf_ppl:.2f} | TF_BPB: {tf_bpb:.4f}\n")
                                     sys.stdout.write(f"{'─'*100}\n\n")
                                     sys.stdout.flush()
 

@@ -127,6 +127,17 @@ def _decode_block_from_logits(block_logits, temperature, top_p):
     return torch.cat(decoded, dim=1)
 
 
+def _resolve_block_mode(hparams, infer_block_size=None):
+    if infer_block_size is None:
+        infer_block_size = max(1, int(getattr(hparams, "infer_block_size", 1)))
+    infer_block_mode = str(getattr(hparams, "infer_block_mode", "auto"))
+    if infer_block_mode not in ("auto", "sequential", "direct_block"):
+        raise ValueError(f"Unsupported infer_block_mode: {infer_block_mode}. Expected 'auto', 'sequential' or 'direct_block'.")
+    if infer_block_mode == "auto":
+        return "direct_block" if infer_block_size > 1 else "sequential"
+    return infer_block_mode
+
+
 def generate_text(model, batch, hparams):
     tokenizer = _get_tokenizer(hparams)
 
@@ -168,12 +179,7 @@ def generate_text(model, batch, hparams):
     infer_block_use_refine = bool(getattr(hparams, "infer_block_use_refine", True))
     infer_block_refine_steps = int(getattr(hparams, "infer_block_refine_steps", 0))
     infer_block_init_logit_scale = float(getattr(hparams, "infer_block_init_logit_scale", 8.0))
-    infer_block_mode = str(getattr(hparams, "infer_block_mode", "auto"))
-    if infer_block_mode not in ("auto", "sequential", "direct_block"):
-        raise ValueError(f"Unsupported infer_block_mode: {infer_block_mode}. Expected 'auto', 'sequential' or 'direct_block'.")
-    effective_block_mode = infer_block_mode
-    if infer_block_mode == "auto":
-        effective_block_mode = "direct_block" if infer_block_size > 1 else "sequential"
+    effective_block_mode = _resolve_block_mode(hparams, infer_block_size=infer_block_size)
     if infer_block_size > 1 and logprobs:
         raise NotImplementedError("logprobs=True is not supported in block inference mode yet")
     if infer_block_size > 1 and effective_block_mode == "direct_block" and hparams.model_name != "ebt":
@@ -388,37 +394,88 @@ def generate_text(model, batch, hparams):
     return outputs
 
 
-def get_ppl(model, batch, hparams, token_bytes=None): # is very similar to model forward_loss_wrapper, just doesnt work on list for logits and calls advanced inference. mainly to avoid using inference_mode which generates tokens one at a time, this is for getting PPL over the entire sequence
+def get_ppl(model, batch, hparams, token_bytes=None): # computes teacher-forced metrics
     batch_size = batch['input_ids'].shape[0]
+    infer_block_size = max(1, int(getattr(hparams, "infer_block_size", 1)))
+    effective_block_mode = _resolve_block_mode(hparams, infer_block_size=infer_block_size)
+
     with torch.no_grad(): # by default no grad, although ebt will enable grad
-        input_ids = batch['input_ids'].squeeze(dim=1)[:, :-1]
-        if hparams.model_name == "ebt":
-            logits, energies = call_model_forward_ppl(hparams, model, input_ids, 0, batch_size)
+        full_ids = batch['input_ids'].squeeze(dim=1)
+        if hparams.model_name == "ebt" and effective_block_mode == "direct_block" and infer_block_size > 1:
+            # Blockwise teacher-forced:
+            # for each chunk starting at cur_pos, condition on real prefix full_ids[:, :cur_pos]
+            # and predict the next K tokens in one shot.
+            pad_token_id = model.tokenizer_pad_token_id
+            if pad_token_id is None:
+                pad_token_id = -100
+
+            all_losses = []
+            for cur_pos in range(1, full_ids.shape[1], infer_block_size):
+                block_len = min(infer_block_size, full_ids.shape[1] - cur_pos)
+                if block_len <= 0:
+                    continue
+                input_tokens = full_ids[:, :cur_pos]
+                ebt_outputs = model.forward(
+                    input_tokens,
+                    start_pos=0,
+                    learning=False,
+                    return_raw_logits=True,
+                    block_size=block_len,
+                )
+                block_logits = ebt_outputs[0][-1]  # [B, block_len, V]
+                block_targets = full_ids[:, cur_pos:cur_pos + block_len]  # [B, block_len]
+                block_losses = F.cross_entropy(
+                    block_logits.reshape(-1, block_logits.shape[-1]),
+                    block_targets.reshape(-1),
+                    ignore_index=pad_token_id,
+                    reduction="none",
+                )
+                all_losses.append(block_losses)
+
+            if len(all_losses) == 0:
+                per_token_loss = torch.tensor([0.0], device=full_ids.device)
+            else:
+                per_token_loss = torch.cat(all_losses, dim=0)
+            energies = None
         else:
-            logits, _ = call_model_forward_ppl(hparams, model, input_ids, 0, batch_size)
+            input_ids = full_ids[:, :-1]
+            if hparams.model_name == "ebt":
+                logits, energies = call_model_forward_ppl(hparams, model, input_ids, 0, batch_size)
+            else:
+                logits, _ = call_model_forward_ppl(hparams, model, input_ids, 0, batch_size)
 
-    next_token_indices = batch['input_ids'].squeeze(dim=1)[:, 1:].reshape(-1) # BS * S; reshape since targets are supposed to be 1D
+            next_token_indices = full_ids[:, 1:].reshape(-1) # BS * S; reshape since targets are supposed to be 1D
 
-    # Get pad token id safely - nanochat doesn't have pad token, so use -100 (standard ignore index)
-    pad_token_id = model.tokenizer_pad_token_id
-    if pad_token_id is None:
-        pad_token_id = -100  # Standard ignore index that won't match any actual token
+            # Get pad token id safely - nanochat doesn't have pad token, so use -100 (standard ignore index)
+            pad_token_id = model.tokenizer_pad_token_id
+            if pad_token_id is None:
+                pad_token_id = -100  # Standard ignore index that won't match any actual token
 
-    per_token_loss = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
-        next_token_indices,
-        ignore_index=pad_token_id,
-        reduction="none",
-    )
+            per_token_loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                next_token_indices,
+                ignore_index=pad_token_id,
+                reduction="none",
+            )
     cce_loss = per_token_loss.mean()
     perplexity = torch.exp(cce_loss).detach()
 
     outputs = {
-        'loss': cce_loss,
-        'perplexity': perplexity
+        'loss': cce_loss,  # legacy
+        'perplexity': perplexity,  # legacy
+        'teacher_forced_loss': cce_loss,
+        'teacher_forced_ppl': perplexity,
     }
 
     if token_bytes is not None:
+        if hparams.model_name == "ebt" and effective_block_mode == "direct_block" and infer_block_size > 1:
+            # Next-token targets are all tokens after BOS-equivalent first token in full_ids.
+            next_token_indices = full_ids[:, 1:].reshape(-1)
+            # blockwise all_losses is built in the same left-to-right order; trim to target length if needed
+            if per_token_loss.numel() != next_token_indices.numel():
+                min_len = min(per_token_loss.numel(), next_token_indices.numel())
+                per_token_loss = per_token_loss[:min_len]
+                next_token_indices = next_token_indices[:min_len]
         if token_bytes.device != next_token_indices.device:
             token_bytes = token_bytes.to(next_token_indices.device)
 
@@ -436,9 +493,10 @@ def get_ppl(model, batch, hparams, token_bytes=None): # is very similar to model
         total_nats = (per_token_loss * (num_bytes > 0)).sum()
         total_bytes = num_bytes.sum().to(torch.int64)
         bpb = total_nats.item() / (math.log(2) * total_bytes.item()) if total_bytes.item() > 0 else float('inf')
-        outputs["bpb"] = bpb
+        outputs["bpb"] = bpb  # legacy
+        outputs["teacher_forced_bpb"] = bpb
 
-    if hparams.model_name == "ebt":
+    if hparams.model_name == "ebt" and energies is not None:
         energy_tensors = []
         for step_energies in zip(*[energies]):
             step_tensor = torch.stack(step_energies)

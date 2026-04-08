@@ -213,6 +213,9 @@ import sys
 path = sys.argv[1]
 losses = []
 ppls = []
+tf_losses = []
+tf_ppls = []
+tf_bpbs = []
 with open(path, "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
@@ -223,6 +226,12 @@ with open(path, "r", encoding="utf-8") as f:
             losses.append(float(rec["loss"]))
         if "ppl" in rec:
             ppls.append(float(rec["ppl"]))
+        if "teacher_forced_loss" in rec:
+            tf_losses.append(float(rec["teacher_forced_loss"]))
+        if "teacher_forced_ppl" in rec:
+            tf_ppls.append(float(rec["teacher_forced_ppl"]))
+        if "teacher_forced_bpb" in rec:
+            tf_bpbs.append(float(rec["teacher_forced_bpb"]))
 
 def fmt_stats(name, vals):
     if not vals:
@@ -234,6 +243,9 @@ def fmt_stats(name, vals):
 
 fmt_stats("loss", losses)
 fmt_stats("ppl", ppls)
+fmt_stats("teacher_forced_loss", tf_losses)
+fmt_stats("teacher_forced_ppl", tf_ppls)
+fmt_stats("teacher_forced_bpb", tf_bpbs)
 PY
     else
         echo "  - 评估结果: 未生成"

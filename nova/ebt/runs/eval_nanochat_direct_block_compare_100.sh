@@ -16,7 +16,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 cd "$EBT_DIR"
 
-CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt}"
+CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/lixueyan/nar/ckpt/last.ckpt}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/lixueyan/nar/tokenizer}"
 NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/mnt/shared-storage-user/lixueyan/nar}"
 
@@ -108,6 +108,7 @@ import json
 import statistics
 import sys
 from pathlib import Path
+from collections import Counter
 
 base = Path(sys.argv[1])
 modes = [
@@ -146,34 +147,49 @@ print(f"Base output dir: {base}")
 print()
 
 print("[teacher_forced_ppl]")
-print("  NOTE: 该部分来自 trainer.py -> get_ppl()，其内部走 call_model_forward_ppl() -> model.forward(... return_raw_logits=True)")
-print("        未显式传入 block_size，因此不是 direct-block free-running 指标；用于 teacher-forced 对比。")
-print("        valid_bpb 与 ppl 一样来自 teacher-forced 路径（只是按 token bytes 归一化），不代表 free-running 质量。")
+print("  NOTE: teacher-forced 指标来自 get_ppl()，与 free-running 生成质量分开看。")
 for mode in modes:
     recs = all_data[mode]
-    losses = [float(r["loss"]) for r in recs if "loss" in r]
-    ppls = [float(r["ppl"]) for r in recs if "ppl" in r]
-    bpbs = [float(r["valid_bpb"]) for r in recs if "valid_bpb" in r]
-    print(f"  [{mode}] samples={len(recs)} loss_mean={safefmt(mean(losses))} ppl_mean={safefmt(mean(ppls))} valid_bpb_mean={safefmt(mean(bpbs))}")
+    losses = [float(r["teacher_forced_loss"]) for r in recs if "teacher_forced_loss" in r]
+    ppls = [float(r["teacher_forced_ppl"]) for r in recs if "teacher_forced_ppl" in r]
+    bpbs = [float(r["teacher_forced_bpb"]) for r in recs if "teacher_forced_bpb" in r]
+    print(
+        f"  [{mode}] samples={len(recs)} "
+        f"teacher_forced_loss={safefmt(mean(losses))} "
+        f"teacher_forced_ppl={safefmt(mean(ppls))} "
+        f"teacher_forced_bpb={safefmt(mean(bpbs))}"
+    )
 print()
 
 print("[free_running_generation_metrics]")
+def char_overlap(a, b):
+    if not b:
+        return 0.0
+    ca, cb = Counter(a), Counter(b)
+    inter = sum((ca & cb).values())
+    return inter / max(1, len(b))
+
 for mode in modes:
     recs = all_data[mode]
     dts = [float(r["decode_time_sec"]) for r in recs if "decode_time_sec" in r]
     eb = [float(r["block_energy_before_refine"]) for r in recs if "block_energy_before_refine" in r]
     ea = [float(r["block_energy_after_refine"]) for r in recs if "block_energy_after_refine" in r]
     lens = [len(r.get("generation", "")) for r in recs if "generation" in r]
+    target_overlaps = []
+    for r in recs:
+        if "generation" in r and "target" in r:
+            target_overlaps.append(char_overlap(r.get("generation", ""), r.get("target", "")))
     print(f"[{mode}]")
     print(f"  samples: {len(recs)}")
     print(f"  decode_time_sec_mean: {safefmt(mean(dts))}")
     print(f"  generation_char_len_mean: {safefmt(mean(lens))}")
+    print(f"  generation_char_overlap_vs_target: {safefmt(mean(target_overlaps))}")
     print(f"  block_energy_before_mean: {safefmt(mean(eb))}")
     print(f"  block_energy_after_mean: {safefmt(mean(ea))}")
     print()
 
 if baseline:
-    print("[vs sequential generation similarity]")
+    print("[vs_sequential_generation_metrics]")
     base_gens = [r.get("generation", "") for r in baseline]
     for mode in modes[1:]:
         recs = all_data[mode]
@@ -195,7 +211,12 @@ if baseline:
                 match += 1
             denom = max(1, len(g0))
             prefix.append(match / denom)
-        print(f"  {mode}: exact_match={exact/n:.4f}, prefix_char_match={statistics.fmean(prefix):.4f}, paired_n={n}")
+        print(
+            f"  {mode}: "
+            f"generation_exact_match_vs_sequential={exact/n:.4f}, "
+            f"generation_prefix_char_match_vs_sequential={statistics.fmean(prefix):.4f}, "
+            f"paired_n={n}"
+        )
 PY
 
 echo ""
