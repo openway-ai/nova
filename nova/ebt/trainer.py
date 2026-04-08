@@ -113,6 +113,9 @@ class ModelTrainer(LightningModule):
         self._train_step_start_time = None
         self._train_start_time = None  # wall-clock start for ETA
 
+        # Dataloader resume state: 用于从 checkpoint 恢复 dataloader 位置
+        self._dataloader_resume_state = None
+
         if self.hparams.modality == "NLP":
             if "execution_mode" in self.hparams and "save_generation_logs_dir" in self.hparams and self.hparams.execution_mode == "inference": # two of these are sanity check for loading pretrained ckpt that may not have newer params
                 print("setting up infer logger")
@@ -408,7 +411,25 @@ class ModelTrainer(LightningModule):
     # def on_train_epoch_end(self): ## not effective for EBT
     #     if self.hparams.optimizer != "adamw": # e.g. for lars need to manually update epoch
     #         optimizer = self.trainer.optimizers[0]
-    #         optimizer.update_epoch(self.current_epoch)   
+    #         optimizer.update_epoch(self.current_epoch)
+
+    def on_save_checkpoint(self, checkpoint):
+        # 保存 dataloader 的位置信息到 checkpoint，用于 resume 时跳过已训练数据
+        try:
+            train_dl = self.trainer.train_dataloader
+            if train_dl is not None:
+                dataset = train_dl.dataset
+                if hasattr(dataset, 'last_state_dict') and dataset.last_state_dict is not None:
+                    checkpoint['dataloader_state_dict'] = dataset.last_state_dict
+                    print(f"[Checkpoint] 保存 dataloader state: {dataset.last_state_dict}")
+        except Exception:
+            pass  # 非训练阶段可能没有 train_dataloader
+
+    def on_load_checkpoint(self, checkpoint):
+        # 从 checkpoint 恢复 dataloader 位置信息
+        if 'dataloader_state_dict' in checkpoint:
+            self._dataloader_resume_state = checkpoint['dataloader_state_dict']
+            print(f"[Checkpoint] 恢复 dataloader state: {self._dataloader_resume_state}")
 
     def validation_step(self, batch, batch_idx):
         # Move token_bytes to the same device as the model if needed
@@ -1395,6 +1416,10 @@ class ModelTrainer(LightningModule):
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
 
+        # 从 checkpoint 恢复的 dataloader 位置（只用一次）
+        resume_state = getattr(self, '_dataloader_resume_state', None)
+        self._dataloader_resume_state = None
+
         if getattr(self.hparams, 'dataset_name', 'nanochat') == 'nanochat_sft':
             train_dataloader = generate_sft_dataloader(
                 tokenizer=tokenizer,
@@ -1412,7 +1437,7 @@ class ModelTrainer(LightningModule):
                 max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches, # 显示的1个epoch对应设置的self.hparams.max_steps个训练步数
                 split="train",
                 device=self.device,
-                resume_state_dict=None,
+                resume_state_dict=resume_state,
             )
         return train_dataloader
 

@@ -211,15 +211,29 @@ def main(args):
     
     opt_name = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
     checkpoint_filename = f"e={{epoch}}-s={{step}}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
-    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = True, dirpath=f"./logs/checkpoints/{args.run_name}", filename=checkpoint_filename, verbose=True, min_free_gb=50)
-    
+    save_last = (args.save_periodic_steps <= 0)  # periodic 启用时不需要 last.ckpt，periodic 已覆盖 crash recovery
+    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=f"./logs/checkpoints/{args.run_name}", filename=checkpoint_filename, verbose=True, min_free_gb=50)
+
+    # 定期保存 checkpoint（不依赖 val_loss），防止 SFT 后期模型丢失
+    periodic_checkpoint = None
+    if args.save_periodic_steps > 0:
+        periodic_checkpoint = DiskAwareCheckpoint(
+            save_top_k=1,
+            save_last=False,
+            every_n_train_steps=args.save_periodic_steps,
+            dirpath=f"./logs/checkpoints/{args.run_name}",
+            filename=f"periodic-s={{step}}-lr{args.peak_learning_rate}",
+            verbose=True,
+            min_free_gb=50
+        )
+
     for name, param in model_trainer.model.named_parameters():
         if not param.requires_grad:
             print(f"Non-trainable parameters: {name} with shape {param.shape}")
     
     if not args.only_test: #training and testing (if testing selected) as per usual
         print("$$$$$$$$$$  STARTED TRAINING  $$$$$$$$$$")
-        trainer = set_trainer(args, wandb_logger, checkpoint_callback)
+        trainer = set_trainer(args, wandb_logger, checkpoint_callback, periodic_checkpoint=periodic_checkpoint)
         resume_training_ckpt = None if args.resume_training_ckpt == "" else args.resume_training_ckpt
         trainer.fit(model_trainer, ckpt_path=resume_training_ckpt, weights_only=False)
         
@@ -288,7 +302,7 @@ def main(args):
         else:
             raise NotImplementedError(f"no post test evaluation setup for this modality: {args.modality} yet")
 
-def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train"):
+def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", periodic_checkpoint=None):
     torch.autograd.set_detect_anomaly(args.detect_anomaly) #NOTE seems pl detect anomaly is not working so manually set it here
 
     if args.find_unused_parameters or args.distributed_strategy == "ddp": 
@@ -311,7 +325,7 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train"):
         max_steps=args.max_steps,
         logger=wandb_logger,
         enable_model_summary=args.log_model_archi,
-        callbacks = [checkpoint_callback, ModelSummary(max_depth=-1)],
+        callbacks = [checkpoint_callback] + ([periodic_checkpoint] if periodic_checkpoint else []) + [ModelSummary(max_depth=-1)],
         strategy = args.distributed_strategy, 
         enable_checkpointing=True,
         fast_dev_run = args.fast_dev_run,
@@ -824,6 +838,9 @@ if __name__ == '__main__':
     parser.add_argument("--checkpoint_monitor_mode", help="monitoring mode for checkpoint_monitor_string, either ['min', 'max']. if is loss do min, if is a metric like accuracy do max", type=str, default="min")
 
     parser.add_argument("--save_top_k_ckpts", help="number of ckpts to save when doing val (saves the ones with best metrics using checkpoint monitor string and mode defined). -1 means save all", type=int, default=10)
+
+    parser.add_argument("--save_periodic_steps", type=int, default=0,
+        help="Save checkpoint every N training steps regardless of val_loss (0=disabled). Useful for SFT where val_loss may rise while task performance improves.")
 
     #PRECISION#########################################################################
 

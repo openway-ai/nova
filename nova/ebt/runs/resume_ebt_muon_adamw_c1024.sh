@@ -16,9 +16,10 @@ export MODEL_SIZE="d26"
 ### 恢复训练配置 ###
 # RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0318_20260324_164538_2026-03-24_16-46-34_/last.ckpt"
 # RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
+# context 512
 RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/e=epoch=0-s=step=55999-lr0.00025-bs4x8-muon_adamw-valid_loss=valid_loss=2.6877.ckpt"
-# 1024
-RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0403_20260403_141607/last.ckpt"
+# context 1024
+RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0403_20260403_141607/e=epoch=0-s=step=2624-lr0.00025-bs2x16-muon_adamw-valid_loss=valid_loss=3.4605.ckpt"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -63,8 +64,8 @@ MAX_STEPS=$(( TARGET_TOTAL_TOKENS / EFFECTIVE_BATCH_SIZE ))
 MAX_SCHEDULING_STEPS=$MAX_STEPS
 
 # TODO =============
-MAX_STEPS=559990
-MAX_SCHEDULING_STEPS=559990
+# MAX_STEPS=559990
+# MAX_SCHEDULING_STEPS=559990
 
 ################################################################################
 # 学习率配置

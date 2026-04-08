@@ -7,7 +7,7 @@
 ################################################################################
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-muon-adamw-wu5000-0406-from0327"
+export RUN_NAME="ebt-d26-muon-adamw-wu5000-0407-from0327"
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
@@ -41,23 +41,34 @@ NO_MCMC_DETACH=false
 ################################################################################
 # Batch 配置
 ################################################################################
-NUM_GPUS=8
+# NUM_GPUS=8 # TODO
+NUM_GPUS=6
 DEVICE_BATCH_SIZE=4
 GRAD_ACCUM=8
 CONTEXT_LENGTH=512
+
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENGTH))
 TARGET_TOTAL_TOKENS=7340032000
 MAX_STEPS=$(( TARGET_TOTAL_TOKENS / EFFECTIVE_BATCH_SIZE ))
 MAX_SCHEDULING_STEPS=$MAX_STEPS
 
+# MAX_STEPS=55999
+# MAX_SCHEDULING_STEPS=55999
+# 
 # TODO =============
-MAX_STEPS=559990
-MAX_SCHEDULING_STEPS=559990
+MAX_STEPS=112000
+MAX_SCHEDULING_STEPS=112000
 
 ################################################################################
 # 学习率配置
+# 注意: 恢复训练使用原始 Peak LR 的 70%
+# 原因: checkpoint 在 step 55999 已完成完整 warmdown (LR≈0)，模型权重处于退火后的
+# 较尖锐局部最优。直接回到 100% peak LR 会扰动过大导致 loss 恶化。
+# 70% 是平衡点: 足够高以继续有效学习 (模型仅训练 7.3B tokens，远未收敛)，
+# 又足够低以尊重退火后的权重状态。
+# 所有优化器 LR (Muon/AdamW 各组) 同步按 70% 缩放。
 ################################################################################
-PEAK_LR=0.00025
+PEAK_LR=0.000175  # 原 0.00025 × 0.7
 WARM_UP_STEPS=0
 WARM_UP_BASE_LR_DIVIDER=10
 MIN_LR_SCALE=50
@@ -78,9 +89,11 @@ LIMIT_VAL_BATCHES=50
 NUM_WORKERS=8
 
 ################################################################################
-# 优化选项配置
+# 优化选项配置 (LR 同步按 70% 缩放)
 ################################################################################
-OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
+# 原始: muon_lr=0.02, adamw_embedding_lr=0.3, adamw_vocab_to_embed_lr=0.01, adamw_scalar_lr=0.04
+# 恢复: muon_lr=0.014, adamw_embedding_lr=0.21, adamw_vocab_to_embed_lr=0.007, adamw_scalar_lr=0.028
+OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.25 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.014 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.21 --adamw_vocab_to_embed_lr 0.007 --adamw_scalar_lr 0.028 --adamw_dmodel_lr_scaling"
 
 ################################################################################
 # torch.compile 配置
@@ -199,8 +212,9 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --log_model_archi \
 --set_matmul_precision "medium" \
 --save_top_k_ckpts ${SAVE_TOP_K} \
+--save_periodic_steps 1000 \
 --resume_training_ckpt ${RESUME_CKPT} \
---resume_warmup_steps 5000 \
+--resume_warmup_steps 3000 \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}

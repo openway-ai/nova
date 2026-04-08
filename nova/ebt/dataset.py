@@ -26,11 +26,8 @@ class IterableDataset(_IterableDataset):
         max_len,
         split,
         max_iter,
-        # tokenizer_threads=4,
-        # tokenizer_batch_size=128,
         device="cuda",
         resume_state_dict=None,
-        # buffer_size=1000,
     ):
         super().__init__()
 
@@ -39,43 +36,23 @@ class IterableDataset(_IterableDataset):
         self.T = max_len
         self.split = split
         self.max_iter = max_iter
-        # self.tokenizer_threads = tokenizer_threads
-        # self.tokenizer_batch_size = tokenizer_batch_size
         self.device = device
         self.resume_state_dict = resume_state_dict
-        # self.buffer_size = buffer_size
         self.batch_idx = 0
+        self.last_state_dict = None  # 最新的 dataloader 位置，用于 checkpoint 恢复
 
     def __iter__(self):
-        
-        return tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(
             tokenizer=self.tokenizer,
             B=self.B,
             T=self.T,
             split=self.split,
-            # tokenizer_threads=self.tokenizer_threads,
-            # tokenizer_batch_size=self.tokenizer_batch_size,
             device=self.device,
             resume_state_dict=self.resume_state_dict,
-            # buffer_size=1000,
-        )
+        ):
+            self.last_state_dict = state_dict
+            yield inputs, targets
 
-        # inputs, targets, state_dict = tokenizing_distributed_data_loader_with_state_bos_bestfit(
-        #     tokenizer=self.tokenizer,
-        #     B=self.B,
-        #     T=self.T,
-        #     split=self.split,
-        #     # tokenizer_threads=self.tokenizer_threads,
-        #     # tokenizer_batch_size=self.tokenizer_batch_size,
-        #     device=self.device,
-        #     resume_state_dict=self.resume_state_dict,
-        #     # buffer_size=1000,
-        # )
-        # state_dict["batch_idx"] = self.batch_idx
-        # self.batch_idx += 1
-        # yield inputs, targets, state_dict
-
-    
     def __len__(self):
         return self.max_iter
 
