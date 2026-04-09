@@ -5,6 +5,7 @@
 #   bash nova/ebt/runs/test_sdpa.sh [--gpus N]   # default N=1
 # Usage (from nova/ebt/):
 #   bash runs/test_sdpa.sh [--gpus N]
+#   bash runs/test_sdpa.sh --gpus 2
 
 set -euo pipefail
 
