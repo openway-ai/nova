@@ -466,6 +466,8 @@ if __name__ == '__main__':
     
     parser.add_argument("--mcmc_num_steps", help="number of MCMC steps, try 2-5, check data samples as well to see how many we need. NOTE if are using time embed or adaln is the number of energy landscapes", type=int, default=2)
 
+    parser.add_argument("--mcmc_update_fraction", help="fraction of tokens to update during MCMC (1.0 = all tokens, 0.5 = 50% randomly selected)", type=float, default=1.0)
+
     parser.add_argument("--randomize_mcmc_num_steps", help="makes mcmc_num_steps random, each step at each landscape is repeated uniform(1, 1+randomize_mcmc_num_steps) times (unless randomize_mcmc_num_steps_min is set, then thats the min value). if ebt_type is default each landscape is the same, so it effectively just randomized mcmc_num_steps", type=int, default=0)
 
     parser.add_argument("--randomize_mcmc_num_steps_final_landscape", help="makes it so the randomize_mcmc_num_steps param only applies to the final energy landscape when using non default EBT", action="store_true", default = False)

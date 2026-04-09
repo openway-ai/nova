@@ -110,6 +110,11 @@ class EBT_NLP(LightningModule):
             predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
         # predicted_tokens_grad has shape B, S, V
         
+        # Apply mask to gradients if mcmc_update_fraction is set
+        if hasattr(self.hparams, 'mcmc_update_fraction') and self.hparams.mcmc_update_fraction < 1.0:
+            mask = (torch.rand(batch_size, seq_length, 1, device=predicted_tokens_grad.device) < self.hparams.mcmc_update_fraction).float()
+            predicted_tokens_grad = predicted_tokens_grad * mask
+
         if self.hparams.clamp_futures_grad:
             min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
             # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
