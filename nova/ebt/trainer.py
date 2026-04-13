@@ -1713,10 +1713,13 @@ class ModelTrainer(LightningModule):
                 # --- 最新 valid 指标 ---
                 last_valid = getattr(self, '_last_valid_metrics', {})
                 valid_loss_val = last_valid.get('loss', None)
+                valid_bpb_val = last_valid.get('bpb', None)
                 valid_ppl_val = last_valid.get('perplexity', None)
                 valid_str = ""
                 if valid_loss_val is not None:
                     valid_str += f" | valid_loss: {valid_loss_val:.4f}"
+                if valid_bpb_val is not None:
+                    valid_str += f" | valid_bpb: {valid_bpb_val:.4f}"
                 if valid_ppl_val is not None:
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
 

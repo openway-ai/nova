@@ -26,7 +26,7 @@
 #SBATCH --output=logs/slurm/nlp/ebt-d26-stable_%A-%a.log
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-muon-adamw-0406-from0327"
+export RUN_NAME="ebt-d26-ctx512-muon-adamw-0406-from0327"
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
