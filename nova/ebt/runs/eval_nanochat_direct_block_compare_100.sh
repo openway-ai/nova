@@ -16,7 +16,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 cd "$EBT_DIR"
 
-CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/lixueyan/nar/ckpt/last.ckpt}"
+CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/lixueyan/nar/tokenizer}"
 NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/mnt/shared-storage-user/lixueyan/nar}"
 
@@ -93,10 +93,10 @@ run_one_mode() {
 
 run_one_mode "sequential_k1" "sequential" "1" "false"
 run_one_mode "direct_block_k2" "direct_block" "2" "true"
-run_one_mode "direct_block_k4" "direct_block" "4" "true"
-run_one_mode "direct_block_k8" "direct_block" "8" "true"
+# run_one_mode "direct_block_k4" "direct_block" "4" "true"
+# run_one_mode "direct_block_k8" "direct_block" "8" "true"
 run_one_mode "direct_block_k128" "direct_block" "128" "true"
-run_one_mode "direct_block_k256" "direct_block" "256" "true"
+# run_one_mode "direct_block_k256" "direct_block" "256" "true"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
