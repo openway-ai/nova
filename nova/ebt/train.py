@@ -210,7 +210,7 @@ def main(args):
         torch.set_float32_matmul_precision(args.set_matmul_precision)
     
     opt_name = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
-    checkpoint_filename = f"e={{epoch}}-s={{step}}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
+    checkpoint_filename = f"s={{step}}-{args.model_size}-ctx{args.context_length}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
     save_last = (args.save_periodic_steps <= 0)  # periodic 启用时不需要 last.ckpt，periodic 已覆盖 crash recovery
     checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=f"./logs/checkpoints/{args.run_name}", filename=checkpoint_filename, verbose=True, min_free_gb=50)
 
@@ -222,7 +222,7 @@ def main(args):
             save_last=False,
             every_n_train_steps=args.save_periodic_steps,
             dirpath=f"./logs/checkpoints/{args.run_name}",
-            filename=f"periodic-s={{step}}-lr{args.peak_learning_rate}",
+            filename=f"periodic-s={{step}}-{args.model_size}-ctx{args.context_length}",
             verbose=True,
             min_free_gb=50
         )

@@ -7,7 +7,7 @@
 ################################################################################
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-muon-adamw-wu5000-0407-from0327"
+export RUN_NAME="ebt-d26-ctx512-muon-adamw-0409-from0327"
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
