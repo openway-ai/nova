@@ -451,7 +451,8 @@ class Attention(nn.Module):
         # o_mask is [original_seqlen, original_seqlen]; SDPA fuses softmax+matmul
         # and avoids materialising the score matrix in HBM (FlashAttention backend).
         o_mask = mask[:-1, :-1] if mask is not None else None
-        output_o = F.scaled_dot_product_attention(xq_o, keys_o, values_o, attn_mask=o_mask)
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+            output_o = F.scaled_dot_product_attention(xq_o, keys_o, values_o, attn_mask=o_mask)
         output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1)
 
         #pred sequence attn calc is for energy-based transformer ########################################################################################
@@ -495,7 +496,8 @@ class Attention(nn.Module):
 
         mask_p = torch.cat([orig_mask_part, self_mask_part], dim=1)  # [pred_seqlen, 2K-1]
 
-        output_p = F.scaled_dot_product_attention(xq_p, keys_all, values_all, attn_mask=mask_p)
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+            output_p = F.scaled_dot_product_attention(xq_p, keys_all, values_all, attn_mask=mask_p)
         output_p = output_p.transpose(1, 2).contiguous().view(bsz, original_seqlen-1, -1)
         
         #return linear projection of concatted outputs ########################################################################################
