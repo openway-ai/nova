@@ -14,7 +14,11 @@ except:
     pass
 
 # 抑制 CUDA stream 不匹配警告（恢复训练时的已知问题）
-torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+# 该 API 在 PyTorch 2.9 中被移除，用 try/except 兼容新旧版本, 此处为新修改的部分！
+try:
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+except AttributeError:
+    pass
 
 # from nanolightning.torchlightning_trainer import Trainer
 # from nanolightning.iteratabletrainer import IterableTrainer
@@ -235,7 +239,7 @@ def main(args):
         print("$$$$$$$$$$  STARTED TRAINING  $$$$$$$$$$")
         trainer = set_trainer(args, wandb_logger, checkpoint_callback, periodic_checkpoint=periodic_checkpoint)
         resume_training_ckpt = None if args.resume_training_ckpt == "" else args.resume_training_ckpt
-        trainer.fit(model_trainer, ckpt_path=resume_training_ckpt, weights_only=False)
+        trainer.fit(model_trainer, ckpt_path=resume_training_ckpt)
         
         if args.run_testing_after_training:
             args.only_test_model_ckpt = checkpoint_callback.best_model_path
@@ -484,7 +488,9 @@ if __name__ == '__main__':
 
     parser.add_argument("--clamp_max_after_warm_up", help="clamps the absolute value of predicted_tokens to be within range [-val, val], after warming up. not used anymore", type=float, default=0.0)
 
-    parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
+    parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26", "nanochat_time_embed"], type=str, default="default")
+    parser.add_argument("--window_pattern", help="Per-layer attention window pattern for NanoChatEBT. L=full context, S=half context. E.g. 'SSSL'.", type=str, default="L")
+    parser.add_argument("--vocab_size", help="Vocabulary size for NanoChatEBT (nanochat_time_embed). Defaults to 32768 to match the nanochat custom BPE tokenizer.", type=int, default=32768)
 
     parser.add_argument("--ebt_norm", help="type of norm to use for energy based transformer, NOTE is only supported for ebt_time_embed. not used anymore didnt work better than default rms from llama2", choices=["rms", "none", "layer", "ebm_backwards_norm", "dyt"], type=str, default="rms")
 

@@ -68,8 +68,8 @@ class EBT_NLP(LightningModule):
             self.parameters_not_to_check = set() # dont check these since may be frozen or dont want them to update
         
     @torch.compiler.disable
-    def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps, 
-                      langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits):
+    def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps,
+                      langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits, input_ids=None):
         batch_size = predicted_tokens.shape[0]
         seq_length = predicted_tokens.shape[1]
         
@@ -98,7 +98,10 @@ class EBT_NLP(LightningModule):
         
         all_embeddings = torch.cat((real_embeddings_input.detach(), predicted_embeddings), dim = 1) # B, 2*S, D
         
-        energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+        if self.hparams.ebt_type == "nanochat_time_embed":
+            energy_preds = self.transformer(all_embeddings, idx=torch.cat((input_ids, input_ids), dim=1), start_pos=start_pos, mcmc_step=mcmc_step)
+        else:
+            energy_preds = self.transformer(all_embeddings, start_pos=start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
         energy_preds = energy_preds.reshape(-1, 1)
         
         if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
@@ -184,7 +187,7 @@ class EBT_NLP(LightningModule):
                 
                 predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
-                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits
+                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits, input_ids=x
                 )
                 predicted_energies.append(energy_preds)
                 predicted_distributions.append(predicted_tokens_for_loss)        
