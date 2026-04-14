@@ -27,12 +27,15 @@
 
 ### 基础配置 ###
 # export RUN_NAME="ebt-d26-ctx512-muon-adamw-0406-from0327"
-export RUN_NAME="ebt-d26-ctx1024-muon-adamw-0413"
-# export RUN_NAME="ebt-d26-ctx2048-true-muon-adamw-0414"
+# export RUN_NAME="ebt-d26-ctx2048-muon-adamw-0413"
+export RUN_NAME="ebt-medium-ctx2048-true-muon-adamw-0414"
 
 
 export MODEL_NAME="${RUN_NAME%%-*}"
-export MODEL_SIZE="d26"
+# export MODEL_SIZE="d26"
+export MODEL_SIZE="medium"
+
+
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -40,9 +43,7 @@ export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
 # PyTorch 内存优化
 # export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:1024"
-# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:2048"
-
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:2048"
 
 
 # WandB 配置
@@ -100,8 +101,8 @@ NO_MCMC_DETACH=false
 NUM_GPUS=8
 DEVICE_BATCH_SIZE=1
 GRAD_ACCUM=32
-CONTEXT_LENGTH=1024
-# CONTEXT_LENGTH=2048
+# CONTEXT_LENGTH=1024
+CONTEXT_LENGTH=2048
 
 
 # 2. 计算每步的有效 Token 数 (Tokens per step)
