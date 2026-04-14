@@ -452,7 +452,8 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
         ebt = EBTDefault(params=transformer_args)
     elif hparams.ebt_type == "time_embed": # time embed
         from ar_ebt_time_embed import EBTTimeConcat
-        ebt = EBTTimeConcat(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps)
+        gradient_checkpointing = getattr(hparams, 'gradient_checkpointing', False)
+        ebt = EBTTimeConcat(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps, gradient_checkpointing=gradient_checkpointing)
     else: # adaln or adaln_zero
         from ar_ebt_adaln import EBTAdaLN
         ebt = EBTAdaLN(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps)

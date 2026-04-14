@@ -28,7 +28,11 @@
 ### 基础配置 ###
 # export RUN_NAME="ebt-d26-ctx512-muon-adamw-0406-from0327"
 # export RUN_NAME="ebt-d26-ctx2048-muon-adamw-0413"
-export RUN_NAME="ebt-medium-ctx2048-true-muon-adamw-0414"
+# export RUN_NAME="ebt-medium-ctx2048-true-bf16-gc-0414"
+export RUN_NAME="ebt-medium-ctx2048-true-0414-test"
+
+
+
 
 
 export MODEL_NAME="${RUN_NAME%%-*}"
@@ -98,11 +102,26 @@ NO_MCMC_DETACH=false
 # GRAD_ACCUM=16
 # CONTEXT_LENGTH=1024
 
+# --float_precision "bf16-mixed" \
+# --gradient_checkpointing \
+
 NUM_GPUS=8
-DEVICE_BATCH_SIZE=1
-GRAD_ACCUM=32
-# CONTEXT_LENGTH=1024
+DEVICE_BATCH_SIZE=2
+GRAD_ACCUM=4
 CONTEXT_LENGTH=2048
+
+# 可运行
+# NUM_GPUS=8
+# DEVICE_BATCH_SIZE=1
+# GRAD_ACCUM=4
+# CONTEXT_LENGTH=2048
+
+# TODO oom
+# NUM_GPUS=8
+# DEVICE_BATCH_SIZE=1
+# GRAD_ACCUM=32 
+# CONTEXT_LENGTH=2048
+
 
 
 # 2. 计算每步的有效 Token 数 (Tokens per step)
@@ -519,11 +538,15 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
 --set_matmul_precision "medium" \
+--float_precision "bf16-mixed" \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --save_periodic_steps 1000 \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}
+
+# --float_precision "bf16-mixed" \
+# --gradient_checkpointing \
 
 TRAIN_EXIT_CODE=$?
 set -e
