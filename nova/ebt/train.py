@@ -855,6 +855,8 @@ if __name__ == '__main__':
     parser.add_argument("--compile_backend", help="torch.compile 后端: inductor (默认), eager, aot_eager", type=str, default="inductor")
     parser.add_argument("--compile_dynamic", help="允许动态形状 (可能降低加速效果)", action="store_true", default=False)
 
+    parser.add_argument("--gradient_checkpointing", help="启用 gradient checkpointing 以节省显存 (用计算换显存)", action="store_true", default=False)
+
     #SLURM#########################################################################
 
     parser.add_argument("--is_slurm_run", help="please set to true if doing slurm run, as of now just stops capturing console logs", action="store_true", default=False)

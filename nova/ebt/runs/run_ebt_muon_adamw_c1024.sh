@@ -28,6 +28,9 @@
 ### 基础配置 ###
 # export RUN_NAME="ebt-d26-ctx512-muon-adamw-0406-from0327"
 export RUN_NAME="ebt-d26-ctx1024-muon-adamw-0413"
+
+export RUN_NAME="ebt-d26-ctx1024-muon-adamw-0414-test"
+
 # export RUN_NAME="ebt-d26-ctx2048-true-muon-adamw-0414"
 
 
@@ -97,10 +100,24 @@ NO_MCMC_DETACH=false
 # GRAD_ACCUM=16
 # CONTEXT_LENGTH=1024
 
+# 实际运行
 NUM_GPUS=8
 DEVICE_BATCH_SIZE=1
 GRAD_ACCUM=32
 CONTEXT_LENGTH=1024
+
+# todo
+# NUM_GPUS=8
+# DEVICE_BATCH_SIZE=2
+# GRAD_ACCUM=16
+# CONTEXT_LENGTH=1024
+
+# oom
+# NUM_GPUS=8
+# DEVICE_BATCH_SIZE=4
+# GRAD_ACCUM=8
+# CONTEXT_LENGTH=1024
+
 # CONTEXT_LENGTH=2048
 
 

@@ -672,7 +672,7 @@ class TransformerBlock(nn.Module):
 
 
 class EBTTimeConcat(nn.Module):
-    def __init__(self, params: EBTModelArgs, max_mcmc_steps, gradient_checkpointing=False):
+    def __init__(self, params: EBTModelArgs, max_mcmc_steps):
         """
         Initialize a Transformer model.
 
@@ -691,7 +691,6 @@ class EBTTimeConcat(nn.Module):
         super().__init__()
         self.params = params
         self.n_layers = params.n_layers
-        self.gradient_checkpointing = gradient_checkpointing
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
@@ -774,11 +773,7 @@ class EBTTimeConcat(nn.Module):
 
 
             for i, layer in enumerate(self.layers):
-                if self.gradient_checkpointing and embeddings.requires_grad:
-                    from torch.utils.checkpoint import checkpoint as torch_checkpoint
-                    embeddings = torch_checkpoint(layer, embeddings, start_pos, freqs_cis, mask, use_reentrant=False)
-                else:
-                    embeddings = layer(embeddings, start_pos, freqs_cis, mask)
+                embeddings = layer(embeddings, start_pos, freqs_cis, mask)
             embeddings = self.norm(embeddings)
             embeddings = embeddings[:, 1:] # remove temporal embed
             energies = self.final_layer(embeddings)
