@@ -1182,14 +1182,82 @@ class ModelTrainer(LightningModule):
         # --- 创建优化器 ---
         # PL 调用 optimizer.step(closure=closure), 但 MuonAdamW.step() 不接受 closure 参数
         # 包装一下使其兼容 PL 的调用约定
-        class PLMuonAdamW(MuonAdamW):
-            """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
-            @torch.no_grad()
-            def step(self, closure=None):
-                if closure is not None:
-                    with torch.enable_grad():
-                        closure()
-                super().step()
+        use_cpu_offload = getattr(self.hparams, 'cpu_offload_optimizer', False)
+        if use_cpu_offload:
+            class PLMuonAdamW(MuonAdamW):
+                """MuonAdamW + CPU offload: AdamW 和 Muon 优化器状态均存放在 CPU。"""
+
+                @torch.no_grad()
+                def step(self, closure=None):
+                    if closure is not None:
+                        with torch.enable_grad():
+                            closure()
+
+                    # 遍历所有 param group，按 kind 分别处理
+                    for group in self.param_groups:
+                        kind = group.get('kind')
+
+                        if kind == 'adamw':
+                            # AdamW: 逐参数搬运 exp_avg / exp_avg_sq
+                            for p in group['params']:
+                                if p.grad is None:
+                                    continue
+                                state = self.state[p]
+                                if not state:
+                                    continue
+                                for k in ('exp_avg', 'exp_avg_sq'):
+                                    if k in state and state[k].device.type == 'cpu':
+                                        state[k] = state[k].to(p.device, non_blocking=False)
+
+                        elif kind == 'muon':
+                            # Muon: group-level buffer 存在 params[0] 的 state 里
+                            if not group['params']:
+                                continue
+                            p0 = group['params'][0]
+                            state = self.state[p0]
+                            if not state:
+                                continue
+                            for k in ('momentum_buffer', 'second_momentum_buffer'):
+                                if k in state and state[k].device.type == 'cpu':
+                                    state[k] = state[k].to(p0.device, non_blocking=False)
+
+                    # 执行实际的优化器 step（fused kernel 要求 state 在 GPU 上）
+                    super().step()
+
+                    # step 完成后，将所有 state 搬回 CPU
+                    for group in self.param_groups:
+                        kind = group.get('kind')
+
+                        if kind == 'adamw':
+                            for p in group['params']:
+                                state = self.state[p]
+                                for k in ('exp_avg', 'exp_avg_sq'):
+                                    if k in state and state[k].device.type != 'cpu':
+                                        cpu_t = state[k].to('cpu', non_blocking=False)
+                                        del state[k]
+                                        state[k] = cpu_t
+
+                        elif kind == 'muon':
+                            if not group['params']:
+                                continue
+                            p0 = group['params'][0]
+                            state = self.state[p0]
+                            for k in ('momentum_buffer', 'second_momentum_buffer'):
+                                if k in state and state[k].device.type != 'cpu':
+                                    cpu_t = state[k].to('cpu', non_blocking=False)
+                                    del state[k]
+                                    state[k] = cpu_t
+
+                    torch.cuda.synchronize()
+        else:
+            class PLMuonAdamW(MuonAdamW):
+                """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
+                @torch.no_grad()
+                def step(self, closure=None):
+                    if closure is not None:
+                        with torch.enable_grad():
+                            closure()
+                    super().step()
 
         optimizer = PLMuonAdamW(param_groups)
 
