@@ -540,7 +540,8 @@ class EBT_NLP(LightningModule):
                 return energies
 
         # ebt_type
-        if self.hparams.ebt_type == "default":
+        if self.hparams.ebt_type == "default" or (self.hparams.ebt_type == "time_embed" and not getattr(self.hparams, 'use_mcmc_time_embed', False)):
+            # default mode or time_embed without time embedding: shared transition kernel, arbitrary step count
             total_steps = self.hparams.infer_ebt_num_steps if self.hparams.infer_ebt_num_steps > 1 else self.hparams.mcmc_num_steps
             pred_state = initial_pred_tokens
             for step_idx in range(total_steps):
