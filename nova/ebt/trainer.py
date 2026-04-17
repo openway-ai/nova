@@ -396,6 +396,7 @@ class ModelTrainer(LightningModule):
             if self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
                 print("calling GC manually")
                 gc.collect()
+                torch.cuda.empty_cache()
 
         # Record step end time for dt calculation
         import time as _time

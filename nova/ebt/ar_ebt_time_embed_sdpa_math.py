@@ -448,11 +448,11 @@ class Attention(nn.Module):
         values_o = xv_o.transpose(1, 2)
 
         # Path A: standard causal self-attention on original tokens via SDPA.
-        # o_mask is [original_seqlen, original_seqlen]; SDPA fuses softmax+matmul
-        # and avoids materialising the score matrix in HBM (FlashAttention backend).
-        o_mask = mask[:-1, :-1] if mask is not None else None
+        # Must use math backend (not FlashAttention) because EBT's create_graph=True
+        # requires second-order derivatives, which FlashAttention backward doesn't support.
+        # Using is_causal=True avoids materializing the explicit mask tensor.
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
-            output_o = F.scaled_dot_product_attention(xq_o, keys_o, values_o, attn_mask=o_mask)
+            output_o = F.scaled_dot_product_attention(xq_o, keys_o, values_o, is_causal=True)
         output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1)
 
         #pred sequence attn calc is for energy-based transformer ########################################################################################
