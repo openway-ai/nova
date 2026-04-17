@@ -28,12 +28,12 @@
 ### 基础配置 ###
 # export RUN_NAME="ebt-d26-ctx512-muon-adamw-0406-from0327"
 # export RUN_NAME="ebt-d26-ctx2048-muon-adamw-0413"
-export RUN_NAME="ebt-medium-ctx2048-true-muon-adamw-0414"
+export RUN_NAME="ebt-basetrain-d26-ctx2048-true-muon-adamw-0417"
 
 
 export MODEL_NAME="${RUN_NAME%%-*}"
-# export MODEL_SIZE="d26"
-export MODEL_SIZE="medium"
+export MODEL_SIZE="d26"
+# export MODEL_SIZE="medium"
 
 
 
@@ -93,15 +93,16 @@ NO_MCMC_DETACH=false
 # GRAD_ACCUM=8
 # CONTEXT_LENGTH=512
 
+# 可运行
 # NUM_GPUS=8
-# DEVICE_BATCH_SIZE=2
-# GRAD_ACCUM=16
-# CONTEXT_LENGTH=1024
+# DEVICE_BATCH_SIZE=1
+# GRAD_ACCUM=2
+# CONTEXT_LENGTH=2048
 
+# TODO oom
 NUM_GPUS=8
 DEVICE_BATCH_SIZE=1
-GRAD_ACCUM=32
-# CONTEXT_LENGTH=1024
+GRAD_ACCUM=32 
 CONTEXT_LENGTH=2048
 
 
@@ -513,6 +514,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
 --limit_val_batches ${LIMIT_VAL_BATCHES} \
+--float_precision bf16-mixed \
+--manual_gc_collect_every_n_steps 1 \
 --val_sanity 1 \
 --validation_split_pct 0.0027 \
 \

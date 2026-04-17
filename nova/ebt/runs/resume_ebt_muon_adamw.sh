@@ -56,8 +56,8 @@ MAX_SCHEDULING_STEPS=$MAX_STEPS
 # MAX_SCHEDULING_STEPS=55999
 # 
 # TODO =============
-MAX_STEPS=112000
-MAX_SCHEDULING_STEPS=112000
+# MAX_STEPS=112000
+# MAX_SCHEDULING_STEPS=112000
 
 ################################################################################
 # 学习率配置
