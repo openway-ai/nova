@@ -175,7 +175,7 @@ fi
 export NANOCHAT_OFFLINE_MODE=1
 export HF_HUB_OFFLINE=1
 export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 # 清除分布式训练环境变量
 unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT

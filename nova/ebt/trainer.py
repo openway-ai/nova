@@ -393,7 +393,7 @@ class ModelTrainer(LightningModule):
             print(f"Used parameters: {self.model.used_parameters}")
 
         if self.hparams.manual_gc_collect_every_n_steps != -1:
-            if self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
+            if self.global_step > 0 and self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
                 print("calling GC manually")
                 gc.collect()
                 torch.cuda.empty_cache()

@@ -33,8 +33,6 @@
 export RUN_NAME="ebt-basetrain-d26-ctx2048-bf16mixed-0417"
 
 
-
-
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 # export MODEL_SIZE="medium"
@@ -46,7 +44,7 @@ HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
 # PyTorch 内存优化
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 
 # WandB 配置
@@ -108,6 +106,7 @@ NO_MCMC_DETACH=false
 NUM_GPUS=8
 DEVICE_BATCH_SIZE=1
 GRAD_ACCUM=32
+# GRAD_ACCUM=16
 CONTEXT_LENGTH=2048
 
 # NUM_GPUS=8
@@ -199,7 +198,8 @@ GRADIENT_CLIP_VAL=1.0
 # VAL_CHECK_INTERVAL=1000
 VAL_CHECK_INTERVAL=2000
 LIMIT_VAL_BATCHES=50
-NUM_WORKERS=8
+# NUM_WORKERS=16
+NUM_WORKERS=19
 SAVE_TOP_K=2
 
 ################################################################################
@@ -255,7 +255,9 @@ OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio
 # 不使用 compile，steps 较少时适用
 # COMPILE_FLAGS="--compile_model --compile_mode disabled" 
 # 启用 compile，steps 较多时适用
+# full mode causes repeated recompilation with create_graph=True + bf16-mixed
 COMPILE_FLAGS="--compile_model --compile_mode full"
+# COMPILE_FLAGS="--compile_model --compile_mode disabled"
 
 ################################################################################
 # WandB 配置 (训练参数)
@@ -531,7 +533,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --log_model_archi \
 --set_matmul_precision "medium" \
 --float_precision "bf16-mixed" \
---manual_gc_collect_every_n_steps 10000 \
+--manual_gc_collect_every_n_steps -1 \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --save_periodic_steps 1000 \
 ${WANDB_FLAGS} \
