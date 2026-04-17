@@ -29,15 +29,15 @@
 # export RUN_NAME="ebt-d26-ctx512-muon-adamw-0406-from0327"
 # export RUN_NAME="ebt-d26-ctx2048-muon-adamw-0413"
 # export RUN_NAME="ebt-medium-ctx2048-true-bf16-gc-0414"
-export RUN_NAME="ebt-medium-ctx2048-true-0414-test"
-
+# export RUN_NAME="ebt-medium-ctx2048-true-0414-test"
+export RUN_NAME="ebt-basetrain-d26-ctx2048-bf16mixed-0417"
 
 
 
 
 export MODEL_NAME="${RUN_NAME%%-*}"
-# export MODEL_SIZE="d26"
-export MODEL_SIZE="medium"
+export MODEL_SIZE="d26"
+# export MODEL_SIZE="medium"
 
 
 
@@ -46,8 +46,7 @@ HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
 # PyTorch 内存优化
-# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:2048"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
 
 
 # WandB 配置
@@ -105,23 +104,16 @@ NO_MCMC_DETACH=false
 # --float_precision "bf16-mixed" \
 # --gradient_checkpointing \
 
+# 可运行
 NUM_GPUS=8
-DEVICE_BATCH_SIZE=2
-GRAD_ACCUM=4
+DEVICE_BATCH_SIZE=1
+GRAD_ACCUM=32
 CONTEXT_LENGTH=2048
 
-# 可运行
 # NUM_GPUS=8
 # DEVICE_BATCH_SIZE=1
-# GRAD_ACCUM=4
+# GRAD_ACCUM=48
 # CONTEXT_LENGTH=2048
-
-# TODO oom
-# NUM_GPUS=8
-# DEVICE_BATCH_SIZE=1
-# GRAD_ACCUM=32 
-# CONTEXT_LENGTH=2048
-
 
 
 # 2. 计算每步的有效 Token 数 (Tokens per step)
@@ -539,6 +531,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --log_model_archi \
 --set_matmul_precision "medium" \
 --float_precision "bf16-mixed" \
+--manual_gc_collect_every_n_steps 10000 \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --save_periodic_steps 1000 \
 ${WANDB_FLAGS} \
@@ -547,6 +540,8 @@ ${COMPILE_FLAGS}
 
 # --float_precision "bf16-mixed" \
 # --gradient_checkpointing \
+# --manual_gc_collect_every_n_steps 50 \
+
 
 TRAIN_EXIT_CODE=$?
 set -e

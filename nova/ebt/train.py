@@ -305,12 +305,11 @@ def main(args):
 def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", periodic_checkpoint=None):
     torch.autograd.set_detect_anomaly(args.detect_anomaly) #NOTE seems pl detect anomaly is not working so manually set it here
 
-    if args.find_unused_parameters or args.distributed_strategy == "ddp": 
-            # Enable find_unused_parameters=True by default for DDP to handle conditional parameters in EBT
-            args.distributed_strategy = DDPStrategy(find_unused_parameters = True)
-        # else:
-        #     pass
-        # if having issues with strategy try 'ddp_spawn' instead of 'ddp'
+    if args.find_unused_parameters or args.distributed_strategy == "ddp":
+            args.distributed_strategy = DDPStrategy(
+                find_unused_parameters=True,
+                gradient_as_bucket_view=True,
+            )
     args.overfit_batches = int(args.overfit_batches) if int(args.overfit_batches) == args.overfit_batches else args.overfit_batches
     profiler = None if args.profiler == "" else args.profiler
     gradient_clip_val = args.gradient_clip_val if args.gradient_clip_val > 0 else None
@@ -856,6 +855,7 @@ if __name__ == '__main__':
     parser.add_argument("--compile_dynamic", help="允许动态形状 (可能降低加速效果)", action="store_true", default=False)
 
     parser.add_argument("--gradient_checkpointing", help="启用 gradient checkpointing 以节省显存 (用计算换显存)", action="store_true", default=False)
+    parser.add_argument("--use_sdpa_attention", help="使用 SDPA 注意力变体 (ar_ebt_time_embed_sdpa_math.py), 大幅减少 Path B 中间张量显存占用", action="store_true", default=False)
 
     #SLURM#########################################################################
 
