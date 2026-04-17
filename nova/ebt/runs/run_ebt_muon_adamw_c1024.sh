@@ -183,10 +183,20 @@ WANDB_FLAGS=""
 # 日志配置 - 自动路由 stdout/stderr 到日志文件
 ################################################################################
 
+# 自动生成命名组件
+TIMESTAMP=$(date +"%m%d_%H%M")
+DATE_DIR=$(date +"%Y%m%d")
+CONFIG_TAG="${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_bs$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM))_lr${PEAK_LR}"
+
+# 最终名称 (用于 --run_name 和 wandb)
+export RUN_NAME="${RUN_PREFIX}_${TIMESTAMP}_${CONFIG_TAG}"
+
+# 日志按日期分文件夹
+LOG_DIR="logs_base_train/${DATE_DIR}"
 current_time=$(date +"%Y%m%d_%H%M%S")
-# 日志文件名包含: 日期时间_模型名_层数_上下文长度_优化器_GPU数
-LOG_FILE="logs/${current_time}_${MODEL_NAME}_${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_muon-adamw_gpu${NUM_GPUS}.log"
-mkdir -p logs
+
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/${RUN_NAME}.log"
 
 # 定义颜色
 RED='\033[0;31m'
