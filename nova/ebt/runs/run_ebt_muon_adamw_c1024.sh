@@ -42,9 +42,7 @@ HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
 # PyTorch 内存优化
-# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:1024"
-# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:2048"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 
 
