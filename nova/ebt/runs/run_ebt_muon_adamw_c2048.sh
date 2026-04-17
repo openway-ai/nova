@@ -27,7 +27,7 @@
 
 ### 基础配置 ###
 # 用户只需改这一行 —— 描述本次实验的意图/标签
-RUN_PREFIX="bf16mixed-compile"
+RUN_PREFIX="bf16mixed-nomcmctime"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -75,6 +75,7 @@ NORMALIZE_INITIAL_CONDITION=true
 DENOISING_INITIAL_CONDITION="random_noise"
 MCMC_STEP_SIZE_LEARNABLE=true
 NO_MCMC_DETACH=false
+USE_MCMC_TIME_EMBED=false          # false: shared transition kernel, supports arbitrary inference steps
 
 # 不使用的高级参数 (官方: not recommended for getting started)
 # ebt_norm, ebt_act_func, dyt_alpha_init, mcmc_replay_buffer 等
@@ -509,6 +510,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --mcmc_step_size ${MCMC_STEP_SIZE} \
 --mcmc_step_size_lr_multiplier ${MCMC_STEP_SIZE_LR_MULTIPLIER} \
 --mcmc_num_steps ${MCMC_NUM_STEPS} \
+$([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 \
 --context_length ${CONTEXT_LENGTH} \
 \

@@ -348,8 +348,9 @@ class Attention(nn.Module):
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
         init_whole_model_weights(self.wo, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
         
+        self.time_offset = 2 if args.use_mcmc_time_embed else 1
         self.register_buffer('superdiag_rows', torch.arange(args.max_seq_len - 1))
-        self.register_buffer('superdiag_cols', torch.arange(2, args.max_seq_len + 1))
+        self.register_buffer('superdiag_cols', torch.arange(self.time_offset, args.max_seq_len + self.time_offset - 1))
         # self.wq = ColumnParallelLinear(
         #     args.dim,
         #     args.n_heads * self.head_dim,
@@ -438,7 +439,7 @@ class Attention(nn.Module):
         
         xq_o, xk_o = apply_rotary_emb(xq_o, xk_o, freqs_cis=freqs_cis[:original_seqlen])
 
-        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[2:original_seqlen+1]) # use 2 since are the next preds and also have time embeddings and thus need to condition on two tokens
+        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[self.time_offset:original_seqlen+1]) # use time_offset since are the next preds and also have time embeddings (offset=2) or not (offset=1)
         # I tested this compared to prepending row on S dimension and the tensors were the same
 
         # self.cache_k = self.cache_k.to(xq)
@@ -501,7 +502,7 @@ class Attention(nn.Module):
         scores_p = scores_p + diagonal_addition_mask         
         
         if mask is not None:
-            p_mask = mask[2:, :]  #S-1, S+1 like 0 0 0 -inf -inf -inf; 0 0 0 0 -inf -inf; etc  
+            p_mask = mask[self.time_offset:, :]  #S-1, S+1 like 0 0 0 -inf -inf -inf; 0 0 0 0 -inf -inf; etc
             scores_p = scores_p + p_mask
         if scores_p.dtype != torch.float32:
             scores_p = scores_p.float()
@@ -510,7 +511,7 @@ class Attention(nn.Module):
             scores_p = scores_p.to(xq_p.dtype)
         
         #Q: why do I need to extract superdiagonal why cant i just do matmul after? A: its bc would need same subsequence in value matrix but dont have it, have original subsequence and then seperately all next preds
-        scores_p_superdiagonal = scores_p.diagonal(offset=2, dim1=2, dim2=3) # is B, N, S; basically how much each token on this superdiag should attent to itself; clone since dont want mask to change this
+        scores_p_superdiagonal = scores_p.diagonal(offset=self.time_offset, dim1=2, dim2=3) # is B, N, S; basically how much each token on this superdiag should attent to itself; clone since dont want mask to change this
         
         scores_p = scores_p * diagonal_removal_mask # keeps scores_p as is except for superdiagonal which is next preds attention to selves, cant multiply these naively by values_p or values_o
         
@@ -521,7 +522,8 @@ class Attention(nn.Module):
         next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim = -1) # B, N, S-1, H this is for weighted sum of each next pred to its final embed rep.
         
         output_p = output_p + next_pred_self_attention # B, N, S-1, H adding this is adding the aspect of each next pred embedding attending to itself
-        output_p = output_p.transpose(1, 2).contiguous().view(bsz, original_seqlen-1, -1) # after this is B, S-1, D
+        n_pred = full_seqlen - original_seqlen
+        output_p = output_p.transpose(1, 2).contiguous().view(bsz, n_pred, -1) # after this is B, S-1, D
         
         #return linear projection of concatted outputs ########################################################################################
         
@@ -672,12 +674,14 @@ class TransformerBlock(nn.Module):
 
 
 class EBTTimeConcat(nn.Module):
-    def __init__(self, params: EBTModelArgs, max_mcmc_steps, gradient_checkpointing=False):
+    def __init__(self, params: EBTModelArgs, max_mcmc_steps, gradient_checkpointing=False, use_mcmc_time_embed=False):
         """
         Initialize a Transformer model.
 
         Args:
             params (EBTModelArgs): Model configuration parameters.
+            use_mcmc_time_embed (bool): If True, use per-step time embeddings (original behavior).
+                If False, all MCMC steps share the same transition kernel, enabling arbitrary inference steps.
 
         Attributes:
             params (EBTModelArgs): Model configuration parameters.
@@ -692,6 +696,7 @@ class EBTTimeConcat(nn.Module):
         self.params = params
         self.n_layers = params.n_layers
         self.gradient_checkpointing = gradient_checkpointing
+        self.use_mcmc_time_embed = use_mcmc_time_embed
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
@@ -714,7 +719,8 @@ class EBTTimeConcat(nn.Module):
             self.params.dim // self.params.n_heads, self.params.max_seq_len
         )
 
-        self.time_embeddings = nn.Embedding(max_mcmc_steps, params.dim)
+        if self.use_mcmc_time_embed:
+            self.time_embeddings = nn.Embedding(max_mcmc_steps, params.dim)
 
         self.final_layer = nn.Linear(params.dim, 1, bias = False)
         init_whole_model_weights(self.final_layer, self.params.weight_initialization)
@@ -732,13 +738,18 @@ class EBTTimeConcat(nn.Module):
 
         """
         _bsz = embeddings.shape[0]
-        mcmc_step_val = mcmc_step
-        mcmc_step = torch.empty((_bsz,), device=embeddings.device, dtype=torch.long).fill_(mcmc_step_val)
-        time_embeddings = self.time_embeddings(mcmc_step).unsqueeze(dim=1) # needs to be expanded to B, 1, D
-        embeddings = torch.cat((time_embeddings, embeddings), dim = 1) # B, 2S - 1, D
+
+        if self.use_mcmc_time_embed:
+            mcmc_step_val = mcmc_step
+            mcmc_step = torch.empty((_bsz,), device=embeddings.device, dtype=torch.long).fill_(mcmc_step_val)
+            time_embeddings = self.time_embeddings(mcmc_step).unsqueeze(dim=1) # needs to be expanded to B, 1, D
+            embeddings = torch.cat((time_embeddings, embeddings), dim = 1) # B, 2S - 1 + 1, D
 
         _bsz, seqlen = embeddings.shape[:2]
-        seqlen = (seqlen+3) // 2 # do this since passed in seqlen is 2(S-1)+1 so add 3 div 2 = S+1 which corresponds to concatting time embed
+        if self.use_mcmc_time_embed:
+            seqlen = (seqlen+3) // 2 # passed in seqlen is 2(S-1)+1+1(time) so add 3 div 2 = S+1
+        else:
+            seqlen = (seqlen+2) // 2 # passed in seqlen is 2(S-1) so add 2 div 2 = S
         self.freqs_cis = self.freqs_cis.to(embeddings.device)
 
         # 动态扩展 freqs_cis 如果需要的长度超过预计算的长度
@@ -780,7 +791,8 @@ class EBTTimeConcat(nn.Module):
                 else:
                     embeddings = layer(embeddings, start_pos, freqs_cis, mask)
             embeddings = self.norm(embeddings)
-            embeddings = embeddings[:, 1:] # remove temporal embed
+            if self.use_mcmc_time_embed:
+                embeddings = embeddings[:, 1:] # remove temporal embed
             energies = self.final_layer(embeddings)
 
             energies = energies[:, embeddings.shape[1] // 2:]
