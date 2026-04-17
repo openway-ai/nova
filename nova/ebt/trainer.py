@@ -239,47 +239,36 @@ class ModelTrainer(LightningModule):
             #     raise ValueError(f"do not recognize model name: {self.hparams.model_name}")
 
         # torch.compile 支持
-        # 注意: EBT 使用 autograd.grad 进行 MCMC 更新，与 fullgraph=True 可能不兼容
-        # 推荐使用 --compile_model --compile_mode transformer_only 仅编译 transformer 部分
+        # EBT 训练时 autograd.grad(create_graph=True) 产生二阶梯度,
+        # torch.compile (aot_autograd) 不支持 double backward, 因此训练时跳过编译.
+        # 推理时 learning=False → create_graph=False, 可以安全编译.
         if self.hparams.compile_model:
-            compile_mode = getattr(self.hparams, 'compile_mode', 'full')
+            compile_mode = getattr(self.hparams, 'compile_mode', 'transformer_only')
             compile_backend = getattr(self.hparams, 'compile_backend', 'inductor')
             compile_dynamic = getattr(self.hparams, 'compile_dynamic', False)
 
-            if compile_mode == 'full':
-                # 编译整个模型 (可能与 autograd.grad 不兼容)
-                print(f"\n{'='*80}")
-                print(f"[torch.compile] 开始编译整个模型...")
-                print(f"[torch.compile] 模式: full | 后端: {compile_backend} | 动态: {compile_dynamic}")
-                print(f"[torch.compile] 警告: EBT 的 MCMC 循环使用 autograd.grad，可能导致编译失败")
-                print(f"[torch.compile] 首次编译可能需要 5-15 分钟，请耐心等待...")
-                print(f"{'='*80}\n")
-                import time
-                start_time = time.time()
-                self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
-                compile_time = time.time() - start_time
-                print(f"\n{'='*80}")
-                print(f"[torch.compile] ✓ 模型编译完成 (耗时: {compile_time:.1f}s)")
-                print(f"{'='*80}\n")
-
-            elif compile_mode == 'transformer_only':
-                # 仅编译 transformer 部分 (推荐，避开 MCMC 循环)
-                print(f"[torch.compile] 仅编译 transformer 部分 (mode=transformer_only, backend={compile_backend})")
-                if hasattr(self.model, 'transformer'):
-                    self.model.transformer = torch.compile(
-                        self.model.transformer,
-                        backend=compile_backend,
-                        dynamic=compile_dynamic
-                    )
-                    print(f"[torch.compile] transformer 编译成功")
-                else:
-                    print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过编译")
-
-            elif compile_mode == 'disabled':
+            if compile_mode == 'disabled':
                 print(f"[torch.compile] 编译已禁用")
 
+            elif (self.hparams.execution_mode == "inference") or getattr(self.hparams, 'only_test', False):
+                # 推理模式: learning=False → 无 double backward, 可以安全编译
+                if compile_mode == 'full':
+                    print(f"[torch.compile] 推理模式: 编译整个模型 (backend={compile_backend})")
+                    self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
+                elif compile_mode == 'transformer_only':
+                    if hasattr(self.model, 'transformer'):
+                        print(f"[torch.compile] 推理模式: 编译 transformer (backend={compile_backend})")
+                        self.model.transformer = torch.compile(
+                            self.model.transformer, backend=compile_backend, dynamic=compile_dynamic
+                        )
+                    else:
+                        print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过")
+                else:
+                    raise ValueError(f"未知 compile_mode: {compile_mode}")
+
             else:
-                raise ValueError(f"未知的 compile_mode: {compile_mode}，可选: full, transformer_only, disabled")
+                # 训练模式: 跳过编译 (EBT MCMC 需要 double backward)
+                print(f"[torch.compile] 训练模式下跳过编译 (EBT MCMC 需要 create_graph=True, aot_autograd 不支持 double backward)")
 
         phases = ['train', 'valid', 'test']
         self.torchmetrics_dict = nn.ModuleDict()
