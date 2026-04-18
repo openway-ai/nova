@@ -3,7 +3,28 @@
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
-source ../../.venv/ebt/bin/activate
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
+cd "$EBT_DIR"
+
+# 优先使用项目 venv；没有则回退到当前 conda/python 环境
+if [ -f "$EBT_DIR/../../.venv/ebt/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    source "$EBT_DIR/../../.venv/ebt/bin/activate"
+fi
+
+if [ -n "${PYTHON:-}" ] && [ -x "$PYTHON" ]; then
+    PYTHON_BIN="$PYTHON"
+elif [ -n "${CONDA_PREFIX:-}" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
+    PYTHON_BIN="$CONDA_PREFIX/bin/python"
+elif [ -x "/mnt/shared-storage-user/lixueyan/miniconda3/envs/nanochat/bin/python" ]; then
+    PYTHON_BIN="/mnt/shared-storage-user/lixueyan/miniconda3/envs/nanochat/bin/python"
+elif [ -x "$(command -v python3)" ]; then
+    PYTHON_BIN="$(command -v python3)"
+else
+    PYTHON_BIN="$(command -v python)"
+fi
 
 ### LOG INFO ###
 # SBATCH --job-name=ebt-xxs-bs_256_s1_lr_
@@ -13,18 +34,22 @@ export RUN_NAME="ebt-xxs-bs_256_s1_lr_"
 # NOTE ctrl d ALL THREE of above to modify job-name, output, and RUN_NAME (which should all be the same)
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="${RUN_NAME#*-}"; export MODEL_SIZE="${MODEL_SIZE%%-*}"
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/mnt/shared-storage-user/lixueyan/nar}"
 
-export WANDB_API_KEY="Your WandB API Key"
+# 训练脚本默认 wandb_offline=True，因此不会联网上传；会将 wandb 文件写到本地 logs/。
+# 只有你显式传 --wandb_offline False 并配置 WANDB_API_KEY 时才会尝试联网。
 mkdir -p logs/slurm/nlp/
-module purge
+if command -v module >/dev/null 2>&1; then
+    module purge
+fi
 
 lr=(0.0002)
 alpha=(500)
 alpha_lr=(1500)
-MAX_STEP=10000
+MAX_STEP=50000
 WARMUP_STEP=1000
 
-python train.py \
+"$PYTHON_BIN" train.py \
 --run_name ${RUN_NAME}${lr[${SLURM_ARRAY_TASK_ID}]} \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \

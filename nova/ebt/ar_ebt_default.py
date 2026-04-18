@@ -497,7 +497,16 @@ class EBTDefault(nn.Module):
         init_whole_model_weights(self.final_layer, self.params.weight_initialization)
 
 
-    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = None, context_len: Optional[int] = None, pred_len: Optional[int] = None):  # NOTE mcmc_step not used here
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        start_pos: int,
+        mcmc_step = None,
+        context_len: Optional[int] = None,
+        pred_len: Optional[int] = None,
+        return_pred_hidden: bool = False,
+        return_context_hidden: bool = False,
+    ):  # NOTE mcmc_step not used here
         """
         Perform a forward pass through the Transformer model.
 
@@ -546,6 +555,14 @@ class EBTDefault(nn.Module):
         for i, layer in enumerate(self.layers):
             embeddings = layer(embeddings, start_pos, freqs_cis, mask, context_len=context_len, pred_len=pred_len)
         embeddings = self.norm(embeddings)
+        context_hidden = embeddings[:, :context_len]
+        pred_hidden = embeddings[:, context_len:]
         energies = self.final_layer(embeddings)
         energies = energies[:, context_len:]
+        if return_context_hidden and return_pred_hidden:
+            return energies, context_hidden, pred_hidden
+        if return_context_hidden:
+            return energies, context_hidden
+        if return_pred_hidden:
+            return energies, pred_hidden
         return energies

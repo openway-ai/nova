@@ -14,7 +14,8 @@ except:
     pass
 
 # 抑制 CUDA stream 不匹配警告（恢复训练时的已知问题）
-torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+if hasattr(torch.autograd, "graph") and hasattr(torch.autograd.graph, "set_warn_on_accumulate_grad_stream_mismatch"):
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 # from nanolightning.torchlightning_trainer import Trainer
 # from nanolightning.iteratabletrainer import IterableTrainer
@@ -44,6 +45,7 @@ import sys
 import wandb
 import ast
 import math
+import inspect
 from tqdm import tqdm
 import json
 import shutil
@@ -148,6 +150,32 @@ def main(args):
     #     assert args.embedding_dim != 0, "must define embedding dim for IMG models"
     else:
         raise ValueError(f"please add support for modality {args.modality}")
+
+    if args.training_objective == "blockwise":
+        if args.train_block_size <= 0:
+            raise ValueError(f"--train_block_size must be > 0 for blockwise training, got {args.train_block_size}")
+        if args.num_block_samples_per_window <= 0:
+            raise ValueError(
+                f"--num_block_samples_per_window must be > 0 for blockwise training, got {args.num_block_samples_per_window}"
+            )
+        if args.train_block_size > args.context_length:
+            raise ValueError(
+                f"--train_block_size must be <= --context_length for dense blockwise supervision, got K={args.train_block_size}, context_length={args.context_length}"
+            )
+        print(
+            f"[Blockwise:dense] using MTP-style dense block supervision with K={args.train_block_size} offsets "
+            f"(num_block_samples_per_window={args.num_block_samples_per_window} kept for compatibility, no random sampled-block path)."
+        )
+        if args.train_context_length is not None:
+            print(
+                f"[Blockwise:dense] --train_context_length={args.train_context_length} is ignored in dense mode."
+            )
+        if args.mcmc_replay_buffer:
+            raise ValueError("--mcmc_replay_buffer is not supported with --training_objective blockwise")
+        if args.contrastive_loss:
+            raise ValueError("--contrastive_loss is not supported with --training_objective blockwise")
+        if args.execution_mode == "finetune":
+            raise ValueError("execution_mode=finetune is not supported with --training_objective blockwise yet")
     
     # assert not(args.random_num_mcmc_steps == True and args.reconstruct_loss_only_final_step == True), "cannot have both random_num_mcmc_steps and reconstruct_loss_only_final_step set"
     # if args.ramp_up_num_mcmc_steps_every_x_epochs != -1:
@@ -235,7 +263,11 @@ def main(args):
         print("$$$$$$$$$$  STARTED TRAINING  $$$$$$$$$$")
         trainer = set_trainer(args, wandb_logger, checkpoint_callback, periodic_checkpoint=periodic_checkpoint)
         resume_training_ckpt = None if args.resume_training_ckpt == "" else args.resume_training_ckpt
-        trainer.fit(model_trainer, ckpt_path=resume_training_ckpt, weights_only=False)
+        fit_signature = inspect.signature(trainer.fit)
+        if "weights_only" in fit_signature.parameters:
+            trainer.fit(model_trainer, ckpt_path=resume_training_ckpt, weights_only=False)
+        else:
+            trainer.fit(model_trainer, ckpt_path=resume_training_ckpt)
         
         if args.run_testing_after_training:
             args.only_test_model_ckpt = checkpoint_callback.best_model_path
@@ -559,6 +591,11 @@ if __name__ == '__main__':
     # transformer specific ############################################
 
     parser.add_argument("--context_length", help="context length for AR models, i.e. for language model (commonly 256) or video model (commonly 16)", type=int, default=0)
+    parser.add_argument("--training_objective", help="training target construction objective (blockwise now uses dense MTP-style K-offset supervision)", choices=["dense_next_token", "blockwise"], type=str, default="dense_next_token")
+    parser.add_argument("--train_block_size", help="number of future offsets K for dense blockwise supervision", type=int, default=2)
+    parser.add_argument("--train_context_length", help="[compat-only] legacy sampled-block context length (ignored in dense blockwise mode)", type=int, default=None)
+    parser.add_argument("--num_block_samples_per_window", help="[compat-only] legacy sampled-block count (kept for CLI compatibility, ignored by dense blockwise path)", type=int, default=4)
+    parser.add_argument("--debug_blockwise_shapes", help="print blockwise context/target/logit shapes and loss during forward_loss_wrapper", action="store_true", default=False)
           
     parser.add_argument("--num_transformer_blocks", help="number of transformer blocks, uses default from model size specified", type=int, default=12)
     

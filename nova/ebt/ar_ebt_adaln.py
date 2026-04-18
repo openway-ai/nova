@@ -560,7 +560,16 @@ class EBTAdaLN(nn.Module):
         else:
             init_whole_model_weights(self.final_layer.linear, self.params.weight_initialization)
 
-    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0, context_len = None, pred_len = None):
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        start_pos: int,
+        mcmc_step = 0,
+        context_len = None,
+        pred_len = None,
+        return_pred_hidden: bool = False,
+        return_context_hidden: bool = False,
+    ):
         """
         Perform a forward pass through the Transformer model.
 
@@ -619,7 +628,15 @@ class EBTAdaLN(nn.Module):
             for i, layer in enumerate(self.layers):
                 embeddings = layer(embeddings, start_pos, freqs_cis, mask, time_embeddings)
             embeddings = self.norm(embeddings)
+            pred_start = embeddings.shape[1] // 2
+            context_hidden = embeddings[:, :pred_start]
+            pred_hidden = embeddings[:, pred_start:]
             energies = self.final_layer(embeddings, time_embeddings)
-
-            energies = energies[:, embeddings.shape[1] // 2:]
+            energies = energies[:, pred_start:]
+            if return_context_hidden and return_pred_hidden:
+                return energies, context_hidden, pred_hidden
+            if return_context_hidden:
+                return energies, context_hidden
+            if return_pred_hidden:
+                return energies, pred_hidden
             return energies

@@ -178,6 +178,30 @@ class ModelTrainer(LightningModule):
         # The tokenizer is loaded via get_tokenizer() which uses NanoChat custom BPE tokenizer
         # from $NANOCHAT_BASE_DIR/tokenizer/ (vocab_size=32768)
         # The --tokenizer parameter passed from command line is IGNORED for NanoChat!
+        def _resolve_nanochat_base_dir():
+            # Prefer user-provided env var first.
+            base_from_env = os.environ.get("NANOCHAT_BASE_DIR")
+            if base_from_env:
+                pkl_path = os.path.join(base_from_env, "tokenizer", "tokenizer.pkl")
+                if os.path.exists(pkl_path):
+                    return base_from_env
+
+            # Auto-discover common locations, including this workspace's sibling tokenizer dir.
+            candidate_dirs = [
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")),  # /.../nar
+                "/mnt/shared-storage-user/lixueyan/nar",
+            ]
+            for candidate in candidate_dirs:
+                pkl_path = os.path.join(candidate, "tokenizer", "tokenizer.pkl")
+                if os.path.exists(pkl_path):
+                    return candidate
+            return None
+
+        resolved_base_dir = _resolve_nanochat_base_dir()
+        if resolved_base_dir is not None:
+            os.environ["NANOCHAT_BASE_DIR"] = resolved_base_dir
+            print(f"[Tokenizer] Using NANOCHAT_BASE_DIR={resolved_base_dir}")
+
         self.hparams.tokenizer_obj = tokenizer = get_tokenizer() # Store tokenizer object
         # Keep tokenizer path as string for generate_text compatibility
         if not hasattr(self.hparams, 'tokenizer_path'):
@@ -380,6 +404,8 @@ class ModelTrainer(LightningModule):
             things_to_log['avg_gradient_norms'] = average_norm
             things_to_log['pct_gradient_clipped'] = percentage_clipped
             self.log_metrics(things_to_log, "train", log_torchmetrics = False)
+        if getattr(self.hparams, "debug_blockwise_shapes", False) and getattr(self.hparams, "training_objective", "dense_next_token") == "blockwise":
+            print("[blockwise-debug] backward success", flush=True)
         
     def on_train_batch_end(self, outputs, batch, batch_idx):
         #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
@@ -1458,6 +1484,11 @@ class ModelTrainer(LightningModule):
                 split="train",
                 device=self.device,
                 resume_state_dict=resume_state,
+                training_objective=getattr(self.hparams, "training_objective", "dense_next_token"),
+                train_block_size=getattr(self.hparams, "train_block_size", 2),
+                train_context_length=getattr(self.hparams, "train_context_length", None),
+                num_block_samples_per_window=getattr(self.hparams, "num_block_samples_per_window", 1),
+                debug_blockwise_shapes=getattr(self.hparams, "debug_blockwise_shapes", False),
             )
         return train_dataloader
 
@@ -1490,6 +1521,11 @@ class ModelTrainer(LightningModule):
                 split="val",
                 device=self.device,
                 resume_state_dict=None,
+                training_objective=getattr(self.hparams, "training_objective", "dense_next_token"),
+                train_block_size=getattr(self.hparams, "train_block_size", 2),
+                train_context_length=getattr(self.hparams, "train_context_length", None),
+                num_block_samples_per_window=getattr(self.hparams, "num_block_samples_per_window", 1),
+                debug_blockwise_shapes=getattr(self.hparams, "debug_blockwise_shapes", False),
             )
 
         return val_dataloader
