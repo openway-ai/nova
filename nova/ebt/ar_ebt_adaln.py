@@ -560,7 +560,16 @@ class EBTAdaLN(nn.Module):
         else:
             init_whole_model_weights(self.final_layer.linear, self.params.weight_initialization)
 
-    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0):
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        start_pos: int,
+        mcmc_step = 0,
+        context_len = None,
+        pred_len = None,
+        return_pred_hidden: bool = False,
+        return_context_hidden: bool = False,
+    ):
         """
         Perform a forward pass through the Transformer model.
 
@@ -572,6 +581,10 @@ class EBTAdaLN(nn.Module):
             torch.Tensor: Output energies after applying the Transformer model.
 
         """
+        if context_len is not None and pred_len is not None and context_len != pred_len:
+            raise NotImplementedError(
+                f"ar_ebt_adaln currently expects context_len == pred_len, got context_len={context_len}, pred_len={pred_len}"
+            )
         _bsz, seqlen = embeddings.shape[:2]
         seqlen = (seqlen+2) // 2 # do this since passed in seqlen is 2(S-1) so add 2 div 2 = S
         self.freqs_cis = self.freqs_cis.to(embeddings.device)
@@ -615,7 +628,15 @@ class EBTAdaLN(nn.Module):
             for i, layer in enumerate(self.layers):
                 embeddings = layer(embeddings, start_pos, freqs_cis, mask, time_embeddings)
             embeddings = self.norm(embeddings)
+            pred_start = embeddings.shape[1] // 2
+            context_hidden = embeddings[:, :pred_start]
+            pred_hidden = embeddings[:, pred_start:]
             energies = self.final_layer(embeddings, time_embeddings)
-
-            energies = energies[:, embeddings.shape[1] // 2:]
+            energies = energies[:, pred_start:]
+            if return_context_hidden and return_pred_hidden:
+                return energies, context_hidden, pred_hidden
+            if return_context_hidden:
+                return energies, context_hidden
+            if return_pred_hidden:
+                return energies, pred_hidden
             return energies

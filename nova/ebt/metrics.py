@@ -120,5 +120,7 @@ def calculate_bpb_score(next_token_indices, per_token_loss,token_bytes):
     total_nats_val = total_nats.item()
     total_bytes_val = total_bytes.item()
     bpb = total_nats_val / (math.log(2) * total_bytes_val) if total_bytes_val > 0 else float('inf')
-    
-    return bpb
+
+    if isinstance(per_token_loss, torch.Tensor):
+        return per_token_loss.new_tensor(bpb)
+    return torch.tensor(bpb, dtype=torch.float32)

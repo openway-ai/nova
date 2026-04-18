@@ -23,23 +23,29 @@ else
 fi
 echo "🐍 Python: $PYTHON ($($PYTHON --version 2>&1))"
 
-export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/mnt/shared-storage-user/lixueyan/nar}"
 export OMP_NUM_THREADS=1
 export NANOCHAT_OFFLINE_MODE=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+export PYTHONNOUSERSITE=1
 
 ################################################################################
 # 参数 (优先使用环境变量，否则使用默认值)
 ################################################################################
 
 CKPT_PATH="${CKPT_PATH:-}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/lixueyan/nar/tokenizer}"
 GPUS="${GPUS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 LIMIT_TEST_BATCHES="${LIMIT_TEST_BATCHES:-100}"
 USE_WANDB="${USE_WANDB:-false}"
 WANDB_API_KEY="${WANDB_API_KEY:-}"
 EVAL_TASK="${EVAL_TASK:-nanochat}"
+INFER_BLOCK_SIZE="${INFER_BLOCK_SIZE:-1}"
+INFER_BLOCK_USE_REFINE="${INFER_BLOCK_USE_REFINE:-true}"
+INFER_BLOCK_REFINE_STEPS="${INFER_BLOCK_REFINE_STEPS:-0}"
+INFER_BLOCK_INIT_LOGIT_SCALE="${INFER_BLOCK_INIT_LOGIT_SCALE:-8.0}"
+INFER_BLOCK_DIAGNOSE="${INFER_BLOCK_DIAGNOSE:-false}"
 
 ################################################################################
 # 参数验证
@@ -139,6 +145,7 @@ echo "📁 Checkpoint: $CKPT_PATH"
 echo "📁 Tokenizer: $TOKENIZER_PATH"
 echo "📁 输出目录: $INFER_OUTPUT_DIR"
 echo "📁 日志文件: $LOG_FILE"
+echo "🧱 Block推理: size=$INFER_BLOCK_SIZE | refine=$INFER_BLOCK_USE_REFINE | steps=$INFER_BLOCK_REFINE_STEPS | init_scale=$INFER_BLOCK_INIT_LOGIT_SCALE"
 
 ################################################################################
 # WandB 配置
@@ -151,6 +158,11 @@ if [ "$USE_WANDB" = "true" ] && [ -n "$WANDB_API_KEY" ]; then
     echo "📊 WandB: 启用 (离线模式)"
 else
     echo "📊 WandB: 禁用"
+fi
+
+BLOCK_DIAG_FLAG=""
+if [ "$INFER_BLOCK_DIAGNOSE" = "true" ]; then
+    BLOCK_DIAG_FLAG="--infer_block_diagnose"
 fi
 
 echo ""
@@ -173,7 +185,13 @@ $PYTHON train.py \
     --infer_max_gen_len 256 \
     --infer_temp 0.6 \
     --infer_topp 0.9 \
+    --infer_block_size "$INFER_BLOCK_SIZE" \
+    --infer_block_use_refine "$INFER_BLOCK_USE_REFINE" \
+    --infer_block_refine_steps "$INFER_BLOCK_REFINE_STEPS" \
+    --infer_block_init_logit_scale "$INFER_BLOCK_INIT_LOGIT_SCALE" \
+    $BLOCK_DIAG_FLAG \
     --gpus "$GPUS" \
+    --distributed_strategy "auto" \
     --batch_size_per_device "$BATCH_SIZE" \
     --limit_test_batches "$LIMIT_TEST_BATCHES" \
     --num_workers 4 \

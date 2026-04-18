@@ -178,6 +178,30 @@ class ModelTrainer(LightningModule):
         # The tokenizer is loaded via get_tokenizer() which uses NanoChat custom BPE tokenizer
         # from $NANOCHAT_BASE_DIR/tokenizer/ (vocab_size=32768)
         # The --tokenizer parameter passed from command line is IGNORED for NanoChat!
+        def _resolve_nanochat_base_dir():
+            # Prefer user-provided env var first.
+            base_from_env = os.environ.get("NANOCHAT_BASE_DIR")
+            if base_from_env:
+                pkl_path = os.path.join(base_from_env, "tokenizer", "tokenizer.pkl")
+                if os.path.exists(pkl_path):
+                    return base_from_env
+
+            # Auto-discover common locations, including this workspace's sibling tokenizer dir.
+            candidate_dirs = [
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")),  # /.../nar
+                "/mnt/shared-storage-user/lixueyan/nar",
+            ]
+            for candidate in candidate_dirs:
+                pkl_path = os.path.join(candidate, "tokenizer", "tokenizer.pkl")
+                if os.path.exists(pkl_path):
+                    return candidate
+            return None
+
+        resolved_base_dir = _resolve_nanochat_base_dir()
+        if resolved_base_dir is not None:
+            os.environ["NANOCHAT_BASE_DIR"] = resolved_base_dir
+            print(f"[Tokenizer] Using NANOCHAT_BASE_DIR={resolved_base_dir}")
+
         self.hparams.tokenizer_obj = tokenizer = get_tokenizer() # Store tokenizer object
         # Keep tokenizer path as string for generate_text compatibility
         if not hasattr(self.hparams, 'tokenizer_path'):
@@ -380,6 +404,8 @@ class ModelTrainer(LightningModule):
             things_to_log['avg_gradient_norms'] = average_norm
             things_to_log['pct_gradient_clipped'] = percentage_clipped
             self.log_metrics(things_to_log, "train", log_torchmetrics = False)
+        if getattr(self.hparams, "debug_blockwise_shapes", False) and getattr(self.hparams, "training_objective", "dense_next_token") == "blockwise":
+            print("[blockwise-debug] backward success", flush=True)
         
     def on_train_batch_end(self, outputs, batch, batch_idx):
         #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
@@ -480,11 +506,14 @@ class ModelTrainer(LightningModule):
 
                     # 1. Always compute PPL on full sequence
                     batch_dict = batch  # Already a dict from DataLoader
-                    ppl_outputs = get_ppl(self.model, batch_dict, self.hparams)
+                    ppl_outputs = get_ppl(self.model, batch_dict, self.hparams, token_bytes=self.token_bytes)
+                    tf_loss = float(ppl_outputs.get('teacher_forced_loss', ppl_outputs['loss']))
+                    tf_ppl = float(ppl_outputs.get('teacher_forced_ppl', ppl_outputs['perplexity']))
+                    tf_bpb = float(ppl_outputs['teacher_forced_bpb']) if 'teacher_forced_bpb' in ppl_outputs else None
 
                     # Track metrics for averaging
-                    self.test_losses.append(ppl_outputs['loss'].item())
-                    self.test_perplexities.append(ppl_outputs['perplexity'].item())
+                    self.test_losses.append(tf_loss)
+                    self.test_perplexities.append(tf_ppl)
 
                     # Track energy metrics if available
                     if not hasattr(self, 'test_energies'):
@@ -524,8 +553,10 @@ class ModelTrainer(LightningModule):
                         # Log generation results with additional context
                         for i, output in enumerate(generation_outputs):
                             # Add PPL info and shard index
-                            output['loss'] = ppl_outputs['loss'].item()
-                            output['ppl'] = ppl_outputs['perplexity'].item()
+                            output['teacher_forced_loss'] = tf_loss
+                            output['teacher_forced_ppl'] = tf_ppl
+                            if tf_bpb is not None:
+                                output['teacher_forced_bpb'] = tf_bpb
                             output['shard_idx'] = batch['shard_indices'][i]
                             # Note: prompt and target are already in output from generate_text()
                             # No need to add duplicate fields
@@ -555,7 +586,10 @@ class ModelTrainer(LightningModule):
                         sys.stdout.write(f"\n{'─'*100}\n")
                         sys.stdout.write(f"📊 Batch {batch_idx:3d}/{batches_total} | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s\n")
                         sys.stdout.write(f"{'─'*100}\n")
-                        sys.stdout.write(f"  Current Batch:  Loss={ppl_outputs['loss'].item():.4f}  PPL={ppl_outputs['perplexity'].item():.2f}\n")
+                        if tf_bpb is None:
+                            sys.stdout.write(f"  Current Batch:  TF_Loss={tf_loss:.4f}  TF_PPL={tf_ppl:.2f}\n")
+                        else:
+                            sys.stdout.write(f"  Current Batch:  TF_Loss={tf_loss:.4f}  TF_PPL={tf_ppl:.2f}  TF_BPB={tf_bpb:.4f}\n")
                         sys.stdout.write(f"  Running Avg:    Loss={current_avg_loss:.4f} (±{current_std_loss:.4f})  PPL={current_avg_ppl:.2f} (±{current_std_ppl:.2f})\n")
 
                         # Show energy metrics if available
@@ -594,11 +628,15 @@ class ModelTrainer(LightningModule):
                         batch_dict = batch
 
                     # Compute PPL and save sample outputs
-                    ppl_outputs = get_ppl(self.model, batch_dict, self.hparams)
+                    ppl_outputs = get_ppl(self.model, batch_dict, self.hparams, token_bytes=self.token_bytes)
+
+                    tf_loss = float(ppl_outputs.get('teacher_forced_loss', ppl_outputs['loss']))
+                    tf_ppl = float(ppl_outputs.get('teacher_forced_ppl', ppl_outputs['perplexity']))
+                    tf_bpb = float(ppl_outputs['teacher_forced_bpb']) if 'teacher_forced_bpb' in ppl_outputs else None
 
                     # Track metrics for averaging
-                    self.test_losses.append(ppl_outputs['loss'].item())
-                    self.test_perplexities.append(ppl_outputs['perplexity'].item())
+                    self.test_losses.append(tf_loss)
+                    self.test_perplexities.append(tf_ppl)
 
                     # Track energy metrics if available
                     if not hasattr(self, 'test_energies'):
@@ -632,7 +670,10 @@ class ModelTrainer(LightningModule):
                         sys.stdout.write(f"\n{'─'*100}\n")
                         sys.stdout.write(f"📊 Batch {batch_idx:3d}/{batches_total} | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s\n")
                         sys.stdout.write(f"{'─'*100}\n")
-                        sys.stdout.write(f"  Current Batch:  Loss={ppl_outputs['loss'].item():.4f}  PPL={ppl_outputs['perplexity'].item():.2f}\n")
+                        if tf_bpb is None:
+                            sys.stdout.write(f"  Current Batch:  TF_Loss={tf_loss:.4f}  TF_PPL={tf_ppl:.2f}\n")
+                        else:
+                            sys.stdout.write(f"  Current Batch:  TF_Loss={tf_loss:.4f}  TF_PPL={tf_ppl:.2f}  TF_BPB={tf_bpb:.4f}\n")
                         sys.stdout.write(f"  Running Avg:    Loss={current_avg_loss:.4f} (±{current_std_loss:.4f})  PPL={current_avg_ppl:.2f} (±{current_std_ppl:.2f})\n")
 
                         # Show energy metrics if available
@@ -667,9 +708,11 @@ class ModelTrainer(LightningModule):
                                     "batch_idx": batch_idx,
                                     "sample_idx": i,
                                     "text": full_text[:500],  # First 500 chars
-                                    "loss": ppl_outputs['loss'].item(),
-                                    "perplexity": ppl_outputs['perplexity'].item(),
+                                    "teacher_forced_loss": tf_loss,
+                                    "teacher_forced_ppl": tf_ppl,
                                 }
+                                if tf_bpb is not None:
+                                    output_record["teacher_forced_bpb"] = tf_bpb
                                 self.infer_logger.log_data(output_record)
 
                                 # Also print to console for first few samples
@@ -680,7 +723,10 @@ class ModelTrainer(LightningModule):
                                     sys.stdout.write(f"{'─'*100}\n")
                                     sys.stdout.write(f"{full_text[:300]}...\n")
                                     sys.stdout.write(f"{'─'*100}\n")
-                                    sys.stdout.write(f"   Loss: {ppl_outputs['loss'].item():.4f} | PPL: {ppl_outputs['perplexity'].item():.2f}\n")
+                                    if tf_bpb is None:
+                                        sys.stdout.write(f"   TF_Loss: {tf_loss:.4f} | TF_PPL: {tf_ppl:.2f}\n")
+                                    else:
+                                        sys.stdout.write(f"   TF_Loss: {tf_loss:.4f} | TF_PPL: {tf_ppl:.2f} | TF_BPB: {tf_bpb:.4f}\n")
                                     sys.stdout.write(f"{'─'*100}\n\n")
                                     sys.stdout.flush()
 
@@ -1438,6 +1484,11 @@ class ModelTrainer(LightningModule):
                 split="train",
                 device=self.device,
                 resume_state_dict=resume_state,
+                training_objective=getattr(self.hparams, "training_objective", "dense_next_token"),
+                train_block_size=getattr(self.hparams, "train_block_size", 2),
+                train_context_length=getattr(self.hparams, "train_context_length", None),
+                num_block_samples_per_window=getattr(self.hparams, "num_block_samples_per_window", 1),
+                debug_blockwise_shapes=getattr(self.hparams, "debug_blockwise_shapes", False),
             )
         return train_dataloader
 
@@ -1470,6 +1521,11 @@ class ModelTrainer(LightningModule):
                 split="val",
                 device=self.device,
                 resume_state_dict=None,
+                training_objective=getattr(self.hparams, "training_objective", "dense_next_token"),
+                train_block_size=getattr(self.hparams, "train_block_size", 2),
+                train_context_length=getattr(self.hparams, "train_context_length", None),
+                num_block_samples_per_window=getattr(self.hparams, "num_block_samples_per_window", 1),
+                debug_blockwise_shapes=getattr(self.hparams, "debug_blockwise_shapes", False),
             )
 
         return val_dataloader

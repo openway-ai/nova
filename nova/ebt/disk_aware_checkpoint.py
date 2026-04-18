@@ -5,7 +5,10 @@
 import os
 import shutil
 from pathlib import Path
-from lightning.pytorch.callbacks import ModelCheckpoint
+try:
+    from lightning.pytorch.callbacks import ModelCheckpoint
+except ImportError:
+    from pytorch_lightning.callbacks import ModelCheckpoint
 
 
 class DiskAwareCheckpoint(ModelCheckpoint):

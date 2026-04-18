@@ -9,6 +9,7 @@ from nanolightning.torchlightning_module import LightningModule
 import math
 import random
 import os
+import inspect
 from utils import setup_ebt, init_whole_model_weights
 from utils import MLP, Memory_Augmented_MLP, Memory_Gating_MLP, mask_q_tokens
 from replay_buffer import CausalReplayBuffer
@@ -36,6 +37,20 @@ class EBT_NLP(LightningModule):
 
         self.embeddings = nn.Embedding(self.vocab_size, self.hparams.embedding_dim)
         init_whole_model_weights(self.embeddings, self.hparams.weight_initialization_method, weight_initialization_gain=self.hparams.weight_initialization_gain)
+
+        max_blockwise_offsets = max(1, int(getattr(self.hparams, "train_block_size", 1)))
+        # Dense blockwise joint head:
+        # shared trunk features [B, S, D] -> [B, S, K_max * V], then reshape to [B, K, S, V].
+        self.blockwise_joint_head = nn.Linear(
+            self.hparams.embedding_dim,
+            max_blockwise_offsets * self.vocab_size,
+            bias=False,
+        )
+        init_whole_model_weights(
+            self.blockwise_joint_head,
+            self.hparams.weight_initialization_method,
+            weight_initialization_gain=self.hparams.weight_initialization_gain,
+        )
         
         self.log_softmax = nn.LogSoftmax(dim = -1)
         self.softmax = nn.Softmax(dim = -1)
@@ -53,6 +68,12 @@ class EBT_NLP(LightningModule):
             init_whole_model_weights(self.vocab_to_embed, self.hparams.weight_initialization_method, weight_initialization_gain=self.hparams.weight_initialization_gain)
 
         self.transformer = setup_ebt(self.hparams)
+        self._transformer_accepts_return_pred_hidden = (
+            "return_pred_hidden" in inspect.signature(self.transformer.forward).parameters
+        )
+        self._transformer_accepts_return_context_hidden = (
+            "return_context_hidden" in inspect.signature(self.transformer.forward).parameters
+        )
         
         self.finished_warming_up = False
 
@@ -133,30 +154,53 @@ class EBT_NLP(LightningModule):
             
         return predicted_tokens, energy_preds, predicted_tokens_for_loss
 
-    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
-        predicted_distributions = []
-        predicted_energies = []
-
+    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True, block_size = None): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
         real_embeddings_input = self.embeddings(x)
         batch_size = x.shape[0]
         seq_length = x.shape[1]
-        
+        if block_size is None:
+            block_size = getattr(self.hparams, "block_size", seq_length)
+        block_size = int(block_size)
+        if block_size <= 0:
+            raise ValueError(f"block_size must be > 0, got {block_size}")
+
+        if getattr(self.hparams, "ebt_type", "default") not in ("default", "time_embed") and block_size != seq_length:
+            raise NotImplementedError(
+                f"block_size != seq_length is currently only supported for ebt_type in [default, time_embed]; got ebt_type={self.hparams.ebt_type}, block_size={block_size}, seq_length={seq_length}"
+            )
+
         alpha = torch.clamp(self.alpha, min=0.0001)
         if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
-            expanded_alpha = alpha.expand(batch_size, seq_length, 1)
-
+            expanded_alpha = alpha.expand(batch_size, block_size, 1)
             scale = self.hparams.randomize_mcmc_step_size_scale
             low = alpha / scale
             high = alpha * scale
             alpha = low + torch.rand_like(expanded_alpha) * (high - low)
 
         langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
-
-        predicted_tokens = self.corrupt_embeddings(real_embeddings_input) # B, S, V
+        predicted_tokens = self.corrupt_embeddings(real_embeddings_input, target_length=block_size) # B, K, V
         if replay_buffer_logits is not None: # using replay buffer, use the logits instead of corruption
+            if block_size != seq_length:
+                raise NotImplementedError("replay_buffer_logits path only supports block_size == seq_length")
+            if replay_buffer_logits.shape[1] != block_size:
+                raise ValueError(
+                    f"replay_buffer_logits shape mismatch: expected second dim {block_size}, got {replay_buffer_logits.shape[1]}"
+                )
             predicted_tokens[batch_size - replay_buffer_logits.shape[0]:] = replay_buffer_logits # NOTE this assumes the fresh data is concatted first
-                
-        
+
+        _, predicted_distributions, predicted_energies = self._run_mcmc_on_given_pred_tokens(
+            real_embeddings_input=real_embeddings_input,
+            predicted_tokens=predicted_tokens,
+            start_pos=start_pos,
+            learning=learning,
+            return_raw_logits=return_raw_logits,
+            no_randomness=no_randomness,
+            alpha=alpha,
+            langevin_dynamics_noise_std=langevin_dynamics_noise_std,
+        )
+        return predicted_distributions, predicted_energies
+
+    def _build_mcmc_steps(self, no_randomness=True):
         mcmc_steps = [] # in the general case of no randomize_mcmc_num_steps then this has len == self.hparams.randomize_mcmc_num_steps
         for step in range(self.hparams.mcmc_num_steps):
             if not no_randomness and hasattr(self.hparams, 'randomize_mcmc_num_steps') and self.hparams.randomize_mcmc_num_steps > 0:
@@ -178,39 +222,518 @@ class EBT_NLP(LightningModule):
                     mcmc_steps.append(step)
             else:
                 mcmc_steps.append(step)
+        return mcmc_steps
+
+    def _run_mcmc_on_given_pred_tokens(
+        self,
+        real_embeddings_input,
+        predicted_tokens,
+        start_pos=0,
+        learning=True,
+        return_raw_logits=False,
+        no_randomness=True,
+        alpha=None,
+        langevin_dynamics_noise_std=None,
+        optimize_mask=None,
+        mcmc_steps=None,
+        return_pred_hidden=False,
+        return_context_hidden=False,
+    ):
+        predicted_distributions = []
+        predicted_energies = []
+        predicted_hiddens = []
+        context_hiddens = []
+        batch_size, seq_length, _ = predicted_tokens.shape
+        if alpha is None:
+            alpha = torch.clamp(self.alpha, min=0.0001)
+        if langevin_dynamics_noise_std is None:
+            langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
+        if mcmc_steps is None:
+            mcmc_steps = self._build_mcmc_steps(no_randomness=no_randomness)
+
+        optimize_mask_bool = None
+        optimize_mask_float = None
+        fixed_logits = None
+        if optimize_mask is not None:
+            optimize_mask_bool = optimize_mask.to(dtype=torch.bool)
+            optimize_mask_float = optimize_mask.to(dtype=predicted_tokens.dtype)
+            fixed_logits = predicted_tokens.detach()
 
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
-                
-                predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
-                    predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
-                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits
-                )
-                predicted_energies.append(energy_preds)
-                predicted_distributions.append(predicted_tokens_for_loss)        
+                if self.hparams.no_mcmc_detach:
+                    predicted_tokens.requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
+                else: # default, do detach
+                    predicted_tokens = predicted_tokens.detach().requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
 
-        return predicted_distributions, predicted_energies
+                if self.hparams.langevin_dynamics_noise != 0:
+                    ld_noise = torch.randn_like(predicted_tokens.detach()) * langevin_dynamics_noise_std # langevin dynamics
+                    if optimize_mask_float is not None:
+                        ld_noise = ld_noise * optimize_mask_float
+                    predicted_tokens = predicted_tokens + ld_noise
+
+                if self.hparams.normalize_initial_condition:
+                    if self.hparams.normalize_initial_condition_only_first_step:
+                        if mcmc_step == 0:
+                            predicted_tokens = self.softmax(predicted_tokens)
+                    else:
+                        predicted_tokens = self.softmax(predicted_tokens)
+
+                    if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
+                        predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
+                    else:
+                        predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
+                else:
+                    predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
+
+                all_embeddings = torch.cat((real_embeddings_input, predicted_embeddings), dim = 1) # B, S+K, D
+                transformer_kwargs = dict(
+                    start_pos=start_pos,
+                    mcmc_step=mcmc_step,
+                    context_len=real_embeddings_input.shape[1],
+                    pred_len=predicted_embeddings.shape[1],
+                )
+                if self._transformer_accepts_return_context_hidden:
+                    transformer_kwargs["return_context_hidden"] = return_context_hidden
+                elif return_context_hidden:
+                    raise NotImplementedError(
+                        f"Transformer {type(self.transformer).__name__} does not support return_context_hidden=True"
+                    )
+
+                if self._transformer_accepts_return_pred_hidden:
+                    transformer_kwargs["return_pred_hidden"] = return_pred_hidden
+                elif return_pred_hidden:
+                    raise NotImplementedError(
+                        f"Transformer {type(self.transformer).__name__} does not support return_pred_hidden=True"
+                    )
+
+                transformer_out = self.transformer(
+                    all_embeddings,
+                    **transformer_kwargs,
+                ) # checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+                if return_context_hidden and return_pred_hidden:
+                    energy_preds, context_hidden, pred_hidden = transformer_out
+                    context_hiddens.append(context_hidden)
+                    predicted_hiddens.append(pred_hidden)
+                elif return_context_hidden:
+                    energy_preds, context_hidden = transformer_out
+                    context_hiddens.append(context_hidden)
+                elif return_pred_hidden:
+                    energy_preds, pred_hidden = transformer_out
+                    predicted_hiddens.append(pred_hidden)
+                else:
+                    energy_preds = transformer_out
+                energy_preds = energy_preds.reshape(-1, 1)
+                predicted_energies.append(energy_preds)
+
+                if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
+                    if i == (len(mcmc_steps) - 1):
+                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+                    else:
+                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=False)[0]
+                else:
+                    predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+                # predicted_tokens_grad has shape B, S, V
+
+                if optimize_mask_float is not None:
+                    predicted_tokens_grad = predicted_tokens_grad * optimize_mask_float
+
+                if self.hparams.clamp_futures_grad:
+                    min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
+                    predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
+
+                if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
+                    raise ValueError("NaN or Inf gradients detected during MCMC.")
+
+                predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after
+                if self.hparams.absolute_clamp != 0.0:
+                    predicted_tokens = torch.clamp(predicted_tokens, min = -self.hparams.absolute_clamp, max = self.hparams.absolute_clamp)
+                if self.hparams.sharpen_predicted_distribution != 0.0:
+                    predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
+
+                if optimize_mask_bool is not None:
+                    predicted_tokens = torch.where(optimize_mask_bool, predicted_tokens, fixed_logits)
+
+                if return_raw_logits:
+                    predicted_tokens_for_loss = predicted_tokens # BS, S, V
+                else:
+                    predicted_tokens_for_loss = self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size) # BS*S, V
+                predicted_distributions.append(predicted_tokens_for_loss)
+
+        if return_context_hidden and return_pred_hidden:
+            return predicted_tokens, predicted_distributions, predicted_energies, context_hiddens, predicted_hiddens
+        if return_context_hidden:
+            return predicted_tokens, predicted_distributions, predicted_energies, context_hiddens
+        if return_pred_hidden:
+            return predicted_tokens, predicted_distributions, predicted_energies, predicted_hiddens
+        return predicted_tokens, predicted_distributions, predicted_energies
+
+    def _discrete_token_ids_to_initial_logits(self, token_ids, init_logit_scale=8.0):
+        logits = torch.zeros(
+            token_ids.shape[0],
+            token_ids.shape[1],
+            self.vocab_size,
+            device=token_ids.device,
+            dtype=self.embeddings.weight.dtype,
+        )
+        return logits.scatter_(-1, token_ids.unsqueeze(-1), float(init_logit_scale))
+
+    def _draft_block_ids_to_initial_logits(self, draft_block_ids, init_logit_scale=8.0):
+        return self._discrete_token_ids_to_initial_logits(draft_block_ids, init_logit_scale=init_logit_scale)
+
+    def _logits_to_pred_embeddings(self, logits, step_idx):
+        if self.hparams.normalize_initial_condition:
+            if self.hparams.normalize_initial_condition_only_first_step:
+                if step_idx == 0:
+                    logits = self.softmax(logits)
+            else:
+                logits = self.softmax(logits)
+
+            if self.hparams.vocab_to_embed_uses_prob_dist:
+                return torch.matmul(logits, self.embeddings.weight)
+            return self.vocab_to_embed(logits)
+        return self.vocab_to_embed(logits)
+
+    def ebt_refine_block_fast(self, context_ids, draft_block_ids, refine_steps=None, init_logit_scale=8.0, start_pos=0, learning=False):
+        """
+        Fast block refinement: only block logits require grad.
+        Returns:
+            refined_block_logits: [B, K, V]
+            refined_block_ids: [B, K]
+        """
+        if draft_block_ids.shape[1] == 0:
+            empty_logits = torch.empty(
+                draft_block_ids.shape[0], 0, self.vocab_size, device=draft_block_ids.device, dtype=self.embeddings.weight.dtype
+            )
+            return empty_logits, draft_block_ids
+
+        if context_ids.shape[1] == 0:
+            raise ValueError("ebt_refine_block_fast requires at least one context token")
+
+        # EBT-compatible pair:
+        # real_input_ids: [context, draft[:-1]] length = C + K - 1
+        # predicted targets: [context[1:], draft] where only draft logits are optimized
+        real_input_ids = torch.cat([context_ids, draft_block_ids[:, :-1]], dim=1)
+        block_len = draft_block_ids.shape[1]
+        real_embeddings_input = self.embeddings(real_input_ids)
+        context_target_ids = context_ids[:, 1:]
+        fixed_prefix_logits = self._discrete_token_ids_to_initial_logits(
+            context_target_ids, init_logit_scale=init_logit_scale
+        ).detach()
+        block_logits = self._draft_block_ids_to_initial_logits(
+            draft_block_ids, init_logit_scale=init_logit_scale
+        ).detach()
+        init_block_logits = block_logits.detach().clone()
+
+        alpha = torch.clamp(self.alpha, min=0.0001)
+        noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
+
+        requested_steps = int(refine_steps) if refine_steps is not None else int(self.hparams.mcmc_num_steps)
+        if requested_steps <= 0:
+            refined_block_ids = torch.argmax(block_logits, dim=-1)
+            return block_logits, refined_block_ids
+        effective_steps = min(requested_steps, int(self.hparams.mcmc_num_steps))
+        mcmc_steps = list(range(effective_steps))
+        diagnose = bool(getattr(self.hparams, "infer_block_diagnose", False))
+
+        def _block_energy_mean(logits, step_idx):
+            with torch.no_grad():
+                prefix_embeds = self._logits_to_pred_embeddings(fixed_prefix_logits, step_idx)
+                block_embeds = self._logits_to_pred_embeddings(logits, step_idx)
+                pred_embeddings = torch.cat([prefix_embeds, block_embeds], dim=1)
+                all_embeddings = torch.cat((real_embeddings_input, pred_embeddings), dim=1)
+                energy_preds = self.transformer(all_embeddings, start_pos=start_pos, mcmc_step=step_idx)
+                return energy_preds[:, -block_len:].mean().item()
+
+        initial_energy_mean = _block_energy_mean(init_block_logits, mcmc_steps[0])
+        last_grad_norm = 0.0
+
+        with torch.set_grad_enabled(True):
+            for i, mcmc_step in enumerate(mcmc_steps):
+                block_logits = block_logits.detach().requires_grad_()
+                cur_block_logits = block_logits
+                if self.hparams.langevin_dynamics_noise != 0:
+                    ld_noise = torch.randn_like(cur_block_logits.detach()) * noise_std
+                    cur_block_logits = cur_block_logits + ld_noise
+
+                prefix_embeds = self._logits_to_pred_embeddings(fixed_prefix_logits, mcmc_step)
+                block_embeds = self._logits_to_pred_embeddings(cur_block_logits, mcmc_step)
+                pred_embeddings = torch.cat([prefix_embeds, block_embeds], dim=1)
+                all_embeddings = torch.cat((real_embeddings_input, pred_embeddings), dim=1)
+                energy_preds = self.transformer(
+                    all_embeddings,
+                    start_pos=start_pos,
+                    mcmc_step=mcmc_step,
+                    context_len=real_embeddings_input.shape[1],
+                    pred_len=pred_embeddings.shape[1],
+                )
+                energy_block = energy_preds[:, -block_len:].reshape(-1, 1)
+
+                block_grad = torch.autograd.grad([energy_block.sum()], [cur_block_logits], create_graph=learning)[0]
+                last_grad_norm = block_grad.norm().item()
+                if self.hparams.clamp_futures_grad:
+                    min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha)
+                    block_grad = torch.clamp(block_grad, min=-min_and_max, max=min_and_max)
+                if torch.isnan(block_grad).any() or torch.isinf(block_grad).any():
+                    raise ValueError("NaN or Inf gradients detected during block refinement.")
+
+                block_logits = cur_block_logits - alpha * block_grad
+                if self.hparams.absolute_clamp != 0.0:
+                    block_logits = torch.clamp(block_logits, min=-self.hparams.absolute_clamp, max=self.hparams.absolute_clamp)
+                if self.hparams.sharpen_predicted_distribution != 0.0:
+                    block_logits = block_logits / self.hparams.sharpen_predicted_distribution
+                block_logits = block_logits.detach()
+
+        final_energy_mean = _block_energy_mean(block_logits, mcmc_steps[-1])
+        refined_block_logits = block_logits
+        refined_block_ids = torch.argmax(refined_block_logits, dim=-1)
+
+        if diagnose:
+            delta_norm = (refined_block_logits - init_block_logits).norm().item()
+            max_show = min(2, draft_block_ids.shape[0])
+            for b in range(max_show):
+                print(f"draft_block_ids[{b}]: {draft_block_ids[b].tolist()}", flush=True)
+                print(f"refined_block_ids[{b}]: {refined_block_ids[b].tolist()}", flush=True)
+            print(f"||refined_logits - init_logits||: {delta_norm:.6f}", flush=True)
+            print(f"block 初始 energy: {initial_energy_mean:.6f}", flush=True)
+            print(f"block 最终 energy: {final_energy_mean:.6f}", flush=True)
+            print(f"block logits 梯度范数 grad.norm(): {last_grad_norm:.6f}", flush=True)
+
+        return refined_block_logits, refined_block_ids
+
+    def ebt_refine_block(self, context_ids, draft_block_ids, refine_steps=None, init_logit_scale=8.0, start_pos=0, learning=False):
+        # Backward-compatible wrapper for older callsites.
+        return self.ebt_refine_block_fast(
+            context_ids=context_ids,
+            draft_block_ids=draft_block_ids,
+            refine_steps=refine_steps,
+            init_logit_scale=init_logit_scale,
+            start_pos=start_pos,
+            learning=learning,
+        )
+
+    def forward_blockwise_dense_hidden(self, input_ids, no_randomness):
+        """
+        Shared-trunk blockwise dense hidden extraction (context/input branch only).
+        Returns:
+            context_hiddens_per_step: list[[B, S_eff, D]]
+            predicted_energies: list[[B*S_eff, 1]]
+        """
+        if input_ids.dim() != 2:
+            raise ValueError(f"Expected input_ids [B, S_eff], got shape {tuple(input_ids.shape)}")
+
+        real_embeddings_input = self.embeddings(input_ids)
+        seq_eff = input_ids.shape[1]
+        alpha = torch.clamp(self.alpha, min=0.0001)
+        langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
+        predicted_tokens = self.corrupt_embeddings(real_embeddings_input, target_length=seq_eff)  # [B, S_eff, V]
+
+        _, _, predicted_energies, context_hiddens_per_step = self._run_mcmc_on_given_pred_tokens(
+            real_embeddings_input=real_embeddings_input,
+            predicted_tokens=predicted_tokens,
+            start_pos=0,
+            learning=True,
+            return_raw_logits=True,
+            no_randomness=no_randomness,
+            alpha=alpha,
+            langevin_dynamics_noise_std=langevin_dynamics_noise_std,
+            return_context_hidden=True,
+        )
+        return context_hiddens_per_step, predicted_energies
+
+    def forward_blockwise_dense_logits(self, input_ids, num_offsets, no_randomness, return_hidden=False):
+        """
+        Shared-trunk blockwise dense prediction.
+        Returns:
+            multi_offset_logits_per_step: list[[B, K, S_eff, V]]
+            predicted_energies: list[[B*S_eff, 1]]
+        """
+        if input_ids.dim() != 2:
+            raise ValueError(f"Expected input_ids [B, S_eff], got shape {tuple(input_ids.shape)}")
+        if num_offsets <= 0:
+            raise ValueError(f"num_offsets must be > 0, got {num_offsets}")
+        max_offsets = self.blockwise_joint_head.out_features // self.vocab_size
+        if num_offsets > max_offsets:
+            raise ValueError(
+                f"Requested K={num_offsets} offsets but model only initialized K_max={max_offsets}. "
+                "Increase --train_block_size and reinitialize model."
+            )
+
+        batch_size = input_ids.shape[0]
+        seq_eff = input_ids.shape[1]
+        context_hiddens_per_step, predicted_energies = self.forward_blockwise_dense_hidden(
+            input_ids=input_ids,
+            no_randomness=no_randomness,
+        )
+
+        multi_offset_logits_per_step = []
+        for context_hidden in context_hiddens_per_step:
+            projected = self.blockwise_joint_head(context_hidden)  # [B, S_eff, K_max*V]
+            projected = projected.reshape(batch_size, seq_eff, max_offsets, self.vocab_size)
+            projected = projected[:, :, :num_offsets, :]  # [B, S_eff, K, V]
+            projected = projected.permute(0, 2, 1, 3).contiguous()  # [B, K, S_eff, V]
+            multi_offset_logits_per_step.append(projected)
+
+        if return_hidden:
+            return multi_offset_logits_per_step, predicted_energies, context_hiddens_per_step
+        return multi_offset_logits_per_step, predicted_energies
 
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
         no_randomness = False if phase == "train" else True
-        if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
-            # all_tokens = x['input_ids'].squeeze(dim=1)
-            all_tokens = x[0].squeeze(dim=0)
-            input_ids, replay_buffer_logits, next_token_indices = self.replay_buffer.get_batch(all_tokens) # this automatically does indexing for input ids and next token indices while also passing back the logits
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness)
-            self.replay_buffer.update(all_tokens.detach(), predicted_distributions[-1].detach()) # update using the final predicted distributions
+        training_objective = getattr(self.hparams, "training_objective", "dense_next_token")
+
+        if training_objective == "blockwise":
+            if self.mcmc_replay_buffer:
+                raise NotImplementedError("mcmc_replay_buffer is not supported for training_objective=blockwise")
+            if self.hparams.contrastive_loss:
+                raise NotImplementedError("contrastive_loss is not supported for training_objective=blockwise")
+            if self.hparams.execution_mode == "finetune":
+                raise NotImplementedError("execution_mode=finetune is not supported for training_objective=blockwise yet")
+
+            if not isinstance(x, dict):
+                raise ValueError("Expected dense blockwise batch to be a dict with keys: input_ids and block_targets")
+
+            def _maybe_squeeze_loader_dim(tensor):
+                if tensor is None:
+                    return None
+                if isinstance(tensor, torch.Tensor) and tensor.dim() > 1 and tensor.shape[0] == 1:
+                    return tensor.squeeze(dim=0)
+                return tensor
+
+            input_ids = _maybe_squeeze_loader_dim(x["input_ids"])
+            block_targets = _maybe_squeeze_loader_dim(x["block_targets"])
+            target_offsets = _maybe_squeeze_loader_dim(x.get("target_offsets"))
+
+            if input_ids.dim() != 2:
+                raise ValueError(f"Expected input_ids to be 2D [B, S_eff], got shape {tuple(input_ids.shape)}")
+            if block_targets.dim() != 3:
+                raise ValueError(f"Expected block_targets to be 3D [B, K, S_eff], got shape {tuple(block_targets.shape)}")
+            if block_targets.shape[0] != input_ids.shape[0]:
+                raise ValueError(
+                    f"Batch mismatch between input_ids and block_targets: {tuple(input_ids.shape)} vs {tuple(block_targets.shape)}"
+                )
+            if block_targets.shape[2] != input_ids.shape[1]:
+                raise ValueError(
+                    f"S_eff mismatch between input_ids and block_targets: input_ids.shape[1]={input_ids.shape[1]}, block_targets.shape[2]={block_targets.shape[2]}"
+                )
+
+            num_offsets = int(block_targets.shape[1])
+            seq_eff = int(input_ids.shape[1])
+            if target_offsets is None:
+                target_offsets = torch.arange(1, num_offsets + 1, device=input_ids.device, dtype=torch.long)
+
+            multi_offset_logits_per_step, predicted_energies, context_hiddens_per_step = self.forward_blockwise_dense_logits(
+                input_ids,
+                num_offsets=num_offsets,
+                no_randomness=no_randomness,
+                return_hidden=True,
+            )
+            next_token_indices = block_targets.reshape(-1)
+            reconstruction_loss = 0
+            total_mcmc_steps = len(predicted_energies)
+            final_cce_loss = None
+
+            for mcmc_step, (predicted_distribution, predicted_energy) in enumerate(zip(multi_offset_logits_per_step, predicted_energies)):
+                predicted_distribution = predicted_distribution.reshape(-1, self.vocab_size)
+
+                if self.hparams.soften_target_prob_dist != 0.0:
+                    if total_mcmc_steps <= 1:
+                        label_smoothing = 0.0
+                    else:
+                        label_smoothing = ((total_mcmc_steps - 1) - mcmc_step) / (total_mcmc_steps - 1) * self.hparams.soften_target_prob_dist
+                    cce_loss = F.cross_entropy(
+                        predicted_distribution,
+                        next_token_indices,
+                        label_smoothing=label_smoothing,
+                        ignore_index=-1,
+                    )
+                else:
+                    predicted_distribution = self.log_softmax(predicted_distribution)
+                    cce_loss = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1)
+
+                if self.hparams.truncate_mcmc:
+                    if mcmc_step == (total_mcmc_steps - 1):
+                        reconstruction_loss = cce_loss
+                        final_reconstruction_loss = cce_loss.detach()
+                        final_cce_loss = cce_loss.detach()
+                else:
+                    reconstruction_loss += cce_loss
+                    if mcmc_step == (total_mcmc_steps - 1):
+                        final_reconstruction_loss = cce_loss.detach()
+                        final_cce_loss = cce_loss.detach()
+                        reconstruction_loss = reconstruction_loss / total_mcmc_steps
+
+                if mcmc_step == 0:
+                    initial_loss = cce_loss.detach()
+                    initial_pred_energies = predicted_energy.squeeze().mean().detach()
+                if mcmc_step == (total_mcmc_steps - 1):
+                    final_pred_energies = predicted_energy.squeeze().mean().detach()
+
+            initial_final_pred_energies_gap = initial_pred_energies - final_pred_energies
+            ppl_loss = torch.exp(final_reconstruction_loss).detach()
+            total_loss = self.hparams.reconstruction_coeff * reconstruction_loss
+            contrastive_loss = 0.0
+
+            if token_bytes is not None:
+                bpb_loss = calculate_bpb_score(next_token_indices, final_cce_loss, token_bytes)
+            else:
+                bpb_loss = 0
+
+            if getattr(self.hparams, "debug_blockwise_shapes", False):
+                print(
+                    f"[blockwise-debug][phase={phase}] dense_mode=True, "
+                    f"input_ids.shape={tuple(input_ids.shape)}, block_targets.shape={tuple(block_targets.shape)}, "
+                    f"offsets={target_offsets.tolist()}, logits_last_step.shape={tuple(multi_offset_logits_per_step[-1].shape)}",
+                    flush=True,
+                )
+                print(
+                    f"[blockwise-debug][phase={phase}] context_hidden_last_step.shape={tuple(context_hiddens_per_step[-1].shape)}",
+                    flush=True,
+                )
+                if num_offsets >= 1:
+                    print(
+                        f"[blockwise-debug][phase={phase}] offset_1_logits.shape={tuple(multi_offset_logits_per_step[-1][:, 0, :, :].shape)}",
+                        flush=True,
+                    )
+                if num_offsets >= 2:
+                    print(
+                        f"[blockwise-debug][phase={phase}] offset_2_logits.shape={tuple(multi_offset_logits_per_step[-1][:, 1, :, :].shape)}",
+                        flush=True,
+                    )
+                print(
+                    f"[blockwise-debug][phase={phase}] aggregated_loss={total_loss.detach().item():.6f}",
+                    flush=True,
+                )
+
+            log_dict = {
+                'loss': total_loss,
+                'initial_loss' : initial_loss,
+                'final_step_loss': final_reconstruction_loss,
+                'contrastive_loss' : contrastive_loss,
+                'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
+                'perplexity': ppl_loss,
+                'bpb': bpb_loss
+            }
+            return log_dict
         else:
-            input_ids = x[0].squeeze(dim=0)
-            next_token_indices = x[1].squeeze(dim=0)
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
+            if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
+                # all_tokens = x['input_ids'].squeeze(dim=1)
+                all_tokens = x[0].squeeze(dim=0)
+                input_ids, replay_buffer_logits, next_token_indices = self.replay_buffer.get_batch(all_tokens) # this automatically does indexing for input ids and next token indices while also passing back the logits
+                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness)
+                self.replay_buffer.update(all_tokens.detach(), predicted_distributions[-1].detach()) # update using the final predicted distributions
+            else:
+                input_ids = x[0].squeeze(dim=0)
+                next_token_indices = x[1].squeeze(dim=0)
+                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
 
-            # input_ids = x['input_ids'].squeeze(dim=1)[:, :-1]
-            # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
-            # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
+                # input_ids = x['input_ids'].squeeze(dim=1)[:, :-1]
+                # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
+                # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
 
-        if self.hparams.execution_mode == "finetune": # Only tokens after "[[Answer]]: " will be calculated in finetune
-            next_token_indices = mask_q_tokens(next_token_indices, self.tokenizer)
-        next_token_indices = next_token_indices.reshape(-1) # BS * S; reshape since targets are supposed to be 1D
+            if self.hparams.execution_mode == "finetune": # Only tokens after "[[Answer]]: " will be calculated in finetune
+                next_token_indices = mask_q_tokens(next_token_indices, self.tokenizer)
+            next_token_indices = next_token_indices.reshape(-1) # BS * S; reshape since targets are supposed to be 1D
 
         reconstruction_loss = 0
         total_mcmc_steps = len(predicted_energies) # in general this equals self.hparams.mcmc_num_steps, isnt in case of rand number
@@ -272,13 +795,15 @@ class EBT_NLP(LightningModule):
         return log_dict
     
 
-    def corrupt_embeddings(self, embeddings):
+    def corrupt_embeddings(self, embeddings, target_length=None):
+        if target_length is None:
+            target_length = embeddings.shape[1]
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device) * self.hparams.gaussian_random_noise_scaling
+            predicted_tokens = torch.randn(size=(embeddings.shape[0], target_length, self.vocab_size), device = self.device) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
-            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device)
+            predicted_tokens = torch.zeros(size=(embeddings.shape[0], target_length, self.vocab_size), device = self.device)
         else:
             raise NotImplementedError(f"{self.hparams.denoising_initial_condition} denoising_initial_condition not yet supported")
         
