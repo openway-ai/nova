@@ -288,6 +288,17 @@ class ModelTrainer(LightningModule):
 
         
     def on_train_start(self):
+        # --- RNG 恢复 (在 val sanity check 之后、第一个 training step 之前) ---
+        import random
+        rng = getattr(self, '_rng_resume_state', None)
+        if rng is not None:
+            torch.random.set_rng_state(rng['torch_cpu'])
+            if rng.get('torch_cuda') is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state(rng['torch_cuda'])
+            random.setstate(rng['python'])
+            self._rng_resume_state = None
+            print(f"[Exact Resume] RNG states restored for rank {self.global_rank}")
+
         if self.hparams.debug_unused_parameters: 
             for name, param in self.model.named_parameters():
                 if param.requires_grad and "image_encoder" not in name: # NOTE need to modify this code to exclude specific frozen portions
@@ -404,22 +415,73 @@ class ModelTrainer(LightningModule):
     #         optimizer.update_epoch(self.current_epoch)
 
     def on_save_checkpoint(self, checkpoint):
-        # 保存 dataloader 的位置信息到 checkpoint，用于 resume 时跳过已训练数据
+        # 保存 per-rank dataloader 位置 + RNG 状态到 checkpoint，用于精确续训
+        import torch.distributed as dist
+        import random
+
+        # 1. 收集当前 rank 的 dataloader state（精确版，含 doc_buffer）
+        local_dl_state = None
         try:
             train_dl = self.trainer.train_dataloader
             if train_dl is not None:
                 dataset = train_dl.dataset
-                if hasattr(dataset, 'last_state_dict') and dataset.last_state_dict is not None:
-                    checkpoint['dataloader_state_dict'] = dataset.last_state_dict
-                    print(f"[Checkpoint] 保存 dataloader state: {dataset.last_state_dict}")
+                if hasattr(dataset, 'get_dataloader_state'):
+                    local_dl_state = dataset.get_dataloader_state()
+                elif hasattr(dataset, 'last_state_dict') and dataset.last_state_dict is not None:
+                    local_dl_state = dataset.last_state_dict
         except Exception:
             pass  # 非训练阶段可能没有 train_dataloader
 
+        # 2. 收集当前 rank 的 RNG state
+        local_rng_state = {
+            'torch_cpu': torch.random.get_rng_state(),
+            'torch_cuda': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            'python': random.getstate(),
+        }
+
+        # 3. DDP: all_gather 收集所有 rank 的状态到 rank 0
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            all_dl_states = [None] * dist.get_world_size()
+            dist.all_gather_object(all_dl_states, local_dl_state)
+            all_rng_states = [None] * dist.get_world_size()
+            dist.all_gather_object(all_rng_states, local_rng_state)
+        else:
+            all_dl_states = [local_dl_state]
+            all_rng_states = [local_rng_state]
+
+        # 4. 写入 checkpoint
+        checkpoint['dataloader_state_dict_by_rank'] = all_dl_states
+        checkpoint['dataloader_state_dict'] = all_dl_states[0]  # 旧格式兼容
+        checkpoint['rng_states_by_rank'] = all_rng_states
+
+        print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
+
     def on_load_checkpoint(self, checkpoint):
-        # 从 checkpoint 恢复 dataloader 位置信息
-        if 'dataloader_state_dict' in checkpoint:
+        # 从 checkpoint 恢复 per-rank dataloader 位置 + RNG 状态
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # Dataloader state: 优先 per-rank，回退旧格式
+        if 'dataloader_state_dict_by_rank' in checkpoint:
+            states = checkpoint['dataloader_state_dict_by_rank']
+            self._dataloader_resume_state = states[rank] if rank < len(states) else None
+        elif 'dataloader_state_dict' in checkpoint:
             self._dataloader_resume_state = checkpoint['dataloader_state_dict']
-            print(f"[Checkpoint] 恢复 dataloader state: {self._dataloader_resume_state}")
+
+        # RNG state: per-rank
+        if 'rng_states_by_rank' in checkpoint:
+            rng_states = checkpoint['rng_states_by_rank']
+            self._rng_resume_state = rng_states[rank] if rank < len(rng_states) else None
+        else:
+            self._rng_resume_state = None
+
+        if self._dataloader_resume_state:
+            print(f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
+                  f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
+                  f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
+                  f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}")
+        if self._rng_resume_state:
+            print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
 
     def validation_step(self, batch, batch_idx):
         # Move token_bytes to the same device as the model if needed
