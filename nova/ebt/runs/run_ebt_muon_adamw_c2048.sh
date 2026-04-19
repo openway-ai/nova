@@ -288,7 +288,7 @@ CONFIG_TAG="${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_bs$((NUM_GPUS * DEVICE_BATCH_SIZE
 export RUN_NAME="${RUN_PREFIX}_${TIMESTAMP}_${CONFIG_TAG}"
 
 # 日志按日期分文件夹
-LOG_DIR="logs/${DATE_DIR}"
+LOG_DIR="logs_base_train/${DATE_DIR}"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/${RUN_NAME}.log"
 
