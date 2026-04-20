@@ -27,7 +27,7 @@
 
 ### 基础配置 ###
 # 用户只需改这一行 —— 描述本次实验的意图/标签
-RUN_PREFIX="bf16mixed-nomcmctime"
+RUN_PREFIX="base-train-ctx2048-bf16mixed-nomcmctime-0420"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -535,8 +535,6 @@ $([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 --num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
 --limit_val_batches ${LIMIT_VAL_BATCHES} \
---float_precision bf16-mixed \
---manual_gc_collect_every_n_steps 1 \
 --val_sanity 1 \
 --validation_split_pct 0.0027 \
 \

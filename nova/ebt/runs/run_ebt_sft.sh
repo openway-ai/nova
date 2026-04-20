@@ -8,7 +8,9 @@
 set -e
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-sft-0406-from0327-v2"
+# export RUN_NAME="ebt-d26-sft-0406-from0327-v2"
+export RUN_NAME="ebt-d26-sft-0420-from0413"
+
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
@@ -58,9 +60,10 @@ NO_MCMC_DETACH=false
 ################################################################################
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)}
 NUM_GPUS=${NUM_GPUS:-8}
-DEVICE_BATCH_SIZE=4
-GRAD_ACCUM=16
-CONTEXT_LENGTH=512  # 受限于 base_train 阶段的上下文长度
+DEVICE_BATCH_SIZE=2
+GRAD_ACCUM=32
+# CONTEXT_LENGTH=512  # 受限于 base_train 阶段的上下文长度
+CONTEXT_LENGTH=1024  # 受限于 base_train 阶段的上下文长度
 
 
 ################################################################################
