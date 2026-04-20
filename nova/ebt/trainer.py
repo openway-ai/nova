@@ -263,15 +263,17 @@ class ModelTrainer(LightningModule):
                 print(f"{'='*80}\n")
 
             elif compile_mode == 'transformer_only':
-                # 仅编译 transformer 部分 (推荐，避开 MCMC 循环)
+                # 仅编译 transformer 部分 (避开 MCMC )
+                # 保留 eager 引用供 _mcmc_step_excluded 中 create_graph=True 时使用
                 print(f"[torch.compile] 仅编译 transformer 部分 (mode=transformer_only, backend={compile_backend})")
                 if hasattr(self.model, 'transformer'):
+                    self.model.transformer_eager = self.model.transformer  # 保留 eager 引用
                     self.model.transformer = torch.compile(
                         self.model.transformer,
                         backend=compile_backend,
                         dynamic=compile_dynamic
                     )
-                    print(f"[torch.compile] transformer 编译成功")
+                    print(f"[torch.compile] transformer 编译成功，transformer_eager 已保留用于 MCMC")
                 else:
                     print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过编译")
 
