@@ -457,6 +457,28 @@ class ModelTrainer(LightningModule):
         print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
 
     def on_load_checkpoint(self, checkpoint):
+        # --- 修复 torch.compile _orig_mod 前缀不匹配 ---
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+            has_orig_mod_keys = any('_orig_mod.' in k for k in state_dict)
+            model_has_orig_mod = any('_orig_mod.' in k for k in self.state_dict())
+
+            if has_orig_mod_keys and not model_has_orig_mod:
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    new_state_dict[k.replace('._orig_mod.', '.')] = v
+                checkpoint['state_dict'] = new_state_dict
+                print(f"[Checkpoint] Stripped '_orig_mod' prefix from {len(state_dict)} keys")
+            elif not has_orig_mod_keys and model_has_orig_mod:
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith('model.'):
+                        new_state_dict['model._orig_mod.' + k[len('model.'):]] = v
+                    else:
+                        new_state_dict[k] = v
+                checkpoint['state_dict'] = new_state_dict
+                print(f"[Checkpoint] Added '_orig_mod' prefix to {len(state_dict)} keys")
+
         # 从 checkpoint 恢复 per-rank dataloader 位置 + RNG 状态
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
