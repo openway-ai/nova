@@ -239,47 +239,36 @@ class ModelTrainer(LightningModule):
             #     raise ValueError(f"do not recognize model name: {self.hparams.model_name}")
 
         # torch.compile 支持
-        # 注意: EBT 使用 autograd.grad 进行 MCMC 更新，与 fullgraph=True 可能不兼容
-        # 推荐使用 --compile_model --compile_mode transformer_only 仅编译 transformer 部分
+        # EBT 训练时 autograd.grad(create_graph=True) 产生二阶梯度,
+        # torch.compile (aot_autograd) 不支持 double backward, 因此训练时跳过编译.
+        # 推理时 learning=False → create_graph=False, 可以安全编译.
         if self.hparams.compile_model:
-            compile_mode = getattr(self.hparams, 'compile_mode', 'full')
+            compile_mode = getattr(self.hparams, 'compile_mode', 'transformer_only')
             compile_backend = getattr(self.hparams, 'compile_backend', 'inductor')
             compile_dynamic = getattr(self.hparams, 'compile_dynamic', False)
 
-            if compile_mode == 'full':
-                # 编译整个模型 (可能与 autograd.grad 不兼容)
-                print(f"\n{'='*80}")
-                print(f"[torch.compile] 开始编译整个模型...")
-                print(f"[torch.compile] 模式: full | 后端: {compile_backend} | 动态: {compile_dynamic}")
-                print(f"[torch.compile] 警告: EBT 的 MCMC 循环使用 autograd.grad，可能导致编译失败")
-                print(f"[torch.compile] 首次编译可能需要 5-15 分钟，请耐心等待...")
-                print(f"{'='*80}\n")
-                import time
-                start_time = time.time()
-                self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
-                compile_time = time.time() - start_time
-                print(f"\n{'='*80}")
-                print(f"[torch.compile] ✓ 模型编译完成 (耗时: {compile_time:.1f}s)")
-                print(f"{'='*80}\n")
-
-            elif compile_mode == 'transformer_only':
-                # 仅编译 transformer 部分 (推荐，避开 MCMC 循环)
-                print(f"[torch.compile] 仅编译 transformer 部分 (mode=transformer_only, backend={compile_backend})")
-                if hasattr(self.model, 'transformer'):
-                    self.model.transformer = torch.compile(
-                        self.model.transformer,
-                        backend=compile_backend,
-                        dynamic=compile_dynamic
-                    )
-                    print(f"[torch.compile] transformer 编译成功")
-                else:
-                    print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过编译")
-
-            elif compile_mode == 'disabled':
+            if compile_mode == 'disabled':
                 print(f"[torch.compile] 编译已禁用")
 
+            elif (self.hparams.execution_mode == "inference") or getattr(self.hparams, 'only_test', False):
+                # 推理模式: learning=False → 无 double backward, 可以安全编译
+                if compile_mode == 'full':
+                    print(f"[torch.compile] 推理模式: 编译整个模型 (backend={compile_backend})")
+                    self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
+                elif compile_mode == 'transformer_only':
+                    if hasattr(self.model, 'transformer'):
+                        print(f"[torch.compile] 推理模式: 编译 transformer (backend={compile_backend})")
+                        self.model.transformer = torch.compile(
+                            self.model.transformer, backend=compile_backend, dynamic=compile_dynamic
+                        )
+                    else:
+                        print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过")
+                else:
+                    raise ValueError(f"未知 compile_mode: {compile_mode}")
+
             else:
-                raise ValueError(f"未知的 compile_mode: {compile_mode}，可选: full, transformer_only, disabled")
+                # 训练模式: 跳过编译 (EBT MCMC 需要 double backward)
+                print(f"[torch.compile] 训练模式下跳过编译 (EBT MCMC 需要 create_graph=True, aot_autograd 不支持 double backward)")
 
         phases = ['train', 'valid', 'test']
         self.torchmetrics_dict = nn.ModuleDict()
@@ -299,6 +288,17 @@ class ModelTrainer(LightningModule):
 
         
     def on_train_start(self):
+        # --- RNG 恢复 (在 val sanity check 之后、第一个 training step 之前) ---
+        import random
+        rng = getattr(self, '_rng_resume_state', None)
+        if rng is not None:
+            torch.random.set_rng_state(rng['torch_cpu'])
+            if rng.get('torch_cuda') is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state(rng['torch_cuda'])
+            random.setstate(rng['python'])
+            self._rng_resume_state = None
+            print(f"[Exact Resume] RNG states restored for rank {self.global_rank}")
+
         if self.hparams.debug_unused_parameters: 
             for name, param in self.model.named_parameters():
                 if param.requires_grad and "image_encoder" not in name: # NOTE need to modify this code to exclude specific frozen portions
@@ -393,9 +393,10 @@ class ModelTrainer(LightningModule):
             print(f"Used parameters: {self.model.used_parameters}")
 
         if self.hparams.manual_gc_collect_every_n_steps != -1:
-            if self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
+            if self.global_step > 0 and self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
                 print("calling GC manually")
                 gc.collect()
+                torch.cuda.empty_cache()
 
         # Record step end time for dt calculation
         import time as _time
@@ -414,22 +415,73 @@ class ModelTrainer(LightningModule):
     #         optimizer.update_epoch(self.current_epoch)
 
     def on_save_checkpoint(self, checkpoint):
-        # 保存 dataloader 的位置信息到 checkpoint，用于 resume 时跳过已训练数据
+        # 保存 per-rank dataloader 位置 + RNG 状态到 checkpoint，用于精确续训
+        import torch.distributed as dist
+        import random
+
+        # 1. 收集当前 rank 的 dataloader state（精确版，含 doc_buffer）
+        local_dl_state = None
         try:
             train_dl = self.trainer.train_dataloader
             if train_dl is not None:
                 dataset = train_dl.dataset
-                if hasattr(dataset, 'last_state_dict') and dataset.last_state_dict is not None:
-                    checkpoint['dataloader_state_dict'] = dataset.last_state_dict
-                    print(f"[Checkpoint] 保存 dataloader state: {dataset.last_state_dict}")
+                if hasattr(dataset, 'get_dataloader_state'):
+                    local_dl_state = dataset.get_dataloader_state()
+                elif hasattr(dataset, 'last_state_dict') and dataset.last_state_dict is not None:
+                    local_dl_state = dataset.last_state_dict
         except Exception:
             pass  # 非训练阶段可能没有 train_dataloader
 
+        # 2. 收集当前 rank 的 RNG state
+        local_rng_state = {
+            'torch_cpu': torch.random.get_rng_state(),
+            'torch_cuda': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            'python': random.getstate(),
+        }
+
+        # 3. DDP: all_gather 收集所有 rank 的状态到 rank 0
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            all_dl_states = [None] * dist.get_world_size()
+            dist.all_gather_object(all_dl_states, local_dl_state)
+            all_rng_states = [None] * dist.get_world_size()
+            dist.all_gather_object(all_rng_states, local_rng_state)
+        else:
+            all_dl_states = [local_dl_state]
+            all_rng_states = [local_rng_state]
+
+        # 4. 写入 checkpoint
+        checkpoint['dataloader_state_dict_by_rank'] = all_dl_states
+        checkpoint['dataloader_state_dict'] = all_dl_states[0]  # 旧格式兼容
+        checkpoint['rng_states_by_rank'] = all_rng_states
+
+        print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
+
     def on_load_checkpoint(self, checkpoint):
-        # 从 checkpoint 恢复 dataloader 位置信息
-        if 'dataloader_state_dict' in checkpoint:
+        # 从 checkpoint 恢复 per-rank dataloader 位置 + RNG 状态
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # Dataloader state: 优先 per-rank，回退旧格式
+        if 'dataloader_state_dict_by_rank' in checkpoint:
+            states = checkpoint['dataloader_state_dict_by_rank']
+            self._dataloader_resume_state = states[rank] if rank < len(states) else None
+        elif 'dataloader_state_dict' in checkpoint:
             self._dataloader_resume_state = checkpoint['dataloader_state_dict']
-            print(f"[Checkpoint] 恢复 dataloader state: {self._dataloader_resume_state}")
+
+        # RNG state: per-rank
+        if 'rng_states_by_rank' in checkpoint:
+            rng_states = checkpoint['rng_states_by_rank']
+            self._rng_resume_state = rng_states[rank] if rank < len(rng_states) else None
+        else:
+            self._rng_resume_state = None
+
+        if self._dataloader_resume_state:
+            print(f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
+                  f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
+                  f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
+                  f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}")
+        if self._rng_resume_state:
+            print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
 
     def validation_step(self, batch, batch_idx):
         # Move token_bytes to the same device as the model if needed
