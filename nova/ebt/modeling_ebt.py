@@ -85,9 +85,9 @@ class EBT_NLP(LightningModule):
         if self.hparams.normalize_initial_condition:
             if self.hparams.normalize_initial_condition_only_first_step:
                 if mcmc_step == 0:
-                    predicted_tokens = self.softmax(predicted_tokens)
+                    predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
             else:
-                predicted_tokens = self.softmax(predicted_tokens)
+                predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
                 
             if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
                 predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
@@ -187,7 +187,8 @@ class EBT_NLP(LightningModule):
                     langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits
                 )
                 predicted_energies.append(energy_preds)
-                predicted_distributions.append(predicted_tokens_for_loss)        
+                predicted_distributions.append(predicted_tokens_for_loss)
+                del energy_preds, predicted_tokens_for_loss  # release references to help GC
 
         return predicted_distributions, predicted_energies
 
@@ -276,7 +277,7 @@ class EBT_NLP(LightningModule):
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device) * self.hparams.gaussian_random_noise_scaling
+            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=torch.bfloat16, device = self.device) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
             predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device)
         else:
@@ -539,7 +540,8 @@ class EBT_NLP(LightningModule):
                 return energies
 
         # ebt_type
-        if self.hparams.ebt_type == "default":
+        if self.hparams.ebt_type == "default" or (self.hparams.ebt_type == "time_embed" and not getattr(self.hparams, 'use_mcmc_time_embed', False)):
+            # default mode or time_embed without time embedding: shared transition kernel, arbitrary step count
             total_steps = self.hparams.infer_ebt_num_steps if self.hparams.infer_ebt_num_steps > 1 else self.hparams.mcmc_num_steps
             pred_state = initial_pred_tokens
             for step_idx in range(total_steps):
