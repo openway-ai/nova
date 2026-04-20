@@ -26,7 +26,7 @@ echo "🐍 Python: $PYTHON ($($PYTHON --version 2>&1))"
 export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
 export OMP_NUM_THREADS=1
 export NANOCHAT_OFFLINE_MODE=1
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 ################################################################################
 # 参数 (优先使用环境变量，否则使用默认值)

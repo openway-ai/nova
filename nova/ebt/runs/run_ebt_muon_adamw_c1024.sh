@@ -39,7 +39,7 @@ export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 # WandB 配置
-export WANDB_API_KEY="968275bc822c87ac741ecce2f06cdfb54dbc1608"
+export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"
 
 mkdir -p logs/slurm/nlp/
