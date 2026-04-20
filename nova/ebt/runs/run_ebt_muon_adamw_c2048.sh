@@ -26,12 +26,10 @@
 #SBATCH --output=logs/slurm/nlp/ebt-d26-stable_%A-%a.log
 
 ### 基础配置 ###
-# export RUN_NAME="ebt-d26-ctx512-muon-adamw-0406-from0327"
-# export RUN_NAME="ebt-d26-ctx2048-muon-adamw-0413"
-export RUN_NAME="ebt-basetrain-d26-ctx2048-true-muon-adamw-0417"
+# 用户只需改这一行 —— 描述本次实验的意图/标签
+RUN_PREFIX="bf16mixed-nomcmctime"
 
-
-export MODEL_NAME="${RUN_NAME%%-*}"
+export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
 # export MODEL_SIZE="medium"
 
@@ -42,8 +40,7 @@ HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
 # PyTorch 内存优化
-# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:2048"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 
 # WandB 配置
@@ -78,6 +75,7 @@ NORMALIZE_INITIAL_CONDITION=true
 DENOISING_INITIAL_CONDITION="random_noise"
 MCMC_STEP_SIZE_LEARNABLE=true
 NO_MCMC_DETACH=false
+USE_MCMC_TIME_EMBED=false          # false: shared transition kernel, supports arbitrary inference steps
 
 # 不使用的高级参数 (官方: not recommended for getting started)
 # ebt_norm, ebt_act_func, dyt_alpha_init, mcmc_replay_buffer 等
@@ -99,11 +97,20 @@ NO_MCMC_DETACH=false
 # GRAD_ACCUM=2
 # CONTEXT_LENGTH=2048
 
-# TODO oom
+# --float_precision "bf16-mixed" \
+# --gradient_checkpointing \
+
+# 可运行
 NUM_GPUS=8
 DEVICE_BATCH_SIZE=1
-GRAD_ACCUM=32 
+# DEVICE_BATCH_SIZE=2
+GRAD_ACCUM=32
 CONTEXT_LENGTH=2048
+
+# NUM_GPUS=8
+# DEVICE_BATCH_SIZE=1
+# GRAD_ACCUM=48
+# CONTEXT_LENGTH=2048
 
 
 # 2. 计算每步的有效 Token 数 (Tokens per step)
@@ -189,7 +196,10 @@ GRADIENT_CLIP_VAL=1.0
 # VAL_CHECK_INTERVAL=1000
 VAL_CHECK_INTERVAL=2000
 LIMIT_VAL_BATCHES=50
-NUM_WORKERS=8
+# NUM_WORKERS: passed to train.py --num_workers but NOT used by nanochat dataloader
+# (hardcoded num_workers=0 in dataset.py because nanochat generator holds GPU state).
+# Kept for compatibility with the CLI arg parser.
+NUM_WORKERS=19
 SAVE_TOP_K=2
 
 ################################################################################
@@ -245,7 +255,9 @@ OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio
 # 不使用 compile，steps 较少时适用
 # COMPILE_FLAGS="--compile_model --compile_mode disabled" 
 # 启用 compile，steps 较多时适用
+# full mode causes repeated recompilation with create_graph=True + bf16-mixed
 COMPILE_FLAGS="--compile_model --compile_mode full"
+# COMPILE_FLAGS="--compile_model --compile_mode disabled"
 
 ################################################################################
 # WandB 配置 (训练参数)
@@ -265,13 +277,21 @@ WANDB_FLAGS=""
 # WANDB_FLAGS="--wandb_watch --wandb_watch_level all"
 
 ################################################################################
-# 日志配置 - 自动路由 stdout/stderr 到日志文件
+# 日志配置 - 自动命名 + 按日期分层
 ################################################################################
 
-current_time=$(date +"%Y%m%d_%H%M%S")
-# 日志文件名包含: 日期时间_模型名_层数_上下文长度_优化器_GPU数
-LOG_FILE="logs/${current_time}_${MODEL_NAME}_${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_muon-adamw_gpu${NUM_GPUS}.log"
-mkdir -p logs
+# 自动生成命名组件
+TIMESTAMP=$(date +"%m%d_%H%M")
+DATE_DIR=$(date +"%Y%m%d")
+CONFIG_TAG="${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_bs$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM))_lr${PEAK_LR}"
+
+# 最终名称 (用于 --run_name 和 wandb)
+export RUN_NAME="${RUN_PREFIX}_${TIMESTAMP}_${CONFIG_TAG}"
+
+# 日志按日期分文件夹
+LOG_DIR="logs_base_train/${DATE_DIR}"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/${RUN_NAME}.log"
 
 # 定义颜色
 RED='\033[0;31m'
@@ -381,7 +401,7 @@ print_kv "Val Check Interval" "${VAL_CHECK_INTERVAL}"
 echo ""
 echo -e "${CYAN}▶ 输出配置${NC}"
 print_separator "─" 60
-print_kv "Run Name" "${RUN_NAME}_${current_time}"
+print_kv "Run Name" "${RUN_NAME}"
 print_kv "Log File" "${LOG_FILE}"
 print_kv "WandB Mode" "${WANDB_MODE}"
 
@@ -404,7 +424,7 @@ cat << LOG_HEADER > "${LOG_FILE}"
 #                    EBT d26 Muon+AdamW 训练日志
 ################################################################################
 #
-# Run Name:        ${RUN_NAME}_${current_time}
+# Run Name:        ${RUN_NAME}
 # Start Time:      $(date '+%Y-%m-%d %H:%M:%S')
 # Log File:        ${LOG_FILE}
 #
@@ -477,7 +497,7 @@ echo ""
 
 set +e
 torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
---run_name ${RUN_NAME}_${current_time} \
+--run_name ${RUN_NAME} \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
 --model_size ${MODEL_SIZE} \
@@ -491,6 +511,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --mcmc_step_size ${MCMC_STEP_SIZE} \
 --mcmc_step_size_lr_multiplier ${MCMC_STEP_SIZE_LR_MULTIPLIER} \
 --mcmc_num_steps ${MCMC_NUM_STEPS} \
+$([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 \
 --context_length ${CONTEXT_LENGTH} \
 \
@@ -522,11 +543,20 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
 --set_matmul_precision "medium" \
+--float_precision "bf16-mixed" \
+--manual_gc_collect_every_n_steps -1 \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --save_periodic_steps 1000 \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}
+
+# --manual_gc_collect_every_n_steps -1 \
+
+# --float_precision "bf16-mixed" \
+# --gradient_checkpointing \
+# --manual_gc_collect_every_n_steps 50 \
+
 
 TRAIN_EXIT_CODE=$?
 set -e
