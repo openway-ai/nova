@@ -7,19 +7,22 @@
 ################################################################################
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-ctx512-muon-adamw-0409-from0327"
+export RUN_NAME="ebt-d26-ctx1024-from0419"
+
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
 ### 恢复训练配置 ###
-# RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0318_20260324_164538_2026-03-24_16-46-34_/last.ckpt"
-# RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
-RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/e=epoch=0-s=step=55999-lr0.00025-bs4x8-muon_adamw-valid_loss=valid_loss=2.6877.ckpt"
+
+# context 1024
+RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-muon-adamw-0413_20260413_123504/s=step=27937-d26-ctx1024-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.6296.ckpt"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export PYTHONUNBUFFERED=1
+
 export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"
 
@@ -41,34 +44,35 @@ NO_MCMC_DETACH=false
 ################################################################################
 # Batch 配置
 ################################################################################
-# NUM_GPUS=8 # TODO
-NUM_GPUS=6
-DEVICE_BATCH_SIZE=4
-GRAD_ACCUM=8
-CONTEXT_LENGTH=512
+# NUM_GPUS=8
+# DEVICE_BATCH_SIZE=4
+# GRAD_ACCUM=8
+# CONTEXT_LENGTH=512
+
+# NUM_GPUS=8
+# DEVICE_BATCH_SIZE=2
+# GRAD_ACCUM=16
+# CONTEXT_LENGTH=1024
+
+NUM_GPUS=8
+DEVICE_BATCH_SIZE=1
+GRAD_ACCUM=32
+CONTEXT_LENGTH=1024
 
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENGTH))
 TARGET_TOTAL_TOKENS=7340032000
-MAX_STEPS=$(( TARGET_TOTAL_TOKENS / EFFECTIVE_BATCH_SIZE ))
-MAX_SCHEDULING_STEPS=$MAX_STEPS
+# Override for resume: total 56000 steps (28000 original + 28000 continuation)
+MAX_STEPS=56000
+MAX_SCHEDULING_STEPS=56000
 
-# MAX_STEPS=55999
-# MAX_SCHEDULING_STEPS=55999
-# 
 # TODO =============
-# MAX_STEPS=112000
-# MAX_SCHEDULING_STEPS=112000
+# MAX_STEPS=559990
+# MAX_SCHEDULING_STEPS=559990
 
 ################################################################################
 # 学习率配置
-# 注意: 恢复训练使用原始 Peak LR 的 70%
-# 原因: checkpoint 在 step 55999 已完成完整 warmdown (LR≈0)，模型权重处于退火后的
-# 较尖锐局部最优。直接回到 100% peak LR 会扰动过大导致 loss 恶化。
-# 70% 是平衡点: 足够高以继续有效学习 (模型仅训练 7.3B tokens，远未收敛)，
-# 又足够低以尊重退火后的权重状态。
-# 所有优化器 LR (Muon/AdamW 各组) 同步按 70% 缩放。
 ################################################################################
-PEAK_LR=0.000175  # 原 0.00025 × 0.7
+PEAK_LR=0.000125
 WARM_UP_STEPS=0
 WARM_UP_BASE_LR_DIVIDER=10
 MIN_LR_SCALE=50
@@ -89,11 +93,9 @@ LIMIT_VAL_BATCHES=50
 NUM_WORKERS=8
 
 ################################################################################
-# 优化选项配置 (LR 同步按 70% 缩放)
+# 优化选项配置
 ################################################################################
-# 原始: muon_lr=0.02, adamw_embedding_lr=0.3, adamw_vocab_to_embed_lr=0.01, adamw_scalar_lr=0.04
-# 恢复: muon_lr=0.014, adamw_embedding_lr=0.21, adamw_vocab_to_embed_lr=0.007, adamw_scalar_lr=0.028
-OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.25 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.014 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.21 --adamw_vocab_to_embed_lr 0.007 --adamw_scalar_lr 0.028 --adamw_dmodel_lr_scaling"
+OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.25 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.01 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.15 --adamw_vocab_to_embed_lr 0.005 --adamw_scalar_lr 0.02 --adamw_dmodel_lr_scaling"
 
 ################################################################################
 # torch.compile 配置
@@ -144,14 +146,7 @@ cat << LOG_HEADER > "${LOG_FILE}"
 
 LOG_HEADER
 
-################################################################################
-# 自动重定向所有输出到日志文件 (使用 exec 避免管道缓冲问题)
-################################################################################
-exec > >(tee -a "${LOG_FILE}") 2>&1
-
-# 强制 Python 子进程不缓冲 stdout/stderr
-export PYTHONUNBUFFERED=1
-
+{
 echo "================================================================================"
 echo "[SYSTEM INFO]"
 echo "================================================================================"
@@ -212,9 +207,9 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --log_model_archi \
 --set_matmul_precision "medium" \
 --save_top_k_ckpts ${SAVE_TOP_K} \
---save_periodic_steps 1000 \
 --resume_training_ckpt ${RESUME_CKPT} \
---resume_warmup_steps 3000 \
+--resume_warmup_steps 2000 \
+--save_periodic_steps 1000 \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}
@@ -227,6 +222,8 @@ if [ $TRAIN_EXIT_CODE -eq 0 ]; then
 else
     echo -e "\033[0;31m✗ 训练异常退出 (exit code: $TRAIN_EXIT_CODE)\033[0m"
 fi
+
+} 2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush() }' | tee -a "${LOG_FILE}"
 
 echo ""
 echo "日志已保存到: ${LOG_FILE}"

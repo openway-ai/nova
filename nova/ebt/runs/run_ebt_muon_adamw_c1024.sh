@@ -27,8 +27,11 @@
 
 ### 基础配置 ###
 # export RUN_NAME="ebt-d26-ctx512-muon-adamw-0406-from0327"
-export RUN_NAME="ebt-d26-ctx1024-muon-adamw-0413"
-# export RUN_NAME="ebt-d26-ctx2048-true-muon-adamw-0414"
+# export RUN_NAME="ebt-d26-ctx1024-muon-adamw-0413"
+
+# export RUN_NAME="ebt-d26-ctx1024-muon-adamw-0414-test"
+
+export RUN_NAME="ebt-d26-ctx1024-from0419"
 
 
 export MODEL_NAME="${RUN_NAME%%-*}"
@@ -39,9 +42,7 @@ HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
 # PyTorch 内存优化
-# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:1024"
-# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:2048"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 
 
@@ -97,10 +98,24 @@ NO_MCMC_DETACH=false
 # GRAD_ACCUM=16
 # CONTEXT_LENGTH=1024
 
+# 实际运行
 NUM_GPUS=8
 DEVICE_BATCH_SIZE=1
 GRAD_ACCUM=32
 CONTEXT_LENGTH=1024
+
+# todo
+# NUM_GPUS=8
+# DEVICE_BATCH_SIZE=2
+# GRAD_ACCUM=16
+# CONTEXT_LENGTH=1024
+
+# oom
+# NUM_GPUS=8
+# DEVICE_BATCH_SIZE=4
+# GRAD_ACCUM=8
+# CONTEXT_LENGTH=1024
+
 # CONTEXT_LENGTH=2048
 
 
@@ -267,9 +282,23 @@ WANDB_FLAGS=""
 ################################################################################
 
 current_time=$(date +"%Y%m%d_%H%M%S")
-# 日志文件名包含: 日期时间_模型名_层数_上下文长度_优化器_GPU数
-LOG_FILE="logs/${current_time}_${MODEL_NAME}_${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_muon-adamw_gpu${NUM_GPUS}.log"
-mkdir -p logs
+
+################################################################################
+# 日志配置 - 自动命名 + 按日期分层
+################################################################################
+
+# 自动生成命名组件
+TIMESTAMP=$(date +"%m%d_%H%M")
+DATE_DIR=$(date +"%Y%m%d")
+CONFIG_TAG="${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_bs$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM))_lr${PEAK_LR}"
+
+# 最终名称 (用于 --run_name 和 wandb)
+export RUN_NAME="${RUN_PREFIX}_${TIMESTAMP}_${CONFIG_TAG}"
+
+# 日志按日期分文件夹
+LOG_DIR="logs_sft_train/${DATE_DIR}"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/${RUN_NAME}.log"
 
 # 定义颜色
 RED='\033[0;31m'
