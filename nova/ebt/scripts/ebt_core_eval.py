@@ -14,6 +14,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import torch.multiprocessing as mp
 import numpy as np
 
 # 添加项目根目录到路径
@@ -74,7 +75,7 @@ class EBTModelWrapper:
         return self.device
 
 
-def load_ebt_model(ckpt_path, tokenizer_path, device):
+def load_ebt_model(ckpt_path, tokenizer_path, device, dtype=torch.bfloat16):
     """加载 EBT checkpoint"""
     print(f"Loading EBT checkpoint from: {ckpt_path}")
 
@@ -88,10 +89,29 @@ def load_ebt_model(ckpt_path, tokenizer_path, device):
 
     # 加载模型
     model_trainer = ModelTrainer(hparams)
-    model_trainer.load_state_dict(checkpoint['state_dict'])
+
+    # 复用 on_load_checkpoint 的 _orig_mod 前缀修复逻辑
+    state_dict = checkpoint['state_dict']
+    has_orig_mod_keys = any('_orig_mod.' in k for k in state_dict)
+    model_has_orig_mod = any('_orig_mod.' in k for k in model_trainer.state_dict())
+
+    if has_orig_mod_keys and not model_has_orig_mod:
+        state_dict = {k.replace('._orig_mod.', '.'): v for k, v in state_dict.items()}
+        print(f"[load_ebt_model] Stripped '_orig_mod' prefix from {len(checkpoint['state_dict'])} keys")
+    elif not has_orig_mod_keys and model_has_orig_mod:
+        new_sd = {}
+        for k, v in state_dict.items():
+            if k.startswith('model.'):
+                new_sd['model._orig_mod.' + k[len('model.'):]] = v
+            else:
+                new_sd[k] = v
+        state_dict = new_sd
+        print(f"[load_ebt_model] Added '_orig_mod' prefix to {len(checkpoint['state_dict'])} keys")
+
+    model_trainer.load_state_dict(state_dict)
     model_trainer.eval()
     model = model_trainer.model
-    model.to(device)
+    model.to(device=device, dtype=dtype)
     model.eval()
 
     # 加载 tokenizer
@@ -111,7 +131,7 @@ def load_ebt_model(ckpt_path, tokenizer_path, device):
     return wrapped_model, tokenizer, hparams
 
 
-def evaluate_task(model, tokenizer, data, device, task_meta):
+def evaluate_task(model, tokenizer, data, device, task_meta, max_seq_len=None):
     """
     评估单个 CORE 任务
     改编自 nanochat.core_eval.evaluate_task
@@ -147,15 +167,22 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
                 choice_tokens = torch.tensor([choice_ids], dtype=torch.long).to(device)
                 full_tokens = torch.cat([prompt_tokens, choice_tokens], dim=1)
 
+                # 截断到 max_seq_len（从左截，保留 choice 尾部）
+                if max_seq_len and full_tokens.shape[1] > max_seq_len:
+                    full_tokens = full_tokens[:, -max_seq_len:]
+                    actual_prompt_len = max(0, max_seq_len - choice_tokens.shape[1])
+                else:
+                    actual_prompt_len = prompt_tokens.shape[1]
+
                 # 计算损失（只对 choice 部分）
                 with torch.no_grad():
                     logits = model(full_tokens)
                     targets = full_tokens[:, 1:].contiguous()
-                    logits_choice = logits[:, prompt_tokens.shape[1]-1:-1, :].contiguous()
+                    logits_choice = logits[:, actual_prompt_len-1:-1, :].contiguous()
 
                     loss = F.cross_entropy(
                         logits_choice.view(-1, logits_choice.size(-1)),
-                        targets[:, prompt_tokens.shape[1]-1:].view(-1),
+                        targets[:, actual_prompt_len-1:].view(-1),
                         reduction='mean'
                     )
                     choice_losses.append(loss.item())
@@ -179,6 +206,8 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
 
             full_ids = tokenizer.encode(full_text)
             tokens = torch.tensor([full_ids], dtype=torch.long).to(device)
+            if max_seq_len and tokens.shape[1] > max_seq_len:
+                tokens = tokens[:, -max_seq_len:]
 
             # 计算困惑度
             with torch.no_grad():
@@ -212,6 +241,8 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
             for choice_text in choices:
                 choice_ids = tokenizer.encode(choice_text)
                 tokens = torch.tensor([choice_ids], dtype=torch.long).to(device)
+                if max_seq_len and tokens.shape[1] > max_seq_len:
+                    tokens = tokens[:, -max_seq_len:]
                 with torch.no_grad():
                     loss = model(tokens, targets=tokens[:, 1:])
                     choice_losses.append(loss.item())
@@ -303,7 +334,8 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1, ta
             print(f"  Total samples: {len(data)} (evaluating ALL samples)")
 
         # 评估
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy = evaluate_task(model, tokenizer, data, device, task_meta,
+                                 max_seq_len=getattr(model, 'max_seq_len', None))
         results[label] = accuracy
 
         # 计算 centered result
@@ -316,6 +348,119 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1, ta
 
     # 计算 CORE metric
     core_metric = sum(centered_results.values()) / len(centered_results)
+
+    return {
+        "results": results,
+        "centered_results": centered_results,
+        "core_metric": core_metric
+    }
+
+
+def _eval_worker(rank, world_size, ckpt_path, tokenizer_path, dtype,
+                 eval_bundle_dir, max_per_task, task_samples,
+                 all_tasks, random_baselines, result_dict):
+    """多 GPU 评估的 worker 进程，根据 rank 自动计算分配的任务"""
+    device = torch.device(f'cuda:{rank}')
+    torch.cuda.set_device(device)
+    torch.set_float32_matmul_precision('medium')
+
+    # 根据 rank 计算自己负责的任务 (round-robin)
+    task_indices = [i for i in range(len(all_tasks)) if i % world_size == rank]
+
+    print(f"[GPU {rank}] Loading model... ({len(task_indices)} tasks assigned)")
+    model, tokenizer, hparams = load_ebt_model(ckpt_path, tokenizer_path, device, dtype=dtype)
+
+    data_base_path = os.path.join(eval_bundle_dir, "eval_data")
+
+    for task_idx in task_indices:
+        task = all_tasks[task_idx]
+        label = task['label']
+        start_time = time.time()
+
+        task_meta = {
+            'task_type': task['icl_task_type'],
+            'dataset_uri': task['dataset_uri'],
+            'num_fewshot': task['num_fewshot'][0],
+            'continuation_delimiter': task.get('continuation_delimiter', ' ')
+        }
+
+        print(f"[GPU {rank}] [{task_idx+1}/{len(all_tasks)}] Evaluating: {label}")
+
+        # 加载数据
+        data_path = os.path.join(data_base_path, task_meta['dataset_uri'])
+        with open(data_path, 'r', encoding='utf-8') as f:
+            data = [json.loads(line.strip()) for line in f]
+
+        # 确定样本数
+        task_max_samples = max_per_task
+        if task_samples and label in task_samples:
+            task_max_samples = task_samples[label]
+
+        if task_max_samples > 0:
+            shuffle_rng = random.Random(1337)
+            shuffle_rng.shuffle(data)
+            data = data[:task_max_samples]
+
+        # 评估
+        accuracy = evaluate_task(model, tokenizer, data, device, task_meta,
+                                 max_seq_len=getattr(model, 'max_seq_len', None))
+
+        # centered result
+        random_baseline = random_baselines.get(label, 50.0)
+        centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
+
+        elapsed = time.time() - start_time
+        print(f"[GPU {rank}]   ✓ {label}: acc={accuracy:.4f} centered={centered_result:.4f} ({elapsed:.2f}s)")
+
+        result_dict[label] = (accuracy, centered_result)
+
+
+def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
+                           eval_bundle_dir, max_per_task, task_samples):
+    """多 GPU 并行评估：按任务 round-robin 分片到各 GPU"""
+    config_path = os.path.join(eval_bundle_dir, "core.yaml")
+    eval_meta_data = os.path.join(eval_bundle_dir, "eval_meta_data.csv")
+
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    all_tasks = config['icl_tasks']
+
+    random_baselines = {}
+    with open(eval_meta_data, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            random_baselines[row['Eval Task']] = float(row['Random baseline'])
+
+    print(f"\n{'='*80}")
+    print(f"Running CORE Evaluation (multi-GPU: {num_gpus} GPUs, {len(all_tasks)} tasks)")
+    print(f"{'='*80}")
+    for rank in range(num_gpus):
+        task_names = [all_tasks[i]['label'] for i in range(len(all_tasks)) if i % num_gpus == rank]
+        print(f"  GPU {rank}: {len(task_names)} tasks — {', '.join(task_names)}")
+    print()
+
+    # 共享结果字典
+    manager = mp.Manager()
+    result_dict = manager.dict()
+
+    # 使用 mp.spawn — worker 内部根据 rank 自动计算任务分配
+    mp.spawn(
+        _eval_worker,
+        args=(num_gpus, ckpt_path, tokenizer_path, dtype,
+              eval_bundle_dir, max_per_task, task_samples,
+              all_tasks, random_baselines, result_dict),
+        nprocs=num_gpus,
+        join=True,
+    )
+
+    # 汇总结果
+    results = {}
+    centered_results = {}
+    for label, (acc, centered) in result_dict.items():
+        results[label] = acc
+        centered_results[label] = centered
+
+    core_metric = sum(centered_results.values()) / len(centered_results) if centered_results else 0.0
 
     return {
         "results": results,
@@ -361,6 +506,8 @@ def main():
     parser.add_argument('--output-dir', type=str, required=True, help='Output directory')
     parser.add_argument('--gpus', type=int, default=-1,
                         help='Number of GPUs to use (-1 = auto-detect all available GPUs)')
+    parser.add_argument('--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'],
+                        help='Model dtype for inference (default: bfloat16)')
     args = parser.parse_args()
 
     # 解析任务特定样本数
@@ -373,7 +520,6 @@ def main():
 
     # 设置设备和 GPU
     if args.gpus == -1:
-        # 自动检测所有可用 GPU
         if torch.cuda.is_available():
             num_gpus = torch.cuda.device_count()
             print(f"🔍 Auto-detected {num_gpus} GPU(s)")
@@ -384,17 +530,7 @@ def main():
         num_gpus = args.gpus
         print(f"📊 Using {num_gpus} GPU(s) as specified")
 
-    # 当前实现使用单 GPU，多 GPU 支持可以后续添加
-    if num_gpus > 1:
-        print(f"⚠️  Multi-GPU support not yet implemented, using GPU 0 only")
-        device = torch.device('cuda:0')
-    elif num_gpus == 1:
-        device = torch.device('cuda:0')
-    else:
-        device = torch.device('cpu')
-
-    print(f"Using device: {device}")
-    print()
+    dtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
 
     # 性能优化: 启用 TF32 (H200/A100 Tensor Core 加速)
     torch.set_float32_matmul_precision('medium')
@@ -402,22 +538,43 @@ def main():
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 加载模型
-    print("="*80)
-    print("Loading EBT Model")
-    print("="*80 + "\n")
-
-    model, tokenizer, hparams = load_ebt_model(args.ckpt_path, args.tokenizer_path, device)
-
-    # 运行 CORE 评估
-    if 'core' in args.eval_modes:
-        core_results = evaluate_core(
-            model, tokenizer, device, args.eval_bundle_dir,
+    # 多 GPU 路径
+    if num_gpus > 1 and 'core' in args.eval_modes:
+        print(f"\n🚀 Using multi-GPU evaluation with {num_gpus} GPUs")
+        core_results = evaluate_core_multigpu(
+            num_gpus=num_gpus,
+            ckpt_path=args.ckpt_path,
+            tokenizer_path=args.tokenizer_path,
+            dtype=dtype,
+            eval_bundle_dir=args.eval_bundle_dir,
             max_per_task=args.max_per_task,
-            task_samples=task_samples_dict if task_samples_dict else None
+            task_samples=task_samples_dict if task_samples_dict else None,
         )
+    else:
+        # 单 GPU / CPU 路径
+        if num_gpus >= 1:
+            device = torch.device('cuda:0')
+        else:
+            device = torch.device('cpu')
 
-        # 打印结果
+        print(f"Using device: {device}\n")
+
+        print("="*80)
+        print("Loading EBT Model")
+        print("="*80 + "\n")
+
+        model, tokenizer, hparams = load_ebt_model(args.ckpt_path, args.tokenizer_path, device, dtype=dtype)
+
+        core_results = None
+        if 'core' in args.eval_modes:
+            core_results = evaluate_core(
+                model, tokenizer, device, args.eval_bundle_dir,
+                max_per_task=args.max_per_task,
+                task_samples=task_samples_dict if task_samples_dict else None
+            )
+
+    # 打印和保存结果
+    if core_results:
         print("\n" + "="*80)
         print("CORE Evaluation Results")
         print("="*80 + "\n")

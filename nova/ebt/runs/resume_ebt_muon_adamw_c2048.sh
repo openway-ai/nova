@@ -205,11 +205,11 @@ $([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 --log_model_archi \
 --set_matmul_precision "medium" \
 --float_precision bf16-mixed \
---manual_gc_collect_every_n_steps 1 \
+--manual_gc_collect_every_n_steps -1 \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --resume_training_ckpt ${RESUME_CKPT} \
 --resume_warmup_steps 0 \
---save_periodic_steps 100 \
+--save_periodic_steps 200 \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}
