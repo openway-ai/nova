@@ -30,7 +30,7 @@ EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 
 # base_train bpb 0.81
 # DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
-DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
+# DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
 
 # base_train bpb 0.85 sft_train 'valid_loss' reached 8.15313 
 # DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-sft_20260331_001308_2026-03-31_00-13-29_/e=epoch=0-s=step=2312-lr5e-05-bs4x8-muon_adamw-valid_loss=valid_loss=8.1531.ckpt"
@@ -41,7 +41,11 @@ DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-
 
 # DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260407_001616/e=epoch=0-s=step=812-lr5e-05-bs4x16-muon_adamw-valid_loss=valid_loss=1.2609.ckpt"
 # DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260408_230436/periodic-s=step=2999-lr5e-05.ckpt"
-DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260408_230436/periodic-s=step=1499-lr5e-05.ckpt"
+# DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260408_230436/periodic-s=step=1499-lr5e-05.ckpt"
+
+# sft_train val_loss=1.88
+# DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0420-from0413_20260420_193427/periodic-s=step=2999-d26-ctx1024.ckpt"
+DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0420-from0413_20260420_193427/s=step=1953-d26-ctx1024-lr5e-05-bs2x32-muon_adamw-valid_loss=valid_loss=2.1394.ckpt"
 
 DEFAULT_TOKENIZER="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer"
 
@@ -51,7 +55,8 @@ TOKENIZER_PATH="${TOKENIZER_PATH:-$DEFAULT_TOKENIZER}"
 TEMPERATURE="${TEMPERATURE:-0.8}"
 # TEMPERATURE="${TEMPERATURE:-0.6}"
 TOP_P="${TOP_P:-0.9}"
-MAX_TOKENS="${MAX_TOKENS:-512}"
+# MAX_TOKENS="${MAX_TOKENS:-512}"
+MAX_TOKENS="${MAX_TOKENS:-1024}"
 # MAX_TOKENS="${MAX_TOKENS:-256}"
 DTYPE="${DTYPE:-bfloat16}"
 DEVICE="${DEVICE:-cuda}"

@@ -196,6 +196,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
 --set_matmul_precision "medium" \
+--float_precision bf16-mixed \
+--manual_gc_collect_every_n_steps -1 \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --resume_training_ckpt ${RESUME_CKPT} \
 --resume_warmup_steps 0 \

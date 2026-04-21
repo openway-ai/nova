@@ -40,6 +40,7 @@ LIMIT_TEST_BATCHES="${LIMIT_TEST_BATCHES:-100}"
 USE_WANDB="${USE_WANDB:-false}"
 WANDB_API_KEY="${WANDB_API_KEY:-}"
 EVAL_TASK="${EVAL_TASK:-nanochat}"
+FLOAT_PRECISION="${FLOAT_PRECISION:-bf16-mixed}"
 
 ################################################################################
 # 参数验证
@@ -170,6 +171,7 @@ $PYTHON train.py \
     --dataset_name "$DATASET_NAME" \
     --context_length 256 \
     --tokenizer "$TOKENIZER_PATH" \
+    --float_precision "$FLOAT_PRECISION" \
     --infer_max_gen_len 256 \
     --infer_temp 0.6 \
     --infer_topp 0.9 \

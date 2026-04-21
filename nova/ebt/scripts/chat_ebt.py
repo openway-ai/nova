@@ -186,7 +186,7 @@ class EBTChatEngine:
             print_colored(f"  ⚠ 严格加载失败，正在回退到 strict=False。详细错误:\n{e}", Colors.YELLOW)
             self.model.load_state_dict(new_state_dict, strict=False)
 
-        self.model = self.model.to(self.device)
+        self.model = self.model.to(device=self.device, dtype=self.dtype)
         self.model.eval()
 
         print_colored("✓ 模型加载与初始化完成", Colors.GREEN)
