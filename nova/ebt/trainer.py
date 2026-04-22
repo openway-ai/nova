@@ -92,8 +92,11 @@ import sys
 from transformers import AutoTokenizer
 
 import ipdb
+import os, sys
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-sys.path.append("../../")
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
 class ModelTrainer(LightningModule):

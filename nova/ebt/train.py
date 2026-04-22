@@ -154,8 +154,25 @@ def main(args):
     #     assert args.random_num_mcmc_steps, "random_num_mcmc_steps needs to be True"
     #NOTE should uncomment if add above hparams back
     
-    args.num_nodes = int(os.getenv('SLURM_JOB_NUM_NODES', 1)) # may not exist if not using slurm so default to 1; multi node only supports slurm as of now
-    print(f"SLURM_JOB_NUM_NODES: {args.num_nodes}")
+    # 按优先级推导 num_nodes:
+    # 1. SLURM_JOB_NUM_NODES  —— Slurm 环境
+    # 2. NODE_COUNT            —— rjob/平台注入的环境变量（本集群使用）
+    # 3. WORLD_SIZE / LOCAL_WORLD_SIZE —— torchrun 自动注入
+    # 4. 默认为 1
+    if os.getenv('SLURM_JOB_NUM_NODES') is not None:
+        args.num_nodes = int(os.getenv('SLURM_JOB_NUM_NODES'))
+        print(f"num_nodes={args.num_nodes} (from SLURM_JOB_NUM_NODES)")
+    elif os.getenv('NODE_COUNT') is not None:
+        args.num_nodes = int(os.getenv('NODE_COUNT'))
+        print(f"num_nodes={args.num_nodes} (from NODE_COUNT)")
+    elif os.getenv('WORLD_SIZE') is not None and os.getenv('LOCAL_WORLD_SIZE') is not None:
+        world_size = int(os.getenv('WORLD_SIZE'))
+        local_world_size = int(os.getenv('LOCAL_WORLD_SIZE'))
+        args.num_nodes = max(1, world_size // local_world_size)
+        print(f"num_nodes={args.num_nodes} (inferred from WORLD_SIZE={world_size} / LOCAL_WORLD_SIZE={local_world_size})")
+    else:
+        args.num_nodes = 1
+        print("num_nodes=1 (default, no distributed env vars found)")
     print("torch.cuda.device_count()", torch.cuda.device_count())
     if args.gpus == "-1":
         num_gpus = args.num_nodes * torch.cuda.device_count()
