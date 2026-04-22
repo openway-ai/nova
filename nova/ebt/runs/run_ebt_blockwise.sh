@@ -36,7 +36,7 @@ fi
 ################################################################################
 # Blockwise training config (dense MTP-style supervision; edit these first)
 ################################################################################
-RUN_NAME="${RUN_NAME:-ebt-xxs-blockwise-k2-v3}"
+RUN_NAME="${RUN_NAME:-ebt-xxs-blockwise-k2-addalpha}"
 MODEL_NAME="${MODEL_NAME:-ebt}"
 MODEL_SIZE="${MODEL_SIZE:-xxs}"
 DATASET_NAME="${DATASET_NAME:-nanochat}"

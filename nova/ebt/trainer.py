@@ -406,6 +406,19 @@ class ModelTrainer(LightningModule):
             self.log_metrics(things_to_log, "train", log_torchmetrics = False)
         if getattr(self.hparams, "debug_blockwise_shapes", False) and getattr(self.hparams, "training_objective", "dense_next_token") == "blockwise":
             print("[blockwise-debug] backward success", flush=True)
+            alpha_grad = self.model.alpha.grad
+            if alpha_grad is None:
+                print(
+                    f"[blockwise-debug] alpha={self.model.alpha.detach().item():.6f}, alpha.grad=None",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[blockwise-debug] alpha={self.model.alpha.detach().item():.6f}, "
+                    f"alpha.grad_mean_abs={alpha_grad.detach().abs().mean().item():.6e}, "
+                    f"alpha.grad_norm={alpha_grad.detach().norm().item():.6e}",
+                    flush=True,
+                )
         
     def on_train_batch_end(self, outputs, batch, batch_idx):
         #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)

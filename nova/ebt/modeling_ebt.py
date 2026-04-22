@@ -251,6 +251,16 @@ class EBT_NLP(LightningModule):
         if mcmc_steps is None:
             mcmc_steps = self._build_mcmc_steps(no_randomness=no_randomness)
 
+        need_post_update_hidden = return_context_hidden or return_pred_hidden
+        if return_context_hidden and not self._transformer_accepts_return_context_hidden:
+            raise NotImplementedError(
+                f"Transformer {type(self.transformer).__name__} does not support return_context_hidden=True"
+            )
+        if return_pred_hidden and not self._transformer_accepts_return_pred_hidden:
+            raise NotImplementedError(
+                f"Transformer {type(self.transformer).__name__} does not support return_pred_hidden=True"
+            )
+
         optimize_mask_bool = None
         optimize_mask_float = None
         fixed_logits = None
@@ -287,42 +297,16 @@ class EBT_NLP(LightningModule):
                     predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
 
                 all_embeddings = torch.cat((real_embeddings_input, predicted_embeddings), dim = 1) # B, S+K, D
-                transformer_kwargs = dict(
+                base_transformer_kwargs = dict(
                     start_pos=start_pos,
                     mcmc_step=mcmc_step,
                     context_len=real_embeddings_input.shape[1],
                     pred_len=predicted_embeddings.shape[1],
                 )
-                if self._transformer_accepts_return_context_hidden:
-                    transformer_kwargs["return_context_hidden"] = return_context_hidden
-                elif return_context_hidden:
-                    raise NotImplementedError(
-                        f"Transformer {type(self.transformer).__name__} does not support return_context_hidden=True"
-                    )
-
-                if self._transformer_accepts_return_pred_hidden:
-                    transformer_kwargs["return_pred_hidden"] = return_pred_hidden
-                elif return_pred_hidden:
-                    raise NotImplementedError(
-                        f"Transformer {type(self.transformer).__name__} does not support return_pred_hidden=True"
-                    )
-
-                transformer_out = self.transformer(
+                energy_preds = self.transformer(
                     all_embeddings,
-                    **transformer_kwargs,
+                    **base_transformer_kwargs,
                 ) # checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
-                if return_context_hidden and return_pred_hidden:
-                    energy_preds, context_hidden, pred_hidden = transformer_out
-                    context_hiddens.append(context_hidden)
-                    predicted_hiddens.append(pred_hidden)
-                elif return_context_hidden:
-                    energy_preds, context_hidden = transformer_out
-                    context_hiddens.append(context_hidden)
-                elif return_pred_hidden:
-                    energy_preds, pred_hidden = transformer_out
-                    predicted_hiddens.append(pred_hidden)
-                else:
-                    energy_preds = transformer_out
                 energy_preds = energy_preds.reshape(-1, 1)
                 predicted_energies.append(energy_preds)
 
@@ -353,6 +337,27 @@ class EBT_NLP(LightningModule):
 
                 if optimize_mask_bool is not None:
                     predicted_tokens = torch.where(optimize_mask_bool, predicted_tokens, fixed_logits)
+
+                if need_post_update_hidden:
+                    post_update_pred_embeddings = self._logits_to_pred_embeddings(predicted_tokens, mcmc_step)
+                    post_update_all_embeddings = torch.cat((real_embeddings_input, post_update_pred_embeddings), dim=1)
+                    post_transformer_kwargs = dict(base_transformer_kwargs)
+                    post_transformer_kwargs["return_context_hidden"] = return_context_hidden
+                    post_transformer_kwargs["return_pred_hidden"] = return_pred_hidden
+                    post_transformer_out = self.transformer(
+                        post_update_all_embeddings,
+                        **post_transformer_kwargs,
+                    )
+                    if return_context_hidden and return_pred_hidden:
+                        _, context_hidden, pred_hidden = post_transformer_out
+                        context_hiddens.append(context_hidden)
+                        predicted_hiddens.append(pred_hidden)
+                    elif return_context_hidden:
+                        _, context_hidden = post_transformer_out
+                        context_hiddens.append(context_hidden)
+                    elif return_pred_hidden:
+                        _, pred_hidden = post_transformer_out
+                        predicted_hiddens.append(pred_hidden)
 
                 if return_raw_logits:
                     predicted_tokens_for_loss = predicted_tokens # BS, S, V
@@ -514,9 +519,13 @@ class EBT_NLP(LightningModule):
 
     def forward_blockwise_dense_hidden(self, input_ids, no_randomness):
         """
-        Shared-trunk blockwise dense hidden extraction (context/input branch only).
+        Shared-trunk blockwise dense hidden extraction for the dense blockwise head.
+        IMPORTANT: use post-update pred_hidden, not context_hidden.
+        In the current attention layout, context_hidden does not attend to the pred branch,
+        so even post-update context_hidden stays independent of alpha. post-update pred_hidden
+        does depend on x' = x - alpha * grad(E), which restores a differentiable alpha path.
         Returns:
-            context_hiddens_per_step: list[[B, S_eff, D]]
+            pred_hiddens_per_step: list[[B, S_eff, D]]
             predicted_energies: list[[B*S_eff, 1]]
         """
         if input_ids.dim() != 2:
@@ -528,7 +537,7 @@ class EBT_NLP(LightningModule):
         langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
         predicted_tokens = self.corrupt_embeddings(real_embeddings_input, target_length=seq_eff)  # [B, S_eff, V]
 
-        _, _, predicted_energies, context_hiddens_per_step = self._run_mcmc_on_given_pred_tokens(
+        _, _, predicted_energies, pred_hiddens_per_step = self._run_mcmc_on_given_pred_tokens(
             real_embeddings_input=real_embeddings_input,
             predicted_tokens=predicted_tokens,
             start_pos=0,
@@ -537,9 +546,9 @@ class EBT_NLP(LightningModule):
             no_randomness=no_randomness,
             alpha=alpha,
             langevin_dynamics_noise_std=langevin_dynamics_noise_std,
-            return_context_hidden=True,
+            return_pred_hidden=True,
         )
-        return context_hiddens_per_step, predicted_energies
+        return pred_hiddens_per_step, predicted_energies
 
     def forward_blockwise_dense_logits(self, input_ids, num_offsets, no_randomness, return_hidden=False):
         """
@@ -561,21 +570,21 @@ class EBT_NLP(LightningModule):
 
         batch_size = input_ids.shape[0]
         seq_eff = input_ids.shape[1]
-        context_hiddens_per_step, predicted_energies = self.forward_blockwise_dense_hidden(
+        pred_hiddens_per_step, predicted_energies = self.forward_blockwise_dense_hidden(
             input_ids=input_ids,
             no_randomness=no_randomness,
         )
 
         multi_offset_logits_per_step = []
-        for context_hidden in context_hiddens_per_step:
-            projected = self.blockwise_joint_head(context_hidden)  # [B, S_eff, K_max*V]
+        for pred_hidden in pred_hiddens_per_step:
+            projected = self.blockwise_joint_head(pred_hidden)  # [B, S_eff, K_max*V]
             projected = projected.reshape(batch_size, seq_eff, max_offsets, self.vocab_size)
             projected = projected[:, :, :num_offsets, :]  # [B, S_eff, K, V]
             projected = projected.permute(0, 2, 1, 3).contiguous()  # [B, K, S_eff, V]
             multi_offset_logits_per_step.append(projected)
 
         if return_hidden:
-            return multi_offset_logits_per_step, predicted_energies, context_hiddens_per_step
+            return multi_offset_logits_per_step, predicted_energies, pred_hiddens_per_step
         return multi_offset_logits_per_step, predicted_energies
 
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
@@ -622,7 +631,7 @@ class EBT_NLP(LightningModule):
             if target_offsets is None:
                 target_offsets = torch.arange(1, num_offsets + 1, device=input_ids.device, dtype=torch.long)
 
-            multi_offset_logits_per_step, predicted_energies, context_hiddens_per_step = self.forward_blockwise_dense_logits(
+            multi_offset_logits_per_step, predicted_energies, pred_hiddens_per_step = self.forward_blockwise_dense_logits(
                 input_ids,
                 num_offsets=num_offsets,
                 no_randomness=no_randomness,
@@ -679,15 +688,30 @@ class EBT_NLP(LightningModule):
             else:
                 bpb_loss = 0
 
+            offset_loss_log_dict = {}
+            final_step_logits = multi_offset_logits_per_step[-1].detach()  # [B, K, S_eff, V]
+            final_step_targets = block_targets.detach()  # [B, K, S_eff]
+            for offset_idx in range(num_offsets):
+                offset_value = int(target_offsets[offset_idx].item())
+                offset_logits = final_step_logits[:, offset_idx, :, :].reshape(-1, self.vocab_size)
+                offset_targets = final_step_targets[:, offset_idx, :].reshape(-1)
+                offset_loss = F.cross_entropy(
+                    offset_logits,
+                    offset_targets,
+                    ignore_index=-1,
+                )
+                offset_loss_log_dict[f"offset_{offset_value}_loss"] = offset_loss
+
             if getattr(self.hparams, "debug_blockwise_shapes", False):
                 print(
                     f"[blockwise-debug][phase={phase}] dense_mode=True, "
                     f"input_ids.shape={tuple(input_ids.shape)}, block_targets.shape={tuple(block_targets.shape)}, "
-                    f"offsets={target_offsets.tolist()}, logits_last_step.shape={tuple(multi_offset_logits_per_step[-1].shape)}",
+                    f"offsets={target_offsets.tolist()}, logits_last_step.shape={tuple(multi_offset_logits_per_step[-1].shape)}, "
+                    f"alpha={self.alpha.detach().item():.6f}",
                     flush=True,
                 )
                 print(
-                    f"[blockwise-debug][phase={phase}] context_hidden_last_step.shape={tuple(context_hiddens_per_step[-1].shape)}",
+                    f"[blockwise-debug][phase={phase}] post_update_pred_hidden_last_step.shape={tuple(pred_hiddens_per_step[-1].shape)}",
                     flush=True,
                 )
                 if num_offsets >= 1:
@@ -704,6 +728,11 @@ class EBT_NLP(LightningModule):
                     f"[blockwise-debug][phase={phase}] aggregated_loss={total_loss.detach().item():.6f}",
                     flush=True,
                 )
+                print(
+                    f"[blockwise-debug][phase={phase}] offset_losses="
+                    f"{ {k: round(v.item(), 6) for k, v in offset_loss_log_dict.items()} }",
+                    flush=True,
+                )
 
             log_dict = {
                 'loss': total_loss,
@@ -714,6 +743,7 @@ class EBT_NLP(LightningModule):
                 'perplexity': ppl_loss,
                 'bpb': bpb_loss
             }
+            log_dict.update(offset_loss_log_dict)
             return log_dict
         else:
             if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
@@ -1089,3 +1119,6 @@ class EBT_NLP(LightningModule):
         final_pred_state_energies = get_energy((self.hparams.mcmc_num_steps - 1), pred_state)
         energies_list.append(final_pred_state_energies)
         return pred_state, energies_list, pred_states_list
+        return pred_state, energies_list, pred_states_list
+
+
