@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+import random
 # from torch.utils.data import random_split, Dataset
 # from torchvision import transforms
 # from torchvision.transforms import ToPILImage
@@ -476,10 +477,20 @@ class ModelTrainer(LightningModule):
             self._rng_resume_state = None
 
         if self._dataloader_resume_state:
-            print(f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
-                  f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
-                  f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
-                  f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}")
+            if 'cursor' in self._dataloader_resume_state:
+                print(
+                    f"[Checkpoint] Rank {rank} 恢复 SFT dataloader state: "
+                    f"cursor={self._dataloader_resume_state.get('cursor')}, "
+                    f"consumed={self._dataloader_resume_state.get('consumed')}, "
+                    f"epoch={self._dataloader_resume_state.get('epoch')}, "
+                    f"it={self._dataloader_resume_state.get('it')}, "
+                    f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}"
+                )
+            else:
+                print(f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
+                      f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
+                      f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
+                      f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}")
         if self._rng_resume_state:
             print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
 
@@ -1480,6 +1491,7 @@ class ModelTrainer(LightningModule):
                 max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches,
                 split="train",
                 device=self.device,
+                resume_state_dict=resume_state,
             )
         else:
             train_dataloader = generate_dataloader(
