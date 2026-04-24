@@ -26,25 +26,17 @@
 #SBATCH --output=logs/slurm/nlp/ebt-d26-stable_%A-%a.log
 
 ### 基础配置 ###
-# export RUN_NAME="ebt-d26-ctx512-muon-adamw-0406-from0327"
-# export RUN_NAME="ebt-d26-ctx1024-muon-adamw-0413"
-
-# export RUN_NAME="ebt-d26-ctx1024-muon-adamw-0414-test"
-
-export RUN_NAME="ebt-d26-ctx1024-from0419"
-
+export RUN_NAME="ebt-d26-ctx1024-0417"
 
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
 ### 环境变量 ###
-HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
+HOME="/mnt/shared-storage-user/luyudong/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
 # PyTorch 内存优化
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-
-
 
 # WandB 配置
 export WANDB_API_KEY="Your WandB API Key"
@@ -52,22 +44,6 @@ export WANDB_MODE="offline"
 
 mkdir -p logs/slurm/nlp/
 module purge
-
-################################################################################
-# EBT 核心超参数 (严格遵循官方建议)
-################################################################################
-# 来源: https://github.com/alexiglad/EBT/blob/main/example_code/minimal_nlp_training_loop.py
-#
-# 官方说明:
-# "keeping mcmc_step_size_lr_multiplier = 3x mcmc_step_size is safe and
-#  what works well so the most important and arguably only really necessary
-#  to tune hparam is mcmc_step_size"
-#
-# 关键要点:
-# 1. mcmc_step_size 是唯一需要调优的超参数
-# 2. mcmc_step_size_lr_multiplier 应该是 step_size 的 3 倍
-# 3. 其他参数保持默认即可
-################################################################################
 
 # EBT 特定参数
 MCMC_STEP_SIZE=500.0
@@ -79,45 +55,15 @@ DENOISING_INITIAL_CONDITION="random_noise"
 MCMC_STEP_SIZE_LEARNABLE=true
 NO_MCMC_DETACH=false
 
-# 不使用的高级参数 (官方: not recommended for getting started)
-# ebt_norm, ebt_act_func, dyt_alpha_init, mcmc_replay_buffer 等
-# 均保持代码默认值,不在命令行覆盖
-
 ################################################################################
 # Batch 配置与训练步数自动计算 - 针对 d26 模型优化
 ################################################################################
 
 # 1. 硬件与 Batch 基础配置
-# NUM_GPUS=8
-# DEVICE_BATCH_SIZE=4
-# GRAD_ACCUM=8
-# CONTEXT_LENGTH=512
-
-# NUM_GPUS=8
-# DEVICE_BATCH_SIZE=2
-# GRAD_ACCUM=16
-# CONTEXT_LENGTH=1024
-
-# 实际运行
 NUM_GPUS=8
-DEVICE_BATCH_SIZE=1
+DEVICE_BATCH_SIZE=2
 GRAD_ACCUM=32
 CONTEXT_LENGTH=1024
-
-# todo
-# NUM_GPUS=8
-# DEVICE_BATCH_SIZE=2
-# GRAD_ACCUM=16
-# CONTEXT_LENGTH=1024
-
-# oom
-# NUM_GPUS=8
-# DEVICE_BATCH_SIZE=4
-# GRAD_ACCUM=8
-# CONTEXT_LENGTH=1024
-
-# CONTEXT_LENGTH=2048
-
 
 # 2. 计算每步的有效 Token 数 (Tokens per step)
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENGTH))
@@ -208,57 +154,13 @@ SAVE_TOP_K=2
 ################################################################################
 # 优化选项配置
 ################################################################################
-#
-# 当前启用: Muon+AdamW 混合优化器 + 动态 Weight Decay + Linear Warmdown
-#
-# 可选优化 (逐个测试):
-#   1. --layered_lr: 分层学习率 (仅用于纯 AdamW 模式, muon_adamw 已内置分层)
-#   2. --dynamic_wd: 动态 Weight Decay (线性衰减到0, 对齐 NanoChat base_train.py:366)
-#   3. --linear_warmdown: NanoChat 风格 LR 调度 (对齐 base_train.py:347)
-#   4. --optimizer muon_adamw: Muon+AdamW 混合优化器 (复用 nanochat/optim.py)
-#      Muon 处理 transformer 矩阵参数 (LR=0.02), AdamW 处理 embedding/scalar/alpha
-#
-# 注意:
-#   - --layered_lr 与 --optimizer muon_adamw 不要同时使用 (muon_adamw 已内置分层)
-#   - --dynamic_wd 和 --linear_warmdown 可以与 muon_adamw 组合使用
-################################################################################
-
-# === Baseline: 纯 AdamW, 不启用任何高级优化 ===
-# OPTION_FLAGS=""
-
-# === 纯 AdamW + 分层学习率 ===
-# OPTION_FLAGS="--layered_lr"
-
-# === Muon+AdamW 全套优化 (对齐 NanoChat) ===
-# --optimizer muon_adamw: Muon 处理 transformer 矩阵, AdamW 处理其余
-# --dynamic_wd: Weight Decay 线性衰减到 0 (对齐 base_train.py:366)
-# --linear_warmdown: 线性 warmdown LR 调度 (对齐 base_train.py:347)
-#
-# AdamW 独立绝对 LR (对齐 NanoChat, 不再从 peak_lr 派生):
-#   embedding:       0.3 (对齐 NanoChat base_train.py:61, 不在 MCMC 循环内, 可用高 LR)
-#   vocab_to_embed:  0.01 (EBT 特有, 在 MCMC 循环内有二阶梯度, 需保守)
-#   scalar:          0.04 (RMSNorm 等, 在 MCMC 循环内, 适度保守)
-#   alpha:           保持 PEAK_LR × MCMC_LR_MULT = 0.375 (EBT 特有, 不变)
-# --adamw_dmodel_lr_scaling: 对 AdamW LR 做 (dim/768)^-0.5 缩放 (对齐 gpt.py:362)
-#   d26 dim=1664: scale = (1664/768)^-0.5 ≈ 0.679
-#   实际 embedding LR = 0.3 × 0.679 = 0.204
-#   实际 scalar LR = 0.04 × 0.679 = 0.027
 OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
 
 
 ################################################################################
 # torch.compile 配置
 ################################################################################
-# EBT 使用 autograd.grad 进行 MCMC 更新,与 fullgraph 模式不兼容
-# 推荐: transformer_only 模式,仅编译 transformer 部分
-
-# 目前这个会报错
-# COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
-
-# 不使用 compile，steps 较少时适用
-# COMPILE_FLAGS="--compile_model --compile_mode disabled" 
-# 启用 compile，steps 较多时适用
-COMPILE_FLAGS="--compile_model --compile_mode full"
+COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
 
 ################################################################################
 # WandB 配置 (训练参数)
@@ -281,12 +183,6 @@ WANDB_FLAGS=""
 # 日志配置 - 自动路由 stdout/stderr 到日志文件
 ################################################################################
 
-current_time=$(date +"%Y%m%d_%H%M%S")
-
-################################################################################
-# 日志配置 - 自动命名 + 按日期分层
-################################################################################
-
 # 自动生成命名组件
 TIMESTAMP=$(date +"%m%d_%H%M")
 DATE_DIR=$(date +"%Y%m%d")
@@ -296,7 +192,9 @@ CONFIG_TAG="${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_bs$((NUM_GPUS * DEVICE_BATCH_SIZE
 export RUN_NAME="${RUN_PREFIX}_${TIMESTAMP}_${CONFIG_TAG}"
 
 # 日志按日期分文件夹
-LOG_DIR="logs_sft_train/${DATE_DIR}"
+LOG_DIR="logs_base_train/${DATE_DIR}"
+current_time=$(date +"%Y%m%d_%H%M%S")
+
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/${RUN_NAME}.log"
 
@@ -503,7 +401,7 @@ print_header "开始训练"
 echo ""
 
 set +e
-torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/luyudong/nova/nova/ebt/train.py \
 --run_name ${RUN_NAME}_${current_time} \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
@@ -549,6 +447,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --set_matmul_precision "medium" \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --save_periodic_steps 1000 \
+--float_precision bf16-mixed \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}

@@ -27,7 +27,7 @@
 
 ### 基础配置 ###
 # 用户只需改这一行 —— 描述本次实验的意图/标签
-RUN_PREFIX="bf16mixed-nomcmctime"
+RUN_PREFIX="base-train-ctx2048-bf16mixed-nomcmctime-0420"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -91,10 +91,11 @@ USE_MCMC_TIME_EMBED=false          # false: shared transition kernel, supports a
 # GRAD_ACCUM=8
 # CONTEXT_LENGTH=512
 
+# 可运行
 # NUM_GPUS=8
-# DEVICE_BATCH_SIZE=2
-# GRAD_ACCUM=16
-# CONTEXT_LENGTH=1024
+# DEVICE_BATCH_SIZE=1
+# GRAD_ACCUM=2
+# CONTEXT_LENGTH=2048
 
 # --float_precision "bf16-mixed" \
 # --gradient_checkpointing \

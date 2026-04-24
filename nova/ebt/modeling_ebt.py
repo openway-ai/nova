@@ -98,16 +98,23 @@ class EBT_NLP(LightningModule):
         
         all_embeddings = torch.cat((real_embeddings_input.detach(), predicted_embeddings), dim = 1) # B, 2*S, D
         
-        energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+        # create_graph=True 的 autograd.grad 与 compiled graph 不兼容
+        # 所以若 transformer 已被 torch.compile 编译，MCMC 中需要用 eager 版本
+        transformer = getattr(self, 'transformer_eager', self.transformer)
+        energy_preds = transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
         energy_preds = energy_preds.reshape(-1, 1)
         
-        if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
-            if i == (num_mcmc_steps - 1):
-                predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            grad_input = predicted_tokens.float()
+            grad_input.requires_grad_(True)
+            energy_f32 = energy_preds.float()
+            if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
+                if i == (num_mcmc_steps - 1):
+                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [grad_input], create_graph=learning)[0]
+                else:
+                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [grad_input], create_graph=False)[0]
             else:
-                predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=False)[0]
-        else:
-            predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+                predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [grad_input], create_graph=learning)[0]
         # predicted_tokens_grad has shape B, S, V
         
         if self.hparams.clamp_futures_grad:
@@ -277,13 +284,9 @@ class EBT_NLP(LightningModule):
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(
-                size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size),
-                dtype=self.embeddings.weight.dtype,
-                device=self.device,
-            ) * self.hparams.gaussian_random_noise_scaling
+            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=self.embeddings.weight.dtype, device = self.device) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
-            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device)
+            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=self.embeddings.weight.dtype, device = self.device)
         else:
             raise NotImplementedError(f"{self.hparams.denoising_initial_condition} denoising_initial_condition not yet supported")
         

@@ -26,8 +26,10 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 # =============================================================================
 
 # export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt}"
-export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260407_001616/e=epoch=0-s=step=812-lr5e-05-bs4x16-muon_adamw-valid_loss=valid_loss=1.2609.ckpt}"
+# export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260407_001616/e=epoch=0-s=step=812-lr5e-05-bs4x16-muon_adamw-valid_loss=valid_loss=1.2609.ckpt}"
 
+# export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0420-from0413_20260420_193427/periodic-s=step=2999-d26-ctx1024.ckpt}"
+export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0420-from0413_20260420_193427/s=step=1953-d26-ctx1024-lr5e-05-bs2x32-muon_adamw-valid_loss=valid_loss=2.1394.ckpt}"
 
 if [ -z "$CKPT_PATH" ]; then
     echo "错误: 必须指定 checkpoint 路径"
@@ -44,9 +46,11 @@ fi
 EVAL_MODES="${EVAL_MODES:-core}"
 MAX_PER_TASK="${MAX_PER_TASK:--1}"
 TASK_SAMPLES="${TASK_SAMPLES:-}"
-DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
+# DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
+DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-24}"
 NUM_GPUS="${NUM_GPUS:--1}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer}"
+DTYPE="${DTYPE:-bfloat16}"
 
 # 自动检测 GPU
 if [ "$NUM_GPUS" = "-1" ]; then
@@ -140,7 +144,8 @@ EVAL_CMD="$PYTHON -m scripts.ebt_core_eval \
     $TASK_SAMPLES_ARG \
     --device-batch-size $DEVICE_BATCH_SIZE \
     --output-dir '$OUTPUT_DIR' \
-    --gpus $NUM_GPUS"
+    --gpus $NUM_GPUS \
+    --dtype $DTYPE"
 
 {
     eval $EVAL_CMD

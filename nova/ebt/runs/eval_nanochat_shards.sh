@@ -46,6 +46,7 @@ MAX_SAMPLES_PER_SHARD="${MAX_SAMPLES_PER_SHARD:-50}"
 ENABLE_GENERATION="${ENABLE_GENERATION:-true}"
 GENERATION_SPLIT_RATIO="${GENERATION_SPLIT_RATIO:-0.5}"
 MIN_GENERATION_LENGTH="${MIN_GENERATION_LENGTH:-64}"
+FLOAT_PRECISION="${FLOAT_PRECISION:-bf16-mixed}"
 
 ################################################################################
 # 参数验证
@@ -139,6 +140,7 @@ $PYTHON train.py \
     --dataset_name "nanochat_shard_eval" \
     --context_length 256 \
     --tokenizer "$TOKENIZER_PATH" \
+    --float_precision "$FLOAT_PRECISION" \
     --eval_shard_indices "$EVAL_SHARD_INDICES" \
     --max_samples_per_shard "$MAX_SAMPLES_PER_SHARD" \
     $GENERATION_FLAGS \

@@ -9,13 +9,14 @@
 ################################################################################
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-ctx1024-exact-resume"
+export RUN_NAME="ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312"
 
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
 ### 恢复训练配置 ###
-RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-muon-adamw-0413_20260413_123504/s=step=27937-d26-ctx1024-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.6296.ckpt"
+# RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-basetrain-d26-ctx2048-bf16mixed-0417_20260417_184333/s=step=4312-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=3.1469.ckpt"
+RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/bf16mixed-nomcmctime_0417_2020_d26_ctx2048_bs256_lr0.00025/s=step=4812-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=3.1023.ckpt"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -23,7 +24,6 @@ export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export PYTHONUNBUFFERED=1
 
-export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"
 
 mkdir -p logs/slurm/nlp/
@@ -40,6 +40,7 @@ NORMALIZE_INITIAL_CONDITION=true
 DENOISING_INITIAL_CONDITION="random_noise"
 MCMC_STEP_SIZE_LEARNABLE=true
 NO_MCMC_DETACH=false
+USE_MCMC_TIME_EMBED=false          # false: shared transition kernel, supports arbitrary inference steps
 
 ################################################################################
 # Batch 配置 (与原始训练完全一致)
@@ -47,13 +48,16 @@ NO_MCMC_DETACH=false
 NUM_GPUS=8
 DEVICE_BATCH_SIZE=1
 GRAD_ACCUM=32
-CONTEXT_LENGTH=1024
+CONTEXT_LENGTH=2048
 
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENGTH))
 
 # 与原始训练完全一致: 28000 步
-MAX_STEPS=28000
-MAX_SCHEDULING_STEPS=28000
+# MAX_STEPS=28000
+# MAX_SCHEDULING_STEPS=28000
+
+MAX_STEPS=14000
+MAX_SCHEDULING_STEPS=14000
 
 ################################################################################
 # 学习率配置 (与原始训练完全一致)
@@ -173,8 +177,12 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --mcmc_step_size ${MCMC_STEP_SIZE} \
 --mcmc_step_size_lr_multiplier ${MCMC_STEP_SIZE_LR_MULTIPLIER} \
 --mcmc_num_steps ${MCMC_NUM_STEPS} \
+$([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
+\
 --context_length ${CONTEXT_LENGTH} \
+\
 --gpus "-1" \
+\
 --peak_learning_rate ${PEAK_LR} \
 --batch_size_per_device ${DEVICE_BATCH_SIZE} \
 --accumulate_grad_batches ${GRAD_ACCUM} \
@@ -201,7 +209,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --resume_training_ckpt ${RESUME_CKPT} \
 --resume_warmup_steps 0 \
---save_periodic_steps 100 \
+--save_periodic_steps 200 \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}
