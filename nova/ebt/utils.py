@@ -421,9 +421,15 @@ def mask_q_tokens(input_tensor, tokenizer):
     '''
     batch_size = input_tensor.shape[0]
     seq_length = input_tensor.shape[1]
-    answer_tag = tokenizer.encode("[[Answer]]:", add_special_tokens=True)
-    
-    answer_start_pos = find_subsequences(input_tensor, answer_tag)
+    try:
+        answer_tag = tokenizer.encode("[[Answer]]:", add_special_tokens=True)
+    except TypeError:
+        answer_tag = tokenizer.encode("[[Answer]]:")
+
+    try:
+        answer_start_pos = find_subsequences(input_tensor, answer_tag)
+    except ValueError:
+        return input_tensor
     answer_start_pos += len(answer_tag)
     mask = torch.arange(seq_length, device=input_tensor.device).expand(batch_size, seq_length)
     mask = mask < answer_start_pos.unsqueeze(1)

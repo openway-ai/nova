@@ -248,7 +248,38 @@ class ModelTrainer(LightningModule):
             compile_backend = getattr(self.hparams, 'compile_backend', 'inductor')
             compile_dynamic = getattr(self.hparams, 'compile_dynamic', False)
 
-            if compile_mode == 'disabled':
+            if compile_mode == 'full':
+                # 编译整个模型 (可能与 autograd.grad 不兼容)
+                print(f"\n{'='*80}")
+                print(f"[torch.compile] 开始编译整个模型...")
+                print(f"[torch.compile] 模式: full | 后端: {compile_backend} | 动态: {compile_dynamic}")
+                print(f"[torch.compile] 警告: EBT 的 MCMC 循环使用 autograd.grad，可能导致编译失败")
+                print(f"[torch.compile] 首次编译可能需要 5-15 分钟，请耐心等待...")
+                print(f"{'='*80}\n")
+                import time
+                start_time = time.time()
+                self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
+                compile_time = time.time() - start_time
+                print(f"\n{'='*80}")
+                print(f"[torch.compile] ✓ 模型编译完成 (耗时: {compile_time:.1f}s)")
+                print(f"{'='*80}\n")
+
+            elif compile_mode == 'transformer_only':
+                # 仅编译 transformer 部分 (避开 MCMC )
+                # 保留 eager 引用供 _mcmc_step_excluded 中 create_graph=True 时使用
+                print(f"[torch.compile] 仅编译 transformer 部分 (mode=transformer_only, backend={compile_backend})")
+                if hasattr(self.model, 'transformer'):
+                    self.model.transformer_eager = self.model.transformer  # 保留 eager 引用
+                    self.model.transformer = torch.compile(
+                        self.model.transformer,
+                        backend=compile_backend,
+                        dynamic=compile_dynamic
+                    )
+                    print(f"[torch.compile] transformer 编译成功，transformer_eager 已保留用于 MCMC")
+                else:
+                    print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过编译")
+
+            elif compile_mode == 'disabled':
                 print(f"[torch.compile] 编译已禁用")
 
             elif (self.hparams.execution_mode == "inference") or getattr(self.hparams, 'only_test', False):
@@ -458,6 +489,28 @@ class ModelTrainer(LightningModule):
         print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
 
     def on_load_checkpoint(self, checkpoint):
+        # --- 修复 torch.compile _orig_mod 前缀不匹配 ---
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+            has_orig_mod_keys = any('_orig_mod.' in k for k in state_dict)
+            model_has_orig_mod = any('_orig_mod.' in k for k in self.state_dict())
+
+            if has_orig_mod_keys and not model_has_orig_mod:
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    new_state_dict[k.replace('._orig_mod.', '.')] = v
+                checkpoint['state_dict'] = new_state_dict
+                print(f"[Checkpoint] Stripped '_orig_mod' prefix from {len(state_dict)} keys")
+            elif not has_orig_mod_keys and model_has_orig_mod:
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith('model.'):
+                        new_state_dict['model._orig_mod.' + k[len('model.'):]] = v
+                    else:
+                        new_state_dict[k] = v
+                checkpoint['state_dict'] = new_state_dict
+                print(f"[Checkpoint] Added '_orig_mod' prefix to {len(state_dict)} keys")
+
         # 从 checkpoint 恢复 per-rank dataloader 位置 + RNG 状态
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -487,10 +540,12 @@ class ModelTrainer(LightningModule):
                     f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}"
                 )
             else:
-                print(f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
-                      f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
-                      f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
-                      f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}")
+                print(
+                    f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
+                    f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
+                    f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
+                    f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}"
+                )
         if self._rng_resume_state:
             print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
 
@@ -1162,14 +1217,82 @@ class ModelTrainer(LightningModule):
         # --- 创建优化器 ---
         # PL 调用 optimizer.step(closure=closure), 但 MuonAdamW.step() 不接受 closure 参数
         # 包装一下使其兼容 PL 的调用约定
-        class PLMuonAdamW(MuonAdamW):
-            """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
-            @torch.no_grad()
-            def step(self, closure=None):
-                if closure is not None:
-                    with torch.enable_grad():
-                        closure()
-                super().step()
+        use_cpu_offload = getattr(self.hparams, 'cpu_offload_optimizer', False)
+        if use_cpu_offload:
+            class PLMuonAdamW(MuonAdamW):
+                """MuonAdamW + CPU offload: AdamW 和 Muon 优化器状态均存放在 CPU。"""
+
+                @torch.no_grad()
+                def step(self, closure=None):
+                    if closure is not None:
+                        with torch.enable_grad():
+                            closure()
+
+                    # 遍历所有 param group，按 kind 分别处理
+                    for group in self.param_groups:
+                        kind = group.get('kind')
+
+                        if kind == 'adamw':
+                            # AdamW: 逐参数搬运 exp_avg / exp_avg_sq
+                            for p in group['params']:
+                                if p.grad is None:
+                                    continue
+                                state = self.state[p]
+                                if not state:
+                                    continue
+                                for k in ('exp_avg', 'exp_avg_sq'):
+                                    if k in state and state[k].device.type == 'cpu':
+                                        state[k] = state[k].to(p.device, non_blocking=False)
+
+                        elif kind == 'muon':
+                            # Muon: group-level buffer 存在 params[0] 的 state 里
+                            if not group['params']:
+                                continue
+                            p0 = group['params'][0]
+                            state = self.state[p0]
+                            if not state:
+                                continue
+                            for k in ('momentum_buffer', 'second_momentum_buffer'):
+                                if k in state and state[k].device.type == 'cpu':
+                                    state[k] = state[k].to(p0.device, non_blocking=False)
+
+                    # 执行实际的优化器 step（fused kernel 要求 state 在 GPU 上）
+                    super().step()
+
+                    # step 完成后，将所有 state 搬回 CPU
+                    for group in self.param_groups:
+                        kind = group.get('kind')
+
+                        if kind == 'adamw':
+                            for p in group['params']:
+                                state = self.state[p]
+                                for k in ('exp_avg', 'exp_avg_sq'):
+                                    if k in state and state[k].device.type != 'cpu':
+                                        cpu_t = state[k].to('cpu', non_blocking=False)
+                                        del state[k]
+                                        state[k] = cpu_t
+
+                        elif kind == 'muon':
+                            if not group['params']:
+                                continue
+                            p0 = group['params'][0]
+                            state = self.state[p0]
+                            for k in ('momentum_buffer', 'second_momentum_buffer'):
+                                if k in state and state[k].device.type != 'cpu':
+                                    cpu_t = state[k].to('cpu', non_blocking=False)
+                                    del state[k]
+                                    state[k] = cpu_t
+
+                    torch.cuda.synchronize()
+        else:
+            class PLMuonAdamW(MuonAdamW):
+                """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
+                @torch.no_grad()
+                def step(self, closure=None):
+                    if closure is not None:
+                        with torch.enable_grad():
+                            closure()
+                    super().step()
 
         optimizer = PLMuonAdamW(param_groups)
 

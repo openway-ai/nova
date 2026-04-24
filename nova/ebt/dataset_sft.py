@@ -69,9 +69,19 @@ def _load_sft_datasets():
 
 class SFTIterableDataset(_IterableDataset):
     """将 NanoChat SFT TaskMixture 适配为 EBT IterableDataset"""
+
     STATE_VERSION = "sft_v1"
 
-    def __init__(self, tokenizer, batch_size, max_len, split, max_iter, device="cuda", resume_state_dict=None):
+    def __init__(
+        self,
+        tokenizer,
+        batch_size,
+        max_len,
+        split,
+        max_iter,
+        device="cuda",
+        resume_state_dict=None,
+    ):
         super().__init__()
         self.tokenizer = tokenizer
         self.B = batch_size
@@ -129,7 +139,7 @@ class SFTIterableDataset(_IterableDataset):
         )
 
     def _build_state_dict(self, copy_buffer):
-        state = {
+        return {
             "state_version": self.STATE_VERSION,
             "split": self.split,
             "cursor": self.cursor,
@@ -142,7 +152,6 @@ class SFTIterableDataset(_IterableDataset):
             "world_size": self.ddp_world_size,
             "conv_buffer": copy.deepcopy(self.conv_buffer) if copy_buffer else self.conv_buffer,
         }
-        return state
 
     def __iter__(self):
         """BOS-aligned bestfit packing，对齐 chat_sft.py"""
@@ -150,6 +159,7 @@ class SFTIterableDataset(_IterableDataset):
         dataset = self.train_dataset if self.split == "train" else self.val_dataset
         dataset_size = len(dataset)
         assert dataset_size > 0
+
         bos_token = self.tokenizer.get_bos_token_id()
         use_cuda = "cuda" in str(self.device)
         if self.split == "train":
@@ -170,7 +180,6 @@ class SFTIterableDataset(_IterableDataset):
                 if self.cursor >= dataset_size:
                     self.cursor = self.cursor % dataset_size
                     self.epoch += 1
-                # 跳过超长对话，只保留能放入 row_capacity 的
                 if len(ids) <= self.row_capacity:
                     self.conv_buffer.append(ids)
 
@@ -179,7 +188,7 @@ class SFTIterableDataset(_IterableDataset):
                 break
 
             rows = []
-            row_lengths = []  # 每行实际内容长度（不含 padding）
+            row_lengths = []
 
             for _ in range(self.B):
                 row = []
@@ -217,13 +226,14 @@ class SFTIterableDataset(_IterableDataset):
             batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
             inputs = batch_tensor[:, :-1].to(device=self.device, dtype=torch.int64, non_blocking=use_cuda)
             targets = batch_tensor[:, 1:].to(device=self.device, dtype=torch.int64, non_blocking=use_cuda)
-            # 只 mask padding 位置（对齐 chat_sft.py），user + assistant token 都参与 loss
             for i, content_len in enumerate(row_lengths):
                 if content_len < self.row_capacity:
-                    targets[i, content_len-1:] = -1
+                    targets[i, content_len - 1 :] = -1
+
             self.it += 1
             self.last_state_dict = self._build_state_dict(copy_buffer=False)
             yield inputs, targets
+
             if self.split != "train" and self.it >= self.max_iter:
                 break
 
@@ -237,9 +247,6 @@ class SFTIterableDataset(_IterableDataset):
         return {} if state is None else state
 
     def load_state_dict(self, state_dict):
-        # Lightning may try to restore a single legacy dataloader_state_dict after we
-        # have already injected the correct per-rank state via trainer.py. Keep the
-        # per-rank ctor state authoritative in that case.
         if self._resume_state_locked and self._can_restore(self.resume_state_dict):
             current_state = self.resume_state_dict
             incoming_state = state_dict
