@@ -43,7 +43,7 @@ if command -v conda &> /dev/null; then
     fi
 fi
 
-cd /mnt/shared-storage-user/puyuan/code/nova/nova/ebt
+cd /mnt/shared-storage-user/puyuan/code/nova
 
 echo -e "${YELLOW}测试 1: 使用训练参数 (默认,推荐)${NC}"
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
