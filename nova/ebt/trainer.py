@@ -2,7 +2,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-import random
 # from torch.utils.data import random_split, Dataset
 # from torchvision import transforms
 # from torchvision.transforms import ToPILImage
@@ -540,12 +539,10 @@ class ModelTrainer(LightningModule):
                     f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}"
                 )
             else:
-                print(
-                    f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
-                    f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
-                    f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
-                    f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}"
-                )
+                print(f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
+                      f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
+                      f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
+                      f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}")
         if self._rng_resume_state:
             print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
 
