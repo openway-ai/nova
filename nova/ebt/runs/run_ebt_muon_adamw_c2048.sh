@@ -26,8 +26,8 @@
 #SBATCH --output=logs/slurm/nlp/ebt-d26-stable_%A-%a.log
 
 ### 基础配置 ###
-# 用户只需改这一行 —— 描述本次实验的意图/标签
-RUN_PREFIX="base-train-ctx2048-bf16mixed-nomcmctime-0420"
+# RUN_PREFIX 用于 exp_id 生成（如需手动指定 EXP_ID，设置 EXP_ID 环境变量）
+RUN_PREFIX="${RUN_PREFIX:-ebt-d26-ctx2048}"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -277,21 +277,35 @@ WANDB_FLAGS=""
 # WANDB_FLAGS="--wandb_watch --wandb_watch_level all"
 
 ################################################################################
-# 日志配置 - 自动命名 + 按日期分层
+# 实验目录布局 - 统一输出到 ebt_runs/<exp_id>/base_train/
 ################################################################################
 
-# 自动生成命名组件
-TIMESTAMP=$(date +"%m%d_%H%M")
-DATE_DIR=$(date +"%Y%m%d")
-CONFIG_TAG="${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_bs$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM))_lr${PEAK_LR}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/utils/exp_layout.sh"
 
-# 最终名称 (用于 --run_name 和 wandb)
-export RUN_NAME="${RUN_PREFIX}_${TIMESTAMP}_${CONFIG_TAG}"
+exp_init_base_train "$0" "muon_adamw"
+export RUN_NAME="${EXP_ID}"
+export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# 日志按日期分文件夹
-LOG_DIR="logs_base_train/${DATE_DIR}"
-mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/${RUN_NAME}.log"
+exp_save_hparams "${EXP_DIR}/base_train" \
+    "model_size=${MODEL_SIZE}" \
+    "context_length=${CONTEXT_LENGTH}" \
+    "peak_lr=${PEAK_LR}" \
+    "weight_decay=${WEIGHT_DECAY}" \
+    "beta1=${BETA1}" \
+    "beta2=${BETA2}" \
+    "device_batch_size=${DEVICE_BATCH_SIZE}" \
+    "grad_accum=${GRAD_ACCUM}" \
+    "num_gpus=${NUM_GPUS}" \
+    "effective_batch_size=${EFFECTIVE_BATCH_SIZE}" \
+    "max_steps=${MAX_STEPS}" \
+    "target_total_tokens=${TARGET_TOTAL_TOKENS}" \
+    "mcmc_step_size=${MCMC_STEP_SIZE}" \
+    "mcmc_lr_multiplier=${MCMC_STEP_SIZE_LR_MULTIPLIER}" \
+    "use_mcmc_time_embed=${USE_MCMC_TIME_EMBED}" \
+    "optimizer=muon_adamw"
+
+LOG_FILE="${EXP_LOG_FILE}"
 
 # 定义颜色
 RED='\033[0;31m'
@@ -498,6 +512,8 @@ echo ""
 set +e
 torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
 --run_name ${RUN_NAME} \
+--checkpoint_dir "${EXP_CKPT_DIR}" \
+--wandb_save_dir "${EXP_WANDB_DIR}" \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
 --model_size ${MODEL_SIZE} \
@@ -558,6 +574,8 @@ ${COMPILE_FLAGS}
 
 TRAIN_EXIT_CODE=$?
 set -e
+
+exp_save_status "${EXP_DIR}/base_train" "base_train" "$TRAIN_EXIT_CODE"
 
 ################################################################################
 # 训练结束处理
