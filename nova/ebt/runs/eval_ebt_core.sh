@@ -78,15 +78,32 @@ if [ "$NUM_GPUS" = "-1" ]; then
 fi
 
 # =============================================================================
-# 输出配置 (使用绝对路径)
+# 输出配置 - 统一到 ebt_runs/<exp_id>/core_eval/<eval_run_id>/
 # =============================================================================
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RUN_NAME=$(basename $(dirname "$CKPT_PATH"))
-RUN_SHORT=$(echo "$RUN_NAME" | sed 's/_[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}-[0-9]\{2\}_\?$//')
-CKPT_FILENAME=$(basename "$CKPT_PATH" .ckpt)
-OUTPUT_DIR="$EBT_DIR/logs/core_eval/${RUN_SHORT}_${TIMESTAMP}/${CKPT_FILENAME}"
-LOG_FILE="$EBT_DIR/logs/core_eval/${RUN_SHORT}_${TIMESTAMP}/core_eval.log"
+source "${SCRIPT_DIR}/utils/exp_layout.sh"
+
+if [ -n "$EXP_ID" ]; then
+    exp_init_eval "$0"
+    OUTPUT_DIR="$EVAL_OUTPUT_DIR"
+    LOG_FILE="$EVAL_LOG_FILE"
+
+    exp_save_eval_params "$EVAL_RUN_DIR" \
+        "ckpt_path=${CKPT_PATH}" \
+        "eval_modes=${EVAL_MODES}" \
+        "max_per_task=${MAX_PER_TASK}" \
+        "device_batch_size=${DEVICE_BATCH_SIZE}" \
+        "num_gpus=${NUM_GPUS}" \
+        "dtype=${DTYPE}"
+else
+    # 兼容旧模式: 不传 EXP_ID 时使用原始路径
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    RUN_NAME=$(basename $(dirname "$CKPT_PATH"))
+    RUN_SHORT=$(echo "$RUN_NAME" | sed 's/_[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}-[0-9]\{2\}_\?$//')
+    CKPT_FILENAME=$(basename "$CKPT_PATH" .ckpt)
+    OUTPUT_DIR="$EBT_DIR/logs/core_eval/${RUN_SHORT}_${TIMESTAMP}/${CKPT_FILENAME}"
+    LOG_FILE="$EBT_DIR/logs/core_eval/${RUN_SHORT}_${TIMESTAMP}/core_eval.log"
+fi
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -215,5 +232,10 @@ fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════════════════════════"
+
+# 保存评估状态
+if [ -n "$EXP_ID" ] && [ -n "$EVAL_RUN_DIR" ]; then
+    exp_save_status "$EVAL_RUN_DIR" "core_eval" "$EXIT_CODE"
+fi
 
 exit $EXIT_CODE
