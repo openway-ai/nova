@@ -7,6 +7,7 @@
 
 # 激活虚拟环境
 source .venv/bin/activate 2>/dev/null || true
+export PYTHONPATH="${PWD}/nanochat:${PWD}:${PYTHONPATH:-}"
 cd openebm/elm
 
 CONDA_ENV_NAME="nanochat"

@@ -15,7 +15,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # 配置
-CHECKPOINT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt"
+CHECKPOINT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt"
 TOKENIZER="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer"
 
 # 测试提示词
@@ -43,7 +43,8 @@ if command -v conda &> /dev/null; then
     fi
 fi
 
-cd /mnt/shared-storage-user/puyuan/code/nova
+cd /mnt/shared-storage-user/puyuan/code/OpenEBM
+export PYTHONPATH="${PWD}/nanochat:${PWD}:${PYTHONPATH:-}"
 
 echo -e "${YELLOW}测试 1: 使用训练参数 (默认,推荐)${NC}"
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"

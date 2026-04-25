@@ -5,7 +5,7 @@ echo "Testing fixed chat script with a simple prompt..."
 echo ""
 
 # 使用简单的测试prompt
-echo "What is 2+2?" | bash /mnt/shared-storage-user/puyuan/code/nova/openebm/elm/runs/chat_ebt.sh --max-tokens 50
+echo "What is 2+2?" | bash /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/runs/chat_ebt.sh --max-tokens 50
 
 echo ""
 echo "Test completed. Check if output is coherent (not gibberish)."

@@ -510,7 +510,7 @@ print_header "开始训练"
 echo ""
 
 set +e
-torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/openebm/elm/train.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/train.py \
 --run_name ${RUN_NAME} \
 --checkpoint_dir "${EXP_CKPT_DIR}" \
 --wandb_save_dir "${EXP_WANDB_DIR}" \

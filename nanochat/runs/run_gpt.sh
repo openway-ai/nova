@@ -11,6 +11,7 @@ if [ -z "$WANDB_RUN" ]; then
 fi
 
 source .venv/nanochat/bin/activate
+export PYTHONPATH="${PWD}/nanochat:${PWD}:${PYTHONPATH:-}"
 
 python -m scripts.base_train --depth=26 --target-param-data-ratio=8.25 --device-batch-size=16 --fp8 --run=$WANDB_RUN
 

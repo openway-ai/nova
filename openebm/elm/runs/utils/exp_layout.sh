@@ -12,8 +12,13 @@
 #     └── core_eval/<eval_run_id>/{config,results,eval.log,status.json}
 ################################################################################
 
-EBT_RUNS_ROOT="${EBT_RUNS_ROOT:-/mnt/shared-storage-user/puyuan/code/nova/logs/ebt_runs}"
+EBT_RUNS_ROOT="${EBT_RUNS_ROOT:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs}"
 _EXP_LAYOUT_SOURCED=1
+
+# Ensure nanochat sub-packages (nanochat, tasks, scripts, data) are importable
+_EXP_LAYOUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_EXP_REPO_ROOT="$(cd "$_EXP_LAYOUT_DIR/../../.." && pwd)"
+export PYTHONPATH="${_EXP_REPO_ROOT}/nanochat:${_EXP_REPO_ROOT}:${PYTHONPATH:-}"
 
 # ---------------------------------------------------------------------------
 # 内部工具函数
@@ -29,7 +34,7 @@ _exp_timestamp_full() {
 
 _exp_git_info() {
     local out_file="$1"
-    local repo_dir="${2:-/mnt/shared-storage-user/puyuan/code/nova}"
+    local repo_dir="${2:-/mnt/shared-storage-user/puyuan/code/OpenEBM}"
     {
         echo "commit: $(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo 'unknown')"
         echo "branch: $(git -C "$repo_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
@@ -398,7 +403,7 @@ _exp_write_meta() {
 {
   "exp_id": "${EXP_ID}",
   "created": "$(_exp_timestamp_full)",
-  "git_commit": "$(git -C /mnt/shared-storage-user/puyuan/code/nova rev-parse --short HEAD 2>/dev/null || echo 'unknown')",
+  "git_commit": "$(git -C /mnt/shared-storage-user/puyuan/code/OpenEBM rev-parse --short HEAD 2>/dev/null || echo 'unknown')",
   "initial_stage": "${initial_stage}"
 }
 EOMETA

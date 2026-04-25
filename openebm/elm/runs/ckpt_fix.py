@@ -1,6 +1,6 @@
 # import struct, os                                             
                                                                   
-# src = '/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=11187-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7656.ckpt'                                                                                                                                                                                                                                                                 
+# src = '/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=11187-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7656.ckpt'                                                                                                                                                                                                                                                                 
 # dst = src + '.repaired' 
                                                                                                                                                                                                                                                                         
 # with open(src, 'rb') as f:                                                                                                                                  
@@ -108,13 +108,13 @@
 
 
 import torch
-ckpt = torch.load('/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=11187-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7656.ckpt.repaired2', map_location='cpu', weights_only=False)
+ckpt = torch.load('/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=11187-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7656.ckpt.repaired2', map_location='cpu', weights_only=False)
 print('Keys:', list(ckpt.keys()))
 print('Step:', ckpt.get('global_step', 'N/A'))
 
 
 # import zipfile
-# z = zipfile.ZipFile('/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=11187-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7656.ckpt.repaired2')                                                                                                                                                                           
+# z = zipfile.ZipFile('/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=11187-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7656.ckpt.repaired2')                                                                                                                                                                           
 # names = z.namelist()                                  
 # print('Total entries:', len(names))
 # print('--- First 20 ---')
@@ -140,7 +140,7 @@ print('Step:', ckpt.get('global_step', 'N/A'))
 
 # import struct, os, zipfile
 
-# src = '/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=11187-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7656.ckpt'
+# src = '/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=11187-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7656.ckpt'
 # dst = src + '.repaired2'
 
 # with open(src, 'rb') as f:

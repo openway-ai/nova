@@ -12,6 +12,7 @@
 
 # all the setup stuff
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+export PYTHONPATH="${PWD}/nanochat:${PWD}:${PYTHONPATH:-}"
 mkdir -p $NANOCHAT_BASE_DIR
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 [ -d ".venv" ] || uv venv

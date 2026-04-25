@@ -1,6 +1,7 @@
 #!/bin/bash
 # activate venv so that `python` uses the project's venv instead of system python
 source .venv/ebt/bin/activate
+export PYTHONPATH="${PWD}/nanochat:${PWD}:${PYTHONPATH:-}"
 
 # -----------------------------------------------------------------------------
 # wandb setup

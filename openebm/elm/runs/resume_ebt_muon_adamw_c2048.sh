@@ -15,10 +15,10 @@ export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
 
 ### 恢复训练配置 ###
-# RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-basetrain-d26-ctx2048-bf16mixed-0417_20260417_184333/s=step=4312-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=3.1469.ckpt"
-# RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/bf16mixed-nomcmctime_0417_2020_d26_ctx2048_bs256_lr0.00025/s=step=4812-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=3.1023.ckpt"
-# RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=11187-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7656.ckpt"
-RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=9562-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.8640.ckpt"
+# RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-basetrain-d26-ctx2048-bf16mixed-0417_20260417_184333/s=step=4312-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=3.1469.ckpt"
+# RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/bf16mixed-nomcmctime_0417_2020_d26_ctx2048_bs256_lr0.00025/s=step=4812-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=3.1023.ckpt"
+# RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=11187-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7656.ckpt"
+RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=9562-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.8640.ckpt"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -174,7 +174,7 @@ echo ""
 
 set +e
 
-torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/openebm/elm/train.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/train.py \
 --run_name ${RUN_NAME}_${current_time} \
 --checkpoint_dir "${EXP_CKPT_DIR}" \
 --wandb_save_dir "${EXP_WANDB_DIR}" \
