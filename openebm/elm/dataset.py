@@ -1,6 +1,3 @@
-import sys
-sys.path.append("../../")
-
 from nanochat.dataloader import StatefulBestFitDataLoader, tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 
 import torch

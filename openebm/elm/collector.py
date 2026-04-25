@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-from tokenizer import AutoTokenizer
+from openebm.elm.tokenizer import AutoTokenizer
 
 @dataclass
 class DataCollatorWithPadding:

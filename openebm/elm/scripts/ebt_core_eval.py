@@ -21,12 +21,8 @@ import torch.multiprocessing as mp
 import numpy as np
 from tqdm import tqdm
 
-# 添加项目根目录到路径
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, "/mnt/shared-storage-user/puyuan/code/nanochat")
-
-from trainer import ModelTrainer
-from nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
+from openebm.elm.trainer import ModelTrainer
+from openebm.elm.nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
 from nanochat.core_eval import (
     evaluate_example,
     evaluate_task as _nanochat_evaluate_task,

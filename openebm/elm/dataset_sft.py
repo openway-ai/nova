@@ -10,15 +10,12 @@ import sys
 import torch
 from torch.utils.data import IterableDataset as _IterableDataset, DataLoader
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "../../"))
-
 from nanochat.common import get_dist_info
 from nanochat.tokenizer import get_tokenizer
 
 
 def _load_sft_datasets():
     """加载 SFT 数据集混合 (支持 offline 模式)"""
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../"))
     from tasks.common import TaskMixture
     from tasks.gsm8k import GSM8K
     from tasks.mmlu import MMLU

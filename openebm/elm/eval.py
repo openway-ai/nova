@@ -1,5 +1,5 @@
 import json
-import metrics
+from openebm.elm import metrics
 # import nltk
 
 # try:

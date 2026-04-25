@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from nanolightning.torchlightning_module import LightningModule
+from openebm.elm.nanolightning.torchlightning_module import LightningModule
 # import torch.optim as optim
 # from torchmetrics import Accuracy
 # from transformers import AutoTokenizer
@@ -9,10 +9,10 @@ from nanolightning.torchlightning_module import LightningModule
 import math
 import random
 import os
-from utils import setup_ebt, init_whole_model_weights
-from utils import MLP, Memory_Augmented_MLP, Memory_Gating_MLP, mask_q_tokens
-from replay_buffer import CausalReplayBuffer
-from metrics import calculate_bpb_score
+from openebm.elm.utils import setup_ebt, init_whole_model_weights
+from openebm.elm.utils import MLP, Memory_Augmented_MLP, Memory_Gating_MLP, mask_q_tokens
+from openebm.elm.replay_buffer import CausalReplayBuffer
+from openebm.elm.metrics import calculate_bpb_score
 
 import ipdb
 
