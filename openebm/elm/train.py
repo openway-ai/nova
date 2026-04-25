@@ -38,7 +38,7 @@ except ImportError:
     from pytorch_lightning.loggers import WandbLogger
     from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
 
-from disk_aware_checkpoint import DiskAwareCheckpoint
+from openebm.elm.disk_aware_checkpoint import DiskAwareCheckpoint
 
 import sys
 import wandb
@@ -47,16 +47,16 @@ import math
 from tqdm import tqdm
 import json
 import shutil
-import logger as text_logger
+from openebm.elm import logger as text_logger
 
 # from torch.utils.tensorboard import SummaryWriter # need to implement, which involves maybe changing the forward function
 
 # from utils.dataloader_debugger import debug_dataloader
 # from utils import load_trained_pl_model
-from utils import model_sizes, init_wandb_watch, call_style_gan_fvd
-import logger
-from trainer import ModelTrainer
-from eval import nlp_eval_acc
+from openebm.elm.utils import model_sizes, init_wandb_watch, call_style_gan_fvd
+from openebm.elm import logger
+from openebm.elm.trainer import ModelTrainer
+from openebm.elm.eval import nlp_eval_acc
 
 @rank_zero_only # to ensure only one wandb run is created, if didnt do that then each GPU would create its own wandb run
 def setup_wandb(args): 

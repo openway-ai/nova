@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from tokenizer import AutoTokenizer
+from openebm.elm.tokenizer import AutoTokenizer
 import matplotlib.pyplot as plt
 import io
 # import base64
@@ -70,7 +70,7 @@ def _get_tokenizer(hparams):
     if hasattr(hparams, '_cached_gen_tokenizer'):
         return hparams._cached_gen_tokenizer
 
-    from nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
+    from openebm.elm.nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
 
     if hasattr(hparams, 'tokenizer_obj') and hparams.tokenizer_obj is not None:
         tokenizer = hparams.tokenizer_obj

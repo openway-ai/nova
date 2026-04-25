@@ -1,4 +1,3 @@
-sys.path.append("../../")
 from nanochat.gpt import GPT, GPTConfig
 
 class NanoChatEBT(GPT):

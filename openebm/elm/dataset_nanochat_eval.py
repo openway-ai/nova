@@ -4,7 +4,6 @@ Enhanced NanoChat evaluation dataset with dual-mode support:
 2. Generation mode: Split sequence (first half as prompt, second half as ground truth)
 """
 import sys
-sys.path.append("../../")
 
 import torch
 from torch.utils.data import Dataset

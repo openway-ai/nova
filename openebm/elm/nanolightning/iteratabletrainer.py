@@ -25,8 +25,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from nanolightning.torchlightning_function import DDPStrategy, ModelCheckpoint
-from nanolightning.torchlightning_trainer import ModelSummary
+from openebm.elm.nanolightning.torchlightning_function import DDPStrategy, ModelCheckpoint
+from openebm.elm.nanolightning.torchlightning_trainer import ModelSummary
 
 
 class IterableTrainer:

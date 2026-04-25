@@ -27,11 +27,11 @@ import gc
 # from data.nlp.planbench_dataloader import PlanBenchDataset
 # from data.nlp.synthetic_dataset import NLPSyntheticDataset
 
-from collector import NLP_HF_Collator
+from openebm.elm.collector import NLP_HF_Collator
 from datasets import load_dataset, load_from_disk
 import os
 # from model.vid.ebt import EBT_VID
-from modeling_ebt import EBT_NLP
+from openebm.elm.modeling_ebt import EBT_NLP
 # from model.img.ebt_t2i import EBT_IMG_T2I
 # from model.img.ebt_denoise import EBT_IMG_Denoise
 
@@ -49,8 +49,8 @@ try:
     from lightning.pytorch import LightningModule
 except ImportError:
     from pytorch_lightning import LightningModule
-from dataset import IterableDataset, generate_dataloader
-from dataset_sft import generate_sft_dataloader
+from openebm.elm.dataset import IterableDataset, generate_dataloader
+from openebm.elm.dataset_sft import generate_sft_dataloader
 
 
 # Simple GSM8K Dataset class for inference
@@ -82,18 +82,17 @@ class GSM8KDataset(torch.utils.data.Dataset):
             raise ValueError(f"Execution mode not supported: {self.hparams.execution_mode}")
 
 # from utils import save_frames, denormalize, load_image_encoder, center_crop_arr
-from generate import generate_text, get_ppl
+from openebm.elm.generate import generate_text, get_ppl
 # from inference.vid.generate_video import generate_video
 # from inference.img.generate_image import generate_image
-from optimization import WarmUpCosineAnnealingLR, WarmUpLinearWarmdownLR, LARS, exclude_bias_and_norm, StableAdamW, StableAdamWUnfused
-import logger as text_logger
-from metrics import get_torchmetrics
+from openebm.elm.optimization import WarmUpCosineAnnealingLR, WarmUpLinearWarmdownLR, LARS, exclude_bias_and_norm, StableAdamW, StableAdamWUnfused
+from openebm.elm import logger as text_logger
+from openebm.elm.metrics import get_torchmetrics
 import sys
 from transformers import AutoTokenizer
 
 import ipdb
 
-sys.path.append("../../")
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
 class ModelTrainer(LightningModule):

@@ -29,12 +29,7 @@ import torch
 from contextlib import asynccontextmanager, nullcontext
 from typing import Optional, List, Dict, Any, AsyncGenerator
 
-# ── 路径设置 (与 chat_ebt.py 保持一致) ──
-repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-sys.path.insert(0, repo_root)
-sys.path.insert(0, os.path.join(repo_root, 'nova', 'ebt'))
-
-from generate import call_model_forward_decode, _get_tokenizer, sample_top_p
+from openebm.elm.generate import call_model_forward_decode, _get_tokenizer, sample_top_p
 
 # 清除分布式训练环境变量
 for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT']:

@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from utils import *
+from openebm.elm.utils import *
 
 
 @dataclass

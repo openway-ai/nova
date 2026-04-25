@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from utils import init_whole_model_weights
+from openebm.elm.utils import init_whole_model_weights
 
 
 class RMSNorm(torch.nn.Module):
