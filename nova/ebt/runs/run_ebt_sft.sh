@@ -10,6 +10,8 @@ set -e
 ### 基础配置 ###
 # EXP_ID 必须指定，指向 base_train 的实验目录
 # 例如: export EXP_ID="d26-ctx1024-muon_adamw-20260413-1235"
+export EXP_ID="d26-ctx2048-20260425"
+
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
 
@@ -23,7 +25,10 @@ export MODEL_SIZE="d26"
 # PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260407_001616/e=epoch=0-s=step=812-lr5e-05-bs4x16-muon_adamw-valid_loss=valid_loss=1.2609.ckpt"
 
 # base_train c1024 bpb 0.78
-PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-muon-adamw-0413_20260413_123504/s=step=27999-d26-ctx1024-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.6294.ckpt"
+# PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-muon-adamw-0413_20260413_123504/s=step=27999-d26-ctx1024-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.6294.ckpt"
+# TODO
+# base_train c2048 bpb 0.xx 
+PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep9562_20260424_211606/s=step=10937-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7801.ckpt"
 
 ### 环境变量 (对齐 resume_ebt_muon_adamw.sh + Offline 支持) ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -63,6 +68,8 @@ DEVICE_BATCH_SIZE=2
 GRAD_ACCUM=32
 # CONTEXT_LENGTH=512  # 受限于 base_train 阶段的上下文长度
 CONTEXT_LENGTH=1024  # 受限于 base_train 阶段的上下文长度
+CONTEXT_LENGTH=2048  # 受限于 base_train 阶段的上下文长度
+
 
 
 ################################################################################
