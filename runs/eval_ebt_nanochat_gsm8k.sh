@@ -3,7 +3,7 @@
 # EBT 评估使用示例（改进版）
 # 使用改进的评估脚本，输出结构化日志
 #
-# 运行位置: /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/runs/
+# 运行位置: /mnt/shared-storage-user/puyuan/code/nova/openebm/elm/runs/
 ################################################################################
 
 # 获取脚本所在目录的绝对路径

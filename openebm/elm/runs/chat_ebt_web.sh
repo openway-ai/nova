@@ -23,6 +23,7 @@ set -e
 # 获取脚本所在目录
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
+REPO_ROOT="$( cd "$EBT_DIR/../.." && pwd )"
 
 # 默认配置 (与 chat_ebt.sh 保持一致)
 DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
@@ -205,15 +206,15 @@ OVERRIDE_FLAGS=""
 [ -n "$OVERRIDE_NOISE_STD" ] && OVERRIDE_FLAGS="$OVERRIDE_FLAGS --override-noise-std $OVERRIDE_NOISE_STD"
 [ -n "$OVERRIDE_ALPHA" ] && OVERRIDE_FLAGS="$OVERRIDE_FLAGS --override-alpha $OVERRIDE_ALPHA"
 
-# 切换到 EBT 目录
-cd "$EBT_DIR"
+# 切换到 repo root（绝对 import 需要从 repo root 运行）
+cd "$REPO_ROOT"
 
 # 运行 Python Web 服务
 PYTHON="${CONDA_ENV_PATH}/bin/python"
 if [ ! -x "$PYTHON" ]; then
     PYTHON="python"
 fi
-$PYTHON -m scripts.chat_ebt_web \
+$PYTHON -m openebm.elm.scripts.chat_ebt_web \
     --checkpoint "$CKPT_PATH" \
     --tokenizer "$TOKENIZER_PATH" \
     --temperature "$TEMPERATURE" \

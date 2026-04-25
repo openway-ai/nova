@@ -12,8 +12,8 @@
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
 export OMP_NUM_THREADS=1
-export NOVA_BASE_DIR="$HOME/.cache/nova/ebt"
-mkdir -p $NOVA_BASE_DIR
+export OPENEBM_BASE_DIR="$HOME/.cache/openebm/elm"
+mkdir -p $OPENEBM_BASE_DIR
 
 # -----------------------------------------------------------------------------
 # Python venv setup with uv

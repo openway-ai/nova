@@ -175,7 +175,7 @@ echo ""
 
 set +e
 
-torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/openebm/elm/train.py \
 --run_name ${RUN_NAME}_${current_time} \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \

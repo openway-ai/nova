@@ -42,12 +42,12 @@ TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/nanochat/
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RUN_NAME=$(basename $(dirname "$CKPT_PATH"))
 CKPT_FILENAME=$(basename "$CKPT_PATH" .ckpt)
-OUTPUT_DIR="../../nova/ebt/logs/core_eval/${RUN_NAME}/${CKPT_FILENAME}"
-LOG_FILE="../../nova/ebt/logs/core_eval_${TIMESTAMP}.log"
+OUTPUT_DIR="../../openebm/elm/logs/core_eval/${RUN_NAME}/${CKPT_FILENAME}"
+LOG_FILE="../../openebm/elm/logs/core_eval_${TIMESTAMP}.log"
 
 # 创建输出目录
 cd /mnt/shared-storage-user/puyuan/code/nanochat
-cd nova/ebt
+cd openebm/elm
 mkdir -p "$(dirname "$OUTPUT_DIR")"
 mkdir -p "logs"
 cd ../..
@@ -110,9 +110,9 @@ echo "════════════════════════�
 echo ""
 
 # 构建评估命令
-cd nova/ebt
+cd openebm/elm
 
-EVAL_CMD="python -m scripts.ebt_core_eval \
+EVAL_CMD="python -m openebm.elm.scripts.ebt_core_eval \
     --ckpt-path '$CKPT_PATH' \
     --tokenizer-path '$TOKENIZER_PATH' \
     --eval-bundle-dir '$NANOCHAT_BASE_DIR/eval_bundle' \

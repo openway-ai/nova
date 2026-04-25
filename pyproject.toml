@@ -1,5 +1,5 @@
 [project]
-name = "nova-nanochat"
+name = "openebm"
 version = "0.1.0"
 description = "the minimal full-stack ChatGPT clone"
 readme = "README.md"
