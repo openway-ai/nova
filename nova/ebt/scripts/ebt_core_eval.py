@@ -8,6 +8,7 @@ import csv
 import time
 import json
 import yaml
+import heapq
 import random
 import argparse
 import glob as glob_module
@@ -448,17 +449,96 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1,
     }
 
 
+def _greedy_assign_tasks(all_tasks, num_gpus, history_timing):
+    """
+    贪心调度：按预估耗时降序排列任务，每次将最重的任务分给累计负载最轻的 GPU。
+    如果没有历史 timing 数据，fall back 到 round-robin。
+
+    Args:
+        all_tasks: 任务列表 (core.yaml 中的 icl_tasks)
+        num_gpus: GPU 数量
+        history_timing: dict, 历史 timing 数据 (timing_summary.json 的内容), 或 None
+
+    Returns:
+        dict: {rank: [task_index, ...]} — 每个 GPU 分配的任务索引列表
+    """
+    # 尝试从历史 timing 中提取每个任务的耗时
+    per_task_duration = {}
+    if history_timing is not None:
+        per_task = history_timing.get("per_task", {})
+        if not per_task:
+            # Try flat list / records format
+            if isinstance(history_timing, list):
+                per_task = {rec["task"]: rec["duration_seconds"]
+                            for rec in history_timing if "task" in rec}
+            elif "timing" in history_timing:
+                per_task = {rec["task"]: rec["duration_seconds"]
+                            for rec in history_timing["timing"] if "task" in rec}
+            elif "records" in history_timing:
+                per_task = {rec["task"]: rec["duration_seconds"]
+                            for rec in history_timing["records"] if "task" in rec}
+
+        for label, val in per_task.items():
+            if isinstance(val, dict):
+                per_task_duration[label] = val.get("duration_seconds", 0)
+            else:
+                per_task_duration[label] = float(val)
+
+    # 如果没有任何历史 timing，fall back 到 round-robin
+    if not per_task_duration:
+        assignment = {r: [] for r in range(num_gpus)}
+        for i in range(len(all_tasks)):
+            assignment[i % num_gpus].append(i)
+        return assignment, False  # False = 没有使用贪心
+
+    # 贪心调度
+    # 1. 为每个任务获取预估耗时 (未见过的任务用中位数)
+    known_durations = list(per_task_duration.values())
+    median_duration = sorted(known_durations)[len(known_durations) // 2] if known_durations else 60.0
+
+    task_costs = []
+    for i, task in enumerate(all_tasks):
+        label = task['label']
+        cost = per_task_duration.get(label, median_duration)
+        task_costs.append((i, label, cost))
+
+    # 2. 按耗时降序排列 (最重的任务优先分配)
+    task_costs.sort(key=lambda x: x[2], reverse=True)
+
+    # 3. 贪心分配：每次将最重的任务分给当前累计负载最轻的 GPU
+    # Min-heap of (cumulative_cost, rank)
+    gpu_heap = [(0.0, r) for r in range(num_gpus)]
+    heapq.heapify(gpu_heap)
+    assignment = {r: [] for r in range(num_gpus)}
+
+    for task_idx, label, cost in task_costs:
+        min_cost, min_rank = heapq.heappop(gpu_heap)
+        assignment[min_rank].append(task_idx)
+        heapq.heappush(gpu_heap, (min_cost + cost, min_rank))
+
+    return assignment, True  # True = 使用了贪心调度
+
+
 def _eval_worker(rank, world_size, ckpt_path, tokenizer_path, dtype,
                  eval_bundle_dir, max_per_task, task_samples,
                  all_tasks, random_baselines, result_dict,
-                 timing_list, output_dir, num_trajectory_samples):
-    """多 GPU 评估的 worker 进程，根据 rank 自动计算分配的任务"""
+                 timing_list, output_dir, num_trajectory_samples,
+                 per_rank_indices=None):
+    """多 GPU 评估的 worker 进程
+
+    Args:
+        per_rank_indices: dict {rank: [task_index, ...]}，由主进程预先计算好的
+                          任务分配 (贪心调度)。如果为 None，fall back 到 round-robin。
+    """
     device = torch.device(f'cuda:{rank}')
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('medium')
 
-    # 根据 rank 计算自己负责的任务 (round-robin)
-    task_indices = [i for i in range(len(all_tasks)) if i % world_size == rank]
+    # 使用预计算的任务分配，或 fall back 到 round-robin
+    if per_rank_indices is not None and rank in per_rank_indices:
+        task_indices = list(per_rank_indices[rank])
+    else:
+        task_indices = [i for i in range(len(all_tasks)) if i % world_size == rank]
 
     print(f"[GPU {rank}] Loading model... ({len(task_indices)} tasks assigned)")
     sys.stdout.flush()
@@ -546,8 +626,9 @@ def _eval_worker(rank, world_size, ckpt_path, tokenizer_path, dtype,
 
 def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
                            eval_bundle_dir, max_per_task, task_samples,
-                           output_dir=None, num_trajectory_samples=10):
-    """多 GPU 并行评估：按任务 round-robin 分片到各 GPU"""
+                           output_dir=None, num_trajectory_samples=10,
+                           history_timing_path=None):
+    """多 GPU 并行评估：使用贪心调度按预估耗时均衡分配任务到各 GPU"""
     config_path = os.path.join(eval_bundle_dir, "core.yaml")
     eval_meta_data = os.path.join(eval_bundle_dir, "eval_meta_data.csv")
 
@@ -561,12 +642,41 @@ def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
         for row in reader:
             random_baselines[row['Eval Task']] = float(row['Random baseline'])
 
+    # 加载历史 timing 用于贪心调度
+    history_timing = None
+    if history_timing_path and os.path.isfile(history_timing_path):
+        try:
+            with open(history_timing_path, 'r', encoding='utf-8') as f:
+                history_timing = json.load(f)
+        except Exception as e:
+            print(f"  Warning: could not load history timing for scheduling: {e}")
+
+    # 贪心调度 (或 fall back 到 round-robin)
+    assignment, used_greedy = _greedy_assign_tasks(all_tasks, num_gpus, history_timing)
+
     print(f"\n{'='*80}")
+    scheduling_method = "greedy load-balanced" if used_greedy else "round-robin (no history timing)"
     print(f"Running CORE Evaluation (multi-GPU: {num_gpus} GPUs, {len(all_tasks)} tasks)")
+    print(f"Task scheduling: {scheduling_method}")
     print(f"{'='*80}")
     for rank in range(num_gpus):
-        task_names = [all_tasks[i]['label'] for i in range(len(all_tasks)) if i % num_gpus == rank]
-        print(f"  GPU {rank}: {len(task_names)} tasks -- {', '.join(task_names)}")
+        task_names = [all_tasks[i]['label'] for i in assignment[rank]]
+        # 显示预估耗时 (如果有历史 timing)
+        if used_greedy and history_timing is not None:
+            per_task = history_timing.get("per_task", {})
+            if not per_task and "records" in history_timing:
+                per_task = {rec["task"]: rec for rec in history_timing["records"] if "task" in rec}
+            total_est = 0
+            for idx in assignment[rank]:
+                label = all_tasks[idx]['label']
+                val = per_task.get(label, {})
+                if isinstance(val, dict):
+                    total_est += val.get("duration_seconds", 0)
+                else:
+                    total_est += float(val)
+            print(f"  GPU {rank}: {len(task_names)} tasks (est. {total_est:.0f}s = {total_est/60:.1f}min) -- {', '.join(task_names)}")
+        else:
+            print(f"  GPU {rank}: {len(task_names)} tasks -- {', '.join(task_names)}")
     print()
 
     # 共享结果字典和 timing 列表
@@ -574,13 +684,19 @@ def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
     result_dict = manager.dict()
     timing_list = manager.list()
 
-    # 使用 mp.spawn — worker 内部根据 rank 自动计算任务分配
+    # 将每个 rank 的任务索引列表转为 manager.list 以便跨进程传递
+    per_rank_indices = manager.dict()
+    for rank in range(num_gpus):
+        per_rank_indices[rank] = assignment[rank]
+
+    # 使用 mp.spawn — 传递预计算好的任务分配
     mp.spawn(
         _eval_worker,
         args=(num_gpus, ckpt_path, tokenizer_path, dtype,
               eval_bundle_dir, max_per_task, task_samples,
               all_tasks, random_baselines, result_dict,
-              timing_list, output_dir, num_trajectory_samples),
+              timing_list, output_dir, num_trajectory_samples,
+              per_rank_indices),
         nprocs=num_gpus,
         join=True,
     )
@@ -785,6 +901,7 @@ def main():
             task_samples=task_samples_dict if task_samples_dict else None,
             output_dir=args.output_dir,
             num_trajectory_samples=args.num_trajectory_samples,
+            history_timing_path=history_timing_path,
         )
     else:
         # 单 GPU / CPU 路径
