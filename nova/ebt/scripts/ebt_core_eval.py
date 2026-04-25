@@ -23,6 +23,11 @@ sys.path.insert(0, "/mnt/shared-storage-user/puyuan/code/nanochat")
 
 from trainer import ModelTrainer
 from nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
+from nanochat.core_eval import (
+    evaluate_example,
+    evaluate_task as _nanochat_evaluate_task,
+    forward_model,
+)
 
 
 class EBTModelWrapper:
@@ -86,6 +91,8 @@ def load_ebt_model(ckpt_path, tokenizer_path, device, dtype=torch.bfloat16):
     # 设置推理模式参数
     hparams['execution_mode'] = 'inference'
     hparams['no_wandb'] = True
+    # 禁用 torch.compile — eval 不需要编译，且 compile + MCMC grad + mp.spawn 会导致 CUBLAS 错误
+    hparams['compile_model'] = False
 
     # 加载模型
     model_trainer = ModelTrainer(hparams)
@@ -117,148 +124,24 @@ def load_ebt_model(ckpt_path, tokenizer_path, device, dtype=torch.bfloat16):
     # 加载 tokenizer
     from nanochat.tokenizer import get_tokenizer
     tokenizer_obj = get_tokenizer()
-    tokenizer = NanoChatTokenizerWrapper(tokenizer_obj=tokenizer_obj)
+    tokenizer_wrapper = NanoChatTokenizerWrapper(tokenizer_obj=tokenizer_obj)
 
     # 获取最大序列长度
     max_seq_len = hparams.get('context_length', 256)
 
     # 包装模型
-    wrapped_model = EBTModelWrapper(model, tokenizer, device, max_seq_len=max_seq_len)
+    wrapped_model = EBTModelWrapper(model, tokenizer_wrapper, device, max_seq_len=max_seq_len)
 
     print(f"✓ Model loaded: {hparams['model_name']} (size: {hparams.get('model_size', 'unknown')})")
     print(f"✓ Context length: {max_seq_len}")
 
-    return wrapped_model, tokenizer, hparams
+    # 返回原始 RustBPETokenizer 给 eval 函数（nanochat core_eval 需要 .get_bos_token_id() 和 __call__(prompts, prepend=...) 接口）
+    return wrapped_model, tokenizer_obj, hparams
 
 
 def evaluate_task(model, tokenizer, data, device, task_meta, max_seq_len=None):
-    """
-    评估单个 CORE 任务
-    改编自 nanochat.core_eval.evaluate_task
-    """
-    task_type = task_meta['task_type']
-    num_fewshot = task_meta['num_fewshot']
-    continuation_delimiter = task_meta['continuation_delimiter']
-
-    correct = 0
-    total = 0
-
-    for example_idx, example in enumerate(data):
-        if task_type == 'multiple_choice':
-            # 多选题任务
-            context = example.get('context', '')
-            question = example.get('query', example.get('question', ''))
-            choices = example['choices']
-            answer_idx = example['gold']
-
-            # 构建提示
-            prompt = context + question if context else question
-            if continuation_delimiter:
-                prompt += continuation_delimiter
-
-            # 编码提示
-            prompt_ids = tokenizer.encode(prompt)
-            prompt_tokens = torch.tensor([prompt_ids], dtype=torch.long).to(device)
-
-            # 计算每个选项的 loss
-            choice_losses = []
-            for choice in choices:
-                choice_ids = tokenizer.encode(choice, add_special_tokens=False)
-                choice_tokens = torch.tensor([choice_ids], dtype=torch.long).to(device)
-                full_tokens = torch.cat([prompt_tokens, choice_tokens], dim=1)
-
-                # 截断到 max_seq_len（从左截，保留 choice 尾部）
-                if max_seq_len and full_tokens.shape[1] > max_seq_len:
-                    full_tokens = full_tokens[:, -max_seq_len:]
-                    actual_prompt_len = max(0, max_seq_len - choice_tokens.shape[1])
-                else:
-                    actual_prompt_len = prompt_tokens.shape[1]
-
-                # 计算损失（只对 choice 部分）
-                with torch.no_grad():
-                    logits = model(full_tokens)
-                    targets = full_tokens[:, 1:].contiguous()
-                    logits_choice = logits[:, actual_prompt_len-1:-1, :].contiguous()
-
-                    loss = F.cross_entropy(
-                        logits_choice.view(-1, logits_choice.size(-1)),
-                        targets[:, actual_prompt_len-1:].view(-1),
-                        reduction='mean'
-                    )
-                    choice_losses.append(loss.item())
-
-            # 选择 loss 最小的选项
-            predicted_idx = np.argmin(choice_losses)
-            if predicted_idx == answer_idx:
-                correct += 1
-            total += 1
-
-        elif task_type == 'language_modeling':
-            # 语言建模任务
-            context = example.get('context', '')
-            continuation = example.get('continuation', example.get('answer', ''))
-
-            # 构建输入
-            if continuation_delimiter:
-                full_text = context + continuation_delimiter + continuation
-            else:
-                full_text = context + continuation
-
-            full_ids = tokenizer.encode(full_text)
-            tokens = torch.tensor([full_ids], dtype=torch.long).to(device)
-            if max_seq_len and tokens.shape[1] > max_seq_len:
-                tokens = tokens[:, -max_seq_len:]
-
-            # 计算困惑度
-            with torch.no_grad():
-                logits = model(tokens)
-                targets = tokens[:, 1:].contiguous()
-                logits = logits[:, :-1, :].contiguous()
-
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1),
-                    reduction='mean'
-                )
-                # 对于语言建模任务，低困惑度表示好的性能
-                # 这里简化处理：如果 ppl < 某个阈值则认为正确
-                ppl = torch.exp(loss).item()
-                if ppl < 50:  # 简单阈值
-                    correct += 1
-                total += 1
-
-        elif task_type == 'schema':
-            # Schema 任务（如 Winograd）
-            # 这类任务通常需要特殊处理
-            # 简化处理：选择 loss 最小的候选
-            choices = example.get('choices', [])
-            if not choices:
-                continue
-
-            answer_idx = example.get('gold', 0)
-
-            choice_losses = []
-            for choice_text in choices:
-                choice_ids = tokenizer.encode(choice_text)
-                tokens = torch.tensor([choice_ids], dtype=torch.long).to(device)
-                if max_seq_len and tokens.shape[1] > max_seq_len:
-                    tokens = tokens[:, -max_seq_len:]
-                with torch.no_grad():
-                    loss = model(tokens, targets=tokens[:, 1:])
-                    choice_losses.append(loss.item())
-
-            predicted_idx = np.argmin(choice_losses)
-            if predicted_idx == answer_idx:
-                correct += 1
-            total += 1
-
-        # 打印进度
-        if (example_idx + 1) % 10 == 0:
-            print(f"  Progress: {example_idx + 1}/{len(data)} examples", end='\r')
-
-    print()  # 换行
-    accuracy = correct / total if total > 0 else 0.0
-    return accuracy
+    """适配 nanochat 的 evaluate_task，忽略 max_seq_len 参数（已通过 model.max_seq_len 传递）"""
+    return _nanochat_evaluate_task(model, tokenizer, data, device, task_meta)
 
 
 def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1, task_samples=None):
@@ -368,6 +251,7 @@ def _eval_worker(rank, world_size, ckpt_path, tokenizer_path, dtype,
     task_indices = [i for i in range(len(all_tasks)) if i % world_size == rank]
 
     print(f"[GPU {rank}] Loading model... ({len(task_indices)} tasks assigned)")
+    sys.stdout.flush()
     model, tokenizer, hparams = load_ebt_model(ckpt_path, tokenizer_path, device, dtype=dtype)
 
     data_base_path = os.path.join(eval_bundle_dir, "eval_data")
@@ -385,6 +269,7 @@ def _eval_worker(rank, world_size, ckpt_path, tokenizer_path, dtype,
         }
 
         print(f"[GPU {rank}] [{task_idx+1}/{len(all_tasks)}] Evaluating: {label}")
+        sys.stdout.flush()
 
         # 加载数据
         data_path = os.path.join(data_base_path, task_meta['dataset_uri'])
@@ -411,6 +296,7 @@ def _eval_worker(rank, world_size, ckpt_path, tokenizer_path, dtype,
 
         elapsed = time.time() - start_time
         print(f"[GPU {rank}]   ✓ {label}: acc={accuracy:.4f} centered={centered_result:.4f} ({elapsed:.2f}s)")
+        sys.stdout.flush()
 
         result_dict[label] = (accuracy, centered_result)
 
