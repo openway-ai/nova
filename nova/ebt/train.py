@@ -89,7 +89,7 @@ def main(args):
         run = None # need both lines since setup_wandb is a @rank_zero_only function
         run = setup_wandb(args)
 
-        wandb_logger = WandbLogger(save_dir="logs/", name=f'{args.run_name}', entity=f'{args.wandb_entity}', project=f'{args.wandb_project}', offline = args.wandb_offline, experiment=run)
+        wandb_logger = WandbLogger(save_dir=args.wandb_save_dir, name=f'{args.run_name}', entity=f'{args.wandb_entity}', project=f'{args.wandb_project}', offline = args.wandb_offline, experiment=run)
         if args.wandb_tags != None:
             wandb_logger.experiment.tags = args.wandb_tags
     else:
@@ -210,9 +210,10 @@ def main(args):
         torch.set_float32_matmul_precision(args.set_matmul_precision)
     
     opt_name = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
+    ckpt_dir = args.checkpoint_dir if args.checkpoint_dir else f"./logs/checkpoints/{args.run_name}"
     checkpoint_filename = f"s={{step}}-{args.model_size}-ctx{args.context_length}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
     save_last = (args.save_periodic_steps <= 0)  # periodic 启用时不需要 last.ckpt，periodic 已覆盖 crash recovery
-    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=f"./logs/checkpoints/{args.run_name}", filename=checkpoint_filename, verbose=True, min_free_gb=50)
+    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=ckpt_dir, filename=checkpoint_filename, verbose=True, min_free_gb=50)
 
     # 定期保存 checkpoint（不依赖 val_loss），防止 SFT 后期模型丢失
     periodic_checkpoint = None
@@ -221,7 +222,7 @@ def main(args):
             save_top_k=1,
             save_last=False,
             every_n_train_steps=args.save_periodic_steps,
-            dirpath=f"./logs/checkpoints/{args.run_name}",
+            dirpath=ckpt_dir,
             filename=f"periodic-s={{step}}-{args.model_size}-ctx{args.context_length}",
             verbose=True,
             min_free_gb=50
@@ -840,6 +841,11 @@ if __name__ == '__main__':
     parser.add_argument("--checkpoint_monitor_mode", help="monitoring mode for checkpoint_monitor_string, either ['min', 'max']. if is loss do min, if is a metric like accuracy do max", type=str, default="min")
 
     parser.add_argument("--save_top_k_ckpts", help="number of ckpts to save when doing val (saves the ones with best metrics using checkpoint monitor string and mode defined). -1 means save all", type=int, default=10)
+
+    parser.add_argument("--checkpoint_dir", type=str, default="",
+        help="Override checkpoint directory (default: ./logs/checkpoints/{run_name})")
+    parser.add_argument("--wandb_save_dir", type=str, default="logs/",
+        help="Override WandB save directory")
 
     parser.add_argument("--save_periodic_steps", type=int, default=0,
         help="Save checkpoint every N training steps regardless of val_loss (0=disabled). Useful for SFT where val_loss may rise while task performance improves.")

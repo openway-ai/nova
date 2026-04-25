@@ -9,9 +9,9 @@
 ################################################################################
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-ctx1024-exact-resume"
-
-export MODEL_NAME="${RUN_NAME%%-*}"
+# EXP_ID 必须指定，指向原始 base_train 的实验目录
+# 例如: export EXP_ID="d26-ctx1024-muon_adamw-20260413-1235"
+export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
 
 ### 恢复训练配置 ###
@@ -91,11 +91,19 @@ COMPILE_FLAGS="--compile_model --compile_mode full"
 WANDB_FLAGS=""
 
 ################################################################################
-# 日志配置
+# 实验目录布局 - 在 base_train/ 下创建 resume_v{N}/ 子目录
 ################################################################################
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/utils/exp_layout.sh"
+
+export RESUME_CKPT="${RESUME_CKPT}"
+exp_init_resume "$0"
+export RUN_NAME="${EXP_ID}-resume"
+export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+
+LOG_FILE="${EXP_LOG_FILE}"
 current_time=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="logs/${current_time}_${MODEL_NAME}_${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_exact-resume.log"
-mkdir -p logs
 
 ################################################################################
 # 显示配置
@@ -162,6 +170,8 @@ set +e
 
 torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
 --run_name ${RUN_NAME}_${current_time} \
+--checkpoint_dir "${EXP_CKPT_DIR}" \
+--wandb_save_dir "${EXP_WANDB_DIR}" \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
 --model_size ${MODEL_SIZE} \
@@ -208,6 +218,8 @@ ${COMPILE_FLAGS}
 
 TRAIN_EXIT_CODE=$?
 set -e
+
+exp_save_status "${RESUME_DIR}" "resume" "$TRAIN_EXIT_CODE"
 
 if [ $TRAIN_EXIT_CODE -eq 0 ]; then
     echo -e "\033[0;32m✓ 精确续训成功完成\033[0m"

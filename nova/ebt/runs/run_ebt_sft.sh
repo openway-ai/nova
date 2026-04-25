@@ -8,10 +8,9 @@
 set -e
 
 ### 基础配置 ###
-# export RUN_NAME="ebt-d26-sft-0406-from0327-v2"
-export RUN_NAME="ebt-d26-sft-0420-from0413"
-
-export MODEL_NAME="${RUN_NAME%%-*}"
+# EXP_ID 必须指定，指向 base_train 的实验目录
+# 例如: export EXP_ID="d26-ctx1024-muon_adamw-20260413-1235"
+export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
 
 ### 预训练权重 ###
@@ -168,11 +167,35 @@ echo "✓ Checkpoint: ${PRETRAIN_CKPT}"
 echo ""
 
 ################################################################################
-# 日志配置
+# 实验目录布局 - 统一输出到 ebt_runs/<exp_id>/sft_train/
 ################################################################################
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/utils/exp_layout.sh"
+
+export PRETRAIN_CKPT="${PRETRAIN_CKPT}"
+exp_init_sft "$0"
+export RUN_NAME="${EXP_ID}-sft"
+export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+
+exp_save_hparams "${EXP_DIR}/sft_train" \
+    "model_size=${MODEL_SIZE}" \
+    "context_length=${CONTEXT_LENGTH}" \
+    "peak_lr=${PEAK_LR}" \
+    "sft_muon_lr=${SFT_MUON_LR}" \
+    "sft_embedding_lr=${SFT_EMBEDDING_LR}" \
+    "weight_decay=${WEIGHT_DECAY}" \
+    "device_batch_size=${DEVICE_BATCH_SIZE}" \
+    "grad_accum=${GRAD_ACCUM}" \
+    "num_gpus=${NUM_GPUS}" \
+    "max_steps=${MAX_STEPS}" \
+    "mcmc_step_size=${MCMC_STEP_SIZE}" \
+    "mcmc_lr_multiplier=${MCMC_STEP_SIZE_LR_MULTIPLIER}" \
+    "pretrain_ckpt=${PRETRAIN_CKPT}" \
+    "optimizer=muon_adamw"
+
+LOG_FILE="${EXP_LOG_FILE}"
 current_time=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="logs/${current_time}_${MODEL_NAME}_${MODEL_SIZE}_sft.log"
-mkdir -p logs
 
 ################################################################################
 # 显示配置
@@ -233,6 +256,8 @@ set -e
 
 torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
 --run_name ${RUN_NAME}_${current_time} \
+--checkpoint_dir "${EXP_CKPT_DIR}" \
+--wandb_save_dir "${EXP_WANDB_DIR}" \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
 --model_size ${MODEL_SIZE} \
@@ -274,6 +299,8 @@ ${COMPILE_FLAGS}
 
 TRAIN_EXIT_CODE=$?
 set -e
+
+exp_save_status "${EXP_DIR}/sft_train" "sft_train" "$TRAIN_EXIT_CODE"
 
 if [ $TRAIN_EXIT_CODE -eq 0 ]; then
     echo -e "\033[0;32m✓ SFT 训练成功完成\033[0m"
