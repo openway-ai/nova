@@ -105,16 +105,14 @@ class EBT_NLP(LightningModule):
         energy_preds = energy_preds.reshape(-1, 1)
         
         with torch.amp.autocast(device_type='cuda', enabled=False):
-            grad_input = predicted_tokens.float()
-            grad_input.requires_grad_(True)
             energy_f32 = energy_preds.float()
             if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
                 if i == (num_mcmc_steps - 1):
-                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [grad_input], create_graph=learning)[0]
+                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
                 else:
-                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [grad_input], create_graph=False)[0]
+                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=False)[0]
             else:
-                predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [grad_input], create_graph=learning)[0]
+                predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
         # predicted_tokens_grad has shape B, S, V
         
         if self.hparams.clamp_futures_grad:

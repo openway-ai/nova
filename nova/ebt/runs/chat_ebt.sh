@@ -182,6 +182,12 @@ export HF_HUB_OFFLINE=1
 export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
+# 确保 pip-installed 的 nvidia cuBLAS 优先于系统库，避免版本不兼容导致 CUBLAS_STATUS_INVALID_VALUE
+export LD_LIBRARY_PATH=/mnt/shared-storage-user/puyuan/conda_envs/nanochat/lib/python3.10/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH:-}
+
+# 确保 pip-installed 的 nvidia 库优先于系统库，避免 cuBLAS 版本冲突导致 CUBLAS_STATUS_INVALID_VALUE
+export LD_LIBRARY_PATH=/mnt/shared-storage-user/puyuan/conda_envs/nanochat/lib/python3.10/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH:-}
+
 # 清除分布式训练环境变量
 unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
 

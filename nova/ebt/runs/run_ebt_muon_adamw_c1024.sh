@@ -26,13 +26,13 @@
 #SBATCH --output=logs/slurm/nlp/ebt-d26-stable_%A-%a.log
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-ctx1024-0417"
+export RUN_NAME="ebt-d26-ctx1024-0422"
 
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="d26"
 
 ### 环境变量 ###
-HOME="/mnt/shared-storage-user/luyudong/nanochat"
+HOME="/mnt/shared-storage-user/puyuan/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
 # PyTorch 内存优化
@@ -401,7 +401,7 @@ print_header "开始训练"
 echo ""
 
 set +e
-torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/luyudong/nova/nova/ebt/train.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/nova/nova/ebt/train.py \
 --run_name ${RUN_NAME}_${current_time} \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \

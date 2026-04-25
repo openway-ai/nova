@@ -21,6 +21,17 @@ export NANOCHAT_OFFLINE_MODE=1
 export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
+# 确保 pip-installed 的 nvidia cuBLAS 优先于系统库，避免版本不兼容导致 CUBLAS_STATUS_INVALID_VALUE
+export LD_LIBRARY_PATH=/mnt/shared-storage-user/puyuan/conda_envs/nanochat/lib/python3.10/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH:-}
+# mp.spawn 子进程通过管道输出时 stdout 全缓冲，导致看不到实时进度
+export PYTHONUNBUFFERED=1
+
+# 确保 pip-installed 的 nvidia 库优先于系统库，避免 cuBLAS 版本冲突导致 CUBLAS_STATUS_INVALID_VALUE
+export LD_LIBRARY_PATH=/mnt/shared-storage-user/puyuan/conda_envs/nanochat/lib/python3.10/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH:-}
+
+# mp.spawn 子进程通过管道输出时 stdout 默认全缓冲，导致 | tee 场景下看不到实时输出
+export PYTHONUNBUFFERED=1
+
 # =============================================================================
 # 参数配置
 # =============================================================================
@@ -30,6 +41,10 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 # export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0420-from0413_20260420_193427/periodic-s=step=2999-d26-ctx1024.ckpt}"
 export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-sft-0420-from0413_20260420_193427/s=step=1953-d26-ctx1024-lr5e-05-bs2x32-muon_adamw-valid_loss=valid_loss=2.1394.ckpt}"
+
+# base-train ckpt
+# export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-muon-adamw-0413_20260413_123504/s=step=27999-d26-ctx1024-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.6294.ckpt}"
+
 
 if [ -z "$CKPT_PATH" ]; then
     echo "错误: 必须指定 checkpoint 路径"
