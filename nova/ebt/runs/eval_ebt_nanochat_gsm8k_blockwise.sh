@@ -22,6 +22,9 @@ export INFER_BLOCK_SIZE="${INFER_BLOCK_SIZE:-4}"
 export INFER_BLOCK_USE_REFINE="${INFER_BLOCK_USE_REFINE:-true}"
 export INFER_BLOCK_REFINE_STEPS="${INFER_BLOCK_REFINE_STEPS:-4}"
 export INFER_BLOCK_INIT_LOGIT_SCALE="${INFER_BLOCK_INIT_LOGIT_SCALE:-8.0}"
+# mtp_mcmc is the explicit block_mode for current dev-blockwise checkpoints.
+# This must match what the checkpoint was trained with; no silent fallback.
+export BLOCK_MODE="${BLOCK_MODE:-mtp_mcmc}"
 export PYTHONNOUSERSITE=1
 # For NanoChat shard eval, generation in test_step is very expensive with blockwise refine.
 # Default to PPL-only there; GSM8K task still runs generation as expected.

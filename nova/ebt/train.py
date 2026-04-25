@@ -176,7 +176,31 @@ def main(args):
             raise ValueError("--contrastive_loss is not supported with --training_objective blockwise")
         if args.execution_mode == "finetune":
             raise ValueError("execution_mode=finetune is not supported with --training_objective blockwise yet")
-    
+
+    # Resolve the explicit attention / training semantic. This value must flow
+    # unchanged through the model, training loop, and every inference path.
+    # Defaults: training_objective=dense_next_token -> dense_token;
+    # training_objective=blockwise -> mtp_mcmc (this is the "current
+    # dev-blockwise behaviour" the user runs today).
+    if args.block_mode is None:
+        if args.training_objective == "blockwise":
+            args.block_mode = "mtp_mcmc"
+        else:
+            args.block_mode = "dense_token"
+    if args.block_mode in ("future_latent_non_causal", "blockwise"):
+        raise NotImplementedError(
+            f"--block_mode {args.block_mode!r} is reserved; its algorithm is not implemented yet."
+        )
+    if args.block_mode == "mtp_mcmc" and args.training_objective != "blockwise":
+        raise ValueError(
+            "--block_mode mtp_mcmc requires --training_objective blockwise for training."
+        )
+    if args.block_mode == "dense_token" and args.training_objective != "dense_next_token":
+        raise ValueError(
+            "--block_mode dense_token requires --training_objective dense_next_token for training."
+        )
+    print(f"[block_mode] Using block_mode={args.block_mode!r} (training_objective={args.training_objective})")
+
     # assert not(args.random_num_mcmc_steps == True and args.reconstruct_loss_only_final_step == True), "cannot have both random_num_mcmc_steps and reconstruct_loss_only_final_step set"
     # if args.ramp_up_num_mcmc_steps_every_x_epochs != -1:
     #     assert args.random_num_mcmc_steps, "random_num_mcmc_steps needs to be True"
@@ -592,6 +616,19 @@ if __name__ == '__main__':
 
     parser.add_argument("--context_length", help="context length for AR models, i.e. for language model (commonly 256) or video model (commonly 16)", type=int, default=0)
     parser.add_argument("--training_objective", help="training target construction objective (blockwise now uses dense MTP-style K-offset supervision)", choices=["dense_next_token", "blockwise"], type=str, default="dense_next_token")
+    parser.add_argument(
+        "--block_mode",
+        help=(
+            "explicit attention / training semantic that the trunk and all "
+            "downstream MCMC / refine / inference paths dispatch on. Replaces the "
+            "old implicit 'legacy_symmetric = (pred_len == context_len)' branching. "
+            "If unset, a default is chosen from --training_objective: "
+            "dense_next_token -> dense_token, blockwise -> mtp_mcmc."
+        ),
+        choices=["dense_token", "mtp_mcmc", "future_latent_non_causal", "blockwise"],
+        type=str,
+        default=None,
+    )
     parser.add_argument("--train_block_size", help="number of future offsets K for dense blockwise supervision", type=int, default=2)
     parser.add_argument("--train_context_length", help="[compat-only] legacy sampled-block context length (ignored in dense blockwise mode)", type=int, default=None)
     parser.add_argument("--num_block_samples_per_window", help="[compat-only] legacy sampled-block count (kept for CLI compatibility, ignored by dense blockwise path)", type=int, default=4)

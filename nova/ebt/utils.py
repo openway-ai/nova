@@ -25,6 +25,14 @@ from dataclasses import dataclass
 # import json
 
 
+BLOCK_MODE_CHOICES = (
+    "dense_token",
+    "mtp_mcmc",
+    "future_latent_non_causal",
+    "blockwise",
+)
+
+
 @dataclass
 class EBTModelArgs:
     dim: int = 768
@@ -42,6 +50,11 @@ class EBTModelArgs:
     ebt_act_func: str = "silu"
     weight_initialization_gain: float = 1.0
     debug_blockwise_shapes: bool = False
+    # Explicit attention / training semantic. Replaces the previous implicit
+    # "legacy_symmetric = (pred_len == context_len)" branching. See
+    # nova/ebt/ar_ebt_time_embed.py and ar_ebt_default.py for the exact
+    # mapping from block_mode -> attention implementation.
+    block_mode: str = "dense_token"
 
 # nanochat depth-based auto-scaling
 # base_dim = depth * aspect_ratio # aspect_ratio = 64
@@ -446,7 +459,12 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
     max_seq_len = max_seq_len + 1 if hparams.ebt_type == "time_embed" else max_seq_len # need +1 since cat time embed on sequence dim
 
     adaln_zero_init = True if hparams.ebt_type == "adaln_zero" else False
-    transformer_args = EBTModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=max_seq_len, weight_initialization = hparams.weight_initialization_method, adaln_zero_init=adaln_zero_init, ebt_norm=hparams.ebt_norm, ffn_dim_multiplier=hparams.ffn_dim_multiplier, ebt_act_func=hparams.ebt_act_func, weight_initialization_gain=hparams.weight_initialization_gain, dyt_alpha_init=hparams.dyt_alpha_init, debug_blockwise_shapes=getattr(hparams, "debug_blockwise_shapes", False))
+    block_mode = getattr(hparams, "block_mode", "dense_token")
+    if block_mode not in BLOCK_MODE_CHOICES:
+        raise ValueError(
+            f"Unknown block_mode={block_mode!r}; must be one of {BLOCK_MODE_CHOICES}"
+        )
+    transformer_args = EBTModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=max_seq_len, weight_initialization = hparams.weight_initialization_method, adaln_zero_init=adaln_zero_init, ebt_norm=hparams.ebt_norm, ffn_dim_multiplier=hparams.ffn_dim_multiplier, ebt_act_func=hparams.ebt_act_func, weight_initialization_gain=hparams.weight_initialization_gain, dyt_alpha_init=hparams.dyt_alpha_init, debug_blockwise_shapes=getattr(hparams, "debug_blockwise_shapes", False), block_mode=block_mode)
     
     if hparams.ebt_type == "default": # causal decoder trans for ebm https://arxiv.org/abs/2406.08862
         from ar_ebt_default import EBTDefault

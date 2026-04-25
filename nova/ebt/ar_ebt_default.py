@@ -6,7 +6,16 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from utils import init_whole_model_weights, EBTModelArgs
+from utils import init_whole_model_weights, EBTModelArgs, BLOCK_MODE_CHOICES
+
+
+def _resolve_block_mode(explicit: Optional[str], fallback: str) -> str:
+    mode = explicit if explicit is not None else fallback
+    if mode not in BLOCK_MODE_CHOICES:
+        raise ValueError(
+            f"Unknown block_mode={mode!r}; must be one of {BLOCK_MODE_CHOICES}"
+        )
+    return mode
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -245,33 +254,44 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        context_len: Optional[int] = None,
-        pred_len: Optional[int] = None,
+        context_len: int,
+        pred_len: int,
+        block_mode: str,
     ):
+        """Forward pass of the ar_ebt_default Attention module.
+
+        block_mode dispatch:
+          - ``dense_token``: original EBT superdiagonal attention (matches
+            ``main`` branch).
+          - ``mtp_mcmc``: the current dev-blockwise ``cat(ctx, self)``
+            attention (preserves current dev-blockwise behavior for this
+            trunk). A separate code path from dense_token.
+          - ``future_latent_non_causal`` / ``blockwise``: not yet implemented.
+
+        Both symmetric modes require ``pred_len == context_len`` as a shape
+        invariant.
         """
-        Forward pass of the attention module.
+        bsz, full_seqlen, _ = x.shape
+        block_mode = _resolve_block_mode(block_mode, "dense_token")
 
-        Args:
-            x (torch.Tensor): Input tensor.
-            start_pos (int): Starting position for caching.
-            freqs_cis (torch.Tensor): Precomputed frequency tensor.
-            mask (torch.Tensor, optional): Attention mask tensor.
+        if block_mode in ("future_latent_non_causal", "blockwise"):
+            raise NotImplementedError(
+                f"ar_ebt_default Attention does not implement block_mode={block_mode!r} yet; "
+                f"only 'dense_token' and 'mtp_mcmc' are supported."
+            )
+        if block_mode not in ("dense_token", "mtp_mcmc"):
+            raise ValueError(f"Unsupported block_mode={block_mode!r}")
 
-        Returns:
-            torch.Tensor: Output tensor after attention.
-
-        """
-        bsz, full_seqlen, _ = x.shape # full_seqlen includes real embeds and pred embeds
-        if context_len is None or pred_len is None:
-            if full_seqlen % 2 != 0:
-                raise ValueError(
-                    f"Unable to infer context/pred lengths from odd full_seqlen={full_seqlen}; pass context_len and pred_len explicitly."
-                )
-            context_len = full_seqlen // 2
-            pred_len = full_seqlen - context_len
+        if pred_len != context_len:
+            raise ValueError(
+                f"block_mode={block_mode!r} requires pred_len == context_len; "
+                f"got context_len={context_len}, pred_len={pred_len}. "
+                f"Non-symmetric layouts are reserved for the 'blockwise' mode."
+            )
         if context_len + pred_len != full_seqlen:
             raise ValueError(
-                f"context_len + pred_len must equal full_seqlen, got {context_len}+{pred_len}!={full_seqlen}"
+                f"context_len + pred_len must equal full_seqlen, got "
+                f"{context_len}+{pred_len}!={full_seqlen}"
             )
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -279,66 +299,93 @@ class Attention(nn.Module):
         xq = xq.view(bsz, full_seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
-        
-        # _o is for original attention stuff
+
         xq_o = xq[:, :context_len, :, :]
         xk_o = xk[:, :context_len, :, :]
         xv_o = xv[:, :context_len, :, :]
-        
-        # _p is for predicted attention stuff
+
         xq_p = xq[:, context_len:, :, :]
         xk_p = xk[:, context_len:, :, :]
         xv_p = xv[:, context_len:, :, :]
-        
-        
+
         xq_o, xk_o = apply_rotary_emb(xq_o, xk_o, freqs_cis=freqs_cis[:context_len])
-        
-        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[1:1 + pred_len]) # next-token positions are shifted by one
+        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[1:1 + pred_len])
 
-        # self.cache_k = self.cache_k.to(xq)
-        # self.cache_v = self.cache_v.to(xq)
+        xq_o = xq_o.transpose(1, 2)
+        keys_o = xk_o.transpose(1, 2)
+        values_o = xv_o.transpose(1, 2)
+        xq_p = xq_p.transpose(1, 2)
+        keys_p = xk_p.transpose(1, 2)
+        values_p = xv_p.transpose(1, 2)
 
-        # self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        # self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        if block_mode == "dense_token":
+            # Main-branch EBT Attention: context uses causal mask,
+            # predicted tokens use the superdiagonal self-attention trick.
+            scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if mask is not None:
+                scores_o = scores_o + mask[:-1, :-1]
+            scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
+            output_o = torch.matmul(scores_o, values_o)
+            output_o = output_o.transpose(1, 2).contiguous().view(bsz, context_len, -1)
 
-        # keys = self.cache_k[:bsz, : start_pos + seqlen]
-        # values = self.cache_v[:bsz, : start_pos + seqlen]
+            # scores_p: B, N, K, S ; append one zero column for the superdiag slot
+            scores_p = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
+            temp_append = torch.zeros(
+                (scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1),
+                dtype=scores_p.dtype,
+                device=scores_p.device,
+            )
+            scores_p = torch.cat((scores_p, temp_append), dim=-1)
 
-        # # repeat k/v heads if n_kv_heads < n_heads # this does nothing since self.n_rep = 1
-        # keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        # values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        
-        #original attn calc is more normal############################################
+            insertion_superdiagonal = (xq_p * keys_p).sum(dim=3) / math.sqrt(self.head_dim)
+            insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype)
 
-        xq_o = xq_o.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys_o = xk_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        values_o = xv_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores_o = scores_o + mask
-        scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
-        output_o = torch.matmul(scores_o, values_o)
-        output_o = output_o.transpose(1, 2).contiguous().view(bsz, context_len, -1)
-        
-        # pred attention: each predicted token attends to all context tokens and itself
-        xq_p = xq_p.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys_p = xk_p.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        values_p = xv_p.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        scores_ctx = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim) # B, N, K, S
-        scores_self = (xq_p * keys_p).sum(dim=3, keepdim=True) / math.sqrt(self.head_dim)  # B, N, K, 1
-        scores_p = torch.cat((scores_ctx, scores_self), dim=-1)  # B, N, K, S+1
-        scores_p = F.softmax(scores_p.float(), dim=-1).type_as(xq_p)
+            superdiag_rows = torch.arange(scores_p.shape[2], device=scores_p.device)
+            superdiag_cols = torch.arange(1, scores_p.shape[3], device=scores_p.device)
 
-        scores_ctx = scores_p[:, :, :, :context_len]
-        scores_self = scores_p[:, :, :, context_len]
-        output_ctx = torch.matmul(scores_ctx, values_o)
-        output_self = values_p * scores_self.unsqueeze(dim=-1)
-        output_p = output_ctx + output_self
-        output_p = output_p.transpose(1, 2).contiguous().view(bsz, pred_len, -1)
-        
-        #return linear projection of concatted outputs ########################################################################################
-        
-        output = torch.cat((output_o, output_p), dim = 1) # B, S+K, D
+            zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device)
+            diagonal_removal_mask = torch.ones_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
+            diagonal_removal_mask[:, :, superdiag_rows, superdiag_cols] = zero_superdiag
+            scores_p = scores_p * diagonal_removal_mask
+
+            diagonal_addition_mask = torch.zeros_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
+            diagonal_addition_mask[:, :, superdiag_rows, superdiag_cols] = insertion_superdiagonal
+            scores_p = scores_p + diagonal_addition_mask
+
+            if mask is not None:
+                scores_p = scores_p + mask[1:, :]
+            scores_p = F.softmax(scores_p.float(), dim=-1).type_as(xq_p)
+
+            scores_p_superdiagonal = scores_p.diagonal(offset=1, dim1=2, dim2=3).clone()
+            scores_p = scores_p * diagonal_removal_mask
+            scores_p = scores_p[:, :, :, :-1]
+            output_p = torch.matmul(scores_p, values_o)
+            next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim=-1)
+            output_p = output_p + next_pred_self_attention
+            output_p = output_p.transpose(1, 2).contiguous().view(bsz, pred_len, -1)
+        else:
+            # block_mode == "mtp_mcmc": preserve current dev-blockwise
+            # cat(ctx, self) attention for ar_ebt_default.
+            scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if mask is not None:
+                scores_o = scores_o + mask
+            scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
+            output_o = torch.matmul(scores_o, values_o)
+            output_o = output_o.transpose(1, 2).contiguous().view(bsz, context_len, -1)
+
+            scores_ctx = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
+            scores_self = (xq_p * keys_p).sum(dim=3, keepdim=True) / math.sqrt(self.head_dim)
+            scores_p = torch.cat((scores_ctx, scores_self), dim=-1)
+            scores_p = F.softmax(scores_p.float(), dim=-1).type_as(xq_p)
+
+            scores_ctx = scores_p[:, :, :, :context_len]
+            scores_self = scores_p[:, :, :, context_len]
+            output_ctx = torch.matmul(scores_ctx, values_o)
+            output_self = values_p * scores_self.unsqueeze(dim=-1)
+            output_p = output_ctx + output_self
+            output_p = output_p.transpose(1, 2).contiguous().view(bsz, pred_len, -1)
+
+        output = torch.cat((output_o, output_p), dim=1)
         return self.wo(output)
 
 
@@ -438,25 +485,22 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        context_len: Optional[int] = None,
-        pred_len: Optional[int] = None,
+        context_len: int,
+        pred_len: int,
+        block_mode: str,
     ):
+        """Perform a forward pass through the TransformerBlock.
+
+        ``block_mode`` is forwarded to ``Attention.forward``.
         """
-        Perform a forward pass through the TransformerBlock.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            start_pos (int): Starting position for attention caching.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-            mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
-
-        Returns:
-            torch.Tensor: Output tensor after applying attention and feedforward layers.
-
-        """
-        # x has shape B, 2*(S-1), D?
         h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask, context_len=context_len, pred_len=pred_len
+            self.attention_norm(x),
+            start_pos,
+            freqs_cis,
+            mask,
+            context_len=context_len,
+            pred_len=pred_len,
+            block_mode=block_mode,
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -506,18 +550,22 @@ class EBTDefault(nn.Module):
         pred_len: Optional[int] = None,
         return_pred_hidden: bool = False,
         return_context_hidden: bool = False,
+        block_mode: Optional[str] = None,
     ):  # NOTE mcmc_step not used here
+        """Perform a forward pass through the EBTDefault trunk.
+
+        Attention / mask semantics are chosen via ``block_mode``. See
+        ``Attention.forward`` for the exact dispatch.
         """
-        Perform a forward pass through the Transformer model.
+        block_mode = _resolve_block_mode(block_mode, self.params.block_mode)
+        if block_mode in ("future_latent_non_causal", "blockwise"):
+            raise NotImplementedError(
+                f"EBTDefault.forward does not implement block_mode={block_mode!r} yet; "
+                f"only 'dense_token' and 'mtp_mcmc' are supported."
+            )
+        if block_mode not in ("dense_token", "mtp_mcmc"):
+            raise ValueError(f"Unsupported block_mode={block_mode!r}")
 
-        Args:
-            embeds (torch.Tensor): Embeddings (instead of tokens since is for vision).
-            start_pos (int): Starting position for attention caching.
-
-        Returns:
-            torch.Tensor: Output energies after applying the Transformer model.
-
-        """
         _bsz, full_len = embeddings.shape[:2]
         if context_len is None or pred_len is None:
             if full_len % 2 != 0:
@@ -530,30 +578,56 @@ class EBTDefault(nn.Module):
             raise ValueError(
                 f"context_len + pred_len must equal full length, got {context_len}+{pred_len}!={full_len}"
             )
+        # Shape invariant for both symmetric modes.
+        if pred_len != context_len:
+            raise ValueError(
+                f"block_mode={block_mode!r} requires pred_len == context_len for ar_ebt_default; "
+                f"got context_len={context_len}, pred_len={pred_len}."
+            )
         self.freqs_cis = self.freqs_cis.to(embeddings.device)
 
-        # 动态扩展 freqs_cis 如果需要的长度超过预计算的长度
-        required_length = start_pos + max(context_len, pred_len + 1)
+        # dense_token needs rotary positions up to context_len + 1 (superdiag shift).
+        # mtp_mcmc needs positions up to max(context_len, pred_len + 1); with
+        # pred_len == context_len this equals context_len + 1 as well.
+        rotary_len = context_len + 1
+        required_length = start_pos + rotary_len
         if required_length > self.freqs_cis.shape[0]:
-            # 重新计算更长的 freqs_cis
             new_freqs_cis = precompute_freqs_cis(
                 self.params.dim // self.params.n_heads,
-                required_length
+                required_length,
             ).to(embeddings.device)
             self.freqs_cis = new_freqs_cis
 
-        freqs_cis = self.freqs_cis[start_pos : start_pos + max(context_len, pred_len + 1)]
+        freqs_cis = self.freqs_cis[start_pos : start_pos + rotary_len]
 
         mask = None
-        if context_len > 1:
-            mask = torch.full(
-                (context_len, context_len), float("-inf"), device=embeddings.device
-            )
-            mask = torch.triu(mask, diagonal=1)
-            mask = mask.type_as(embeddings)
+        if block_mode == "dense_token":
+            # Full mask of shape (context_len + 1, context_len + 1) for the
+            # superdiagonal layout; Attention slices as mask[:-1,:-1] / mask[1:,:].
+            if context_len + 1 > 1:
+                mask = torch.full(
+                    (context_len + 1, context_len + 1), float("-inf"), device=embeddings.device
+                )
+                mask = torch.triu(mask, diagonal=1)
+                mask = mask.type_as(embeddings)
+        else:  # mtp_mcmc
+            if context_len > 1:
+                mask = torch.full(
+                    (context_len, context_len), float("-inf"), device=embeddings.device
+                )
+                mask = torch.triu(mask, diagonal=1)
+                mask = mask.type_as(embeddings)
 
-        for i, layer in enumerate(self.layers):
-            embeddings = layer(embeddings, start_pos, freqs_cis, mask, context_len=context_len, pred_len=pred_len)
+        for layer in self.layers:
+            embeddings = layer(
+                embeddings,
+                start_pos,
+                freqs_cis,
+                mask,
+                context_len=context_len,
+                pred_len=pred_len,
+                block_mode=block_mode,
+            )
         embeddings = self.norm(embeddings)
         context_hidden = embeddings[:, :context_len]
         pred_hidden = embeddings[:, context_len:]

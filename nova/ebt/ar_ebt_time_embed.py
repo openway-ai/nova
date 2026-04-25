@@ -6,7 +6,23 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from utils import init_whole_model_weights, EBTModelArgs
+from utils import init_whole_model_weights, EBTModelArgs, BLOCK_MODE_CHOICES
+
+
+def _resolve_block_mode(explicit: Optional[str], fallback: str) -> str:
+    """Resolve a block_mode string, preferring the explicit argument.
+
+    Any call site that owns a trained model must pass its block_mode
+    explicitly. We only fall back to the model-configured default when
+    no override is provided (e.g. from legacy call sites that will be
+    updated progressively).
+    """
+    mode = explicit if explicit is not None else fallback
+    if mode not in BLOCK_MODE_CHOICES:
+        raise ValueError(
+            f"Unknown block_mode={mode!r}; must be one of {BLOCK_MODE_CHOICES}"
+        )
+    return mode
 
 
 class BackwardRMSNormFunction(torch.autograd.Function):
@@ -402,34 +418,55 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        context_len: Optional[int] = None,
-        pred_len: Optional[int] = None,
+        context_len: int,
+        pred_len: int,
+        block_mode: str,
     ):
-        """
-        Forward pass of the attention module.
+        """Forward pass of the attention module.
+
+        block_mode dispatch:
+          - ``dense_token`` / ``mtp_mcmc``: legacy symmetric EBT attention
+            (matches ``main`` branch). Requires ``pred_len == context_len``
+            as a shape invariant, not as a semantic selector.
+          - ``future_latent_non_causal`` / ``blockwise``: not yet implemented.
 
         Args:
-            x (torch.Tensor): Input tensor.
-            start_pos (int): Starting position for caching.
-            freqs_cis (torch.Tensor): Precomputed frequency tensor.
-            mask (torch.Tensor, optional): Attention mask tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after attention.
-
+            x: Input tensor of shape ``(B, 1 + context_len + pred_len, D)``.
+            start_pos: Starting position for rotary caching (unused here but
+                kept for symmetry with other EBT variants).
+            freqs_cis: Precomputed rotary frequency tensor.
+            mask: Additive attention mask of shape
+                ``(context_len + 2, context_len + 2)`` for the symmetric
+                modes. ``None`` is accepted when ``context_len + 2 <= 1``.
+            context_len: Number of real context tokens (pre-time-embed).
+            pred_len: Number of predicted-block tokens.
+            block_mode: Explicit attention semantic. See module docstring.
         """
         bsz, full_seqlen, _ = x.shape
-        if context_len is None or pred_len is None:
-            # Fallback for legacy callers: infer symmetric layout from [time + context + pred]
-            if (full_seqlen - 1) % 2 != 0:
-                raise ValueError(
-                    f"Unable to infer context/pred lengths from full_seqlen={full_seqlen}; pass context_len and pred_len explicitly."
-                )
-            context_len = (full_seqlen - 1) // 2
-            pred_len = full_seqlen - 1 - context_len
+        block_mode = _resolve_block_mode(block_mode, "dense_token")
+
+        if block_mode in ("future_latent_non_causal", "blockwise"):
+            raise NotImplementedError(
+                f"Attention dispatch for block_mode={block_mode!r} is not implemented yet. "
+                f"Only 'dense_token' and 'mtp_mcmc' are supported at this time."
+            )
+        if block_mode not in ("dense_token", "mtp_mcmc"):
+            raise ValueError(f"Unsupported block_mode={block_mode!r}")
+
+        # dense_token and mtp_mcmc share the legacy symmetric attention math.
+        # pred_len == context_len is a shape invariant under these modes; it
+        # is NOT used to pick between algorithms.
+        if pred_len != context_len:
+            raise ValueError(
+                f"block_mode={block_mode!r} requires a symmetric layout with "
+                f"pred_len == context_len; got context_len={context_len}, "
+                f"pred_len={pred_len}. Non-symmetric layouts are reserved for "
+                f"the 'blockwise' mode which is not implemented yet."
+            )
         if 1 + context_len + pred_len != full_seqlen:
             raise ValueError(
-                f"Invalid layout: expected 1 + context_len + pred_len == full_seqlen, got 1 + {context_len} + {pred_len} != {full_seqlen}"
+                f"Invalid layout: expected 1 + context_len + pred_len == "
+                f"full_seqlen, got 1 + {context_len} + {pred_len} != {full_seqlen}"
             )
 
         context_with_time_len = context_len + 1
@@ -438,105 +475,69 @@ class Attention(nn.Module):
         xq = xq.view(bsz, full_seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
-        
-        legacy_symmetric = (pred_len == context_len)
 
         # Context path includes the prepended time embedding.
         xq_o = xq[:, :context_with_time_len, :, :]
         xk_o = xk[:, :context_with_time_len, :, :]
         xv_o = xv[:, :context_with_time_len, :, :]
-        
+
         # Predicted block path has exactly pred_len positions.
         xq_p = xq[:, context_with_time_len:, :, :]
         xk_p = xk[:, context_with_time_len:, :, :]
         xv_p = xv[:, context_with_time_len:, :, :]
-        
-        
+
         xq_o, xk_o = apply_rotary_emb(xq_o, xk_o, freqs_cis=freqs_cis[:context_with_time_len])
-        if legacy_symmetric:
-            xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[2:context_with_time_len + 1])
-        else:
-            # Blockwise/non-symmetric path: pred positions must continue after context-with-time.
-            pred_rotary_start = context_with_time_len
-            pred_rotary_end = pred_rotary_start + pred_len
-            xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[pred_rotary_start:pred_rotary_end])
+        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[2:context_with_time_len + 1])
 
-        # self.cache_k = self.cache_k.to(xq)
-        # self.cache_v = self.cache_v.to(xq)
+        xq_o = xq_o.transpose(1, 2)
+        keys_o = xk_o.transpose(1, 2)
+        values_o = xv_o.transpose(1, 2)
+        scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores_o = scores_o + mask[:-1, :-1]
+        scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
+        output_o = torch.matmul(scores_o, values_o)
+        output_o = output_o.transpose(1, 2).contiguous().view(bsz, context_with_time_len, -1)
 
-        # self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        # self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        xq_p = xq_p.transpose(1, 2)
+        keys_p = xk_p.transpose(1, 2)
+        values_p = xv_p.transpose(1, 2)
+        scores_p = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
+        temp_append = torch.zeros(
+            (scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1),
+            dtype=scores_p.dtype,
+            device=scores_p.device,
+        )
+        scores_p = torch.cat((scores_p, temp_append), dim=-1)
 
-        # keys = self.cache_k[:bsz, : start_pos + seqlen]
-        # values = self.cache_v[:bsz, : start_pos + seqlen]
+        insertion_superdiagonal = (xq_p * keys_p).sum(dim=3) / math.sqrt(self.head_dim)
+        insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype)
 
-        # # repeat k/v heads if n_kv_heads < n_heads # this does nothing since self.n_rep = 1
-        # keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        # values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        
-        #original attn calc is more normal############################################
+        seq_len_minus_1 = scores_p.shape[2]
+        superdiag_rows = self.superdiag_rows[:seq_len_minus_1]
+        superdiag_cols = self.superdiag_cols[:seq_len_minus_1]
 
-        if legacy_symmetric:
-            xq_o = xq_o.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-            keys_o = xk_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-            values_o = xv_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-            scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
-            if mask is not None:
-                scores_o = scores_o + mask[:-1, :-1]
-            scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
-            output_o = torch.matmul(scores_o, values_o)
-            output_o = output_o.transpose(1, 2).contiguous().view(bsz, context_with_time_len, -1)
+        zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device)
+        diagonal_removal_mask = torch.ones_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
+        diagonal_removal_mask[:, :, superdiag_rows, superdiag_cols] = zero_superdiag
+        scores_p = scores_p * diagonal_removal_mask
 
-            xq_p = xq_p.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-            keys_p = xk_p.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-            values_p = xv_p.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-            # Preserve original time_embed behavior for K == S.
-            scores_p = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
-            temp_append = torch.zeros((scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1), dtype=scores_p.dtype, device=scores_p.device)
-            scores_p = torch.cat((scores_p, temp_append), dim=-1)
+        diagonal_addition_mask = torch.zeros_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
+        diagonal_addition_mask[:, :, superdiag_rows, superdiag_cols] = insertion_superdiagonal
+        scores_p = scores_p + diagonal_addition_mask
 
-            insertion_superdiagonal = (xq_p * keys_p).sum(dim=3) / math.sqrt(self.head_dim)
-            insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype)
+        if mask is not None:
+            scores_p = scores_p + mask[2:, :]
+        scores_p = F.softmax(scores_p.float(), dim=-1).type_as(xq_p)
 
-            seq_len_minus_1 = scores_p.shape[2]
-            superdiag_rows = self.superdiag_rows[:seq_len_minus_1]
-            superdiag_cols = self.superdiag_cols[:seq_len_minus_1]
-
-            zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device)
-            diagonal_removal_mask = torch.ones_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
-            diagonal_removal_mask[:, :, superdiag_rows, superdiag_cols] = zero_superdiag
-            scores_p = scores_p * diagonal_removal_mask
-
-            diagonal_addition_mask = torch.zeros_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
-            diagonal_addition_mask[:, :, superdiag_rows, superdiag_cols] = insertion_superdiagonal
-            scores_p = scores_p + diagonal_addition_mask
-
-            if mask is not None:
-                scores_p = scores_p + mask[2:, :]
-            scores_p = F.softmax(scores_p.float(), dim=-1).type_as(xq_p)
-
-            scores_p_superdiagonal = scores_p.diagonal(offset=2, dim1=2, dim2=3).clone()
-            scores_p = scores_p * diagonal_removal_mask
-            scores_p = scores_p[:, :, :, :-1]
-            output_p = torch.matmul(scores_p, values_o)
-            next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim=-1)
-            output_p = output_p + next_pred_self_attention
-            output_p = output_p.transpose(1, 2).contiguous().view(bsz, pred_len, -1)
-            output = torch.cat((output_o, output_p), dim = 1) # B, (S+1)+K, D
-        else:
-            # Non-symmetric blockwise path:
-            # - context (with time token) uses causal attention
-            # - predicted block can attend all context tokens
-            # - predicted block is causal inside itself
-            xq_full = torch.cat((xq_o, xq_p), dim=1).transpose(1, 2)
-            xk_full = torch.cat((xk_o, xk_p), dim=1).transpose(1, 2)
-            xv_full = torch.cat((xv_o, xv_p), dim=1).transpose(1, 2)
-            scores_full = torch.matmul(xq_full, xk_full.transpose(2, 3)) / math.sqrt(self.head_dim)
-            if mask is not None:
-                scores_full = scores_full + mask
-            scores_full = F.softmax(scores_full.float(), dim=-1).type_as(xq_full)
-            output = torch.matmul(scores_full, xv_full)
-            output = output.transpose(1, 2).contiguous().view(bsz, full_seqlen, -1)
+        scores_p_superdiagonal = scores_p.diagonal(offset=2, dim1=2, dim2=3).clone()
+        scores_p = scores_p * diagonal_removal_mask
+        scores_p = scores_p[:, :, :, :-1]
+        output_p = torch.matmul(scores_p, values_o)
+        next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim=-1)
+        output_p = output_p + next_pred_self_attention
+        output_p = output_p.transpose(1, 2).contiguous().view(bsz, pred_len, -1)
+        output = torch.cat((output_o, output_p), dim=1)  # B, (S+1)+K, D
 
         return self.wo(output)
 
@@ -661,25 +662,22 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        context_len: Optional[int] = None,
-        pred_len: Optional[int] = None,
+        context_len: int,
+        pred_len: int,
+        block_mode: str,
     ):
+        """Perform a forward pass through the TransformerBlock.
+
+        ``block_mode`` is forwarded to ``Attention.forward``.
         """
-        Perform a forward pass through the TransformerBlock.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            start_pos (int): Starting position for attention caching.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-            mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
-
-        Returns:
-            torch.Tensor: Output tensor after applying attention and feedforward layers.
-
-        """
-        # x has shape B, 2*(S-1), D?
         h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask, context_len=context_len, pred_len=pred_len
+            self.attention_norm(x),
+            start_pos,
+            freqs_cis,
+            mask,
+            context_len=context_len,
+            pred_len=pred_len,
+            block_mode=block_mode,
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -741,18 +739,23 @@ class EBTTimeConcat(nn.Module):
         pred_len = None,
         return_pred_hidden: bool = False,
         return_context_hidden: bool = False,
+        block_mode: Optional[str] = None,
     ):
+        """Perform a forward pass through the Transformer model.
+
+        Attention / mask semantics are selected explicitly via ``block_mode``.
+        Shape validation (``pred_len == context_len``) is treated as a shape
+        invariant for the symmetric modes, not as a semantic branch.
         """
-        Perform a forward pass through the Transformer model.
+        block_mode = _resolve_block_mode(block_mode, self.params.block_mode)
+        if block_mode in ("future_latent_non_causal", "blockwise"):
+            raise NotImplementedError(
+                f"EBTTimeConcat.forward does not implement block_mode={block_mode!r} yet; "
+                f"only 'dense_token' and 'mtp_mcmc' are supported."
+            )
+        if block_mode not in ("dense_token", "mtp_mcmc"):
+            raise ValueError(f"Unsupported block_mode={block_mode!r}")
 
-        Args:
-            embeds (torch.Tensor): Embeddings (instead of tokens since is for vision).
-            start_pos (int): Starting position for attention caching.
-
-        Returns:
-            torch.Tensor: Output energies after applying the Transformer model.
-
-        """
         if context_len is None or pred_len is None:
             full_len = embeddings.shape[1]
             if full_len % 2 != 0:
@@ -765,70 +768,41 @@ class EBTTimeConcat(nn.Module):
             raise ValueError(
                 f"context_len + pred_len must equal embeddings length, got {context_len}+{pred_len}!={embeddings.shape[1]}"
             )
+        # Shape invariant for dense_token / mtp_mcmc.
+        if pred_len != context_len:
+            raise ValueError(
+                f"block_mode={block_mode!r} requires symmetric context/pred layout, "
+                f"got context_len={context_len}, pred_len={pred_len}. "
+                f"Non-symmetric block prediction will be enabled by block_mode='blockwise' "
+                f"once implemented."
+            )
         _bsz = embeddings.shape[0]
-        legacy_symmetric = (pred_len == context_len)
-        mcmc_step = torch.full(size=(_bsz,), fill_value=mcmc_step, device = embeddings.device, dtype=torch.long)
-        time_embeddings = self.time_embeddings(mcmc_step).unsqueeze(dim=1) # needs to be expanded to B, 1, D
-        embeddings = torch.cat((time_embeddings, embeddings), dim = 1) # B, 1+S+K, D
+        mcmc_step = torch.full(size=(_bsz,), fill_value=mcmc_step, device=embeddings.device, dtype=torch.long)
+        time_embeddings = self.time_embeddings(mcmc_step).unsqueeze(dim=1)  # (B, 1, D)
+        embeddings = torch.cat((time_embeddings, embeddings), dim=1)  # (B, 1+S+K, D)
 
-        _bsz, _full_len = embeddings.shape[:2]
-        context_with_time_len = context_len + 1
         self.freqs_cis = self.freqs_cis.to(embeddings.device)
 
-        # 动态扩展 freqs_cis 如果需要的长度超过预计算的长度
-        if legacy_symmetric:
-            legacy_seqlen = context_len + 2
-            required_length = start_pos + legacy_seqlen
-        else:
-            # Need rotary positions for the full [time + context + pred] layout.
-            required_length = start_pos + _full_len
+        # Rotary length for the symmetric EBT layout: context_with_time + 1
+        # extra slot for the pred superdiagonal shift.
+        legacy_seqlen = context_len + 2
+        required_length = start_pos + legacy_seqlen
         if required_length > self.freqs_cis.shape[0]:
-            # 重新计算更长的 freqs_cis
             new_freqs_cis = precompute_freqs_cis(
                 self.params.dim // self.params.n_heads,
-                required_length
+                required_length,
             ).to(embeddings.device)
             self.freqs_cis = new_freqs_cis
 
-        if legacy_symmetric:
-            freqs_cis = self.freqs_cis[start_pos : start_pos + legacy_seqlen]
-        else:
-            freqs_cis = self.freqs_cis[start_pos : start_pos + _full_len]
-            if getattr(self.params, "debug_blockwise_shapes", False):
-                pred_rotary_start = start_pos + context_with_time_len
-                pred_rotary_end = pred_rotary_start + pred_len
-                print(
-                    f"[blockwise-debug][rotary] context_len={context_len}, pred_len={pred_len}, "
-                    f"pred_rotary_range=[{pred_rotary_start}, {pred_rotary_end})",
-                    flush=True,
-                )
+        freqs_cis = self.freqs_cis[start_pos : start_pos + legacy_seqlen]
 
         mask = None
-        if legacy_symmetric:
-            if legacy_seqlen > 1:
-                mask = torch.full((legacy_seqlen, legacy_seqlen), float("-inf"), device=embeddings.device)
-                mask = torch.triu(mask, diagonal=1)
-                mask = mask.type_as(embeddings)
-        else:
-            full_seqlen = context_with_time_len + pred_len
-            if full_seqlen > 1:
-                mask = torch.full((full_seqlen, full_seqlen), float("-inf"), device=embeddings.device)
-                # context-with-time segment is causal
-                mask[:context_with_time_len, :context_with_time_len] = torch.triu(
-                    torch.full((context_with_time_len, context_with_time_len), float("-inf"), device=embeddings.device),
-                    diagonal=1,
-                )
-                # block segment: attend full context and causal in block
-                block_causal = torch.triu(
-                    torch.full((pred_len, pred_len), float("-inf"), device=embeddings.device),
-                    diagonal=1,
-                )
-                mask[context_with_time_len:, context_with_time_len:] = block_causal
-                # block -> context remains visible, so set to 0
-                mask[context_with_time_len:, :context_with_time_len] = 0.0
-                mask = mask.type_as(embeddings)
+        if legacy_seqlen > 1:
+            mask = torch.full((legacy_seqlen, legacy_seqlen), float("-inf"), device=embeddings.device)
+            mask = torch.triu(mask, diagonal=1)
+            mask = mask.type_as(embeddings)
 
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             embeddings = layer(
                 embeddings,
                 start_pos,
@@ -836,11 +810,12 @@ class EBTTimeConcat(nn.Module):
                 mask,
                 context_len=context_len,
                 pred_len=pred_len,
+                block_mode=block_mode,
             )
         embeddings = self.norm(embeddings)
-        embeddings = embeddings[:, 1:] # remove temporal embed
-        context_hidden = embeddings[:, :context_len]  # [B, context_len, D]
-        pred_hidden = embeddings[:, context_len:]  # [B, pred_len, D]
+        embeddings = embeddings[:, 1:]  # remove time embedding
+        context_hidden = embeddings[:, :context_len]
+        pred_hidden = embeddings[:, context_len:]
         energies = self.final_layer(embeddings)
         energies = energies[:, context_len:]
         if return_context_hidden and return_pred_hidden:

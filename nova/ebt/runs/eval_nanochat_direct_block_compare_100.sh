@@ -32,6 +32,10 @@ INFER_BLOCK_REFINE_STEPS="${INFER_BLOCK_REFINE_STEPS:-1}"
 INFER_BLOCK_INIT_LOGIT_SCALE="${INFER_BLOCK_INIT_LOGIT_SCALE:-8.0}"
 GENERATION_SPLIT_RATIO="${GENERATION_SPLIT_RATIO:-0.5}"
 MIN_GENERATION_LENGTH="${MIN_GENERATION_LENGTH:-64}"
+# Attention semantic of the evaluated checkpoint. This compare script is
+# intended for blockwise (dev-blockwise) checkpoints, so default to
+# mtp_mcmc; override via env var when comparing other checkpoints.
+BLOCK_MODE="${BLOCK_MODE:-mtp_mcmc}"
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 BASE_OUT="${EVAL_RUN_DIR:-$EBT_DIR/logs/eval/direct_block_compare_100_${RUN_TS}}"
@@ -86,6 +90,7 @@ run_one_mode() {
     export INFER_BLOCK_DIAGNOSE=false
     export EVAL_RUN_DIR="$mode_out"
     export NANOCHAT_EVAL_LOG="$mode_log"
+    export BLOCK_MODE
 
     bash "$SCRIPT_DIR/eval_nanochat_shards.sh"
   )

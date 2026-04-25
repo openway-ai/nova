@@ -36,7 +36,7 @@ fi
 ################################################################################
 # Blockwise training config (dense MTP-style supervision; edit these first)
 ################################################################################
-RUN_NAME="${RUN_NAME:-ebt-xxs-blockwise-k2-addalpha}"
+RUN_NAME="${RUN_NAME:-ebt-xxs-blockwise-k2-mtpmcmc}"
 MODEL_NAME="${MODEL_NAME:-ebt}"
 MODEL_SIZE="${MODEL_SIZE:-xxs}"
 DATASET_NAME="${DATASET_NAME:-nanochat}"
@@ -74,6 +74,7 @@ CMD=(
   --denoising_initial_condition random_noise
   --ebt_type time_embed
   --training_objective blockwise
+  --block_mode mtp_mcmc
   --context_length "$CONTEXT_LENGTH"
   --train_block_size "$TRAIN_BLOCK_SIZE"
   --mcmc_step_size_learnable

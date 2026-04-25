@@ -569,21 +569,30 @@ class EBTAdaLN(nn.Module):
         pred_len = None,
         return_pred_hidden: bool = False,
         return_context_hidden: bool = False,
+        block_mode: Optional[str] = None,
     ):
+        """Perform a forward pass through the AdaLN EBT model.
+
+        The AdaLN trunk currently implements only the symmetric superdiagonal
+        EBT attention, which is equivalent for both ``dense_token`` and
+        ``mtp_mcmc``. The other two block modes raise
+        ``NotImplementedError``.
         """
-        Perform a forward pass through the Transformer model.
-
-        Args:
-            embeds (torch.Tensor): Embeddings (instead of tokens since is for vision).
-            start_pos (int): Starting position for attention caching.
-
-        Returns:
-            torch.Tensor: Output energies after applying the Transformer model.
-
-        """
-        if context_len is not None and pred_len is not None and context_len != pred_len:
+        from utils import BLOCK_MODE_CHOICES
+        resolved_block_mode = block_mode if block_mode is not None else getattr(self.params, "block_mode", "dense_token")
+        if resolved_block_mode not in BLOCK_MODE_CHOICES:
+            raise ValueError(f"Unknown block_mode={resolved_block_mode!r}")
+        if resolved_block_mode in ("future_latent_non_causal", "blockwise"):
             raise NotImplementedError(
-                f"ar_ebt_adaln currently expects context_len == pred_len, got context_len={context_len}, pred_len={pred_len}"
+                f"EBTAdaLN.forward does not implement block_mode={resolved_block_mode!r} yet; "
+                f"only 'dense_token' and 'mtp_mcmc' are supported."
+            )
+        if resolved_block_mode not in ("dense_token", "mtp_mcmc"):
+            raise ValueError(f"Unsupported block_mode={resolved_block_mode!r}")
+        if context_len is not None and pred_len is not None and context_len != pred_len:
+            raise ValueError(
+                f"ar_ebt_adaln expects context_len == pred_len for block_mode={resolved_block_mode!r}, "
+                f"got context_len={context_len}, pred_len={pred_len}"
             )
         _bsz, seqlen = embeddings.shape[:2]
         seqlen = (seqlen+2) // 2 # do this since passed in seqlen is 2(S-1) so add 2 div 2 = S

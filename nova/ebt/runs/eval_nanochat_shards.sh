@@ -50,6 +50,11 @@ INFER_BLOCK_USE_REFINE="${INFER_BLOCK_USE_REFINE:-true}"
 INFER_BLOCK_REFINE_STEPS="${INFER_BLOCK_REFINE_STEPS:-0}"
 INFER_BLOCK_INIT_LOGIT_SCALE="${INFER_BLOCK_INIT_LOGIT_SCALE:-8.0}"
 INFER_BLOCK_DIAGNOSE="${INFER_BLOCK_DIAGNOSE:-false}"
+# Attention / training semantic that must match the checkpoint being
+# evaluated. Leave empty to fall back to the checkpoint's recorded block_mode
+# (or dense_token for legacy ckpts). For current dev-blockwise checkpoints
+# this should be explicitly set to "mtp_mcmc".
+BLOCK_MODE="${BLOCK_MODE:-}"
 
 # 分片评估特定参数
 EVAL_SHARD_INDICES="${EVAL_SHARD_INDICES:-0,15}"
@@ -148,6 +153,11 @@ if [ "$INFER_BLOCK_DIAGNOSE" = "true" ]; then
     BLOCK_DIAG_FLAG="--infer_block_diagnose"
 fi
 
+BLOCK_MODE_FLAG=""
+if [ -n "$BLOCK_MODE" ]; then
+    BLOCK_MODE_FLAG="--block_mode $BLOCK_MODE"
+fi
+
 {
 $PYTHON train.py \
     --only_test \
@@ -168,6 +178,7 @@ $PYTHON train.py \
     --infer_block_refine_steps "$INFER_BLOCK_REFINE_STEPS" \
     --infer_block_init_logit_scale "$INFER_BLOCK_INIT_LOGIT_SCALE" \
     $BLOCK_DIAG_FLAG \
+    $BLOCK_MODE_FLAG \
     --gpus "$GPUS" \
     --distributed_strategy "auto" \
     --batch_size_per_device "$BATCH_SIZE" \

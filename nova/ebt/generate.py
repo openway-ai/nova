@@ -127,7 +127,20 @@ def _decode_block_from_logits(block_logits, temperature, top_p):
     return torch.cat(decoded, dim=1)
 
 
-def _resolve_block_mode(hparams, infer_block_size=None):
+BLOCK_MODE_CHOICES = (
+    "dense_token",
+    "mtp_mcmc",
+    "future_latent_non_causal",
+    "blockwise",
+)
+
+
+def _resolve_inference_strategy(hparams, infer_block_size=None):
+    """Resolve the *inference strategy* (sequential vs direct_block vs refine).
+
+    This is distinct from the attention-semantic ``block_mode``; see
+    :func:`_resolve_attention_block_mode` for the latter.
+    """
     if infer_block_size is None:
         infer_block_size = max(1, int(getattr(hparams, "infer_block_size", 1)))
     infer_block_mode = str(getattr(hparams, "infer_block_mode", "auto"))
@@ -136,6 +149,69 @@ def _resolve_block_mode(hparams, infer_block_size=None):
     if infer_block_mode == "auto":
         return "direct_block" if infer_block_size > 1 else "sequential"
     return infer_block_mode
+
+
+def _resolve_attention_block_mode(hparams, model=None):
+    """Resolve the attention-semantic ``block_mode`` for an inference run.
+
+    Priority:
+      1. Explicit ``hparams.block_mode`` set by the CLI / config.
+      2. ``model._block_mode`` recorded by :class:`EBT_NLP` during construction.
+      3. ``"dense_token"`` as a last-resort default matching main-branch EBT.
+
+    The resolved value is validated against :data:`BLOCK_MODE_CHOICES`.
+    Callers must treat this as the single source of truth for how the
+    attention stack interprets context/pred tokens; training and inference
+    must never disagree on this value.
+    """
+    block_mode = getattr(hparams, "block_mode", None)
+    if block_mode is None and model is not None:
+        block_mode = getattr(model, "_block_mode", None)
+    if block_mode is None:
+        block_mode = "dense_token"
+    if block_mode not in BLOCK_MODE_CHOICES:
+        raise ValueError(
+            f"Unknown block_mode={block_mode!r}; must be one of {BLOCK_MODE_CHOICES}"
+        )
+    return block_mode
+
+
+def _check_inference_block_mode_compat(attention_block_mode, inference_strategy, infer_block_size, infer_block_use_refine, infer_block_refine_steps):
+    """Fail fast when (attention block_mode x inference_strategy) is not implemented.
+
+    This is the single chokepoint that enforces the user-facing rule:
+    "training and inference must use identical block_mode semantics". No
+    silent fallback is allowed; if a combination is not yet implemented,
+    we raise ``NotImplementedError`` with a pointer at the user.
+    """
+    if attention_block_mode in ("future_latent_non_causal", "blockwise"):
+        raise NotImplementedError(
+            f"Inference for block_mode={attention_block_mode!r} is not implemented yet. "
+            f"Train with a supported block_mode or wait for the corresponding attention "
+            f"dispatch to be added."
+        )
+    if attention_block_mode not in ("dense_token", "mtp_mcmc"):
+        raise ValueError(f"Unsupported block_mode={attention_block_mode!r}")
+
+    if inference_strategy == "direct_block" and infer_block_size > 1:
+        # direct_block with block_size>1 means the trunk must accept
+        # pred_len != context_len. Under dense_token and mtp_mcmc the
+        # attention stack requires a symmetric layout (pred_len ==
+        # context_len), so this combination is explicitly unsupported and
+        # must NOT silently fall back to sequential. The real non-symmetric
+        # direct_block path is reserved for the future 'blockwise'
+        # block_mode.
+        raise NotImplementedError(
+            f"direct_block inference with infer_block_size={infer_block_size} is not "
+            f"implemented for block_mode={attention_block_mode!r}. The non-symmetric "
+            f"block attention required for direct_block is reserved for block_mode='blockwise' "
+            f"(not yet implemented). Use infer_block_mode=sequential, or reduce "
+            f"infer_block_size to 1, or train a blockwise-mode checkpoint."
+        )
+
+    # refine uses a symmetric pairing (real=[ctx,draft[:-1]], pred=[ctx[1:],draft])
+    # internally, so it is safe under dense_token/mtp_mcmc. Nothing to check here.
+    _ = (infer_block_use_refine, infer_block_refine_steps)
 
 
 def generate_text(model, batch, hparams):
@@ -179,7 +255,19 @@ def generate_text(model, batch, hparams):
     infer_block_use_refine = bool(getattr(hparams, "infer_block_use_refine", True))
     infer_block_refine_steps = int(getattr(hparams, "infer_block_refine_steps", 0))
     infer_block_init_logit_scale = float(getattr(hparams, "infer_block_init_logit_scale", 8.0))
-    effective_block_mode = _resolve_block_mode(hparams, infer_block_size=infer_block_size)
+    effective_block_mode = _resolve_inference_strategy(hparams, infer_block_size=infer_block_size)
+    # attention_block_mode is the attention semantic (dense_token / mtp_mcmc /
+    # future_latent_non_causal / blockwise). It governs the trunk dispatch and
+    # must match the value the checkpoint was trained with. Inference paths
+    # below route strictly via this value.
+    attention_block_mode = _resolve_attention_block_mode(hparams, model=model)
+    _check_inference_block_mode_compat(
+        attention_block_mode=attention_block_mode,
+        inference_strategy=effective_block_mode,
+        infer_block_size=infer_block_size,
+        infer_block_use_refine=infer_block_use_refine,
+        infer_block_refine_steps=infer_block_refine_steps,
+    )
     if infer_block_size > 1 and logprobs:
         raise NotImplementedError("logprobs=True is not supported in block inference mode yet")
     if infer_block_size > 1 and effective_block_mode == "direct_block" and hparams.model_name != "ebt":
@@ -397,7 +485,15 @@ def generate_text(model, batch, hparams):
 def get_ppl(model, batch, hparams, token_bytes=None): # computes teacher-forced metrics
     batch_size = batch['input_ids'].shape[0]
     infer_block_size = max(1, int(getattr(hparams, "infer_block_size", 1)))
-    effective_block_mode = _resolve_block_mode(hparams, infer_block_size=infer_block_size)
+    effective_block_mode = _resolve_inference_strategy(hparams, infer_block_size=infer_block_size)
+    attention_block_mode = _resolve_attention_block_mode(hparams, model=model)
+    _check_inference_block_mode_compat(
+        attention_block_mode=attention_block_mode,
+        inference_strategy=effective_block_mode,
+        infer_block_size=infer_block_size,
+        infer_block_use_refine=False,
+        infer_block_refine_steps=0,
+    )
 
     with torch.no_grad(): # by default no grad, although ebt will enable grad
         full_ids = batch['input_ids'].squeeze(dim=1)

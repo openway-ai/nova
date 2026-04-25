@@ -74,6 +74,12 @@ class EBT_NLP(LightningModule):
         self._transformer_accepts_return_context_hidden = (
             "return_context_hidden" in inspect.signature(self.transformer.forward).parameters
         )
+        # Single source of truth for the attention / training semantic the
+        # trunk and all downstream paths (train, MCMC, blockwise dense, block
+        # refine, inference) must consistently use. If not set on hparams
+        # (e.g. a legacy checkpoint), we default to dense_token which matches
+        # original main-branch EBT semantics.
+        self._block_mode = getattr(self.hparams, "block_mode", "dense_token")
         
         self.finished_warming_up = False
 
@@ -119,7 +125,7 @@ class EBT_NLP(LightningModule):
         
         all_embeddings = torch.cat((real_embeddings_input.detach(), predicted_embeddings), dim = 1) # B, 2*S, D
         
-        energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+        energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step, block_mode=self._block_mode) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
         energy_preds = energy_preds.reshape(-1, 1)
         
         if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
@@ -163,6 +169,27 @@ class EBT_NLP(LightningModule):
         block_size = int(block_size)
         if block_size <= 0:
             raise ValueError(f"block_size must be > 0, got {block_size}")
+
+        # block_mode dispatch: dense_token and mtp_mcmc both require
+        # context_len == pred_len inside the trunk. Equivalently, block_size
+        # must equal seq_length for this forward path. Other modes raise
+        # NotImplementedError so callers cannot silently fall back to a
+        # different attention semantic than the one the model was trained on.
+        if self._block_mode in ("dense_token", "mtp_mcmc"):
+            if block_size != seq_length:
+                raise NotImplementedError(
+                    f"EBT_NLP.forward with block_size != seq_length is not supported under "
+                    f"block_mode={self._block_mode!r}; this path requires the 'blockwise' "
+                    f"block_mode which is not implemented yet. Use sequential inference, "
+                    f"or train a blockwise-mode checkpoint to enable non-symmetric block "
+                    f"prediction. Got block_size={block_size}, seq_length={seq_length}."
+                )
+        elif self._block_mode in ("future_latent_non_causal", "blockwise"):
+            raise NotImplementedError(
+                f"EBT_NLP.forward does not implement block_mode={self._block_mode!r} yet."
+            )
+        else:
+            raise ValueError(f"Unknown block_mode={self._block_mode!r} on EBT_NLP")
 
         if getattr(self.hparams, "ebt_type", "default") not in ("default", "time_embed") and block_size != seq_length:
             raise NotImplementedError(
@@ -302,6 +329,7 @@ class EBT_NLP(LightningModule):
                     mcmc_step=mcmc_step,
                     context_len=real_embeddings_input.shape[1],
                     pred_len=predicted_embeddings.shape[1],
+                    block_mode=self._block_mode,
                 )
                 energy_preds = self.transformer(
                     all_embeddings,
@@ -447,7 +475,7 @@ class EBT_NLP(LightningModule):
                 block_embeds = self._logits_to_pred_embeddings(logits, step_idx)
                 pred_embeddings = torch.cat([prefix_embeds, block_embeds], dim=1)
                 all_embeddings = torch.cat((real_embeddings_input, pred_embeddings), dim=1)
-                energy_preds = self.transformer(all_embeddings, start_pos=start_pos, mcmc_step=step_idx)
+                energy_preds = self.transformer(all_embeddings, start_pos=start_pos, mcmc_step=step_idx, block_mode=self._block_mode)
                 return energy_preds[:, -block_len:].mean().item()
 
         initial_energy_mean = _block_energy_mean(init_block_logits, mcmc_steps[0])
@@ -471,6 +499,7 @@ class EBT_NLP(LightningModule):
                     mcmc_step=mcmc_step,
                     context_len=real_embeddings_input.shape[1],
                     pred_len=pred_embeddings.shape[1],
+                    block_mode=self._block_mode,
                 )
                 energy_block = energy_preds[:, -block_len:].reshape(-1, 1)
 
@@ -878,7 +907,7 @@ class EBT_NLP(LightningModule):
 
         all_true_embeddings = torch.cat((real_embeddings_input, true_embeddings), dim=1)
         
-        real_energies = self.transformer(all_true_embeddings, start_pos=0, mcmc_step=self.hparams.mcmc_num_steps - 1) # NOTE if want to use this maybe check in better detail what ired does
+        real_energies = self.transformer(all_true_embeddings, start_pos=0, mcmc_step=self.hparams.mcmc_num_steps - 1, block_mode=self._block_mode) # NOTE if want to use this maybe check in better detail what ired does
         real_energies = real_energies.reshape(-1, 1) # BS, 1
         fake_energies = predicted_energies[-1] # B*S, 1
         energy_stack = torch.cat([real_energies, fake_energies], dim=1)
@@ -1049,7 +1078,7 @@ class EBT_NLP(LightningModule):
                     pred_embeds = self.vocab_to_embed(cur_pred_tokens)
 
                 combined_embeddings = torch.cat([real_embeds, pred_embeds], dim=1)  # (chunk_size, 2S, D)
-                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx)
+                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx, block_mode=self._block_mode)
                 energies = energies.reshape(-1)
                 energies_list.append(energies.detach())
 
@@ -1089,7 +1118,7 @@ class EBT_NLP(LightningModule):
                 else:
                     pred_embeds = self.vocab_to_embed(cur_pred_tokens)
                 combined_embeddings = torch.cat([real_embeds, pred_embeds], dim=1)  # (chunk_size, 2S, D)
-                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx)
+                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx, block_mode=self._block_mode)
                 energies = energies.reshape(-1)
                 return energies
 
