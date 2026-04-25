@@ -10,6 +10,7 @@ set -o pipefail
 # 获取脚本所在目录的绝对路径
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
+REPO_ROOT="$( cd "$EBT_DIR/../.." && pwd )"
 
 # =============================================================================
 # 环境配置
@@ -150,7 +151,7 @@ fi
 echo "开始 CORE 评估..."
 echo ""
 
-cd "$EBT_DIR"
+cd "$REPO_ROOT"
 
 # 构建任务样本数参数
 TASK_SAMPLES_ARG=""
@@ -167,7 +168,7 @@ else
     PYTHON="python"
 fi
 
-EVAL_CMD="$PYTHON -m scripts.ebt_core_eval \
+EVAL_CMD="$PYTHON -m openebm.elm.scripts.ebt_core_eval \
     --ckpt-path '$CKPT_PATH' \
     --tokenizer-path '$TOKENIZER_PATH' \
     --eval-bundle-dir '$NANOCHAT_BASE_DIR/eval_bundle' \

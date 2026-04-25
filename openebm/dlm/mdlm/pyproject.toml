@@ -1,5 +1,5 @@
 [project]
-name = "nova-mdlm"
+name = "openebm-dlm-mdlm"
 version = "0.1.0"
 description = "a reproduction of masked diffusion language models"
 readme = "README.md"

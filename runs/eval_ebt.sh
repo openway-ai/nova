@@ -7,7 +7,7 @@
 
 # 激活虚拟环境
 source .venv/bin/activate 2>/dev/null || true
-cd nova/ebt
+cd openebm/elm
 
 CONDA_ENV_NAME="nanochat"
 CONDA_ENV_PATH="/mnt/shared-storage-user/puyuan/conda_envs/nanochat"
@@ -101,13 +101,13 @@ RUN_NAME=$(basename $(dirname "$CKPT_PATH"))
 CKPT_FILENAME=$(basename "$CKPT_PATH" .ckpt)
 
 # Simplified output structure: remove redundant logs directory
-OUTPUT_DIR="../../nova/ebt/logs/eval/inference/${DATASET_NAME}/${RUN_NAME}/${CKPT_FILENAME}"
+OUTPUT_DIR="../../openebm/elm/logs/eval/inference/${DATASET_NAME}/${RUN_NAME}/${CKPT_FILENAME}"
 mkdir -p "$OUTPUT_DIR"
 
 # Generate timestamped log file directly in the main eval log
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-# LOG_FILE="../../nova/ebt/logs/eval_${EVAL_TASK}_${TIMESTAMP}.log"
-LOG_FILE="../../nova/ebt/logs/eval/inference/${DATASET_NAME}/${RUN_NAME}/eval_${EVAL_TASK}_${TIMESTAMP}.log"
+# LOG_FILE="../../openebm/elm/logs/eval_${EVAL_TASK}_${TIMESTAMP}.log"
+LOG_FILE="../../openebm/elm/logs/eval/inference/${DATASET_NAME}/${RUN_NAME}/eval_${EVAL_TASK}_${TIMESTAMP}.log"
 
 
 ################################################################################
@@ -165,7 +165,7 @@ python train.py \
 --limit_test_batches "$LIMIT_TEST_BATCHES" \
 --num_workers 4 \
 \
---infer_output_dir "../../nova/ebt/logs/eval/inference" \
+--infer_output_dir "../../openebm/elm/logs/eval/inference" \
 $WANDB_FLAGS \
 \
 --val_sanity 0 \

@@ -9,9 +9,10 @@
 # 获取脚本所在目录的绝对路径
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
+REPO_ROOT="$( cd "$EBT_DIR/../.." && pwd )"
 
-# 切换到 EBT 目录
-cd "$EBT_DIR"
+# 切换到 repo root（绝对 import 需要从 repo root 运行）
+cd "$REPO_ROOT"
 
 # 确定 Python 路径：优先使用 conda 环境的 python，避免误用系统 python
 if [ -n "$CONDA_PREFIX" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
@@ -164,7 +165,7 @@ echo ""
 ################################################################################
 
 {
-$PYTHON train.py \
+$PYTHON -m openebm.elm.train \
     --only_test \
     --only_test_model_ckpt "$CKPT_PATH" \
     --execution_mode "$EXECUTION_MODE" \

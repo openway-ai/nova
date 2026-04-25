@@ -168,7 +168,7 @@ echo ""
 
 set +e
 
-torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/openebm/elm/train.py \
 --run_name ${RUN_NAME}_${current_time} \
 --checkpoint_dir "${EXP_CKPT_DIR}" \
 --wandb_save_dir "${EXP_WANDB_DIR}" \

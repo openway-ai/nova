@@ -6,7 +6,7 @@
 
 set -e
 
-LOGS_DIR="/mnt/shared-storage-user/puyuan/code/nova/nova/ebt/logs"
+LOGS_DIR="/mnt/shared-storage-user/puyuan/code/nova/openebm/elm/logs"
 ARCHIVE_DIR="${LOGS_DIR}/logs_before20260324"
 
 mkdir -p "${ARCHIVE_DIR}/summary"
