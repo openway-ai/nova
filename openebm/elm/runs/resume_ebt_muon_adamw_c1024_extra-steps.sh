@@ -7,6 +7,9 @@
 ################################################################################
 
 ### 基础配置 ###
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/nanochat:${REPO_ROOT}:${PYTHONPATH:-}"
 export RUN_NAME="ebt-d26-ctx1024-from0419"
 
 export MODEL_NAME="${RUN_NAME%%-*}"
@@ -15,7 +18,7 @@ export MODEL_SIZE="d26"
 ### 恢复训练配置 ###
 
 # context 1024
-RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-muon-adamw-0413_20260413_123504/s=step=27937-d26-ctx1024-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.6296.ckpt"
+RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-ctx2048-muon-adamw-0413_20260413_123504/s=step=27937-d26-ctx1024-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.6296.ckpt"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -170,7 +173,7 @@ echo ""
 
 set +e
 
-torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/openebm/elm/train.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/train.py \
 --run_name ${RUN_NAME}_${current_time} \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \

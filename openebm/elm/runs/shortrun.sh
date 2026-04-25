@@ -4,6 +4,9 @@
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
 source ../../.venv/ebt/bin/activate
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/nanochat:${REPO_ROOT}:${PYTHONPATH:-}"
 
 ### LOG INFO ###
 # SBATCH --job-name=ebt-xxs-bs_256_s1_lr_

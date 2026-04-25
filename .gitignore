@@ -52,7 +52,7 @@ tmp_*/
 *.jpeg
 
 # Externel code
-nanochat/external/
+nanochat/nanochat/external/
 
 # User prompts
 prompt/

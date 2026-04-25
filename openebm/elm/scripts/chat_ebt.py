@@ -453,7 +453,7 @@ def print_generation_stats(stats: Dict[str, Any]):
 def main():
     parser = argparse.ArgumentParser(description='EBT 交互式对话终端')
     parser.add_argument('-c', '--checkpoint', type=str,
-                       default="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt",
+                       default="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt",
                        help='Checkpoint 路径')
     parser.add_argument('--tokenizer', type=str,
                        default="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer",

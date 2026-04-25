@@ -35,7 +35,7 @@ dev = [
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
-testpaths = ["tests"]
+testpaths = ["nanochat/tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
@@ -72,3 +72,6 @@ conflicts = [
         { extra = "gpu" },
     ],
 ]
+
+[tool.setuptools.packages.find]
+where = [".", "nanochat"]

@@ -11,6 +11,7 @@ if [ -z "$WANDB_RUN" ]; then
 fi
 
 source .venv/nanochat/bin/activate
+export PYTHONPATH="${PWD}/nanochat:${PWD}:${PYTHONPATH:-}"
 # -----------------------------------------------------------------------------
 # During the course of the run, we will be writing markdown reports to the report/
 # directory in the base dir. This command clears it out and writes a header section

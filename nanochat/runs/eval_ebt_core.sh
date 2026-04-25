@@ -97,6 +97,7 @@ echo ""
 
 echo "🔧 激活虚拟环境..."
 source .venv/bin/activate 2>/dev/null || source /mnt/shared-storage-user/puyuan/code/nanochat/.venv/bin/activate
+export PYTHONPATH="${PWD}/nanochat:${PWD}:${PYTHONPATH:-}"
 
 echo "✅ 环境已激活"
 echo ""

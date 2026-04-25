@@ -10,6 +10,7 @@
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 REPO_ROOT="$( cd "$EBT_DIR/../.." && pwd )"
+export PYTHONPATH="${REPO_ROOT}/nanochat:${REPO_ROOT}:${PYTHONPATH:-}"
 
 # 切换到 repo root（绝对 import 需要从 repo root 运行）
 cd "$REPO_ROOT"
