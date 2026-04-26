@@ -122,7 +122,7 @@ class EBTChatEngine:
 
         self.hparams.tokenizer_obj = self.tokenizer
 
-        from modeling_ebt import EBT_NLP
+        from openebm.elm.modeling_ebt import EBT_NLP
         self.model = EBT_NLP(self.hparams)
 
         state_dict = checkpoint.get('state_dict', checkpoint)
