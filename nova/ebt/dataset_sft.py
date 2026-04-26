@@ -17,26 +17,29 @@ from nanochat.tokenizer import get_tokenizer
 
 
 def _load_sft_datasets():
-    """加载 SFT 数据集混合"""
-    # 导入 nanochat 的 SFT task 类
+    """加载 SFT 数据集混合 (支持 offline 模式)"""
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../"))
     from tasks.common import TaskMixture
     from tasks.gsm8k import GSM8K
     from tasks.mmlu import MMLU
     from tasks.smoltalk import SmolTalk
 
+    # Offline 模式支持：设置 NANOCHAT_SFT_DATA_DIR 环境变量
+    # nanochat tasks 会自动使用该路径下的离线数据集
+    sft_data_dir = os.environ.get("NANOCHAT_SFT_DATA_DIR", "")
+    if sft_data_dir and os.path.exists(sft_data_dir):
+        print(f"[EBT SFT] 使用离线数据集: {sft_data_dir}")
+
     base_dir = os.environ.get("NANOCHAT_BASE_DIR", "")
     identity_path = os.path.join(base_dir, "identity_conversations.jsonl")
 
-    # 训练集: SmolTalk + MMLU + GSM8K (与 nanochat SFT 一致)
     train_tasks = [
-        SmolTalk(split="train"),        # 460K 对话
-        MMLU(subset="auxiliary_train", split="train"),  # 100K 选择题
-        GSM8K(subset="main", split="train"),            # 8K 数学
-        GSM8K(subset="main", split="train"),            # 2 epochs GSM8K
+        SmolTalk(split="train"),
+        MMLU(subset="auxiliary_train", split="train"),
+        GSM8K(subset="main", split="train"),
+        GSM8K(subset="main", split="train"),
     ]
 
-    # 可选: 如果有 identity_conversations.jsonl 和拼写任务
     try:
         from tasks.customjson import CustomJSON
         if os.path.exists(identity_path):
@@ -78,44 +81,48 @@ class SFTIterableDataset(_IterableDataset):
         self.train_dataset, self.val_dataset = _load_sft_datasets()
 
     def __iter__(self):
-        """BOS-aligned bestfit packing，与 nanochat chat_sft.py 逻辑一致"""
+        """BOS-aligned bestfit packing，对齐 chat_sft.py"""
         ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
         dataset = self.train_dataset if self.split == "train" else self.val_dataset
         dataset_size = len(dataset)
         assert dataset_size > 0
 
-        row_capacity = self.T + 1  # +1 用于 target 的最后位置
+        row_capacity = self.T + 1
         bos_token = self.tokenizer.get_bos_token_id()
         use_cuda = "cuda" in str(self.device)
 
-        # 对话缓冲
         conv_buffer = []
         cursor = ddp_rank
-        buffer_size = 100
+        consumed = ddp_rank
+        buffer_size = 1000
+        epoch = 1
 
         def refill_buffer():
-            nonlocal cursor
+            nonlocal cursor, epoch
             while len(conv_buffer) < buffer_size:
                 conversation = dataset[cursor]
                 ids, _ = self.tokenizer.render_conversation(conversation)
-                conv_buffer.append(ids)
                 cursor += ddp_world_size
                 if cursor >= dataset_size:
                     cursor = cursor % dataset_size
+                    epoch += 1
+                # 跳过超长对话，只保留能放入 row_capacity 的
+                if len(ids) <= row_capacity:
+                    conv_buffer.append(ids)
 
         it = 0
         while True:
             rows = []
-            row_lengths = []
+            row_lengths = []  # 每行实际内容长度（不含 padding）
 
             for _ in range(self.B):
                 row = []
                 padded = False
                 while len(row) < row_capacity:
-                    refill_buffer()
+                    while len(conv_buffer) < buffer_size:
+                        refill_buffer()
                     remaining = row_capacity - len(row)
 
-                    # Best-fit: 找最大的能放进去的对话
                     best_idx = -1
                     best_len = 0
                     for i, conv in enumerate(conv_buffer):
@@ -125,25 +132,29 @@ class SFTIterableDataset(_IterableDataset):
                             best_len = conv_len
 
                     if best_idx >= 0:
-                        row.extend(conv_buffer.pop(best_idx))
+                        conv = conv_buffer.pop(best_idx)
+                        row.extend(conv)
+                        consumed += ddp_world_size
                     else:
                         content_len = len(row)
+                        remaining = row_capacity - len(row)
                         row.extend([bos_token] * remaining)
                         padded = True
                         break
 
-                row_lengths.append(content_len if padded else row_capacity)
+                if padded:
+                    row_lengths.append(content_len)
+                else:
+                    row_lengths.append(row_capacity)
                 rows.append(row[:row_capacity])
 
-            # 构建张量
             batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
             inputs = batch_tensor[:, :-1].to(device=self.device, dtype=torch.int64, non_blocking=use_cuda)
             targets = batch_tensor[:, 1:].to(device=self.device, dtype=torch.int64, non_blocking=use_cuda)
-
-            # Mask padding 位置
+            # 只 mask padding 位置（对齐 chat_sft.py），user + assistant token 都参与 loss
             for i, content_len in enumerate(row_lengths):
                 if content_len < row_capacity:
-                    targets[i, content_len - 1:] = -1
+                    targets[i, content_len-1:] = -1
 
             yield inputs, targets
 

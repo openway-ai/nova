@@ -2,11 +2,12 @@
 ################################################################################
 # EBT 评估入口脚本
 #
-# 所有参数在此统一配置，自动传递给子脚本
+# 统一配置参数 → 调度子任务 → 双向输出(屏幕+日志) → 自动清理
 # 运行: bash runs/eval_ebt_nanochat_gsm8k.sh
 ################################################################################
 
-set -e  # 遇到错误立即退出
+set -e
+set -o pipefail
 
 # 获取脚本所在目录的绝对路径
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -17,9 +18,11 @@ EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 ################################################################################
 
 # Checkpoint 路径
-export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt}"
+# export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt}"
+# base_train bpb 0.81
+export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt}"
 
-# 验证 checkpoint 存在
+
 if [ ! -f "$CKPT_PATH" ]; then
     echo "❌ 未找到 checkpoint: $CKPT_PATH"
     exit 1
@@ -54,92 +57,166 @@ export MIN_GENERATION_LENGTH="${MIN_GENERATION_LENGTH:-64}"
 export EVAL_TASK="${EVAL_TASK:-gsm8k}"
 
 ################################################################################
-# 初始化
+# 日志目录设置
 ################################################################################
 
-echo "📦 使用 checkpoint: $CKPT_PATH"
-echo ""
+# 从 checkpoint 路径提取 run 标识
+RUN_NAME=$(basename "$(dirname "$CKPT_PATH")")
+# 简化 run name: 去掉尾部日期目录格式后缀 (_2026-xx-xx_xx-xx-xx_)
+RUN_SHORT=$(echo "$RUN_NAME" | sed 's/_[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}-[0-9]\{2\}_\?$//')
 
-# 创建汇总日志目录
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# 本次运行的统一根目录: logs/eval/<run_short>_<timestamp>/
+# 所有子任务的日志和推理输出都归档于此
+export EVAL_RUN_DIR="$EBT_DIR/logs/eval/${RUN_SHORT}_${TIMESTAMP}"
+mkdir -p "$EVAL_RUN_DIR"
+
+# 主日志 (入口脚本全程记录)
+MASTER_LOG="$EVAL_RUN_DIR/master.log"
+
+# 子任务日志路径 (传递给子脚本)
+export NANOCHAT_EVAL_LOG="$EVAL_RUN_DIR/nanochat_shards.log"
+export GSM8K_EVAL_LOG="$EVAL_RUN_DIR/gsm8k.log"
+
+################################################################################
+# 自动清理: 只保留最近 MAX_KEEP 个运行目录
+################################################################################
+
+MAX_KEEP=10
+
 EVAL_BASE_DIR="$EBT_DIR/logs/eval"
-SUMMARY_DIR="${EVAL_BASE_DIR}/summary"
-mkdir -p "$SUMMARY_DIR"
-SUMMARY_FILE="$SUMMARY_DIR/eval_summary_$(date +%Y%m%d_%H%M%S).txt"
+cleanup_old_run_dirs() {
+    local dirs
+    dirs=$(ls -1dt "$EVAL_BASE_DIR"/${RUN_SHORT}_[0-9]* 2>/dev/null || true)
+    local count
+    count=$(echo "$dirs" | grep -c . 2>/dev/null || true)
+    if [ "$count" -gt "$MAX_KEEP" ]; then
+        echo "$dirs" | tail -n +$((MAX_KEEP + 1)) | xargs rm -rf
+        echo "  🧹 清理 $(( count - MAX_KEEP )) 个旧运行目录"
+    fi
+}
 
-{
+cleanup_old_run_dirs
+
+################################################################################
+# 主逻辑 (包裹在函数中，通过管道 tee 实现双向输出)
+################################################################################
+
+main() {
     echo "======================================================================"
-    echo "EBT 模型评估汇总报告"
-    echo "时间: $(date)"
-    echo "Checkpoint: $CKPT_PATH"
+    echo "  EBT 模型评估 - $RUN_SHORT"
+    echo "  时间: $(date)"
     echo "======================================================================"
     echo ""
-} > "$SUMMARY_FILE"
+    echo "📦 Checkpoint : $CKPT_PATH"
+    echo "📦 Tokenizer  : $TOKENIZER_PATH"
+    echo "📦 GPUs: $GPUS | Batch: $BATCH_SIZE | LimitBatches: $LIMIT_TEST_BATCHES"
+    echo ""
+    echo "📁 运行目录   : $EVAL_RUN_DIR"
+    echo "   主日志     : $(basename "$MASTER_LOG")"
+    echo "   NanoChat   : $(basename "$NANOCHAT_EVAL_LOG")"
+    echo "   GSM8K      : $(basename "$GSM8K_EVAL_LOG")"
+    echo ""
 
-################################################################################
-# 示例 1: NanoChat 分片评估
-################################################################################
+    ############################################################################
+    # 任务 1: NanoChat 分片评估
+    ############################################################################
 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "示例 1: NanoChat 分片评估 (shard $EVAL_SHARD_INDICES)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  任务 1/2: NanoChat 分片评估 (shard $EVAL_SHARD_INDICES)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
 
-{
-    echo "----------------------------------------"
-    echo "任务 1: NanoChat 分片 PPL (shard $EVAL_SHARD_INDICES)"
-    echo "----------------------------------------"
-} >> "$SUMMARY_FILE"
+    TASK1_START=$(date +%s)
 
-bash "$SCRIPT_DIR/eval_nanochat_shards.sh"
+    if bash "$SCRIPT_DIR/eval_nanochat_shards.sh"; then
+        TASK1_STATUS="✅ 成功"
+    else
+        TASK1_STATUS="❌ 失败 (退出码: $?)"
+    fi
 
-# 提取结果到汇总文件
-RESULT_FILE=$(ls -t $EBT_DIR/logs/eval_nanochat_shards_*.log 2>/dev/null | head -1)
-if [ -n "$RESULT_FILE" ]; then
-    echo "结果摘要:" >> "$SUMMARY_FILE"
-    grep -A 15 "TEST EPOCH SUMMARY" "$RESULT_FILE" | tail -16 >> "$SUMMARY_FILE" 2>/dev/null || echo "  未找到汇总指标" >> "$SUMMARY_FILE"
-    echo "" >> "$SUMMARY_FILE"
-fi
+    TASK1_END=$(date +%s)
+    TASK1_DURATION=$(( TASK1_END - TASK1_START ))
 
-echo ""
-echo ""
+    echo ""
+    echo "  ⏱ NanoChat 耗时: ${TASK1_DURATION}s | $TASK1_STATUS"
+    echo ""
 
-################################################################################
-# 示例 2: GSM8K 数学推理
-################################################################################
+    ############################################################################
+    # 任务 2: GSM8K 数学推理
+    ############################################################################
 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "示例 2: GSM8K 数学推理任务"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  任务 2/2: GSM8K 数学推理"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
 
-{
-    echo "----------------------------------------"
-    echo "任务 2: GSM8K"
-    echo "----------------------------------------"
-} >> "$SUMMARY_FILE"
+    TASK2_START=$(date +%s)
 
-bash "$SCRIPT_DIR/eval_ebt.sh"
+    if bash "$SCRIPT_DIR/eval_ebt.sh"; then
+        TASK2_STATUS="✅ 成功"
+    else
+        TASK2_STATUS="❌ 失败 (退出码: $?)"
+    fi
 
-RESULT_FILE=$(ls -t ${EVAL_BASE_DIR}/logs/gsm8k_*_result.txt 2>/dev/null | head -1)
-if [ -n "$RESULT_FILE" ]; then
-    cat "$RESULT_FILE" >> "$SUMMARY_FILE"
-    echo "" >> "$SUMMARY_FILE"
-fi
+    TASK2_END=$(date +%s)
+    TASK2_DURATION=$(( TASK2_END - TASK2_START ))
 
-echo ""
-echo ""
+    echo ""
+    echo "  ⏱ GSM8K 耗时: ${TASK2_DURATION}s | $TASK2_STATUS"
+    echo ""
 
-################################################################################
-# 汇总报告
-################################################################################
+    ############################################################################
+    # 汇总报告
+    ############################################################################
 
-echo "======================================================================"
-echo "✅ 所有评估完成！"
-echo "======================================================================"
-echo ""
-echo "📊 汇总报告已保存到: $SUMMARY_FILE"
-echo ""
-echo "查看报告:"
-echo "  cat $SUMMARY_FILE"
-echo ""
-echo "======================================================================"
+    TOTAL_DURATION=$(( TASK2_END - TASK1_START ))
+
+    echo ""
+    echo "======================================================================"
+    echo "  评估完成 - 汇总"
+    echo "======================================================================"
+    echo ""
+    echo "  模型      : $RUN_SHORT"
+    echo "  NanoChat  : $TASK1_STATUS  (${TASK1_DURATION}s)"
+    echo "  GSM8K     : $TASK2_STATUS  (${TASK2_DURATION}s)"
+    echo "  总耗时    : ${TOTAL_DURATION}s"
+    echo ""
+
+    # 提取 NanoChat 关键指标 (从 [EVAL_SUMMARY] 标记行)
+    if [ -f "$NANOCHAT_EVAL_LOG" ]; then
+        NANOCHAT_SUMMARY=$(grep -E "\[EVAL_SUMMARY\]" "$NANOCHAT_EVAL_LOG" 2>/dev/null | tail -1 || true)
+        if [ -n "$NANOCHAT_SUMMARY" ]; then
+            echo "  NanoChat 指标:"
+            echo "    $NANOCHAT_SUMMARY"
+            echo ""
+        fi
+        # Also show PPL statistics if present
+        PPL_LINE=$(grep -E "Mean:.*[0-9]" "$NANOCHAT_EVAL_LOG" 2>/dev/null | head -4 || true)
+        if [ -n "$PPL_LINE" ]; then
+            echo "  NanoChat PPL/Loss 详情:"
+            echo "$PPL_LINE" | sed 's/^/    /'
+            echo ""
+        fi
+    fi
+
+    # 提取 GSM8K 关键指标
+    if [ -f "$GSM8K_EVAL_LOG" ]; then
+        GSM8K_SUMMARY=$(grep -E "\[EVAL_SUMMARY\]" "$GSM8K_EVAL_LOG" 2>/dev/null | tail -1 || true)
+        if [ -n "$GSM8K_SUMMARY" ]; then
+            echo "  GSM8K 指标:"
+            echo "    $GSM8K_SUMMARY"
+            echo ""
+        fi
+    fi
+
+    echo "  📁 完整日志:"
+    echo "    $EVAL_RUN_DIR"
+    echo ""
+    echo "======================================================================"
+}
+
+# 运行主逻辑: stdout/stderr 同时输出到屏幕和主日志文件
+main 2>&1 | tee "$MASTER_LOG"
+exit ${PIPESTATUS[0]}

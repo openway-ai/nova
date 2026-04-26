@@ -4,6 +4,7 @@ https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk
 We use the "smol" version, which is more appropriate for smaller models.
 """
 
+import os
 from datasets import load_dataset
 from tasks.common import Task
 
@@ -13,7 +14,23 @@ class SmolTalk(Task):
     def __init__(self, split, **kwargs):
         super().__init__(**kwargs)
         assert split in ["train", "test"], "SmolTalk split must be train|test"
-        self.ds = load_dataset("HuggingFaceTB/smol-smoltalk", split=split).shuffle(seed=42)
+
+        # 支持离线数据集
+        cache_dir = None
+        download_mode = None
+        if os.environ.get("NANOCHAT_SFT_DATA_DIR"):
+            cache_dir = os.path.join(os.environ["NANOCHAT_SFT_DATA_DIR"], "smol-smoltalk")
+            if os.path.exists(cache_dir):
+                download_mode = "reuse_cache_if_exists"
+            else:
+                cache_dir = None
+
+        self.ds = load_dataset(
+            "HuggingFaceTB/smol-smoltalk",
+            split=split,
+            cache_dir=cache_dir,
+            download_mode=download_mode
+        ).shuffle(seed=42)
         self.length = len(self.ds)
 
     def num_examples(self):

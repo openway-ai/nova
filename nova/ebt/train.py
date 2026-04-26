@@ -3,10 +3,18 @@
 import torch
 import os
 from argparse import ArgumentParser
-import time
 
 import random
-from datetime import datetime
+
+# 允许加载旧 checkpoint 中的自定义类
+try:
+    from nanochat.tokenizer import RustBPETokenizer
+    torch.serialization.add_safe_globals([RustBPETokenizer])
+except:
+    pass
+
+# 抑制 CUDA stream 不匹配警告（恢复训练时的已知问题）
+torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 # from nanolightning.torchlightning_trainer import Trainer
 # from nanolightning.iteratabletrainer import IterableTrainer
@@ -17,13 +25,20 @@ from datetime import datetime
 # from nanolightning.torchlightning_function import ModelCheckpoint
 # from nanolightning.torchlightning_function import rank_zero_only
 
-from pytorch_lightning import Trainer
-from pytorch_lightning.strategies import DDPStrategy
-from pytorch_lightning import seed_everything
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
-from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.callbacks import ModelSummary
+try:
+    from lightning.pytorch import Trainer, seed_everything
+    from lightning.pytorch.strategies import DDPStrategy
+    from lightning.pytorch.utilities.rank_zero import rank_zero_only
+    from lightning.pytorch.loggers import WandbLogger
+    from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary
+except ImportError:
+    from pytorch_lightning import Trainer, seed_everything
+    from pytorch_lightning.strategies import DDPStrategy
+    from pytorch_lightning.utilities.rank_zero import rank_zero_only
+    from pytorch_lightning.loggers import WandbLogger
+    from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
+
+from disk_aware_checkpoint import DiskAwareCheckpoint
 
 import sys
 import wandb
@@ -74,7 +89,7 @@ def main(args):
         run = None # need both lines since setup_wandb is a @rank_zero_only function
         run = setup_wandb(args)
 
-        wandb_logger = WandbLogger(save_dir="logs/", name=f'{args.run_name}', entity=f'{args.wandb_entity}', project=f'{args.wandb_project}', offline = args.wandb_offline, experiment=run)
+        wandb_logger = WandbLogger(save_dir=args.wandb_save_dir, name=f'{args.run_name}', entity=f'{args.wandb_entity}', project=f'{args.wandb_project}', offline = args.wandb_offline, experiment=run)
         if args.wandb_tags != None:
             wandb_logger.experiment.tags = args.wandb_tags
     else:
@@ -169,13 +184,12 @@ def main(args):
 
     model_trainer = ModelTrainer(args)
 
-    # if args.execution_mode == "finetune":
-    #     assert args.finetuning_model_ckpt != None and args.resume_training_ckpt == "", "Must provide a checkpoint when finetuning and cannot provide a resume_training_ckpt."
-    #     model_trainer.model = load_trained_pl_model(args.finetuning_model_ckpt, args)
-
-    timestamp = int(time.time())
-    dt_object = datetime.fromtimestamp(timestamp)
-    dt_string = dt_object.strftime("%Y-%m-%d_%H-%M-%S")
+    # SFT: 加载预训练权重但不恢复训练状态
+    if args.finetuning_model_ckpt is not None and args.finetuning_model_ckpt != "":
+        print(f"[SFT] 加载预训练权重: {args.finetuning_model_ckpt}")
+        ckpt = torch.load(args.finetuning_model_ckpt, map_location='cpu', weights_only=False)
+        model_trainer.load_state_dict(ckpt['state_dict'], strict=False)
+        print(f"[SFT] 权重加载完成，训练从 step 0 开始")
 
     # if args.debug_dataloader:
     #     debug_dataloader(args, model_trainer)
@@ -195,18 +209,34 @@ def main(args):
     if args.set_matmul_precision is not None: #default is highest
         torch.set_float32_matmul_precision(args.set_matmul_precision)
     
-    checkpoint_filename = "epoch={epoch}-step={step}-" + args.checkpoint_monitor_string + "={"+args.checkpoint_monitor_string+":.4f}"
-    checkpoint_callback = ModelCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = True, dirpath=f"./logs/checkpoints/{args.run_name}_{dt_string}_", filename=checkpoint_filename, verbose=True)
-    
+    opt_name = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
+    ckpt_dir = args.checkpoint_dir if args.checkpoint_dir else f"./logs/checkpoints/{args.run_name}"
+    checkpoint_filename = f"s={{step}}-{args.model_size}-ctx{args.context_length}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
+    save_last = (args.save_periodic_steps <= 0)  # periodic 启用时不需要 last.ckpt，periodic 已覆盖 crash recovery
+    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=ckpt_dir, filename=checkpoint_filename, verbose=True, min_free_gb=50)
+
+    # 定期保存 checkpoint（不依赖 val_loss），防止 SFT 后期模型丢失
+    periodic_checkpoint = None
+    if args.save_periodic_steps > 0:
+        periodic_checkpoint = DiskAwareCheckpoint(
+            save_top_k=1,
+            save_last=False,
+            every_n_train_steps=args.save_periodic_steps,
+            dirpath=ckpt_dir,
+            filename=f"periodic-s={{step}}-{args.model_size}-ctx{args.context_length}",
+            verbose=True,
+            min_free_gb=50
+        )
+
     for name, param in model_trainer.model.named_parameters():
         if not param.requires_grad:
             print(f"Non-trainable parameters: {name} with shape {param.shape}")
     
     if not args.only_test: #training and testing (if testing selected) as per usual
         print("$$$$$$$$$$  STARTED TRAINING  $$$$$$$$$$")
-        trainer = set_trainer(args, wandb_logger, checkpoint_callback)
+        trainer = set_trainer(args, wandb_logger, checkpoint_callback, periodic_checkpoint=periodic_checkpoint)
         resume_training_ckpt = None if args.resume_training_ckpt == "" else args.resume_training_ckpt
-        trainer.fit(model_trainer, ckpt_path=resume_training_ckpt)
+        trainer.fit(model_trainer, ckpt_path=resume_training_ckpt, weights_only=False)
         
         if args.run_testing_after_training:
             args.only_test_model_ckpt = checkpoint_callback.best_model_path
@@ -273,14 +303,14 @@ def main(args):
         else:
             raise NotImplementedError(f"no post test evaluation setup for this modality: {args.modality} yet")
 
-def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train"):
+def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", periodic_checkpoint=None):
     torch.autograd.set_detect_anomaly(args.detect_anomaly) #NOTE seems pl detect anomaly is not working so manually set it here
 
-    if args.find_unused_parameters: #for if ever need more manipulation
-            args.distributed_strategy = DDPStrategy(find_unused_parameters = True)
-        # else:
-        #     pass
-        # if having issues with strategy try 'ddp_spawn' instead of 'ddp'
+    if args.find_unused_parameters or args.distributed_strategy == "ddp":
+            args.distributed_strategy = DDPStrategy(
+                find_unused_parameters=True,
+                gradient_as_bucket_view=True,
+            )
     args.overfit_batches = int(args.overfit_batches) if int(args.overfit_batches) == args.overfit_batches else args.overfit_batches
     profiler = None if args.profiler == "" else args.profiler
     gradient_clip_val = args.gradient_clip_val if args.gradient_clip_val > 0 else None
@@ -295,7 +325,7 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train"):
         max_steps=args.max_steps,
         logger=wandb_logger,
         enable_model_summary=args.log_model_archi,
-        callbacks = [checkpoint_callback, ModelSummary(max_depth=-1)],
+        callbacks = [checkpoint_callback] + ([periodic_checkpoint] if periodic_checkpoint else []) + [ModelSummary(max_depth=-1)],
         strategy = args.distributed_strategy, 
         enable_checkpointing=True,
         fast_dev_run = args.fast_dev_run,
@@ -455,6 +485,9 @@ if __name__ == '__main__':
     parser.add_argument("--clamp_max_after_warm_up", help="clamps the absolute value of predicted_tokens to be within range [-val, val], after warming up. not used anymore", type=float, default=0.0)
 
     parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
+
+    parser.add_argument("--use_mcmc_time_embed", action="store_true", default=False,
+        help="Enable MCMC step time embedding (only for ebt_type=time_embed). When False, all steps share the same transition kernel, enabling arbitrary step count at inference.")
 
     parser.add_argument("--ebt_norm", help="type of norm to use for energy based transformer, NOTE is only supported for ebt_time_embed. not used anymore didnt work better than default rms from llama2", choices=["rms", "none", "layer", "ebm_backwards_norm", "dyt"], type=str, default="rms")
 
@@ -798,13 +831,24 @@ if __name__ == '__main__':
 
     # CHECKPOINTING ##################################################################
 
-    parser.add_argument("--resume_training_ckpt", help="checkpoint to resume training from, use absolute",type=str, default="")     
+    parser.add_argument("--resume_training_ckpt", help="checkpoint to resume training from, use absolute",type=str, default="")
+
+    parser.add_argument("--resume_warmup_steps", type=int, default=0,
+        help="Resume 后的 warmup 步数，LR 从 0 线性升到 schedule 值。0=不启用")     
 
     parser.add_argument("--checkpoint_monitor_string", help="string to use to monitor for saving checkpoint. supported by PL callback", type=str, default="valid_loss")
 
     parser.add_argument("--checkpoint_monitor_mode", help="monitoring mode for checkpoint_monitor_string, either ['min', 'max']. if is loss do min, if is a metric like accuracy do max", type=str, default="min")
 
     parser.add_argument("--save_top_k_ckpts", help="number of ckpts to save when doing val (saves the ones with best metrics using checkpoint monitor string and mode defined). -1 means save all", type=int, default=10)
+
+    parser.add_argument("--checkpoint_dir", type=str, default="",
+        help="Override checkpoint directory (default: ./logs/checkpoints/{run_name})")
+    parser.add_argument("--wandb_save_dir", type=str, default="logs/",
+        help="Override WandB save directory")
+
+    parser.add_argument("--save_periodic_steps", type=int, default=0,
+        help="Save checkpoint every N training steps regardless of val_loss (0=disabled). Useful for SFT where val_loss may rise while task performance improves.")
 
     #PRECISION#########################################################################
 
@@ -818,6 +862,9 @@ if __name__ == '__main__':
     parser.add_argument("--compile_mode", help="torch.compile 模式: full (编译整个模型), transformer_only (仅编译 transformer，推荐), disabled", type=str, default="transformer_only", choices=["full", "transformer_only", "disabled"])
     parser.add_argument("--compile_backend", help="torch.compile 后端: inductor (默认), eager, aot_eager", type=str, default="inductor")
     parser.add_argument("--compile_dynamic", help="允许动态形状 (可能降低加速效果)", action="store_true", default=False)
+
+    parser.add_argument("--gradient_checkpointing", help="启用 gradient checkpointing 以节省显存 (用计算换显存)", action="store_true", default=False)
+    parser.add_argument("--use_sdpa_attention", help="使用 SDPA 注意力变体 (ar_ebt_time_embed_sdpa_math.py), 大幅减少 Path B 中间张量显存占用", action="store_true", default=False)
 
     #SLURM#########################################################################
 
@@ -835,7 +882,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--overfit_batches", help="if nonzero will overfit to specified num/percent of batches", type=float, default=0.0)
 
-    parser.add_argument("--profiler", choices=["simple", "advanced"], type=str, default="")
+    parser.add_argument("--profiler", choices=["simple", "advanced", "pytorch"], type=str, default="")
 
     parser.add_argument("--no_shuffle", help="stops shuffling - helpful for debugging", action="store_true", default=False)
 

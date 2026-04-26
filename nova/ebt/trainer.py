@@ -45,7 +45,10 @@ from modeling_ebt import EBT_NLP
 # from nanolightning.torchlightning_module import LightningModule
 # from nanolightning.iteratabledataset import generate_dataloader, IterableDataset
 
-from pytorch_lightning import LightningModule
+try:
+    from lightning.pytorch import LightningModule
+except ImportError:
+    from pytorch_lightning import LightningModule
 from dataset import IterableDataset, generate_dataloader
 from dataset_sft import generate_sft_dataloader
 
@@ -105,6 +108,13 @@ class ModelTrainer(LightningModule):
         # Initialize tracking for test metrics
         self.test_losses = []
         self.test_perplexities = []
+
+        # Training throughput tracking
+        self._train_step_start_time = None
+        self._train_start_time = None  # wall-clock start for ETA
+
+        # Dataloader resume state: 用于从 checkpoint 恢复 dataloader 位置
+        self._dataloader_resume_state = None
 
         if self.hparams.modality == "NLP":
             if "execution_mode" in self.hparams and "save_generation_logs_dir" in self.hparams and self.hparams.execution_mode == "inference": # two of these are sanity check for loading pretrained ckpt that may not have newer params
@@ -229,37 +239,67 @@ class ModelTrainer(LightningModule):
             #     raise ValueError(f"do not recognize model name: {self.hparams.model_name}")
 
         # torch.compile 支持
-        # 注意: EBT 使用 autograd.grad 进行 MCMC 更新，与 fullgraph=True 可能不兼容
-        # 推荐使用 --compile_model --compile_mode transformer_only 仅编译 transformer 部分
+        # EBT 训练时 autograd.grad(create_graph=True) 产生二阶梯度,
+        # torch.compile (aot_autograd) 不支持 double backward, 因此训练时跳过编译.
+        # 推理时 learning=False → create_graph=False, 可以安全编译.
         if self.hparams.compile_model:
-            compile_mode = getattr(self.hparams, 'compile_mode', 'full')
+            compile_mode = getattr(self.hparams, 'compile_mode', 'transformer_only')
             compile_backend = getattr(self.hparams, 'compile_backend', 'inductor')
             compile_dynamic = getattr(self.hparams, 'compile_dynamic', False)
 
             if compile_mode == 'full':
                 # 编译整个模型 (可能与 autograd.grad 不兼容)
-                print(f"[torch.compile] 编译整个模型 (mode=full, backend={compile_backend}, dynamic={compile_dynamic})")
+                print(f"\n{'='*80}")
+                print(f"[torch.compile] 开始编译整个模型...")
+                print(f"[torch.compile] 模式: full | 后端: {compile_backend} | 动态: {compile_dynamic}")
                 print(f"[torch.compile] 警告: EBT 的 MCMC 循环使用 autograd.grad，可能导致编译失败")
+                print(f"[torch.compile] 首次编译可能需要 5-15 分钟，请耐心等待...")
+                print(f"{'='*80}\n")
+                import time
+                start_time = time.time()
                 self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
+                compile_time = time.time() - start_time
+                print(f"\n{'='*80}")
+                print(f"[torch.compile] ✓ 模型编译完成 (耗时: {compile_time:.1f}s)")
+                print(f"{'='*80}\n")
 
             elif compile_mode == 'transformer_only':
-                # 仅编译 transformer 部分 (推荐，避开 MCMC 循环)
+                # 仅编译 transformer 部分 (避开 MCMC )
+                # 保留 eager 引用供 _mcmc_step_excluded 中 create_graph=True 时使用
                 print(f"[torch.compile] 仅编译 transformer 部分 (mode=transformer_only, backend={compile_backend})")
                 if hasattr(self.model, 'transformer'):
+                    self.model.transformer_eager = self.model.transformer  # 保留 eager 引用
                     self.model.transformer = torch.compile(
                         self.model.transformer,
                         backend=compile_backend,
                         dynamic=compile_dynamic
                     )
-                    print(f"[torch.compile] transformer 编译成功")
+                    print(f"[torch.compile] transformer 编译成功，transformer_eager 已保留用于 MCMC")
                 else:
                     print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过编译")
 
             elif compile_mode == 'disabled':
                 print(f"[torch.compile] 编译已禁用")
 
+            elif (self.hparams.execution_mode == "inference") or getattr(self.hparams, 'only_test', False):
+                # 推理模式: learning=False → 无 double backward, 可以安全编译
+                if compile_mode == 'full':
+                    print(f"[torch.compile] 推理模式: 编译整个模型 (backend={compile_backend})")
+                    self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
+                elif compile_mode == 'transformer_only':
+                    if hasattr(self.model, 'transformer'):
+                        print(f"[torch.compile] 推理模式: 编译 transformer (backend={compile_backend})")
+                        self.model.transformer = torch.compile(
+                            self.model.transformer, backend=compile_backend, dynamic=compile_dynamic
+                        )
+                    else:
+                        print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过")
+                else:
+                    raise ValueError(f"未知 compile_mode: {compile_mode}")
+
             else:
-                raise ValueError(f"未知的 compile_mode: {compile_mode}，可选: full, transformer_only, disabled")
+                # 训练模式: 跳过编译 (EBT MCMC 需要 double backward)
+                print(f"[torch.compile] 训练模式下跳过编译 (EBT MCMC 需要 create_graph=True, aot_autograd 不支持 double backward)")
 
         phases = ['train', 'valid', 'test']
         self.torchmetrics_dict = nn.ModuleDict()
@@ -279,6 +319,17 @@ class ModelTrainer(LightningModule):
 
         
     def on_train_start(self):
+        # --- RNG 恢复 (在 val sanity check 之后、第一个 training step 之前) ---
+        import random
+        rng = getattr(self, '_rng_resume_state', None)
+        if rng is not None:
+            torch.random.set_rng_state(rng['torch_cpu'])
+            if rng.get('torch_cuda') is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state(rng['torch_cuda'])
+            random.setstate(rng['python'])
+            self._rng_resume_state = None
+            print(f"[Exact Resume] RNG states restored for rank {self.global_rank}")
+
         if self.hparams.debug_unused_parameters: 
             for name, param in self.model.named_parameters():
                 if param.requires_grad and "image_encoder" not in name: # NOTE need to modify this code to exclude specific frozen portions
@@ -294,15 +345,26 @@ class ModelTrainer(LightningModule):
     
     @staticmethod
     def wandb_activation_hook(run, step):
-        """ Weights & Biases histogram activation hook. """
+        """ Weights & Biases stats logging hook (optimized). """
         def hook(module, input, output):
             if isinstance(output, tuple):
-                pass # when tried to do things had bug AttributeError: 'list' object has no attribute 'detach'
+                pass 
             else:
-                run.experiment.log(
-                    {f"activations/{module.name}": wandb.Histogram(output.detach().cpu().float())}, 
-                    step=step
-                )
+                try:
+                    # Optimize: Log stats on GPU instead of moving full tensor to CPU for Histogram
+                    data = output.detach().float()
+                    run.experiment.log(
+                        {
+                            f"activations/{module.name}_mean": data.mean().item(),
+                            f"activations/{module.name}_std": data.std().item(),
+                            f"activations/{module.name}_min": data.min().item(),
+                            f"activations/{module.name}_max": data.max().item(),
+                        }, 
+                        step=step
+                    )
+                except RuntimeError:
+                    # Skip logging for tensors without storage (e.g. inside torch.func.grad)
+                    pass
 
         return hook
     
@@ -355,21 +417,124 @@ class ModelTrainer(LightningModule):
         if self.hparams.debug_unused_parameters:
             all_parameters = {name for name, _ in self.model.named_parameters()}
             unused_parameters = all_parameters - self.model.used_parameters - self.model.parameters_not_to_check
-            
+
             print(f"number of parameters total: {len(all_parameters)}")
             print(f"number of unused_parameters: {len(unused_parameters)}")
             print(f"Unused parameters: {unused_parameters}")
             print(f"Used parameters: {self.model.used_parameters}")
-        
+
         if self.hparams.manual_gc_collect_every_n_steps != -1:
-            if self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
+            if self.global_step > 0 and self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
                 print("calling GC manually")
-                gc.collect()            
-           
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        # Record step end time for dt calculation
+        import time as _time
+        now = _time.time()
+        if self._train_step_start_time is not None:
+            self._last_dt = now - self._train_step_start_time
+        else:
+            self._last_dt = None
+        self._train_step_start_time = now
+        if self._train_start_time is None:
+            self._train_start_time = now
+
     # def on_train_epoch_end(self): ## not effective for EBT
     #     if self.hparams.optimizer != "adamw": # e.g. for lars need to manually update epoch
     #         optimizer = self.trainer.optimizers[0]
-    #         optimizer.update_epoch(self.current_epoch)   
+    #         optimizer.update_epoch(self.current_epoch)
+
+    def on_save_checkpoint(self, checkpoint):
+        # 保存 per-rank dataloader 位置 + RNG 状态到 checkpoint，用于精确续训
+        import torch.distributed as dist
+        import random
+
+        # 1. 收集当前 rank 的 dataloader state（精确版，含 doc_buffer）
+        local_dl_state = None
+        try:
+            train_dl = self.trainer.train_dataloader
+            if train_dl is not None:
+                dataset = train_dl.dataset
+                if hasattr(dataset, 'get_dataloader_state'):
+                    local_dl_state = dataset.get_dataloader_state()
+                elif hasattr(dataset, 'last_state_dict') and dataset.last_state_dict is not None:
+                    local_dl_state = dataset.last_state_dict
+        except Exception:
+            pass  # 非训练阶段可能没有 train_dataloader
+
+        # 2. 收集当前 rank 的 RNG state
+        local_rng_state = {
+            'torch_cpu': torch.random.get_rng_state(),
+            'torch_cuda': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            'python': random.getstate(),
+        }
+
+        # 3. DDP: all_gather 收集所有 rank 的状态到 rank 0
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            all_dl_states = [None] * dist.get_world_size()
+            dist.all_gather_object(all_dl_states, local_dl_state)
+            all_rng_states = [None] * dist.get_world_size()
+            dist.all_gather_object(all_rng_states, local_rng_state)
+        else:
+            all_dl_states = [local_dl_state]
+            all_rng_states = [local_rng_state]
+
+        # 4. 写入 checkpoint
+        checkpoint['dataloader_state_dict_by_rank'] = all_dl_states
+        checkpoint['dataloader_state_dict'] = all_dl_states[0]  # 旧格式兼容
+        checkpoint['rng_states_by_rank'] = all_rng_states
+
+        print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
+
+    def on_load_checkpoint(self, checkpoint):
+        # --- 修复 torch.compile _orig_mod 前缀不匹配 ---
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+            has_orig_mod_keys = any('_orig_mod.' in k for k in state_dict)
+            model_has_orig_mod = any('_orig_mod.' in k for k in self.state_dict())
+
+            if has_orig_mod_keys and not model_has_orig_mod:
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    new_state_dict[k.replace('._orig_mod.', '.')] = v
+                checkpoint['state_dict'] = new_state_dict
+                print(f"[Checkpoint] Stripped '_orig_mod' prefix from {len(state_dict)} keys")
+            elif not has_orig_mod_keys and model_has_orig_mod:
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith('model.'):
+                        new_state_dict['model._orig_mod.' + k[len('model.'):]] = v
+                    else:
+                        new_state_dict[k] = v
+                checkpoint['state_dict'] = new_state_dict
+                print(f"[Checkpoint] Added '_orig_mod' prefix to {len(state_dict)} keys")
+
+        # 从 checkpoint 恢复 per-rank dataloader 位置 + RNG 状态
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # Dataloader state: 优先 per-rank，回退旧格式
+        if 'dataloader_state_dict_by_rank' in checkpoint:
+            states = checkpoint['dataloader_state_dict_by_rank']
+            self._dataloader_resume_state = states[rank] if rank < len(states) else None
+        elif 'dataloader_state_dict' in checkpoint:
+            self._dataloader_resume_state = checkpoint['dataloader_state_dict']
+
+        # RNG state: per-rank
+        if 'rng_states_by_rank' in checkpoint:
+            rng_states = checkpoint['rng_states_by_rank']
+            self._rng_resume_state = rng_states[rank] if rank < len(rng_states) else None
+        else:
+            self._rng_resume_state = None
+
+        if self._dataloader_resume_state:
+            print(f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
+                  f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
+                  f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
+                  f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}")
+        if self._rng_resume_state:
+            print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
 
     def validation_step(self, batch, batch_idx):
         # Move token_bytes to the same device as the model if needed
@@ -378,6 +543,14 @@ class ModelTrainer(LightningModule):
             token_bytes = token_bytes.to(self.device)
         eval_step_dict = self.eval_step(batch, "valid", token_bytes)
         self.log_metrics(eval_step_dict, "valid")
+        # 缓存最新 valid 指标，供 train 进度条显示
+        if not hasattr(self, '_last_valid_metrics'):
+            self._last_valid_metrics = {}
+        for k, v in eval_step_dict.items():
+            if isinstance(v, torch.Tensor) and v.dim() == 0:
+                self._last_valid_metrics[k] = v.detach().item()
+            elif isinstance(v, (int, float)):
+                self._last_valid_metrics[k] = v
 
     def on_test_epoch_start(self):
         """Reset test metrics at the start of test epoch"""
@@ -386,6 +559,7 @@ class ModelTrainer(LightningModule):
         self.test_perplexities = []
         self.test_energies = {}
         self.test_start_time = time.time()
+        self.test_generation_count = 0  # track generated samples for GSM8K etc.
 
         # Print header
         import sys
@@ -400,6 +574,7 @@ class ModelTrainer(LightningModule):
                 # For GSM8K and other generation tasks that use DataLoader with collate_fn
                 if self.hparams.dataset_name == "gsm8k":
                     outputs = generate_text(self.model, batch, self.hparams)
+                    self.test_generation_count += len(outputs)
                     for output in outputs:
                         self.infer_logger.log_data(output)
 
@@ -666,15 +841,56 @@ class ModelTrainer(LightningModule):
 
     def on_test_epoch_end(self):
         """Print comprehensive summary statistics at the end of test epoch"""
-        if len(self.test_losses) > 0:
-            import sys
-            import numpy as np
-            import time
+        import sys
+        import numpy as np
+        import time
 
-            # Calculate timing
-            total_time = time.time() - self.test_start_time
+        total_time = time.time() - self.test_start_time
+        has_ppl = len(self.test_losses) > 0
+        has_generation = getattr(self, 'test_generation_count', 0) > 0
+
+        if not has_ppl and not has_generation:
+            return
+
+        sys.stdout.write(f"\n\n")
+        sys.stdout.write(f"{'='*100}\n")
+        sys.stdout.write(f"{'EVALUATION RESULTS SUMMARY':^100}\n")
+        sys.stdout.write(f"{'='*100}\n\n")
+
+        # Dataset info
+        sys.stdout.write(f"Dataset Information:\n")
+        sys.stdout.write(f"   Dataset:           {self.hparams.dataset_name}\n")
+        if has_ppl:
+            sys.stdout.write(f"   Total Batches:     {len(self.test_losses)}\n")
+            sys.stdout.write(f"   Total Samples:     ~{len(self.test_losses) * self.hparams.batch_size_per_device}\n")
+        if has_generation:
+            sys.stdout.write(f"   Generated Samples: {self.test_generation_count}\n")
+        sys.stdout.write(f"   Batch Size:        {self.hparams.batch_size_per_device}\n")
+        sys.stdout.write(f"   Context Length:    {self.hparams.context_length}\n\n")
+
+        # Model info
+        sys.stdout.write(f"Model Information:\n")
+        sys.stdout.write(f"   Model Type:        {self.hparams.model_name.upper()}\n")
+        sys.stdout.write(f"   Model Size:        {self.hparams.model_size}\n")
+        if self.hparams.model_name == "ebt":
+            sys.stdout.write(f"   MCMC Steps:        {self.hparams.mcmc_num_steps}\n")
+            sys.stdout.write(f"   MCMC Step Size:    {self.hparams.mcmc_step_size}\n")
+            sys.stdout.write(f"   EBT Type:          {self.hparams.ebt_type}\n")
+        sys.stdout.write(f"\n")
+
+        # Timing info
+        sys.stdout.write(f"Performance:\n")
+        sys.stdout.write(f"   Total Time:        {total_time:.2f}s\n")
+        if has_ppl:
             samples_per_sec = len(self.test_losses) * self.hparams.batch_size_per_device / total_time
+            sys.stdout.write(f"   Time per Batch:    {total_time/len(self.test_losses):.3f}s\n")
+            sys.stdout.write(f"   Throughput:        {samples_per_sec:.2f} samples/s\n")
+        if has_generation:
+            gen_per_sec = self.test_generation_count / total_time
+            sys.stdout.write(f"   Generation Speed:  {gen_per_sec:.2f} samples/s\n")
+        sys.stdout.write(f"\n")
 
+        if has_ppl:
             # Calculate statistics
             avg_loss = np.mean(self.test_losses)
             avg_ppl = np.mean(self.test_perplexities)
@@ -686,42 +902,11 @@ class ModelTrainer(LightningModule):
             max_ppl = np.max(self.test_perplexities)
             median_loss = np.median(self.test_losses)
             median_ppl = np.median(self.test_perplexities)
-
-            # Calculate percentiles
             p25_loss, p75_loss = np.percentile(self.test_losses, [25, 75])
             p25_ppl, p75_ppl = np.percentile(self.test_perplexities, [25, 75])
 
-            sys.stdout.write(f"\n\n")
-            sys.stdout.write(f"{'='*100}\n")
-            sys.stdout.write(f"{'📊 EVALUATION RESULTS SUMMARY':^100}\n")
-            sys.stdout.write(f"{'='*100}\n\n")
-
-            # Dataset info
-            sys.stdout.write(f"📦 Dataset Information:\n")
-            sys.stdout.write(f"   Dataset:           {self.hparams.dataset_name}\n")
-            sys.stdout.write(f"   Total Batches:     {len(self.test_losses)}\n")
-            sys.stdout.write(f"   Batch Size:        {self.hparams.batch_size_per_device}\n")
-            sys.stdout.write(f"   Total Samples:     ~{len(self.test_losses) * self.hparams.batch_size_per_device}\n")
-            sys.stdout.write(f"   Context Length:    {self.hparams.context_length}\n\n")
-
-            # Model info
-            sys.stdout.write(f"🤖 Model Information:\n")
-            sys.stdout.write(f"   Model Type:        {self.hparams.model_name.upper()}\n")
-            sys.stdout.write(f"   Model Size:        {self.hparams.model_size}\n")
-            if self.hparams.model_name == "ebt":
-                sys.stdout.write(f"   MCMC Steps:        {self.hparams.mcmc_num_steps}\n")
-                sys.stdout.write(f"   MCMC Step Size:    {self.hparams.mcmc_step_size}\n")
-                sys.stdout.write(f"   EBT Type:          {self.hparams.ebt_type}\n")
-            sys.stdout.write(f"\n")
-
-            # Timing info
-            sys.stdout.write(f"⏱️  Performance:\n")
-            sys.stdout.write(f"   Total Time:        {total_time:.2f}s\n")
-            sys.stdout.write(f"   Time per Batch:    {total_time/len(self.test_losses):.3f}s\n")
-            sys.stdout.write(f"   Throughput:        {samples_per_sec:.2f} samples/s\n\n")
-
             # Loss statistics
-            sys.stdout.write(f"📉 Cross-Entropy Loss Statistics:\n")
+            sys.stdout.write(f"Cross-Entropy Loss Statistics:\n")
             sys.stdout.write(f"   Mean:              {avg_loss:.4f}\n")
             sys.stdout.write(f"   Median:            {median_loss:.4f}\n")
             sys.stdout.write(f"   Std Dev:           {std_loss:.4f}\n")
@@ -731,7 +916,7 @@ class ModelTrainer(LightningModule):
             sys.stdout.write(f"   75th Percentile:   {p75_loss:.4f}\n\n")
 
             # Perplexity statistics
-            sys.stdout.write(f"📈 Perplexity (PPL) Statistics:\n")
+            sys.stdout.write(f"Perplexity (PPL) Statistics:\n")
             sys.stdout.write(f"   Mean:              {avg_ppl:.2f}\n")
             sys.stdout.write(f"   Median:            {median_ppl:.2f}\n")
             sys.stdout.write(f"   Std Dev:           {std_ppl:.2f}\n")
@@ -742,55 +927,66 @@ class ModelTrainer(LightningModule):
 
             # Energy statistics if available
             if hasattr(self, 'test_energies') and self.test_energies:
-                sys.stdout.write(f"⚡ Energy Landscape Statistics:\n")
+                sys.stdout.write(f"Energy Landscape Statistics:\n")
                 for key, values in sorted(self.test_energies.items()):
                     avg_energy = np.mean(values)
                     std_energy = np.std(values)
                     min_energy = np.min(values)
                     max_energy = np.max(values)
                     sys.stdout.write(f"   {key}:\n")
-                    sys.stdout.write(f"      Mean: {avg_energy:.4f} ± {std_energy:.4f}\n")
+                    sys.stdout.write(f"      Mean: {avg_energy:.4f} +/- {std_energy:.4f}\n")
                     sys.stdout.write(f"      Range: [{min_energy:.4f}, {max_energy:.4f}]\n")
                 sys.stdout.write(f"\n")
 
             # ASCII histogram for PPL distribution
-            sys.stdout.write(f"📊 Perplexity Distribution (Histogram):\n")
+            sys.stdout.write(f"Perplexity Distribution (Histogram):\n")
             hist, bin_edges = np.histogram(self.test_perplexities, bins=10)
             max_count = max(hist)
             for i in range(len(hist)):
                 bar_length = int(40 * hist[i] / max_count) if max_count > 0 else 0
-                bar = '█' * bar_length
+                bar = '#' * bar_length
                 sys.stdout.write(f"   [{bin_edges[i]:6.2f}-{bin_edges[i+1]:6.2f}]: {bar} ({hist[i]})\n")
             sys.stdout.write(f"\n")
 
             # Quality assessment
-            sys.stdout.write(f"✅ Quality Assessment:\n")
+            sys.stdout.write(f"Quality Assessment:\n")
             if avg_ppl < 20:
                 quality = "Excellent"
-                emoji = "🎉"
             elif avg_ppl < 40:
                 quality = "Good"
-                emoji = "👍"
             elif avg_ppl < 60:
                 quality = "Fair"
-                emoji = "😐"
             else:
                 quality = "Needs Improvement"
-                emoji = "⚠️"
-            sys.stdout.write(f"   Overall: {emoji} {quality} (PPL={avg_ppl:.2f})\n\n")
+            sys.stdout.write(f"   Overall: {quality} (PPL={avg_ppl:.2f})\n\n")
 
-            # Output files
-            if hasattr(self.hparams, 'save_generation_logs_dir'):
-                import os
-                results_file = os.path.join(self.hparams.save_generation_logs_dir, "results.jsonl")
-                if os.path.exists(results_file):
-                    num_samples = sum(1 for _ in open(results_file))
-                    sys.stdout.write(f"📁 Output Files:\n")
-                    sys.stdout.write(f"   Results:           {results_file}\n")
-                    sys.stdout.write(f"   Num Samples:       {num_samples}\n\n")
+        # GSM8K / generation-only summary
+        if has_generation and not has_ppl:
+            sys.stdout.write(f"Generation Summary:\n")
+            sys.stdout.write(f"   Total Generated:   {self.test_generation_count}\n")
+            sys.stdout.write(f"   Total Time:        {total_time:.2f}s\n")
+            sys.stdout.write(f"   Avg Time/Sample:   {total_time/self.test_generation_count:.2f}s\n\n")
 
-            sys.stdout.write(f"{'='*100}\n\n")
-            sys.stdout.flush()
+        # Output files
+        if hasattr(self.hparams, 'save_generation_logs_dir'):
+            import os
+            results_file = os.path.join(self.hparams.save_generation_logs_dir, "results.jsonl")
+            if os.path.exists(results_file):
+                num_samples = sum(1 for _ in open(results_file))
+                sys.stdout.write(f"Output Files:\n")
+                sys.stdout.write(f"   Results:           {results_file}\n")
+                sys.stdout.write(f"   Num Samples:       {num_samples}\n\n")
+
+        # Machine-parseable summary block for bash grep
+        sys.stdout.write(f"{'='*100}\n")
+        sys.stdout.write(f"[EVAL_SUMMARY] dataset={self.hparams.dataset_name}")
+        if has_ppl:
+            sys.stdout.write(f" loss={avg_loss:.4f} ppl={avg_ppl:.2f}")
+        if has_generation:
+            sys.stdout.write(f" generated={self.test_generation_count}")
+        sys.stdout.write(f" time={total_time:.1f}s\n")
+        sys.stdout.write(f"{'='*100}\n\n")
+        sys.stdout.flush()
 
     def eval_step(self, batch, phase, token_bytes=None):
         things_to_log = self.model.forward_loss_wrapper(batch, phase, token_bytes=token_bytes) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop
@@ -842,6 +1038,7 @@ class ModelTrainer(LightningModule):
             warmup_ratio = getattr(self.hparams, 'warmup_ratio', 0.0)
             warmdown_ratio = getattr(self.hparams, 'warmdown_ratio', 0.5)
             final_lr_frac = getattr(self.hparams, 'final_lr_frac', 0.0)
+            resume_warmup_steps = getattr(self.hparams, 'resume_warmup_steps', 0)
 
             lr_scheduler = WarmUpLinearWarmdownLR(
                 optimizer,
@@ -850,7 +1047,8 @@ class ModelTrainer(LightningModule):
                 final_lr_frac=final_lr_frac,
                 total_steps=self.hparams.max_scheduling_steps,
                 warm_up_finished_func=self.on_warm_up_finished,
-                enable_wd_decay=enable_wd_decay
+                enable_wd_decay=enable_wd_decay,
+                resume_warmup_steps=resume_warmup_steps
             )
         else:
             # 原始 Cosine Annealing 调度
@@ -1006,14 +1204,82 @@ class ModelTrainer(LightningModule):
         # --- 创建优化器 ---
         # PL 调用 optimizer.step(closure=closure), 但 MuonAdamW.step() 不接受 closure 参数
         # 包装一下使其兼容 PL 的调用约定
-        class PLMuonAdamW(MuonAdamW):
-            """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
-            @torch.no_grad()
-            def step(self, closure=None):
-                if closure is not None:
-                    with torch.enable_grad():
-                        closure()
-                super().step()
+        use_cpu_offload = getattr(self.hparams, 'cpu_offload_optimizer', False)
+        if use_cpu_offload:
+            class PLMuonAdamW(MuonAdamW):
+                """MuonAdamW + CPU offload: AdamW 和 Muon 优化器状态均存放在 CPU。"""
+
+                @torch.no_grad()
+                def step(self, closure=None):
+                    if closure is not None:
+                        with torch.enable_grad():
+                            closure()
+
+                    # 遍历所有 param group，按 kind 分别处理
+                    for group in self.param_groups:
+                        kind = group.get('kind')
+
+                        if kind == 'adamw':
+                            # AdamW: 逐参数搬运 exp_avg / exp_avg_sq
+                            for p in group['params']:
+                                if p.grad is None:
+                                    continue
+                                state = self.state[p]
+                                if not state:
+                                    continue
+                                for k in ('exp_avg', 'exp_avg_sq'):
+                                    if k in state and state[k].device.type == 'cpu':
+                                        state[k] = state[k].to(p.device, non_blocking=False)
+
+                        elif kind == 'muon':
+                            # Muon: group-level buffer 存在 params[0] 的 state 里
+                            if not group['params']:
+                                continue
+                            p0 = group['params'][0]
+                            state = self.state[p0]
+                            if not state:
+                                continue
+                            for k in ('momentum_buffer', 'second_momentum_buffer'):
+                                if k in state and state[k].device.type == 'cpu':
+                                    state[k] = state[k].to(p0.device, non_blocking=False)
+
+                    # 执行实际的优化器 step（fused kernel 要求 state 在 GPU 上）
+                    super().step()
+
+                    # step 完成后，将所有 state 搬回 CPU
+                    for group in self.param_groups:
+                        kind = group.get('kind')
+
+                        if kind == 'adamw':
+                            for p in group['params']:
+                                state = self.state[p]
+                                for k in ('exp_avg', 'exp_avg_sq'):
+                                    if k in state and state[k].device.type != 'cpu':
+                                        cpu_t = state[k].to('cpu', non_blocking=False)
+                                        del state[k]
+                                        state[k] = cpu_t
+
+                        elif kind == 'muon':
+                            if not group['params']:
+                                continue
+                            p0 = group['params'][0]
+                            state = self.state[p0]
+                            for k in ('momentum_buffer', 'second_momentum_buffer'):
+                                if k in state and state[k].device.type != 'cpu':
+                                    cpu_t = state[k].to('cpu', non_blocking=False)
+                                    del state[k]
+                                    state[k] = cpu_t
+
+                    torch.cuda.synchronize()
+        else:
+            class PLMuonAdamW(MuonAdamW):
+                """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
+                @torch.no_grad()
+                def step(self, closure=None):
+                    if closure is not None:
+                        with torch.enable_grad():
+                            closure()
+                    super().step()
 
         optimizer = PLMuonAdamW(param_groups)
 
@@ -1323,6 +1589,10 @@ class ModelTrainer(LightningModule):
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
 
+        # 从 checkpoint 恢复的 dataloader 位置（只用一次）
+        resume_state = getattr(self, '_dataloader_resume_state', None)
+        self._dataloader_resume_state = None
+
         if getattr(self.hparams, 'dataset_name', 'nanochat') == 'nanochat_sft':
             train_dataloader = generate_sft_dataloader(
                 tokenizer=tokenizer,
@@ -1340,7 +1610,7 @@ class ModelTrainer(LightningModule):
                 max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches, # 显示的1个epoch对应设置的self.hparams.max_steps个训练步数
                 split="train",
                 device=self.device,
-                resume_state_dict=None,
+                resume_state_dict=resume_state,
             )
         return train_dataloader
 
@@ -1470,7 +1740,11 @@ class ModelTrainer(LightningModule):
             #     self.logger.experiment.log({f'{phase}_{key}': wandb_video})
 
             if isinstance(value, torch.Tensor) and value.numel() > 1: # histogram
-                self.logger.experiment.log({f"{phase}_{key}": wandb.Histogram(value.detach().cpu())})
+                # Optimize: Log stats instead of Histogram to avoid CPU sync/copy
+                self.logger.experiment.log({
+                    f"{phase}_{key}_mean": value.detach().mean(),
+                    f"{phase}_{key}_std": value.detach().std(),
+                })
 
             elif isinstance(value, torch.Tensor) and value.dim() == 0: # two types of scalar, tensor (here) and int/float (below)
                 scalar_metrics[f"{phase}_{key}"] = value.detach()
@@ -1480,50 +1754,159 @@ class ModelTrainer(LightningModule):
                 raise ValueError(f"unsupported type/format in log_metrics, type:, {type(value)}, key: {key}")
 
         if scalar_metrics:
-            self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True)
+            if phase == "train":
+                # 训练阶段：on_step=True, on_epoch=False
+                # 每个 train step 独立上报，不跨 step 累积。
+                self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True,
+                              on_step=True, on_epoch=False)
+            else:
+                # 验证/测试阶段：on_step=False, on_epoch=True
+                # Lightning 保证每次 val_loop 是独立的 validation epoch，
+                # on_epoch=True 只在当次 val 的 batch 内累积均值，
+                # 不会跨多次 val_check_interval 累积（不存在"280次val被平均"的问题）。
+                # ModelCheckpoint 在 on_validation_end 查询 epoch-level 指标，
+                # 必须用 on_epoch=True 才能让 valid_loss 出现在 returned metrics 里。
+                self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True,
+                              on_step=False, on_epoch=True)
 
-        # === 增强的调试日志 ===
-        if len(self.trainer.optimizers) > 0:
+        # === 增强的调试日志 (仅 train 阶段) ===
+        # lr/wd/Alpha 等只在训练步骤记录，避免在 validation 阶段触发
+        # "log on epoch level in distributed setting" 的 warning
+        if phase == "train" and len(self.trainer.optimizers) > 0:
             optimizer = self.trainer.optimizers[0]
 
             # 记录所有参数组的学习率
             for i, group in enumerate(optimizer.param_groups):
                 group_lr = group['lr']
                 group_wd = group.get('weight_decay', 0)
-                self.log(f"lr/param_group_{i}", group_lr, prog_bar=False)
-                self.log(f"wd/param_group_{i}", group_wd, prog_bar=False)
+                self.log(f"lr/param_group_{i}", group_lr, prog_bar=False,
+                         on_step=True, on_epoch=False)
+                self.log(f"wd/param_group_{i}", group_wd, prog_bar=False,
+                         on_step=True, on_epoch=False)
 
             # 主学习率 (最后一个参数组，通常是 transformer 参数)
             current_lr = optimizer.param_groups[-1]['lr']
-            self.log("Global_LR", current_lr)
+            self.log("Global_LR", current_lr, on_step=True, on_epoch=False)
 
             # Alpha 参数的学习率 (第一个参数组)
             if len(optimizer.param_groups) > 1:
                 alpha_lr = optimizer.param_groups[0]['lr']
-                self.log("Alpha_LR", alpha_lr)
+                self.log("Alpha_LR", alpha_lr, on_step=True, on_epoch=False)
 
-        # Alpha (MCMC step size) 值
-        if self.hparams.mcmc_step_size_learnable:
-            self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach())
+        # Alpha (MCMC step size) 值 (仅 train 阶段，避免 validation 阶段 warning)
+        if phase == "train" and self.hparams.mcmc_step_size_learnable:
+            self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach(),
+                     on_step=True, on_epoch=False)
 
-        # Langevin dynamics noise
-        if self.hparams.langevin_dynamics_noise_learnable:
-            self.log("Langevin_dynamics_noise", self.model.langevin_dynamics_noise_std.detach())
+        # Langevin dynamics noise (仅 train 阶段)
+        if phase == "train" and self.hparams.langevin_dynamics_noise_learnable:
+            self.log("Langevin_dynamics_noise", self.model.langevin_dynamics_noise_std.detach(),
+                     on_step=True, on_epoch=False)
 
-        # 训练进度信息 (仅在训练阶段)
+        # 训练进度信息 (仅在训练阶段, 仅 rank 0 打印)
         if phase == "train" and hasattr(self, 'trainer') and self.trainer is not None:
-            # 当前步数和进度
-            # global_step 是 optimizer step 计数 (不是 micro-batch/forward 计数)
-            # 与 NanoChat base_train.py 的 step 变量语义一致, 方便对比
+            import time as _time
+
             current_step = self.global_step
             max_steps = self.hparams.max_steps
             progress_pct = 100.0 * current_step / max_steps if max_steps > 0 else 0
-            self.log("step", float(current_step), prog_bar=True)
-            self.log("progress_pct", progress_pct, prog_bar=False)
+            self.log("step", float(current_step), prog_bar=True, on_step=True, on_epoch=False)
+            self.log("progress_pct", progress_pct, prog_bar=False, on_step=True, on_epoch=False)
 
             # GPU 内存使用 (如果可用)
             if torch.cuda.is_available():
                 gpu_mem_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
                 gpu_mem_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
-                self.log("gpu_mem_allocated_gb", gpu_mem_allocated, prog_bar=False)
-                self.log("gpu_mem_reserved_gb", gpu_mem_reserved, prog_bar=False)
+                self.log("gpu_mem_allocated_gb", gpu_mem_allocated, prog_bar=False,
+                         on_step=True, on_epoch=False)
+                self.log("gpu_mem_reserved_gb", gpu_mem_reserved, prog_bar=False,
+                         on_step=True, on_epoch=False)
+
+            # === 丰富训练日志 (仅 rank 0 打印, 避免 DDP 重复) ===
+            if self.trainer.is_global_zero:
+                # --- 时间统计 ---
+                dt_ms = (getattr(self, '_last_dt', None) or 0.0) * 1000.0
+                wall_elapsed = 0.0
+                if self._train_start_time is not None:
+                    wall_elapsed = _time.time() - self._train_start_time
+                total_min = wall_elapsed / 60.0
+
+                # --- LR ratio (相对于 peak_lr) ---
+                lrm = 1.0
+                if len(self.trainer.optimizers) > 0:
+                    opt = self.trainer.optimizers[0]
+                    # 取最后一个参数组（通常是 transformer/muon 主参数组）的 lr
+                    cur_lr = opt.param_groups[-1]['lr']
+                    peak_lr = self.hparams.peak_learning_rate
+                    lrm = cur_lr / peak_lr if peak_lr > 0 else 1.0
+
+                # --- tok/sec: tokens processed per second (全局) ---
+                # 每个 optimizer step 消耗 tokens = num_gpus × batch_per_device × context_length × grad_accum
+                num_gpus = getattr(self.hparams, 'num_gpus', 1)
+                tokens_per_step = (num_gpus
+                                   * self.hparams.batch_size_per_device
+                                   * self.hparams.context_length
+                                   * self.hparams.accumulate_grad_batches)
+                tok_per_sec = tokens_per_step / (dt_ms / 1000.0) if dt_ms > 0 else 0.0
+
+                # --- MFU (Model FLOP Utilization) ---
+                # 参考 PaLM / nanoGPT 计算方式:
+                # FLOPs per token ≈ 6 × num_params（前向 + 反向）
+                # MFU = actual_tok_per_sec × flops_per_token / peak_flops_per_sec
+                # H200 peak bfloat16 FLOPS ≈ 989 TFLOPS per GPU
+                try:
+                    num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                    flops_per_token = 6 * num_params  # forward + backward
+                    # Peak FLOPS: H200=989T, A100=312T; 这里保守用 312T/GPU (A100)
+                    # peak_flops_per_gpu = 312e12
+                    peak_flops_per_gpu = 989e12
+                    gpu_peak_flops = num_gpus * peak_flops_per_gpu
+                    actual_flops_per_sec = tok_per_sec * flops_per_token
+                    mfu = 100.0 * actual_flops_per_sec / gpu_peak_flops if gpu_peak_flops > 0 else 0.0
+                except Exception:
+                    mfu = 0.0
+
+                # --- Epoch ---
+                epoch = self.current_epoch + 1
+
+                # --- ETA ---
+                if current_step > 0 and wall_elapsed > 0 and max_steps > 0:
+                    steps_remaining = max_steps - current_step
+                    sec_per_step = wall_elapsed / current_step
+                    eta_min = steps_remaining * sec_per_step / 60.0
+                    eta_str = f" | eta: {eta_min:.1f}m"
+                else:
+                    eta_str = ""
+
+                # --- 当前 loss ---
+                loss_val = metrics_dict.get('loss', 0.0)
+                if isinstance(loss_val, torch.Tensor):
+                    loss_val = loss_val.item()
+
+                # --- 最新 valid 指标 ---
+                last_valid = getattr(self, '_last_valid_metrics', {})
+                valid_loss_val = last_valid.get('loss', None)
+                valid_bpb_val = last_valid.get('bpb', None)
+                valid_ppl_val = last_valid.get('perplexity', None)
+                valid_str = ""
+                if valid_loss_val is not None:
+                    valid_str += f" | valid_loss: {valid_loss_val:.4f}"
+                if valid_bpb_val is not None:
+                    valid_str += f" | valid_bpb: {valid_bpb_val:.4f}"
+                if valid_ppl_val is not None:
+                    valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
+
+                # --- 打印 ---
+                print(
+                    f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
+                    f"loss: {loss_val:.6f}"
+                    f"{valid_str} | "
+                    f"lrm: {lrm:.2f} | "
+                    f"dt: {dt_ms:.2f}ms | "
+                    f"tok/sec: {tok_per_sec:,.0f} | "
+                    f"mfu: {mfu:.2f} | "
+                    f"epoch: {epoch} | "
+                    f"total time: {total_min:.2f}m"
+                    f"{eta_str}",
+                    flush=True,
+                )

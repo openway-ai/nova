@@ -26,16 +26,22 @@
 #SBATCH --output=logs/slurm/nlp/ebt-d26-stable_%A-%a.log
 
 ### 基础配置 ###
-export RUN_NAME="ebt-d26-muon-adamw-0318"
-export MODEL_NAME="${RUN_NAME%%-*}"
+# RUN_PREFIX 用于 exp_id 生成（如需手动指定 EXP_ID，设置 EXP_ID 环境变量）
+RUN_PREFIX="${RUN_PREFIX:-ebt-d26-ctx2048}"
+
+export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
+# export MODEL_SIZE="medium"
+
+
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 
 # PyTorch 内存优化
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
 
 # WandB 配置
 export WANDB_API_KEY="Your WandB API Key"
@@ -69,45 +75,66 @@ NORMALIZE_INITIAL_CONDITION=true
 DENOISING_INITIAL_CONDITION="random_noise"
 MCMC_STEP_SIZE_LEARNABLE=true
 NO_MCMC_DETACH=false
+USE_MCMC_TIME_EMBED=false          # false: shared transition kernel, supports arbitrary inference steps
 
 # 不使用的高级参数 (官方: not recommended for getting started)
 # ebt_norm, ebt_act_func, dyt_alpha_init, mcmc_replay_buffer 等
 # 均保持代码默认值,不在命令行覆盖
 
 ################################################################################
-# Batch 配置 - 针对 d26 模型优化
+# Batch 配置与训练步数自动计算 - 针对 d26 模型优化
 ################################################################################
 
-# DEVICE_BATCH_SIZE=8
-# GRAD_ACCUM=16
-# CONTEXT_LENGTH=256
-# NUM_GPUS=4
-
-DEVICE_BATCH_SIZE=4
-GRAD_ACCUM=8
-CONTEXT_LENGTH=512
-NUM_GPUS=4
-
+# 1. 硬件与 Batch 基础配置
 # NUM_GPUS=8
+# DEVICE_BATCH_SIZE=4
+# GRAD_ACCUM=8
+# CONTEXT_LENGTH=512
 
+# 可运行
+# NUM_GPUS=8
 # DEVICE_BATCH_SIZE=1
-# GRAD_ACCUM=64
+# GRAD_ACCUM=2
 # CONTEXT_LENGTH=2048
+
+# --float_precision "bf16-mixed" \
+# --gradient_checkpointing \
+
+# 可运行
+NUM_GPUS=8
+DEVICE_BATCH_SIZE=1
+# DEVICE_BATCH_SIZE=2
+GRAD_ACCUM=32
+CONTEXT_LENGTH=2048
+
 # NUM_GPUS=8
+# DEVICE_BATCH_SIZE=1
+# GRAD_ACCUM=48
+# CONTEXT_LENGTH=2048
 
+
+# 2. 计算每步的有效 Token 数 (Tokens per step)
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM * CONTEXT_LENGTH))
-# 131,072 tokens/step
+# 当前配置: 8 × 4 × 8 × 512 = 131,072 tokens/step
 
-################################################################################
-# 训练步数计算
-################################################################################
+# 3. 设置目标总 Token 数
+# NanoChat d26 (speedrun.sh --depth=26):
+#   tokens/step = 16 × 2048 × 4(accum) × 8(GPUs) = 1,048,576
+#   7000 step × 1,048,576 = 7,340,032,000 ≈ 7.34B tokens → bpb=0.747
+TARGET_TOTAL_TOKENS=7340032000 # 约 7.34B tokens
 
-# d26 模型规模: 26层, 13头, 1664维 ≈ 400M 参数
-# 目标训练量: ~10B tokens
-# 131k tokens/step × 75,400 steps ≈ 9.88B tokens
+# 注意: 由于EBT训练时显存消耗更多，目前 NanoChat 的 batch size 更大 ,
+# 大 batch 梯度噪声更低, 每步更新更有效,
+# 所以即使 token 总量相同, EBT 可能需要更多步才能达到同等效果
 
-MAX_STEPS=75400 # 对应模型实际优化步数，而不是梯度累计步数
-MAX_SCHEDULING_STEPS=75400
+# 4. 自动计算总 Steps 数 (向下取整)
+MAX_STEPS=$(( TARGET_TOTAL_TOKENS / EFFECTIVE_BATCH_SIZE ))
+MAX_SCHEDULING_STEPS=$MAX_STEPS
+
+echo "自动计算的训练步数信息："
+echo "  - 每步有效 Token 数: ${EFFECTIVE_BATCH_SIZE}"
+echo "  - 目标总 Token 数:   ${TARGET_TOTAL_TOKENS}"
+echo "  - 计算得出总 Steps:  ${MAX_STEPS}"
 
 ################################################################################
 # 学习率配置 (基于模型规模推荐)
@@ -169,7 +196,11 @@ GRADIENT_CLIP_VAL=1.0
 # VAL_CHECK_INTERVAL=1000
 VAL_CHECK_INTERVAL=2000
 LIMIT_VAL_BATCHES=50
-NUM_WORKERS=8
+# NUM_WORKERS: passed to train.py --num_workers but NOT used by nanochat dataloader
+# (hardcoded num_workers=0 in dataset.py because nanochat generator holds GPU state).
+# Kept for compatibility with the CLI arg parser.
+NUM_WORKERS=19
+SAVE_TOP_K=2
 
 ################################################################################
 # 优化选项配置
@@ -218,19 +249,63 @@ OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio
 # EBT 使用 autograd.grad 进行 MCMC 更新,与 fullgraph 模式不兼容
 # 推荐: transformer_only 模式,仅编译 transformer 部分
 
-# 暂时禁用,确保稳定性优先
-COMPILE_FLAGS=""
-
-# 稳定后可尝试启用
+# 目前这个会报错
 # COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
 
+# 不使用 compile，steps 较少时适用
+# COMPILE_FLAGS="--compile_model --compile_mode disabled" 
+# 启用 compile，steps 较多时适用
+# full mode causes repeated recompilation with create_graph=True + bf16-mixed
+COMPILE_FLAGS="--compile_model --compile_mode full"
+# COMPILE_FLAGS="--compile_model --compile_mode disabled"
+
 ################################################################################
-# 日志配置
+# WandB 配置 (训练参数)
+################################################################################
+# 默认: 只记录 loss 等基础 metric, 不记录 gradients/activations
+# 如需 debug 梯度, 取消下面注释切换到全量记录
+#
+# 选项说明:
+#   不传 --wandb_watch        → 只记录 scalar metrics (最快, 默认)
+#   --wandb_watch              → 记录 parameters only (中等开销)
+#   --wandb_watch --wandb_watch_level all → 记录 gradients+parameters+activations (最慢, debug 用)
+#   --disable_wandb            → 完全关闭 wandb
+#
+WANDB_FLAGS=""
+# WANDB_FLAGS="--disable_wandb"
+# WANDB_FLAGS="--wandb_watch --wandb_watch_level parameters"
+# WANDB_FLAGS="--wandb_watch --wandb_watch_level all"
+
+################################################################################
+# 实验目录布局 - 统一输出到 ebt_runs/<exp_id>/base_train/
 ################################################################################
 
-current_time=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="logs/${current_time}_ebt_d26_stable.log"
-mkdir -p logs
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/utils/exp_layout.sh"
+
+exp_init_base_train "$0" "muon_adamw"
+export RUN_NAME="${EXP_ID}"
+export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+
+exp_save_hparams "${EXP_DIR}/base_train" \
+    "model_size=${MODEL_SIZE}" \
+    "context_length=${CONTEXT_LENGTH}" \
+    "peak_lr=${PEAK_LR}" \
+    "weight_decay=${WEIGHT_DECAY}" \
+    "beta1=${BETA1}" \
+    "beta2=${BETA2}" \
+    "device_batch_size=${DEVICE_BATCH_SIZE}" \
+    "grad_accum=${GRAD_ACCUM}" \
+    "num_gpus=${NUM_GPUS}" \
+    "effective_batch_size=${EFFECTIVE_BATCH_SIZE}" \
+    "max_steps=${MAX_STEPS}" \
+    "target_total_tokens=${TARGET_TOTAL_TOKENS}" \
+    "mcmc_step_size=${MCMC_STEP_SIZE}" \
+    "mcmc_lr_multiplier=${MCMC_STEP_SIZE_LR_MULTIPLIER}" \
+    "use_mcmc_time_embed=${USE_MCMC_TIME_EMBED}" \
+    "optimizer=muon_adamw"
+
+LOG_FILE="${EXP_LOG_FILE}"
 
 # 定义颜色
 RED='\033[0;31m'
@@ -329,15 +404,18 @@ print_kv "Gradient Clip" "${GRADIENT_CLIP_VAL}"
 echo ""
 echo -e "${CYAN}▶ 训练进度${NC}"
 print_separator "─" 60
-print_kv "Max Steps" "${MAX_STEPS}"
-local total_tokens=$(awk "BEGIN {printf \"%.2f\", ${MAX_STEPS} * ${EFFECTIVE_BATCH_SIZE} / 1000000000}")
-print_kv "Total Tokens" "~${total_tokens}B"
+print_kv "Target Tokens" "7.34B"
+print_kv "Max Steps" "${MAX_STEPS} (自适应计算)"
+print_kv "Max Sched Steps" "${MAX_SCHEDULING_STEPS}"
+# 注意：在 bash 脚本的全局作用域中不应使用 local 关键字，直接赋值即可
+total_tokens_b=$(awk "BEGIN {printf \"%.2f\", ${MAX_STEPS} * ${EFFECTIVE_BATCH_SIZE} / 1000000000}")
+print_kv "Actual Total Tokens" "~${total_tokens_b}B"
 print_kv "Val Check Interval" "${VAL_CHECK_INTERVAL}"
 
 echo ""
 echo -e "${CYAN}▶ 输出配置${NC}"
 print_separator "─" 60
-print_kv "Run Name" "${RUN_NAME}_${current_time}"
+print_kv "Run Name" "${RUN_NAME}"
 print_kv "Log File" "${LOG_FILE}"
 print_kv "WandB Mode" "${WANDB_MODE}"
 
@@ -360,7 +438,7 @@ cat << LOG_HEADER > "${LOG_FILE}"
 #                    EBT d26 Muon+AdamW 训练日志
 ################################################################################
 #
-# Run Name:        ${RUN_NAME}_${current_time}
+# Run Name:        ${RUN_NAME}
 # Start Time:      $(date '+%Y-%m-%d %H:%M:%S')
 # Log File:        ${LOG_FILE}
 #
@@ -407,7 +485,7 @@ Weight Decay:             ${WEIGHT_DECAY}
 Beta1/Beta2:              ${BETA1} / ${BETA2}
 Warmup Steps:             ${WARM_UP_STEPS}
 Max Steps:                ${MAX_STEPS}
-Total Tokens:             ~${total_tokens}B
+Total Tokens:             ${total_tokens_b}
 
 Option Flags:             ${OPTION_FLAGS:-"None (Baseline)"}
 Compile Flags:            ${COMPILE_FLAGS:-"None"}
@@ -419,6 +497,11 @@ Compile Flags:            ${COMPILE_FLAGS:-"None"}
 LOG_HEADER
 
 ################################################################################
+# 自动重定向所有输出到日志文件 (替代手动 tee)
+################################################################################
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+################################################################################
 # 启动训练
 ################################################################################
 
@@ -428,7 +511,9 @@ echo ""
 
 set +e
 torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/nova/nova/ebt/train.py \
---run_name ${RUN_NAME}_${current_time} \
+--run_name ${RUN_NAME} \
+--checkpoint_dir "${EXP_CKPT_DIR}" \
+--wandb_save_dir "${EXP_WANDB_DIR}" \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
 --model_size ${MODEL_SIZE} \
@@ -442,6 +527,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --mcmc_step_size ${MCMC_STEP_SIZE} \
 --mcmc_step_size_lr_multiplier ${MCMC_STEP_SIZE_LR_MULTIPLIER} \
 --mcmc_num_steps ${MCMC_NUM_STEPS} \
+$([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 \
 --context_length ${CONTEXT_LENGTH} \
 \
@@ -471,13 +557,25 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
 --set_matmul_precision "medium" \
---wandb_watch \
+--float_precision "bf16-mixed" \
+--manual_gc_collect_every_n_steps -1 \
+--save_top_k_ckpts ${SAVE_TOP_K} \
+--save_periodic_steps 1000 \
+${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
-${COMPILE_FLAGS} \
-2>&1 | tee -a "${LOG_FILE}"
+${COMPILE_FLAGS}
+
+# --manual_gc_collect_every_n_steps -1 \
+
+# --float_precision "bf16-mixed" \
+# --gradient_checkpointing \
+# --manual_gc_collect_every_n_steps 50 \
+
 
 TRAIN_EXIT_CODE=$?
 set -e
+
+exp_save_status "${EXP_DIR}/base_train" "base_train" "$TRAIN_EXIT_CODE"
 
 ################################################################################
 # 训练结束处理

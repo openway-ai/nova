@@ -65,28 +65,33 @@ def call_model_forward_ppl(hparams, model, input_tokens, start_pos, bsz):
         energies = None
     return logits, energies
 
-def generate_text(model, batch, hparams):
-    # Import the wrapper at the top of the function
+def _get_tokenizer(hparams):
+    """Get or create cached tokenizer. Avoids re-wrapping NanoChatTokenizerWrapper per batch."""
+    if hasattr(hparams, '_cached_gen_tokenizer'):
+        return hparams._cached_gen_tokenizer
+
     from nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
 
-    # Use tokenizer_obj if available, otherwise load from path
     if hasattr(hparams, 'tokenizer_obj') and hparams.tokenizer_obj is not None:
         tokenizer = hparams.tokenizer_obj
-        # Wrap nanochat tokenizer if needed
         if hasattr(tokenizer, 'enc') and hasattr(tokenizer.enc, 'encode'):
-            # It's a RustBPETokenizer, wrap it for HF compatibility
             tokenizer = NanoChatTokenizerWrapper(tokenizer_obj=tokenizer)
     elif hasattr(hparams, 'tokenizer_path'):
-        tokenizer = AutoTokenizer.from_pretrained(hparams.tokenizer_path, clean_up_tokenization_spaces = False)
+        tokenizer = AutoTokenizer.from_pretrained(hparams.tokenizer_path, clean_up_tokenization_spaces=False)
     else:
-        # Fallback: if tokenizer is already an object, use it directly
         if isinstance(hparams.tokenizer, str):
-            tokenizer = AutoTokenizer.from_pretrained(hparams.tokenizer, clean_up_tokenization_spaces = False)
+            tokenizer = AutoTokenizer.from_pretrained(hparams.tokenizer, clean_up_tokenization_spaces=False)
         else:
-            tokenizer = hparams.tokenizer  # Already a tokenizer object
-            # Check if it needs wrapping
+            tokenizer = hparams.tokenizer
             if hasattr(tokenizer, 'enc') and hasattr(tokenizer.enc, 'encode'):
                 tokenizer = NanoChatTokenizerWrapper(tokenizer_obj=tokenizer)
+
+    hparams._cached_gen_tokenizer = tokenizer
+    return tokenizer
+
+
+def generate_text(model, batch, hparams):
+    tokenizer = _get_tokenizer(hparams)
 
     # Safe access to eos_token_id with fallback to bos_token_id (for compatibility)
     if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:

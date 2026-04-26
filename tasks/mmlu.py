@@ -3,6 +3,7 @@ The MMLU dataset.
 https://huggingface.co/datasets/cais/mmlu
 """
 
+import os
 from datasets import load_dataset
 from tasks.common import Task, render_mc
 
@@ -19,7 +20,24 @@ class MMLU(Task):
             assert split == "train", "auxiliary_train must be split into train"
         self.subset = subset
         self.split = split
-        self.ds = load_dataset("cais/mmlu", subset, split=split).shuffle(seed=42)
+
+        # 支持离线数据集
+        cache_dir = None
+        download_mode = None
+        if os.environ.get("NANOCHAT_SFT_DATA_DIR"):
+            cache_dir = os.path.join(os.environ["NANOCHAT_SFT_DATA_DIR"], "mmlu")
+            if os.path.exists(cache_dir):
+                download_mode = "reuse_cache_if_exists"
+            else:
+                cache_dir = None
+
+        self.ds = load_dataset(
+            "cais/mmlu",
+            subset,
+            split=split,
+            cache_dir=cache_dir,
+            download_mode=download_mode
+        ).shuffle(seed=42)
         if subset == "auxiliary_train":
             # I don't understand why but the auxiliary_train rows have some weird additional 'train' wrapper
             self.ds = self.ds.map(lambda row: row['train'], remove_columns=['train'])
