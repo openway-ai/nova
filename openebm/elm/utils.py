@@ -450,23 +450,23 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
     transformer_args = EBTModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=max_seq_len, weight_initialization = hparams.weight_initialization_method, adaln_zero_init=adaln_zero_init, ebt_norm=hparams.ebt_norm, ffn_dim_multiplier=hparams.ffn_dim_multiplier, ebt_act_func=hparams.ebt_act_func, weight_initialization_gain=hparams.weight_initialization_gain, dyt_alpha_init=hparams.dyt_alpha_init, use_mcmc_time_embed=use_mcmc_time_embed)
     
     if hparams.ebt_type == "default": # causal decoder trans for ebm https://arxiv.org/abs/2406.08862
-        from ar_ebt_default import EBTDefault
+        from openebm.elm.ar_ebt_default import EBTDefault
         ebt = EBTDefault(params=transformer_args)
     elif hparams.ebt_type == "time_embed": # time embed
         if getattr(hparams, 'use_sdpa_attention', False):
-            from ar_ebt_time_embed_sdpa_math import EBTTimeConcat
+            from openebm.elm.ar_ebt_time_embed_sdpa_math import EBTTimeConcat
         else:
-            from ar_ebt_time_embed import EBTTimeConcat
+            from openebm.elm.ar_ebt_time_embed import EBTTimeConcat
         gradient_checkpointing = getattr(hparams, 'gradient_checkpointing', False)
         ebt = EBTTimeConcat(params=transformer_args, max_mcmc_steps=hparams.mcmc_num_steps, gradient_checkpointing=gradient_checkpointing, use_mcmc_time_embed=use_mcmc_time_embed)
     else: # adaln or adaln_zero
-        from ar_ebt_adaln import EBTAdaLN
+        from openebm.elm.ar_ebt_adaln import EBTAdaLN
         ebt = EBTAdaLN(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps)
 
     return ebt
 
 def setup_transformer(hparams): # specifically for baseline transformer
-    from ar_transformer import Transformer, TransformerModelArgs
+    from openebm.elm.ar_transformer import Transformer, TransformerModelArgs
     transformer_args = TransformerModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=hparams.context_length, weight_initialization = hparams.weight_initialization_method, ffn_dim_multiplier=hparams.ffn_dim_multiplier, weight_initialization_gain=hparams.weight_initialization_gain)
     transformer = Transformer(params=transformer_args)
     return transformer
