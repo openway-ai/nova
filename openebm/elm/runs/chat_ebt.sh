@@ -49,6 +49,10 @@ export PYTHONPATH="${REPO_ROOT}/nanochat:${REPO_ROOT}:${PYTHONPATH:-}"
 # DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-sft-0420-from0413_20260420_193427/periodic-s=step=2999-d26-ctx1024.ckpt"
 DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-sft-0420-from0413_20260420_193427/s=step=1953-d26-ctx1024-lr5e-05-bs2x32-muon_adamw-valid_loss=valid_loss=2.1394.ckpt"
 
+# ctx2048 sft-train/mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/runs/chat_ebt.sh
+DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-20260426/sft_train.v4/checkpoints/s=step=562-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.2264.ckpt"
+
+
 DEFAULT_TOKENIZER="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer"
 
 # 从环境变量读取配置
@@ -58,7 +62,10 @@ TEMPERATURE="${TEMPERATURE:-0.8}"
 # TEMPERATURE="${TEMPERATURE:-0.6}"
 TOP_P="${TOP_P:-0.9}"
 # MAX_TOKENS="${MAX_TOKENS:-512}"
-MAX_TOKENS="${MAX_TOKENS:-1024}"
+# MAX_TOKENS="${MAX_TOKENS:-1024}"
+
+MAX_TOKENS="${MAX_TOKENS:-2048}"
+
 # MAX_TOKENS="${MAX_TOKENS:-256}"
 DTYPE="${DTYPE:-bfloat16}"
 DEVICE="${DEVICE:-cuda}"
