@@ -17,7 +17,7 @@ _EXP_LAYOUT_SOURCED=1
 
 # Ensure nanochat sub-packages (nanochat, tasks, scripts, data) are importable
 _EXP_LAYOUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-_EXP_REPO_ROOT="$(cd "$_EXP_LAYOUT_DIR/../../.." && pwd)"
+_EXP_REPO_ROOT="$(cd "$_EXP_LAYOUT_DIR/../../../.." && pwd)"
 export PYTHONPATH="${_EXP_REPO_ROOT}/nanochat:${_EXP_REPO_ROOT}:${PYTHONPATH:-}"
 
 # ---------------------------------------------------------------------------
