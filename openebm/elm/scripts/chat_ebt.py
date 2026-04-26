@@ -156,7 +156,7 @@ class EBTChatEngine:
         self.hparams.tokenizer_obj = self.tokenizer
 
         # 创建模型
-        from modeling_ebt import EBT_NLP
+        from openebm.elm.modeling_ebt import EBT_NLP
         self.model = EBT_NLP(self.hparams)
 
         # 【修复点 5】: 彻底清洗 state_dict 键名，解决 torch.compile 带来的 _orig_mod 前缀问题
