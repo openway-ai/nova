@@ -10,7 +10,7 @@ set -e
 ### 基础配置 ###
 # EXP_ID 必须指定，指向 base_train 的实验目录
 # 例如: export EXP_ID="d26-ctx1024-muon_adamw-20260413-1235"
-export EXP_ID="d26-ctx2048-20260425"
+export EXP_ID="d26-ctx2048-20260426"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -28,7 +28,10 @@ export MODEL_SIZE="d26"
 # PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-ctx2048-muon-adamw-0413_20260413_123504/s=step=27999-d26-ctx1024-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.6294.ckpt"
 # TODO
 # base_train c2048 bpb 0.xx 
-PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep9562_20260424_211606/s=step=10937-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7801.ckpt"
+# PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep9562_20260424_211606/s=step=10937-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7801.ckpt"
+
+# base_train c2048 bpb 0.86
+PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep9562_20260424_211606/s=step=12374-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7007.ckpt"
 
 ### 环境变量 (对齐 resume_ebt_muon_adamw.sh + Offline 支持) ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -64,11 +67,14 @@ NO_MCMC_DETACH=false
 ################################################################################
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)}
 NUM_GPUS=${NUM_GPUS:-8}
-DEVICE_BATCH_SIZE=2
-GRAD_ACCUM=32
-# CONTEXT_LENGTH=512  # 受限于 base_train 阶段的上下文长度
+
 CONTEXT_LENGTH=1024  # 受限于 base_train 阶段的上下文长度
+# DEVICE_BATCH_SIZE=2
+
 CONTEXT_LENGTH=2048  # 受限于 base_train 阶段的上下文长度
+DEVICE_BATCH_SIZE=1
+
+GRAD_ACCUM=32
 
 
 
@@ -109,7 +115,7 @@ MAX_SCHEDULING_STEPS=3000
 # 验证与数据加载配置
 ################################################################################
 VAL_CHECK_INTERVAL=500
-LIMIT_VAL_BATCHEte=50
+LIMIT_VAL_BATCHES=50
 NUM_WORKERS=8
 
 ################################################################################
