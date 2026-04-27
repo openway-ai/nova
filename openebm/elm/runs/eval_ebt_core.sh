@@ -109,8 +109,8 @@ else
     RUN_NAME=$(basename $(dirname "$CKPT_PATH"))
     RUN_SHORT=$(echo "$RUN_NAME" | sed 's/_[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}-[0-9]\{2\}_\?$//')
     CKPT_FILENAME=$(basename "$CKPT_PATH" .ckpt)
-    OUTPUT_DIR="$EBT_DIR/logs/core_eval/${RUN_SHORT}_${TIMESTAMP}/${CKPT_FILENAME}"
-    LOG_FILE="$EBT_DIR/logs/core_eval/${RUN_SHORT}_${TIMESTAMP}/core_eval.log"
+    OUTPUT_DIR="$REPO_ROOT/logs/core_eval/${RUN_SHORT}_${TIMESTAMP}/${CKPT_FILENAME}"
+    LOG_FILE="$REPO_ROOT/logs/core_eval/${RUN_SHORT}_${TIMESTAMP}/core_eval.log"
 fi
 
 mkdir -p "$OUTPUT_DIR"

@@ -15,8 +15,16 @@ def nlp_eval_acc(answer_file):
     references = []
 
     with open(answer_file, 'r', encoding='utf-8') as f:
+        skipped = 0
         for line in f:
-            data = json.loads(line)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
             output = data['generation']
             # Support both old and new field names for backward compatibility
             # New: 'target', Old: 'gt_answer'
@@ -24,6 +32,8 @@ def nlp_eval_acc(answer_file):
 
             predictions.append(output)
             references.append(gt_ans)
+        if skipped > 0:
+            print(f"WARNING: Skipped {skipped} corrupted JSON lines in {answer_file} (possibly caused by concurrent writes)")
 
     em_score = metrics.calculate_em(predictions, references)
     f1_score = metrics.calculate_f1_score(predictions, references)

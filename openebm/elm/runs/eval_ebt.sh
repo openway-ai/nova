@@ -117,7 +117,7 @@ else
     CKPT_FILENAME=$(basename "$CKPT_PATH" .ckpt)
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     RUN_SHORT=$(echo "$RUN_NAME" | sed 's/_[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}-[0-9]\{2\}_\?$//')
-    INFER_OUTPUT_DIR="$EBT_DIR/logs/eval/${RUN_SHORT}_${TIMESTAMP}"
+    INFER_OUTPUT_DIR="$REPO_ROOT/logs/nanochat_gsm8k_eval/${RUN_SHORT}_${TIMESTAMP}"
 fi
 mkdir -p "$INFER_OUTPUT_DIR"
 

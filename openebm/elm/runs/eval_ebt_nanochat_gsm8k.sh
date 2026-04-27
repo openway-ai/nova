@@ -82,24 +82,25 @@ export EVAL_TASK="${EVAL_TASK:-gsm8k}"
 # 日志目录设置
 ################################################################################
 
-# 从 checkpoint 路径提取 run 标识
-RUN_NAME=$(basename "$(dirname "$CKPT_PATH")")
-# 简化 run name: 去掉尾部日期目录格式后缀 (_2026-xx-xx_xx-xx-xx_)
-RUN_SHORT=$(echo "$RUN_NAME" | sed 's/_[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}-[0-9]\{2\}_\?$//')
+source "${SCRIPT_DIR}/utils/exp_layout.sh"
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+if [ -n "$EXP_ID" ]; then
+    # EXP_ID 模式: 输出到 logs/ebt_runs/<EXP_ID>/nanochat_gsm8k_eval/
+    exp_init_nanochat_gsm8k_eval "$0"
+    MASTER_LOG="$EVAL_LOG_FILE"
+else
+    # Fallback 模式: 输出到 $REPO_ROOT/logs/nanochat_gsm8k_eval/
+    RUN_NAME=$(basename "$(dirname "$CKPT_PATH")")
+    RUN_SHORT=$(echo "$RUN_NAME" | sed 's/_[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}_[0-9]\{2\}-[0-9]\{2\}-[0-9]\{2\}_\?$//')
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-# 本次运行的统一根目录: logs/eval/<run_short>_<timestamp>/
-# 所有子任务的日志和推理输出都归档于此
-export EVAL_RUN_DIR="$EBT_DIR/logs/eval/${RUN_SHORT}_${TIMESTAMP}"
-mkdir -p "$EVAL_RUN_DIR"
+    export EVAL_RUN_DIR="$REPO_ROOT/logs/nanochat_gsm8k_eval/${RUN_SHORT}_${TIMESTAMP}"
+    mkdir -p "$EVAL_RUN_DIR"
 
-# 主日志 (入口脚本全程记录)
-MASTER_LOG="$EVAL_RUN_DIR/master.log"
-
-# 子任务日志路径 (传递给子脚本)
-export NANOCHAT_EVAL_LOG="$EVAL_RUN_DIR/nanochat_shards.log"
-export GSM8K_EVAL_LOG="$EVAL_RUN_DIR/gsm8k.log"
+    MASTER_LOG="$EVAL_RUN_DIR/master.log"
+    export NANOCHAT_EVAL_LOG="$EVAL_RUN_DIR/nanochat_shards.log"
+    export GSM8K_EVAL_LOG="$EVAL_RUN_DIR/gsm8k.log"
+fi
 
 ################################################################################
 # 自动清理: 只保留最近 MAX_KEEP 个运行目录
@@ -107,8 +108,11 @@ export GSM8K_EVAL_LOG="$EVAL_RUN_DIR/gsm8k.log"
 
 MAX_KEEP=10
 
-EVAL_BASE_DIR="$EBT_DIR/logs/eval"
+# 清理的基目录与 EVAL_RUN_DIR 的父目录保持一致
+EVAL_BASE_DIR="$(dirname "$EVAL_RUN_DIR")"
 cleanup_old_run_dirs() {
+    # 仅在 fallback 模式下清理 (EXP_ID 模式由实验管理)
+    [ -n "$EXP_ID" ] && return 0
     local dirs
     dirs=$(ls -1dt "$EVAL_BASE_DIR"/${RUN_SHORT}_[0-9]* 2>/dev/null || true)
     local count
