@@ -682,6 +682,7 @@ if __name__ == '__main__':
     parser.add_argument("--adamw_vocab_to_embed_lr", help="[Muon] vocab_to_embed 绝对 LR (EBT 特有, 建议保守 0.01)", type=float, default=-1)
     parser.add_argument("--adamw_scalar_lr", help="[Muon] transformer scalar 绝对 LR (NanoChat 默认 0.04)", type=float, default=-1)
     parser.add_argument("--adamw_dmodel_lr_scaling", help="[Muon] 是否对 AdamW LR 做 dmodel scaling: lr × (dim/768)^-0.5", action="store_true", default=False)
+    parser.add_argument("--muon_momentum_warmup_steps", help="[Muon] Momentum 从 0.85 线性预热到 muon_momentum 的步数 (NanoChat 默认 300, 设 0 禁用)", type=int, default=300)
 
     # Option 1: 分层学习率参数
     parser.add_argument("--layered_lr", help="[Option 1] 启用分层学习率，不同参数类型使用不同学习率", action="store_true", default=False)
