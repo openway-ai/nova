@@ -297,7 +297,8 @@ def main(args):
                     # Only compute EM/F1 for generation tasks (GSM8K, etc), not PPL tasks (nanochat)
                     if args.dataset_name in ["gsm8k", "arc", "humaneval", "mmlu", "smoltalk", "spellingbee"]:
                         em_score, f1_score = nlp_eval_acc(os.path.join(args.save_generation_logs_dir, "results.jsonl"))
-                        trainer.logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
+                        if wandb_logger is not None:
+                            wandb_logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
                     else:
                         print(f"Skipping EM/F1 evaluation for PPL-only dataset: {args.dataset_name}")
             # elif args.modality == "VID":
