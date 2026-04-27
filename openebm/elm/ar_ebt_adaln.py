@@ -7,7 +7,13 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from openebm.elm.utils import init_whole_model_weights
+from openebm.elm.utils import init_whole_model_weights, EBTModelArgs
+try:
+    from openebm.elm.ve import build_layer_ve, build_value_embeds, has_ve
+except ImportError:
+    has_ve = None
+    build_value_embeds = None
+    build_layer_ve = None
 
 
 class RMSNorm(torch.nn.Module):
@@ -157,7 +163,7 @@ def modulate(x, shift, scale):
 
 class Attention(nn.Module):
     """Multi-head attention module."""
-    def __init__(self, args: EBTModelArgs):
+    def __init__(self, layer_id: int, args: EBTModelArgs):
         """
         Initialize the Attention module.
 
@@ -185,6 +191,13 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
+        self.use_ve = args.use_ve and has_ve is not None and has_ve(layer_id, args.n_layers)
+        if self.use_ve:
+            self.ve_gate_channels = min(32, args.dim)
+            self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_local_kv_heads, bias=False)
+            nn.init.zeros_(self.ve_gate.weight)
+        else:
+            self.ve_gate = None
         
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         init_whole_model_weights(self.wq, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
@@ -250,6 +263,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        ve: Optional[torch.Tensor] = None,
     ):
         """
         Forward pass of the attention module.
@@ -273,6 +287,10 @@ class Attention(nn.Module):
         xq = xq.view(bsz, full_seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
+        if ve is not None and self.ve_gate is not None:
+            ve = ve.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
+            gate = 2 * torch.sigmoid(self.ve_gate(x[:, :, :self.ve_gate_channels]))
+            xv = xv + gate.unsqueeze(-1) * ve
         
         # _o is for original attention stuff
         xq_o = xq[:, :original_seqlen, :, :] #B, S-1, N, H (N and H are num head and head dim respectively)
@@ -453,7 +471,7 @@ class AdaLNTransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        self.attention = Attention(layer_id, args)
         self.feed_forward = FeedForward(
             dim=args.dim,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
@@ -474,7 +492,8 @@ class AdaLNTransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        time_embeddings
+        time_embeddings,
+        ve: Optional[torch.Tensor] = None,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -492,7 +511,7 @@ class AdaLNTransformerBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(time_embeddings).chunk(6, dim=1)
 
         h = x + gate_msa.unsqueeze(1) * self.attention(
-            modulate(self.attention_norm(x), shift_msa, scale_msa), start_pos, freqs_cis, mask,
+            modulate(self.attention_norm(x), shift_msa, scale_msa), start_pos, freqs_cis, mask, ve,
         )
         out = h + gate_mlp.unsqueeze(1) * self.feed_forward(modulate(self.ffn_norm(h), shift_mlp, scale_mlp))
         return out
@@ -535,6 +554,16 @@ class EBTAdaLN(nn.Module):
         super().__init__()
         self.params = params
         self.n_layers = params.n_layers
+        self.use_ve = params.use_ve and build_value_embeds is not None
+        if self.use_ve:
+            n_kv_heads = params.n_heads if params.n_kv_heads is None else params.n_kv_heads
+            self.kv_dim = n_kv_heads * (params.dim // params.n_heads)
+            self.value_embeds = build_value_embeds(params.n_layers, params.vocab_size, self.kv_dim)
+            for ve in self.value_embeds.values():
+                nn.init.xavier_normal_(ve.weight)
+        else:
+            self.value_embeds = None
+            self.kv_dim = None
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
@@ -560,7 +589,14 @@ class EBTAdaLN(nn.Module):
         else:
             init_whole_model_weights(self.final_layer.linear, self.params.weight_initialization)
 
-    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0):
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        start_pos: int,
+        mcmc_step=0,
+        real_token_ids: Optional[torch.Tensor] = None,
+        predicted_tokens: Optional[torch.Tensor] = None,
+    ):
         """
         Perform a forward pass through the Transformer model.
 
@@ -611,9 +647,11 @@ class EBTAdaLN(nn.Module):
             #                         0, 0,    0
                 
 
-
             for i, layer in enumerate(self.layers):
-                embeddings = layer(embeddings, start_pos, freqs_cis, mask, time_embeddings)
+                ve = None
+                if self.use_ve and real_token_ids is not None and predicted_tokens is not None:
+                    ve = build_layer_ve(self.value_embeds, i, real_token_ids, predicted_tokens)
+                embeddings = layer(embeddings, start_pos, freqs_cis, mask, time_embeddings, ve)
             embeddings = self.norm(embeddings)
             energies = self.final_layer(embeddings, time_embeddings)
 

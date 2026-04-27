@@ -31,6 +31,8 @@ class EBTModelArgs:
     n_layers: int = 12
     n_heads: int = 12
     n_kv_heads: Optional[int] = None
+    vocab_size: int = 32768
+    use_ve: bool = False
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
     dyt_alpha_init: float = 0.5
@@ -447,7 +449,12 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
     max_seq_len = max_seq_len + 1 if (hparams.ebt_type == "time_embed" and use_mcmc_time_embed) else max_seq_len # need +1 only when time embed is actually used
 
     adaln_zero_init = True if hparams.ebt_type == "adaln_zero" else False
-    transformer_args = EBTModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=max_seq_len, weight_initialization = hparams.weight_initialization_method, adaln_zero_init=adaln_zero_init, ebt_norm=hparams.ebt_norm, ffn_dim_multiplier=hparams.ffn_dim_multiplier, ebt_act_func=hparams.ebt_act_func, weight_initialization_gain=hparams.weight_initialization_gain, dyt_alpha_init=hparams.dyt_alpha_init, use_mcmc_time_embed=use_mcmc_time_embed)
+    missing_attrs = [name for name in ("use_ve", "vocab_size") if not hasattr(hparams, name)]
+    if missing_attrs:
+        missing = ", ".join(missing_attrs)
+        raise AttributeError(f"hparams must define explicit VE attributes before setup_ebt(): {missing}")
+
+    transformer_args = EBTModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=max_seq_len, weight_initialization = hparams.weight_initialization_method, adaln_zero_init=adaln_zero_init, ebt_norm=hparams.ebt_norm, ffn_dim_multiplier=hparams.ffn_dim_multiplier, ebt_act_func=hparams.ebt_act_func, weight_initialization_gain=hparams.weight_initialization_gain, dyt_alpha_init=hparams.dyt_alpha_init, vocab_size=hparams.vocab_size, use_ve=hparams.use_ve, use_mcmc_time_embed=use_mcmc_time_embed)
     
     if hparams.ebt_type == "default": # causal decoder trans for ebm https://arxiv.org/abs/2406.08862
         from openebm.elm.ar_ebt_default import EBTDefault
