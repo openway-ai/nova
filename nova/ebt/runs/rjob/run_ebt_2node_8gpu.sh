@@ -103,6 +103,7 @@ NORMALIZE_INITIAL_CONDITION=true
 DENOISING_INITIAL_CONDITION="random_noise"
 MCMC_STEP_SIZE_LEARNABLE=true
 NO_MCMC_DETACH=false
+USE_SDPA_ATTENTION=false              # 启用 SDPA 注意力 (大幅减少 Path B 显存占用)，设为 true 启用
 
 ################################################################################
 # Batch 配置与训练步数自动计算
@@ -164,6 +165,15 @@ OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio
 
 COMPILE_FLAGS=""
 # COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
+
+################################################################################
+# SDPA 注意力配置
+################################################################################
+
+SDPA_FLAGS=""
+if [[ "${USE_SDPA_ATTENTION}" == "true" ]]; then
+    SDPA_FLAGS="--use_sdpa_attention"
+fi
 
 ################################################################################
 # WandB 训练标志
@@ -253,7 +263,8 @@ torchrun \
   --save_periodic_steps 1000 \
   ${WANDB_FLAGS} \
   ${OPTION_FLAGS} \
-  ${COMPILE_FLAGS}
+  ${COMPILE_FLAGS} \
+  ${SDPA_FLAGS}
 
 TRAIN_EXIT_CODE=$?
 set -e

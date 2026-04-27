@@ -349,6 +349,7 @@ class Attention(nn.Module):
         init_whole_model_weights(self.wo, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
         
         self.time_offset = 2 if args.use_mcmc_time_embed else 1
+        self.use_sdpa_attention = args.use_sdpa_attention
         self.register_buffer('superdiag_rows', torch.arange(args.max_seq_len - 1))
         self.register_buffer('superdiag_cols', torch.arange(self.time_offset, args.max_seq_len + self.time_offset - 1))
         # self.wq = ColumnParallelLinear(
@@ -455,75 +456,125 @@ class Attention(nn.Module):
         # keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
         # values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
         
-        #original attn calc is more normal############################################
+        #original attn calc############################################
 
         # seqlen here is S-1 which = original_seqlen
         xq_o = xq_o.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys_o = xk_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
         values_o = xv_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim) # B, N, S-1, S-1
-        if mask is not None:
-            #this mask needs to be seqlen, seqlen, was S, S
-            o_mask = mask[:-1, :-1] #set to S-1, S-1 like 0 -inf -inf; 0 0 -inf, etc   
-            scores_o = scores_o + o_mask  # (bs, n_local_heads, seqlen, seqlen)
-        scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
-        output_o = torch.matmul(scores_o, values_o)  # (bs, n_local_heads, seqlen, head_dim)
-        output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1) # has B, S-1, D after
+
+        if self.use_sdpa_attention:
+            # Path A: standard causal self-attention on original tokens via SDPA.
+            # Must use math backend (not FlashAttention) because EBT's create_graph=True
+            # requires second-order derivatives, which FlashAttention backward doesn't support.
+            # Using is_causal=True avoids materializing the explicit mask tensor.
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+                output_o = F.scaled_dot_product_attention(xq_o, keys_o, values_o, is_causal=True)
+            output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1)
+        else:
+            scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim) # B, N, S-1, S-1
+            if mask is not None:
+                #this mask needs to be seqlen, seqlen, was S, S
+                o_mask = mask[:-1, :-1] #set to S-1, S-1 like 0 -inf -inf; 0 0 -inf, etc
+                scores_o = scores_o + o_mask  # (bs, n_local_heads, seqlen, seqlen)
+            scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
+            output_o = torch.matmul(scores_o, values_o)  # (bs, n_local_heads, seqlen, head_dim)
+            output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1) # has B, S-1, D after
         
         #pred sequence attn calc is for energy-based transformer ########################################################################################
         
-        # seqlen here is S-1 which = original_seqlen
-        xq_p = xq_p.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys_p = xk_p.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        
-        values_p = xv_p.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        scores_p = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim) # B, N, S-1, S; this uses xq_p and keys_o since for every next pred calcs similarity to all prev words; right S is because have extra condition
-
-        temp_append = torch.zeros((scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1), dtype=scores_p.dtype, device=scores_p.device) # B, N, S-1, 1; is used since context_length = original_length +1, superdiag needs this
-        scores_p = torch.cat((scores_p, temp_append), dim = -1)# is B, N, S-1, S; represents for each next pred (S-1 row) attending to all previous words (S-1) and then itself +1
-        
-        insertion_superdiagonal = (xq_p * keys_p).sum(dim = 3) / math.sqrt(self.head_dim)
-        insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype) # for if using non 32 precision
-        # bs, n, s-1 ; this calcs attn score of next preds with themselves, is like grabbing diag of matmul
-        
-        seq_len_minus_1 = scores_p.shape[2]
-        superdiag_rows = self.superdiag_rows[:seq_len_minus_1]
-        superdiag_cols = self.superdiag_cols[:seq_len_minus_1]
-  
-        # first remove superdiagonal values so doesnt use attention to future tokens--prevents leakage of probability mass
-        zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device) # for zeroing out superdiag since dont want to include in matmul, do this in differentiable way
-        diagonal_removal_mask = torch.ones_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
-        diagonal_removal_mask[:, :, superdiag_rows, superdiag_cols] = zero_superdiag
-        scores_p = scores_p * diagonal_removal_mask        
-        
-        # then set diagonal to next pred self attention scores in differentiable way
-        diagonal_addition_mask = torch.zeros_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
-        diagonal_addition_mask[:, :, superdiag_rows, superdiag_cols] = insertion_superdiagonal
-        scores_p = scores_p + diagonal_addition_mask         
-        
-        if mask is not None:
-            p_mask = mask[self.time_offset:, :]  #S-1, S+1 like 0 0 0 -inf -inf -inf; 0 0 0 0 -inf -inf; etc
-            scores_p = scores_p + p_mask
-        if scores_p.dtype != torch.float32:
-            scores_p = scores_p.float()
-        scores_p = F.softmax(scores_p, dim=-1)
-        if scores_p.dtype != xq_p.dtype:
-            scores_p = scores_p.to(xq_p.dtype)
-        
-        #Q: why do I need to extract superdiagonal why cant i just do matmul after? A: its bc would need same subsequence in value matrix but dont have it, have original subsequence and then seperately all next preds
-        scores_p_superdiagonal = scores_p.diagonal(offset=self.time_offset, dim1=2, dim2=3) # is B, N, S; basically how much each token on this superdiag should attent to itself; clone since dont want mask to change this
-        
-        scores_p = scores_p * diagonal_removal_mask # keeps scores_p as is except for superdiagonal which is next preds attention to selves, cant multiply these naively by values_p or values_o
-        
-        scores_p = scores_p[:, :, :, :-1] # B, N, S-1, S now; next preds/scores_p_superdiagonal was why needed extra col earlier (temp_append)
-        output_p = torch.matmul(scores_p, values_o) # B, N, S-1, H; is how next preds attend to all original previous tokens;
-        
-        #next_pred_self_attention is to get self attention based on extracted superdiagonal and the values matrix (for predictions)
-        next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim = -1) # B, N, S-1, H this is for weighted sum of each next pred to its final embed rep.
-        
-        output_p = output_p + next_pred_self_attention # B, N, S-1, H adding this is adding the aspect of each next pred embedding attending to itself
+        xq_p = xq_p.transpose(1, 2)  # (bs, n_local_heads, pred_seqlen, head_dim)
+        keys_p = xk_p.transpose(1, 2) # (bs, n_local_heads, pred_seqlen, head_dim)
+        values_p = xv_p.transpose(1, 2) # (bs, n_local_heads, pred_seqlen, head_dim)
         n_pred = full_seqlen - original_seqlen
-        output_p = output_p.transpose(1, 2).contiguous().view(bsz, n_pred, -1) # after this is B, S-1, D
+
+        if self.use_sdpa_attention:
+            # Path B: each pred token i must attend to
+            #   (1) original tokens 0..i+(time_offset-1)  (causal cross-attention)
+            #   (2) itself (pred_i self-attention)
+            #   (3) nothing else (no future orig tokens, no other pred tokens)
+            #
+            # Implementation: concatenate orig and pred K/V into a single sequence of
+            # length K + pred_seqlen, then pass an explicit additive mask to SDPA.
+            # SDPA (math backend) avoids materialising the [B,N,pred_seqlen,K+pred_seqlen]
+            # score matrix in HBM → O(B·K·D) peak memory vs O(B·N·K²) in the original.
+            # FLOPs are ~2x higher for Path B, but memory savings dominate at large K.
+
+            K = original_seqlen           # number of orig tokens
+            pred_seqlen = n_pred          # number of pred tokens
+
+            # Combined K/V: [B, N, K + pred_seqlen, H]
+            keys_all   = torch.cat([keys_o,   keys_p],   dim=2)
+            values_all = torch.cat([values_o, values_p], dim=2)
+
+            # Build additive mask [pred_seqlen, K + pred_seqlen].
+            # Row i allows: orig cols 0..i+(time_offset-1) (causal; time_offset accounts for
+            #               time_embed token at position 0 when use_mcmc_time_embed=True)
+            #               self  col  K+i   (pred_i attends only to itself)
+            # All other entries are -inf.
+            orig_rows = torch.arange(pred_seqlen, device=x.device).unsqueeze(1)  # [pred_seqlen, 1]
+            orig_cols = torch.arange(K,           device=x.device).unsqueeze(0)  # [1, K]
+            orig_mask_part = torch.where(
+                orig_cols <= orig_rows + (self.time_offset - 1),
+                x.new_zeros(1),
+                x.new_full((1,), float('-inf'))
+            )  # [pred_seqlen, K]
+
+            self_mask_part = x.new_full((pred_seqlen, pred_seqlen), float('-inf'))
+            self_mask_part.fill_diagonal_(0.0)  # each pred token attends only to itself
+
+            mask_p = torch.cat([orig_mask_part, self_mask_part], dim=1)  # [pred_seqlen, K + pred_seqlen]
+
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+                output_p = F.scaled_dot_product_attention(xq_p, keys_all, values_all, attn_mask=mask_p)
+            output_p = output_p.transpose(1, 2).contiguous().view(bsz, n_pred, -1)
+        else:
+            scores_p = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim) # B, N, S-1, S; this uses xq_p and keys_o since for every next pred calcs similarity to all prev words; right S is because have extra condition
+
+            temp_append = torch.zeros((scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1), dtype=scores_p.dtype, device=scores_p.device) # B, N, S-1, 1; is used since context_length = original_length +1, superdiag needs this
+            scores_p = torch.cat((scores_p, temp_append), dim = -1)# is B, N, S-1, S; represents for each next pred (S-1 row) attending to all previous words (S-1) and then itself +1
+            
+            insertion_superdiagonal = (xq_p * keys_p).sum(dim = 3) / math.sqrt(self.head_dim)
+            insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype) # for if using non 32 precision
+            # bs, n, s-1 ; this calcs attn score of next preds with themselves, is like grabbing diag of matmul
+            
+            seq_len_minus_1 = scores_p.shape[2]
+            superdiag_rows = self.superdiag_rows[:seq_len_minus_1]
+            superdiag_cols = self.superdiag_cols[:seq_len_minus_1]
+      
+            # first remove superdiagonal values so doesnt use attention to future tokens--prevents leakage of probability mass
+            zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device) # for zeroing out superdiag since dont want to include in matmul, do this in differentiable way
+            diagonal_removal_mask = torch.ones_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
+            diagonal_removal_mask[:, :, superdiag_rows, superdiag_cols] = zero_superdiag
+            scores_p = scores_p * diagonal_removal_mask
+            
+            # then set diagonal to next pred self attention scores in differentiable way
+            diagonal_addition_mask = torch.zeros_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
+            diagonal_addition_mask[:, :, superdiag_rows, superdiag_cols] = insertion_superdiagonal
+            scores_p = scores_p + diagonal_addition_mask
+            
+            if mask is not None:
+                p_mask = mask[self.time_offset:, :]  #S-1, S+1 like 0 0 0 -inf -inf -inf; 0 0 0 0 -inf -inf; etc
+                scores_p = scores_p + p_mask
+            if scores_p.dtype != torch.float32:
+                scores_p = scores_p.float()
+            scores_p = F.softmax(scores_p, dim=-1)
+            if scores_p.dtype != xq_p.dtype:
+                scores_p = scores_p.to(xq_p.dtype)
+            
+            #Q: why do I need to extract superdiagonal why cant i just do matmul after? A: its bc would need same subsequence in value matrix but dont have it, have original subsequence and then seperately all next preds
+            scores_p_superdiagonal = scores_p.diagonal(offset=self.time_offset, dim1=2, dim2=3) # is B, N, S; basically how much each token on this superdiag should attent to itself; clone since dont want mask to change this
+            
+            scores_p = scores_p * diagonal_removal_mask # keeps scores_p as is except for superdiagonal which is next preds attention to selves, cant multiply these naively by values_p or values_o
+            
+            scores_p = scores_p[:, :, :, :-1] # B, N, S-1, S now; next preds/scores_p_superdiagonal was why needed extra col earlier (temp_append)
+            output_p = torch.matmul(scores_p, values_o) # B, N, S-1, H; is how next preds attend to all original previous tokens;
+            
+            #next_pred_self_attention is to get self attention based on extracted superdiagonal and the values matrix (for predictions)
+            next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim = -1) # B, N, S-1, H this is for weighted sum of each next pred to its final embed rep.
+            
+            output_p = output_p + next_pred_self_attention # B, N, S-1, H adding this is adding the aspect of each next pred embedding attending to itself
+            output_p = output_p.transpose(1, 2).contiguous().view(bsz, n_pred, -1) # after this is B, S-1, D
         
         #return linear projection of concatted outputs ########################################################################################
         
