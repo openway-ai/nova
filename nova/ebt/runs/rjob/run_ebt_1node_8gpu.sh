@@ -18,7 +18,8 @@
 ################################################################################
 
 source /root/miniconda3/etc/profile.d/conda.sh
-conda activate /mnt/shared-storage-user/puyuan/conda_envs/nanochat
+conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
+export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH}"
 
 ### 路径配置 ###
 NOVA_HOME="/mnt/shared-storage-user/luyudong/nova"

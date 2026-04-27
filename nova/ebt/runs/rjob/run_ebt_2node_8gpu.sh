@@ -43,7 +43,7 @@ HOME="${NANOCHAT_HOME}"
 export NANOCHAT_BASE_DIR="${HOME}/.cache/nanochat"
 
 # PyTorch 内存优化
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.6"
 
 # WandB 配置
 export WANDB_API_KEY="968275bc822c87ac741ecce2f06cdfb54dbc1608"
@@ -154,16 +154,17 @@ SAVE_TOP_K=2
 # 优化选项
 ################################################################################
 
-OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0 \
+OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.05 \
 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 \
---adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
+--adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling \
+--muon_momentum_warmup_steps 300"
 
 ################################################################################
 # torch.compile 配置
 ################################################################################
 
-COMPILE_FLAGS=""
-# COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
+# COMPILE_FLAGS=""
+COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
 
 ################################################################################
 # SDPA 注意力配置
@@ -255,8 +256,8 @@ torchrun \
   --wandb_project 'nlp_pretrain' \
   --log_model_archi \
   --set_matmul_precision "medium" \
-  --float_precision "bf16-mixed" \
-  --manual_gc_collect_every_n_steps -1 \
+  --float_precision "bf16-true" \
+  --manual_gc_collect_every_n_steps 100 \
   --save_top_k_ckpts "${SAVE_TOP_K}" \
   --save_periodic_steps 1000 \
   ${WANDB_FLAGS} \

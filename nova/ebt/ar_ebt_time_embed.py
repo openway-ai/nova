@@ -32,7 +32,7 @@ class BackwardRMSNormFunction(torch.autograd.Function):
         eps = ctx.eps
 
         # Compute RMS of grad_output over last dim
-        rms = torch.rsqrt(grad_output.float().pow(2).mean(dim=-1, keepdim=True) + eps)
+        rms = torch.rsqrt(grad_output.pow(2).mean(dim=-1, keepdim=True) + eps)
 
         # Normalized gradient wrt the input
         grad_input = grad_output * rms * weight  # shape matches grad_output
@@ -197,100 +197,76 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
-        output = self._norm(x.float()).type_as(x)
+        output = self._norm(x)
         return output * self.weight
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+    Precompute the cosine and sine frequency tensors for rotary embeddings.
 
-    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-    and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
+    Returns a tuple of (cos, sin) tensors with shape (end, dim//2), stored as
+    float32 but applied via real-valued arithmetic to avoid dtype casting in
+    the forward/backward graph.
 
     Args:
-        dim (int): Dimension of the frequency tensor.
-        end (int): End index for precomputing frequencies.
-        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
+        dim (int): Head dimension.
+        end (int): Maximum sequence length.
+        theta (float, optional): RoPE base. Defaults to 10000.0.
 
     Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.
-
-    
-        
-
+        Tuple[torch.Tensor, torch.Tensor]: (cos, sin) each of shape (end, dim//2).
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    """
-    Reshape frequency tensor for broadcasting it with another tensor.
-
-    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
-    for the purpose of broadcasting the frequency tensor during element-wise operations.
-
-    Args:
-        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
-        x (torch.Tensor): Target tensor for broadcasting compatibility.
-
-    Returns:
-        torch.Tensor: Reshaped frequency tensor.
-
-    Raises:
-        AssertionError: If the frequency tensor doesn't match the expected shape.
-        AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
-    """
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs)  # (end, dim//2)
+    return freqs.cos(), freqs.sin()  # both float32, shape (end, dim//2)
 
 
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: Tuple[torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply rotary embeddings to input tensors using the given frequency tensor.
+    Apply rotary embeddings using real-valued cos/sin arithmetic.
 
-    This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
-    frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
-    is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
-    returned as real tensors.
+    Avoids any dtype casting so the computation stays in the model's native
+    dtype (e.g. bfloat16) throughout, which is important for keeping the
+    MCMC autograd graph in low precision.
 
     Args:
-        xq (torch.Tensor): Query tensor to apply rotary embeddings.
-        xk (torch.Tensor): Key tensor to apply rotary embeddings.
-        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
+        xq (torch.Tensor): Query tensor, shape (..., seq, n_heads, head_dim).
+        xk (torch.Tensor): Key tensor, shape (..., seq, n_kv_heads, head_dim).
+        freqs_cis (Tuple[torch.Tensor, torch.Tensor]): (cos, sin) each of
+            shape (seq, head_dim//2), precomputed by precompute_freqs_cis.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-
-        
-
+        Tuple[torch.Tensor, torch.Tensor]: Rotated xq and xk in original dtype.
     """
-    if xq.dtype == torch.float32:
-        xq_ = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2))
-    else:
-        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    if xk.dtype == torch.float32:
-        xk_ = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2))
-    else:
-        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    # xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    # xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    cos, sin = freqs_cis  # (seq, head_dim//2)
+    # cast cos/sin to match input dtype (e.g. bfloat16) to avoid float32 intermediates
+    cos = cos.to(dtype=xq.dtype)
+    sin = sin.to(dtype=xq.dtype)
+
+    # xq/xk: (bs, seq, n_heads, head_dim) → split last dim into pairs
+    # cos/sin: (seq, head_dim//2) → broadcast over bs and n_heads
+    # reshape: (bs, seq, n_heads, head_dim//2, 2)
+    xq_r = xq.reshape(*xq.shape[:-1], -1, 2)   # (..., head_dim//2, 2)
+    xk_r = xk.reshape(*xk.shape[:-1], -1, 2)
+
+    xq0, xq1 = xq_r[..., 0], xq_r[..., 1]      # (..., head_dim//2)
+    xk0, xk1 = xk_r[..., 0], xk_r[..., 1]
+
+    # cos/sin need shape (1, seq, 1, head_dim//2) for broadcasting
+    cos = cos.unsqueeze(0).unsqueeze(2)          # (1, seq, 1, head_dim//2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+
+    xq_out = torch.stack([xq0 * cos - xq1 * sin,
+                          xq0 * sin + xq1 * cos], dim=-1).flatten(-2)
+    xk_out = torch.stack([xk0 * cos - xk1 * sin,
+                          xk0 * sin + xk1 * cos], dim=-1).flatten(-2)
+    return xq_out, xk_out
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -403,7 +379,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor]
     ):
         """
         Forward pass of the attention module.
@@ -438,9 +414,10 @@ class Attention(nn.Module):
         xv_p = xv[:, original_seqlen:, :, :]
         
         
-        xq_o, xk_o = apply_rotary_emb(xq_o, xk_o, freqs_cis=freqs_cis[:original_seqlen])
+        cos, sin = freqs_cis
+        xq_o, xk_o = apply_rotary_emb(xq_o, xk_o, freqs_cis=(cos[:original_seqlen], sin[:original_seqlen]))
 
-        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[self.time_offset:original_seqlen+1]) # use time_offset since are the next preds and also have time embeddings (offset=2) or not (offset=1)
+        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=(cos[self.time_offset:original_seqlen+1], sin[self.time_offset:original_seqlen+1])) # use time_offset since are the next preds and also have time embeddings (offset=2) or not (offset=1)
         # I tested this compared to prepending row on S dimension and the tensors were the same
 
         # self.cache_k = self.cache_k.to(xq)
@@ -459,6 +436,8 @@ class Attention(nn.Module):
         #original attn calc############################################
 
         # seqlen here is S-1 which = original_seqlen
+        # Use F.scaled_dot_product_attention to avoid materialising the full [B, N, S, S]
+        # attention score matrix, which OOMs at context=2048.
         xq_o = xq_o.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys_o = xk_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
         values_o = xv_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
@@ -468,7 +447,7 @@ class Attention(nn.Module):
             # Must use math backend (not FlashAttention) because EBT's create_graph=True
             # requires second-order derivatives, which FlashAttention backward doesn't support.
             # Using is_causal=True avoids materializing the explicit mask tensor.
-            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False, enable_cudnn=False):
                 output_o = F.scaled_dot_product_attention(xq_o, keys_o, values_o, is_causal=True)
             output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1)
         else:
@@ -525,7 +504,7 @@ class Attention(nn.Module):
 
             mask_p = torch.cat([orig_mask_part, self_mask_part], dim=1)  # [pred_seqlen, K + pred_seqlen]
 
-            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False, enable_cudnn=False):
                 output_p = F.scaled_dot_product_attention(xq_p, keys_all, values_all, attn_mask=mask_p)
             output_p = output_p.transpose(1, 2).contiguous().view(bsz, n_pred, -1)
         else:
@@ -701,8 +680,7 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        use_create_graph: bool = False,
+        mask: Optional[torch.Tensor]
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -712,10 +690,6 @@ class TransformerBlock(nn.Module):
             start_pos (int): Starting position for attention caching.
             freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
             mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
-            use_create_graph (bool): 是否处于 create_graph=True 的 MCMC 步骤中。
-                当为 True 时禁用 Gradient Checkpointing，避免双倍激活值显存占用。
-                原因：create_graph=True 要求保留重计算图的中间激活值，
-                GC 的重计算不仅不能节省显存，反而会额外保存一份激活值。
 
         Returns:
             torch.Tensor: Output tensor after applying attention and feedforward layers.
@@ -771,9 +745,11 @@ class EBTTimeConcat(nn.Module):
         else:
             raise ValueError(f"Invalid ebt_norm value: {params.ebt_norm}")
 
-        self.freqs_cis = precompute_freqs_cis(
+        freqs_cos, freqs_sin = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len
         )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
         if self.use_mcmc_time_embed:
             self.time_embeddings = nn.Embedding(max_mcmc_steps, params.dim)
@@ -781,7 +757,7 @@ class EBTTimeConcat(nn.Module):
         self.final_layer = nn.Linear(params.dim, 1, bias = False)
         init_whole_model_weights(self.final_layer, self.params.weight_initialization)
 
-    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0, use_create_graph: bool = False):
+    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0):
         """
         Perform a forward pass through the Transformer model.
 
@@ -789,11 +765,6 @@ class EBTTimeConcat(nn.Module):
             embeds (torch.Tensor): Embeddings (instead of tokens since is for vision).
             start_pos (int): Starting position for attention caching.
             mcmc_step (int): Current MCMC step index, used for time embeddings.
-            use_create_graph (bool): 是否处于需要 create_graph=True 的 MCMC 最后一步。
-                该参数会透传给每个 TransformerBlock，用于决定是否启用 Gradient Checkpointing。
-                - False（默认）：非最后一步或推理阶段，GC 可以正常节省显存
-                - True：最后一步且 learning=True，禁用 GC 以避免双倍激活值开销
-                  （create_graph=True 要求保留重计算图，GC 重计算反而增加显存）
 
         Returns:
             torch.Tensor: Output energies after applying the Transformer model.
@@ -812,19 +783,20 @@ class EBTTimeConcat(nn.Module):
             seqlen = (seqlen+3) // 2 # passed in seqlen is 2(S-1)+1+1(time) so add 3 div 2 = S+1
         else:
             seqlen = (seqlen+2) // 2 # passed in seqlen is 2(S-1) so add 2 div 2 = S
-        self.freqs_cis = self.freqs_cis.to(embeddings.device)
-
-        # 动态扩展 freqs_cis 如果需要的长度超过预计算的长度
+        # 动态扩展 freqs_cos/freqs_sin 如果需要的长度超过预计算的长度
         required_length = start_pos + seqlen
-        if required_length > self.freqs_cis.shape[0]:
-            # 重新计算更长的 freqs_cis
-            new_freqs_cis = precompute_freqs_cis(
+        if required_length > self.freqs_cos.shape[0]:
+            new_cos, new_sin = precompute_freqs_cis(
                 self.params.dim // self.params.n_heads,
                 required_length
-            ).to(embeddings.device)
-            self.freqs_cis = new_freqs_cis
+            )
+            self.freqs_cos = new_cos.to(embeddings.device)
+            self.freqs_sin = new_sin.to(embeddings.device)
 
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        freqs_cis = (
+            self.freqs_cos[start_pos : start_pos + seqlen],
+            self.freqs_sin[start_pos : start_pos + seqlen],
+        )
 
         mask = None
         if seqlen > 1:
