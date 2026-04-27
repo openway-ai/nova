@@ -9,7 +9,8 @@
 #     ├── exp_meta.json
 #     ├── base_train/{config,checkpoints,logs,status.json}
 #     ├── sft_train/{config,checkpoints,logs,status.json}
-#     └── core_eval/<eval_run_id>/{config,results,eval.log,status.json}
+#     ├── core_eval/<eval_run_id>/{config,results,eval.log,status.json}
+#     └── nanochat_gsm8k_eval/<eval_run_id>/{config,master.log,nanochat_shards.log,gsm8k.log}
 ################################################################################
 
 EBT_RUNS_ROOT="${EBT_RUNS_ROOT:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs}"
@@ -297,6 +298,70 @@ EOREF
     echo "  Eval run:     ${eval_run_id}"
     echo "  Output dir:   ${EVAL_OUTPUT_DIR}"
     echo "  Log file:     ${EVAL_LOG_FILE}"
+}
+
+# ---------------------------------------------------------------------------
+# exp_init_nanochat_gsm8k_eval
+#
+# 在 exp_id 目录下创建 nanochat_gsm8k_eval/<eval_run_id>/ 子目录。
+#
+# 需要的变量:
+#   EXP_ID          — 必须指定
+#   CKPT_PATH       — 评估的 checkpoint 路径
+#
+# 设置的导出变量:
+#   EXP_DIR, EVAL_RUN_DIR, EVAL_LOG_FILE, NANOCHAT_EVAL_LOG, GSM8K_EVAL_LOG
+# ---------------------------------------------------------------------------
+exp_init_nanochat_gsm8k_eval() {
+    local caller_script="${1:-$0}"
+
+    if [ -z "$EXP_ID" ]; then
+        echo "错误: nanochat_gsm8k_eval 必须指定 EXP_ID 环境变量"
+        exit 1
+    fi
+
+    export EXP_DIR="${EBT_RUNS_ROOT}/${EXP_ID}"
+
+    local step ts eval_run_id
+    step=$(_exp_parse_ckpt_step "$CKPT_PATH")
+    ts=$(_exp_timestamp)
+    eval_run_id="step${step:-unknown}_${ts}"
+
+    export EVAL_RUN_DIR="${EXP_DIR}/nanochat_gsm8k_eval/${eval_run_id}"
+    export EVAL_LOG_FILE="${EVAL_RUN_DIR}/master.log"
+    export NANOCHAT_EVAL_LOG="${EVAL_RUN_DIR}/nanochat_shards.log"
+    export GSM8K_EVAL_LOG="${EVAL_RUN_DIR}/gsm8k.log"
+
+    mkdir -p "${EVAL_RUN_DIR}/config"
+
+    cp "$caller_script" "${EVAL_RUN_DIR}/config/run_script.sh" 2>/dev/null || true
+
+    if [ -n "$CKPT_PATH" ]; then
+        local valid_loss ckpt_dir_name stage
+        valid_loss=$(_exp_parse_ckpt_valid_loss "$CKPT_PATH")
+        ckpt_dir_name=$(basename "$(dirname "$CKPT_PATH")")
+        if echo "$ckpt_dir_name" | grep -q "sft"; then
+            stage="sft_train"
+        else
+            stage="base_train"
+        fi
+        cat > "${EVAL_RUN_DIR}/config/eval_ckpt_ref.json" << EOREF
+{
+  "ckpt_path": "${CKPT_PATH}",
+  "stage": "${stage}",
+  "step": ${step:-null},
+  "valid_loss": ${valid_loss:-null},
+  "timestamp": "$(_exp_timestamp_full)"
+}
+EOREF
+    fi
+
+    echo "  EXP_ID:       ${EXP_ID}"
+    echo "  Eval run:     ${eval_run_id}"
+    echo "  Run dir:      ${EVAL_RUN_DIR}"
+    echo "  Master log:   ${EVAL_LOG_FILE}"
+    echo "  NanoChat log: ${NANOCHAT_EVAL_LOG}"
+    echo "  GSM8K log:    ${GSM8K_EVAL_LOG}"
 }
 
 # ---------------------------------------------------------------------------

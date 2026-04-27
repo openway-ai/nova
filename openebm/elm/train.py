@@ -285,23 +285,30 @@ def main(args):
         trainer = set_trainer(args, wandb_logger, checkpoint_callback, stage = "test")
         model_trainer.model.eval()
         trainer.test(model_trainer)
-        if args.modality == "NLP": # can have modality specific logic here for inference
-            if args.execution_mode == "inference":
-                # Only compute EM/F1 for generation tasks (GSM8K, etc), not PPL tasks (nanochat)
-                if args.dataset_name in ["gsm8k", "arc", "humaneval", "mmlu", "smoltalk", "spellingbee"]:
-                    em_score, f1_score = nlp_eval_acc(os.path.join(args.save_generation_logs_dir, "results.jsonl"))
-                    trainer.logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
-                else:
-                    print(f"Skipping EM/F1 evaluation for PPL-only dataset: {args.dataset_name}")
-        # elif args.modality == "VID":
-        #     if args.infer_generate_video:
-        #         print("calling style gan FVD code on generated video dataset, NOTE THIS CODE MAY NOT WORK AS EXPECTED or get stuck")
-        #         fvd, fid = call_style_gan_fvd(args)
-        #         trainer.logger.experiment.log({"test_fvd": fvd, "test_fid": fid})
-        # elif args.modality == "IMG":
-        #     pass # no post test code for denoising, for t2i could call FID code here if desired
-        else:
-            raise NotImplementedError(f"no post test evaluation setup for this modality: {args.modality} yet")
+
+        # DDP: only rank 0 merges shard files and computes metrics
+        if trainer.global_rank == 0:
+            # Merge per-rank JSONL shard files into a single results.jsonl
+            from openebm.elm.logger import JsonlLogger
+            JsonlLogger.merge_rank_files(args.save_generation_logs_dir, "results.jsonl")
+
+            if args.modality == "NLP": # can have modality specific logic here for inference
+                if args.execution_mode == "inference":
+                    # Only compute EM/F1 for generation tasks (GSM8K, etc), not PPL tasks (nanochat)
+                    if args.dataset_name in ["gsm8k", "arc", "humaneval", "mmlu", "smoltalk", "spellingbee"]:
+                        em_score, f1_score = nlp_eval_acc(os.path.join(args.save_generation_logs_dir, "results.jsonl"))
+                        trainer.logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
+                    else:
+                        print(f"Skipping EM/F1 evaluation for PPL-only dataset: {args.dataset_name}")
+            # elif args.modality == "VID":
+            #     if args.infer_generate_video:
+            #         print("calling style gan FVD code on generated video dataset, NOTE THIS CODE MAY NOT WORK AS EXPECTED or get stuck")
+            #         fvd, fid = call_style_gan_fvd(args)
+            #         trainer.logger.experiment.log({"test_fvd": fvd, "test_fid": fid})
+            # elif args.modality == "IMG":
+            #     pass # no post test code for denoising, for t2i could call FID code here if desired
+            else:
+                raise NotImplementedError(f"no post test evaluation setup for this modality: {args.modality} yet")
 
 def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", periodic_checkpoint=None):
     torch.autograd.set_detect_anomaly(args.detect_anomaly) #NOTE seems pl detect anomaly is not working so manually set it here

@@ -65,9 +65,16 @@ def setup_custom_logger(log_filename, name="custom_logger", print_console=True, 
 class JsonlLogger(logging.Logger):
     def __init__(self, name, log_filename, base_log_dir="./logs/"):
         super().__init__(name)
-        self.log_filename = os.path.join(base_log_dir, log_filename)
         os.makedirs(base_log_dir, exist_ok=True)  # Ensure the base log directory exists
-        
+
+        # DDP: each rank writes to its own file to avoid concurrent write corruption
+        rank = int(os.environ.get("LOCAL_RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size > 1:
+            base, ext = os.path.splitext(log_filename)
+            log_filename = f"{base}_rank{rank}{ext}"
+
+        self.log_filename = os.path.join(base_log_dir, log_filename)
         # Open the file in write mode to ensure all existing data is overwritten
         self.file = open(self.log_filename, 'w', encoding='utf-8') #NOTE can set to append mode if preferred instead of overwriting
 
@@ -85,6 +92,23 @@ class JsonlLogger(logging.Logger):
     def close(self):
         """Closes the file when logging is complete."""
         self.file.close()
+
+    @staticmethod
+    def merge_rank_files(base_log_dir, log_filename="results.jsonl"):
+        """Merge per-rank shard files into a single unified file."""
+        import glob
+        base, ext = os.path.splitext(log_filename)
+        pattern = os.path.join(base_log_dir, f"{base}_rank*{ext}")
+        rank_files = sorted(glob.glob(pattern))
+        if not rank_files:
+            return
+        merged_path = os.path.join(base_log_dir, log_filename)
+        with open(merged_path, 'w', encoding='utf-8') as out:
+            for rf in rank_files:
+                with open(rf, 'r', encoding='utf-8') as inp:
+                    for line in inp:
+                        out.write(line)
+                os.remove(rf)
 
 def setup_jsonl_logger(log_filename, name="jsonl_logger", base_log_dir="./logs/"):
     return JsonlLogger(name=name, log_filename=log_filename, base_log_dir=base_log_dir)
