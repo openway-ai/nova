@@ -755,7 +755,7 @@ class ModelTrainer(LightningModule):
                         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else None
                         if tokenizer is not None:
                             # Wrap nanochat tokenizer if needed
-                            from nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
+                            from openebm.elm.nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
                             if hasattr(tokenizer, 'enc') and hasattr(tokenizer.enc, 'encode'):
                                 # It's a RustBPETokenizer, wrap it for HF compatibility
                                 tokenizer = NanoChatTokenizerWrapper(tokenizer_obj=tokenizer)
@@ -1661,7 +1661,7 @@ class ModelTrainer(LightningModule):
             )
         elif self.hparams.execution_mode == "inference" and self.hparams.dataset_name == "nanochat_shard_eval":
             # Custom NanoChat shard evaluation dataset
-            from dataset_nanochat_eval import NanoChatShardEvalDataset, collate_fn_nanochat_eval
+            from openebm.elm.dataset_nanochat_eval import NanoChatShardEvalDataset, collate_fn_nanochat_eval
 
             # Parse shard indices from comma-separated string
             shard_indices_str = getattr(self.hparams, 'eval_shard_indices', '0,15')

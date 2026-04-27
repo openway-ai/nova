@@ -192,7 +192,7 @@ class NLP_HF_Collator:
         """
         Wrap nanochat tokenizer to support HuggingFace-like interface.
         """
-        from nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
+        from openebm.elm.nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
 
         # Check if it's already wrapped
         if isinstance(tokenizer_obj, NanoChatTokenizerWrapper):

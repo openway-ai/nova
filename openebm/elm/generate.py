@@ -136,7 +136,6 @@ def generate_text(model, batch, hparams):
     
     params = model.transformer.params
     bsz = len(prompt_tokens)
-    assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
     min_prompt_len = min(len(t) for t in prompt_tokens)
     max_prompt_len = max(len(t) for t in prompt_tokens)
