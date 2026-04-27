@@ -15,6 +15,11 @@ EBT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 REPO_ROOT="$( cd "$EBT_DIR/../.." && pwd )"
 export PYTHONPATH="${REPO_ROOT}/nanochat:${REPO_ROOT}:${PYTHONPATH:-}"
 
+# 确保 pip-installed 的 nvidia cuBLAS 优先于系统库，避免多 GPU 下 CUBLAS_STATUS_INVALID_VALUE
+export LD_LIBRARY_PATH=/mnt/shared-storage-user/puyuan/conda_envs/nanochat/lib/python3.10/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH:-}
+# mp.spawn 子进程通过管道输出时 stdout 全缓冲，导致看不到实时进度
+export PYTHONUNBUFFERED=1
+
 ################################################################################
 # 通用配置 (所有子脚本共享)
 ################################################################################
@@ -22,7 +27,10 @@ export PYTHONPATH="${REPO_ROOT}/nanochat:${REPO_ROOT}:${PYTHONPATH:-}"
 # Checkpoint 路径
 # export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt}"
 # base_train bpb 0.81
-export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt}"
+# export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt}"
+
+# ctx2048 sft-train
+export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-20260426/sft_train.v4/checkpoints/s=step=562-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.2264.ckpt}"
 
 
 if [ ! -f "$CKPT_PATH" ]; then
@@ -34,9 +42,21 @@ fi
 export TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer}"
 
 # GPU 和批量配置
-export GPUS="${GPUS:-1}"
+# GPUS=-1 表示自动检测所有可用 GPU
+export GPUS="${GPUS:--1}"
 export BATCH_SIZE="${BATCH_SIZE:-4}"
 export LIMIT_TEST_BATCHES="${LIMIT_TEST_BATCHES:-100}"
+
+# 自动检测 GPU 数量 (参考 eval_ebt_core.sh)
+if [ "$GPUS" = "-1" ]; then
+    if command -v nvidia-smi &> /dev/null; then
+        GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+        echo "自动检测到 $GPUS 个 GPU"
+    else
+        GPUS=1
+    fi
+    export GPUS
+fi
 
 # WandB 配置
 export USE_WANDB="${USE_WANDB:-false}"
