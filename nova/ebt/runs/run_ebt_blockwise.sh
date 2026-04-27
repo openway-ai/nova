@@ -34,16 +34,53 @@ if command -v module >/dev/null 2>&1; then
 fi
 
 ################################################################################
-# Blockwise training config (dense MTP-style supervision; edit these first)
+# Blockwise training config
+#   This script covers all three block_modes that share the `blockwise`
+#   training_objective (i.e. the dataloader yields block_targets [B, K, S]).
+#   Switch branches by setting the BLOCK_MODE env var; everything else
+#   (dataset, optimizer, MCMC settings) is shared.
 ################################################################################
-RUN_NAME="${RUN_NAME:-ebt-xxs-blockwise-k2-mtpmcmc}"
+# block_mode selects the attention/MCMC/loss semantic. Supported here:
+#   * mtp_mcmc                 (default; current dev-blockwise behavior)
+#   * future_latent_non_causal (K independent latents per source pos, intra-
+#                               block non-causal)
+#   * blockwise                (K independent latents per source pos, intra-
+#                               block causal)
+# `dense_token` is intentionally NOT supported by this script: it requires
+# --training_objective dense_next_token, which is a different training recipe;
+# use a separate run script for it.
+BLOCK_MODE="${BLOCK_MODE:-blockwise}"
+case "$BLOCK_MODE" in
+  mtp_mcmc|future_latent_non_causal|blockwise)
+    TRAINING_OBJECTIVE="${TRAINING_OBJECTIVE:-blockwise}"
+    ;;
+  dense_token)
+    echo "ERROR: --block_mode dense_token requires --training_objective dense_next_token;" >&2
+    echo "       this script is for the blockwise training_objective. Use a dense run script." >&2
+    exit 2
+    ;;
+  *)
+    echo "ERROR: unknown BLOCK_MODE='$BLOCK_MODE'." >&2
+    echo "       Allowed: mtp_mcmc | future_latent_non_causal | blockwise" >&2
+    exit 2
+    ;;
+esac
+
+RUN_NAME="${RUN_NAME:-ebt-xxs-blockwise-k2-${BLOCK_MODE}}"
 MODEL_NAME="${MODEL_NAME:-ebt}"
 MODEL_SIZE="${MODEL_SIZE:-xxs}"
 DATASET_NAME="${DATASET_NAME:-nanochat}"
 
+# S in the [B, K, S] dataloader output: number of source positions per sample.
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-256}"
+# K in the [B, K, S] dataloader output: number of future tokens predicted per
+# source position. For mtp_mcmc, K is the number of joint-head offsets.
+# For future_latent_non_causal / blockwise, K is the number of independent
+# latents allocated per source position.
 TRAIN_BLOCK_SIZE="${TRAIN_BLOCK_SIZE:-2}"
-# Compat-only in dense mode (ignored by current blockwise path).
+# Optional override for the dataloader-side context length (kept for
+# parity with the dense recipe; the blockwise dataloader currently uses
+# CONTEXT_LENGTH directly, so leaving this empty is normal).
 TRAIN_CONTEXT_LENGTH="${TRAIN_CONTEXT_LENGTH:-}"
 
 GPUS="${GPUS:--1}"
@@ -63,42 +100,65 @@ export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/mnt/shared-storage-user/lixueyan
 ################################################################################
 CMD=(
   "$PYTHON_BIN" train.py
-  --run_name "$RUN_NAME"
-  --modality NLP
-  --model_name "$MODEL_NAME"
-  --model_size "$MODEL_SIZE"
-  --dataset_name "$DATASET_NAME"
-  --execution_mode pretrain
-  --pretokenize_dataset
-  --normalize_initial_condition
-  --denoising_initial_condition random_noise
-  --ebt_type time_embed
-  --training_objective blockwise
-  --block_mode mtp_mcmc
-  --context_length "$CONTEXT_LENGTH"
-  --train_block_size "$TRAIN_BLOCK_SIZE"
-  --mcmc_step_size_learnable
-  --mcmc_step_size 500
-  --mcmc_step_size_lr_multiplier 1500
-  --mcmc_num_steps 2
-  --gpus "$GPUS"
+
+  # --- Run identity / data ---------------------------------------------------
+  --run_name "$RUN_NAME"                        # wandb / checkpoint dir name
+  --modality NLP                                # this script is NLP-only
+  --model_name "$MODEL_NAME"                    # "ebt" -> EBT_NLP
+  --model_size "$MODEL_SIZE"                    # xxs / xs / s / ... preset
+  --dataset_name "$DATASET_NAME"                # nanochat tokenizer + corpus
+  --execution_mode pretrain                     # not finetune (blockwise FT n/a)
+  --pretokenize_dataset                         # cache token IDs to disk
+
+  # --- EBT energy-input pre-processing --------------------------------------
+  --normalize_initial_condition                 # L2-normalize the noised input
+  --denoising_initial_condition random_noise    # init MCMC from gaussian noise
+  --ebt_type time_embed                         # trunk variant: prepend a time
+                                                #  token; 'default' is also OK
+
+  # --- Block-mode dispatch (training + attention semantic) ------------------
+  # training_objective drives which dataset/loss path is used:
+  #   * blockwise -> dataloader yields (input_ids [B,S], block_targets [B,K,S])
+  # block_mode drives which attention/MCMC/loss semantic the model uses:
+  #   * mtp_mcmc                 -> 1 latent / source pos + joint K-head
+  #   * future_latent_non_causal -> K latents / source pos, intra-block
+  #                                 latents do NOT see each other
+  #   * blockwise                -> K latents / source pos, intra-block
+  #                                 latents are causal (z_{t,j} sees z_{t,<=j})
+  --training_objective "$TRAINING_OBJECTIVE"
+  --block_mode "$BLOCK_MODE"
+
+  # --- Sequence layout ------------------------------------------------------
+  --context_length "$CONTEXT_LENGTH"            # S: # source positions
+  --train_block_size "$TRAIN_BLOCK_SIZE"        # K: # future tokens / pos
+
+  # --- MCMC (used by all 3 block_modes here) --------------------------------
+  --mcmc_step_size_learnable                    # learn alpha per layer/step
+  --mcmc_step_size 500                          # initial alpha (pre-sigmoid)
+  --mcmc_step_size_lr_multiplier 1500           # alpha LR multiplier
+  --mcmc_num_steps 2                            # # Langevin steps per forward
+
+  # --- Distributed / optimizer ----------------------------------------------
+  --gpus "$GPUS"                                # -1 = all visible GPUs
   --peak_learning_rate "$PEAK_LR"
   --batch_size_per_device "$BATCH_SIZE_PER_DEVICE"
   --accumulate_grad_batches "$ACCUMULATE_GRAD_BATCHES"
   --gradient_clip_val 1.0
   --weight_decay 0.01
-  --min_lr_scale 10
+  --min_lr_scale 10                             # min_lr = peak_lr / 10
   --max_steps "$MAX_STEPS"
-  --max_scheduling_steps "$MAX_STEPS"
+  --max_scheduling_steps "$MAX_STEPS"           # LR scheduler horizon
   --warm_up_steps "$WARMUP_STEPS"
   --num_workers "$NUM_WORKERS"
+
+  # --- Validation / logging -------------------------------------------------
   --val_check_interval "$VAL_CHECK_INTERVAL"
   --limit_val_batches "$LIMIT_VAL_BATCHES"
   --val_sanity 1
   --wandb_project nlp_pretrain
-  --log_model_archi
+  --log_model_archi                             # dump model summary at start
   --log_every_n_steps 100
-  --set_matmul_precision medium
+  --set_matmul_precision medium                 # tf32 matmul on Ampere+
 )
 
 if [ -n "$TRAIN_CONTEXT_LENGTH" ]; then

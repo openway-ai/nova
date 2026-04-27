@@ -6,7 +6,16 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from utils import init_whole_model_weights, EBTModelArgs, BLOCK_MODE_CHOICES
+from utils import (
+    init_whole_model_weights,
+    EBTModelArgs,
+    BLOCK_MODE_CHOICES,
+    EXPLICIT_BLOCK_LATENT_MODES,
+    build_explicit_block_latent_mask,
+    build_explicit_block_latent_freq_indices,
+    build_explicit_block_latent_inference_mask,
+    build_explicit_block_latent_inference_freq_indices,
+)
 
 
 def _resolve_block_mode(explicit: Optional[str], fallback: str) -> str:
@@ -427,28 +436,44 @@ class Attention(nn.Module):
         block_mode dispatch:
           - ``dense_token`` / ``mtp_mcmc``: legacy symmetric EBT attention
             (matches ``main`` branch). Requires ``pred_len == context_len``
-            as a shape invariant, not as a semantic selector.
-          - ``future_latent_non_causal`` / ``blockwise``: not yet implemented.
+            as a shape invariant, not as a semantic selector. **The code
+            path for these two modes is preserved verbatim from the
+            previous version — do not refactor it for the new modes.**
+          - ``future_latent_non_causal`` / ``blockwise``: dispatches to
+            ``_forward_explicit_block_latent`` (a separate, plain SDPA
+            implementation that uses the additive ``mask`` to encode
+            visibility for ``S * K`` independent future latents).
 
         Args:
             x: Input tensor of shape ``(B, 1 + context_len + pred_len, D)``.
+                For the explicit-block-latent modes the layout is instead
+                ``(B, 1 + S + S * K, D)`` with ``pred_len = S * K``.
             start_pos: Starting position for rotary caching (unused here but
                 kept for symmetry with other EBT variants).
-            freqs_cis: Precomputed rotary frequency tensor.
+            freqs_cis: Precomputed rotary frequency tensor. For the
+                explicit-block-latent modes this must already be of length
+                ``full_seqlen`` (the trunk gathers per-token positions).
             mask: Additive attention mask of shape
                 ``(context_len + 2, context_len + 2)`` for the symmetric
-                modes. ``None`` is accepted when ``context_len + 2 <= 1``.
+                modes. For the explicit-block-latent modes this is the
+                ``(full_seqlen, full_seqlen)`` mask produced by
+                ``build_explicit_block_latent_mask``.
             context_len: Number of real context tokens (pre-time-embed).
-            pred_len: Number of predicted-block tokens.
+            pred_len: Number of predicted-block tokens. For the explicit
+                modes this equals ``context_len * block_size``.
             block_mode: Explicit attention semantic. See module docstring.
         """
         bsz, full_seqlen, _ = x.shape
         block_mode = _resolve_block_mode(block_mode, "dense_token")
 
-        if block_mode in ("future_latent_non_causal", "blockwise"):
-            raise NotImplementedError(
-                f"Attention dispatch for block_mode={block_mode!r} is not implemented yet. "
-                f"Only 'dense_token' and 'mtp_mcmc' are supported at this time."
+        if block_mode in EXPLICIT_BLOCK_LATENT_MODES:
+            # Plain full-sequence SDPA path with an explicit (S, K) mask.
+            # Lives in its own method so that mtp_mcmc / dense_token logic
+            # below is *byte-identical* to the previous version.
+            return self._forward_explicit_block_latent(
+                x=x,
+                freqs_cis=freqs_cis,
+                mask=mask,
             )
         if block_mode not in ("dense_token", "mtp_mcmc"):
             raise ValueError(f"Unsupported block_mode={block_mode!r}")
@@ -539,6 +564,59 @@ class Attention(nn.Module):
         output_p = output_p.transpose(1, 2).contiguous().view(bsz, pred_len, -1)
         output = torch.cat((output_o, output_p), dim=1)  # B, (S+1)+K, D
 
+        return self.wo(output)
+
+    def _forward_explicit_block_latent(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        """Plain full-sequence SDPA for the future_latent / blockwise modes.
+
+        This is intentionally a *separate* implementation from the legacy
+        symmetric path used by ``dense_token`` / ``mtp_mcmc``. It does NOT
+        use the superdiagonal trick — that trick was specific to the
+        symmetric "one latent per source position" layout and would not
+        encode the per-(t, j) visibility rules of the new modes.
+
+        ``mask`` must be the full ``(T, T)`` additive mask produced by
+        ``build_explicit_block_latent_mask`` and ``freqs_cis`` must already
+        be a ``(T, head_dim/2)`` slice with the right rotary position per
+        token (built by the caller via
+        ``build_explicit_block_latent_freq_indices``).
+        """
+        bsz, T, _ = x.shape
+        if mask is None:
+            raise ValueError(
+                "explicit-block-latent attention requires a non-None mask "
+                "(use utils.build_explicit_block_latent_mask)."
+            )
+        if freqs_cis.shape[0] != T:
+            raise ValueError(
+                "freqs_cis length mismatch for explicit-block-latent attention: "
+                f"got freqs_cis length {freqs_cis.shape[0]}, expected {T}."
+            )
+
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = xq.view(bsz, T, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, T, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, T, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        xq = xq.transpose(1, 2)            # [B, H, T, D]
+        keys = xk.transpose(1, 2)          # [B, H_kv, T, D]
+        values = xv.transpose(1, 2)        # [B, H_kv, T, D]
+        # The legacy code in this file assumes n_kv_heads == n_heads (no
+        # repeat_kv), so we follow the same assumption to keep behavior
+        # consistent across modes.
+
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        scores = scores + mask  # additive: 0 where allowed, -inf where forbidden
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = torch.matmul(scores, values)
+        output = output.transpose(1, 2).contiguous().view(bsz, T, -1)
         return self.wo(output)
 
 
@@ -740,18 +818,33 @@ class EBTTimeConcat(nn.Module):
         return_pred_hidden: bool = False,
         return_context_hidden: bool = False,
         block_mode: Optional[str] = None,
+        block_size: Optional[int] = None,
     ):
         """Perform a forward pass through the Transformer model.
 
         Attention / mask semantics are selected explicitly via ``block_mode``.
         Shape validation (``pred_len == context_len``) is treated as a shape
         invariant for the symmetric modes, not as a semantic branch.
+
+        For the explicit-block-latent modes (``future_latent_non_causal`` /
+        ``blockwise``), this dispatches to a separate forward path
+        (``_forward_explicit_block_latent``) that uses a different sequence
+        layout (``[time, c_1..c_S, z_{1,1}..z_{S,K}]``) and a per-(t, j)
+        attention mask. The dense_token / mtp_mcmc code below is kept
+        verbatim from the previous version.
         """
         block_mode = _resolve_block_mode(block_mode, self.params.block_mode)
-        if block_mode in ("future_latent_non_causal", "blockwise"):
-            raise NotImplementedError(
-                f"EBTTimeConcat.forward does not implement block_mode={block_mode!r} yet; "
-                f"only 'dense_token' and 'mtp_mcmc' are supported."
+        if block_mode in EXPLICIT_BLOCK_LATENT_MODES:
+            return self._forward_explicit_block_latent(
+                embeddings=embeddings,
+                start_pos=start_pos,
+                mcmc_step=mcmc_step,
+                context_len=context_len,
+                pred_len=pred_len,
+                block_size=block_size,
+                block_mode=block_mode,
+                return_pred_hidden=return_pred_hidden,
+                return_context_hidden=return_context_hidden,
             )
         if block_mode not in ("dense_token", "mtp_mcmc"):
             raise ValueError(f"Unsupported block_mode={block_mode!r}")
@@ -818,6 +911,271 @@ class EBTTimeConcat(nn.Module):
         pred_hidden = embeddings[:, context_len:]
         energies = self.final_layer(embeddings)
         energies = energies[:, context_len:]
+        if return_context_hidden and return_pred_hidden:
+            return energies, context_hidden, pred_hidden
+        if return_context_hidden:
+            return energies, context_hidden
+        if return_pred_hidden:
+            return energies, pred_hidden
+        return energies
+
+    def _forward_explicit_block_latent(
+        self,
+        embeddings: torch.Tensor,
+        start_pos: int,
+        mcmc_step,
+        context_len: Optional[int],
+        pred_len: Optional[int],
+        block_size: Optional[int],
+        block_mode: str,
+        return_pred_hidden: bool,
+        return_context_hidden: bool,
+    ):
+        """Dispatch between training-layout and inference-layout for the
+        explicit-block-latent modes (``future_latent_non_causal`` /
+        ``blockwise``).
+
+        The two layouts are distinguished by ``pred_len``:
+
+          * ``pred_len == context_len * block_size`` → **training layout**:
+            S source positions, each with K future latents (S*K pred tokens
+            in position-major order).
+          * ``pred_len == block_size`` → **inference layout**:
+            C context tokens followed by exactly K pred latents anchored at
+            the end of context.
+
+        Both layouts use the same attention semantics, just at different
+        scales. Inference layout is mathematically equivalent to extracting
+        the last source position's K latents from the training layout, but
+        avoids paying O(S^2) attention cost.
+        """
+        if context_len is None or pred_len is None or block_size is None:
+            raise ValueError(
+                "EBTTimeConcat explicit-block-latent path requires "
+                "context_len, pred_len and block_size to be set explicitly."
+            )
+        S_or_C = int(context_len)
+        K = int(block_size)
+        if S_or_C <= 0 or K <= 0:
+            raise ValueError(
+                f"context_len/block_size must be > 0; got context_len={S_or_C}, K={K}"
+            )
+
+        if int(pred_len) == S_or_C * K:
+            return self._forward_explicit_block_latent_training(
+                embeddings=embeddings,
+                start_pos=start_pos,
+                mcmc_step=mcmc_step,
+                context_len=S_or_C,
+                block_size=K,
+                block_mode=block_mode,
+                return_pred_hidden=return_pred_hidden,
+                return_context_hidden=return_context_hidden,
+            )
+        if int(pred_len) == K:
+            return self._forward_explicit_block_latent_inference(
+                embeddings=embeddings,
+                start_pos=start_pos,
+                mcmc_step=mcmc_step,
+                context_len=S_or_C,
+                block_size=K,
+                block_mode=block_mode,
+                return_pred_hidden=return_pred_hidden,
+                return_context_hidden=return_context_hidden,
+            )
+        raise ValueError(
+            "explicit-block-latent path expects pred_len in "
+            f"{{context_len * block_size, block_size}}; got pred_len={pred_len}, "
+            f"context_len={S_or_C}, block_size={K}."
+        )
+
+    def _forward_explicit_block_latent_training(
+        self,
+        embeddings: torch.Tensor,
+        start_pos: int,
+        mcmc_step,
+        context_len: int,
+        block_size: int,
+        block_mode: str,
+        return_pred_hidden: bool,
+        return_context_hidden: bool,
+    ):
+        """Training-layout forward.
+
+        Sequence layout (1-indexed semantic, 0-indexed positions in the mask):
+            ``[time, c_1, ..., c_S, z_{1,1}, ..., z_{1,K}, z_{2,1}, ...,``
+            ``z_{2,K}, ..., z_{S,1}, ..., z_{S,K}]``
+
+        Pred latents are stored in **position-major** order (outer ``t``,
+        inner ``j``), matching ``build_explicit_block_latent_mask``.
+        Returns energies of shape ``(B, S * K, 1)`` in the same order.
+        """
+        S = int(context_len)
+        K = int(block_size)
+        full_len = embeddings.shape[1]
+        if full_len != S + S * K:
+            raise ValueError(
+                "explicit-block-latent (training) expects embeddings of length "
+                f"S + S * K = {S + S * K}, got {full_len}."
+            )
+
+        # ------ time embedding (prepended as a single token like legacy) ------
+        bsz = embeddings.shape[0]
+        mcmc_step_t = torch.full(
+            size=(bsz,),
+            fill_value=mcmc_step,
+            device=embeddings.device,
+            dtype=torch.long,
+        )
+        time_embeddings = self.time_embeddings(mcmc_step_t).unsqueeze(dim=1)  # (B, 1, D)
+        embeddings = torch.cat((time_embeddings, embeddings), dim=1)
+        T_time = 1
+        T = T_time + S + S * K
+        assert embeddings.shape[1] == T
+
+        # ------ rotary frequencies (gather per-token positions) ------
+        self.freqs_cis = self.freqs_cis.to(embeddings.device)
+        max_pos_needed = start_pos + S + K
+        required_length = max_pos_needed + 1
+        if required_length > self.freqs_cis.shape[0]:
+            self.freqs_cis = precompute_freqs_cis(
+                self.params.dim // self.params.n_heads,
+                required_length,
+            ).to(embeddings.device)
+
+        pos_indices = build_explicit_block_latent_freq_indices(
+            context_len=S,
+            block_size=K,
+            time_len=T_time,
+            start_pos=start_pos,
+        )
+        pos_index_tensor = torch.tensor(
+            pos_indices, dtype=torch.long, device=embeddings.device
+        )
+        freqs_cis = self.freqs_cis.index_select(0, pos_index_tensor)
+
+        mask = build_explicit_block_latent_mask(
+            context_len=S,
+            block_size=K,
+            time_len=T_time,
+            block_mode=block_mode,
+            device=embeddings.device,
+            dtype=embeddings.dtype,
+        )
+
+        for layer in self.layers:
+            embeddings = layer(
+                embeddings,
+                start_pos,
+                freqs_cis,
+                mask,
+                context_len=S,
+                pred_len=S * K,
+                block_mode=block_mode,
+            )
+        embeddings = self.norm(embeddings)
+        embeddings = embeddings[:, T_time:]  # drop the time token
+        context_hidden = embeddings[:, :S]
+        pred_hidden = embeddings[:, S:]      # [B, S*K, D] in position-major order
+        energies = self.final_layer(embeddings)
+        energies = energies[:, S:]           # [B, S*K, 1]
+
+        if return_context_hidden and return_pred_hidden:
+            return energies, context_hidden, pred_hidden
+        if return_context_hidden:
+            return energies, context_hidden
+        if return_pred_hidden:
+            return energies, pred_hidden
+        return energies
+
+    def _forward_explicit_block_latent_inference(
+        self,
+        embeddings: torch.Tensor,
+        start_pos: int,
+        mcmc_step,
+        context_len: int,
+        block_size: int,
+        block_mode: str,
+        return_pred_hidden: bool,
+        return_context_hidden: bool,
+    ):
+        """Inference-layout forward: C context + K pred latents at the end.
+
+        Sequence layout: ``[time, c_1, ..., c_C, z_1, ..., z_K]``
+        with ``z_j`` semantically equal to ``z_{C, j}`` from training. The
+        attention mask (built by ``build_explicit_block_latent_inference_mask``)
+        encodes the same per-mode visibility rules as training.
+
+        Returns energies of shape ``(B, K, 1)`` for the K pred latents.
+        """
+        C = int(context_len)
+        K = int(block_size)
+        full_len = embeddings.shape[1]
+        if full_len != C + K:
+            raise ValueError(
+                "explicit-block-latent (inference) expects embeddings of length "
+                f"C + K = {C + K}, got {full_len}."
+            )
+
+        bsz = embeddings.shape[0]
+        mcmc_step_t = torch.full(
+            size=(bsz,),
+            fill_value=mcmc_step,
+            device=embeddings.device,
+            dtype=torch.long,
+        )
+        time_embeddings = self.time_embeddings(mcmc_step_t).unsqueeze(dim=1)
+        embeddings = torch.cat((time_embeddings, embeddings), dim=1)
+        T_time = 1
+        T = T_time + C + K
+        assert embeddings.shape[1] == T
+
+        self.freqs_cis = self.freqs_cis.to(embeddings.device)
+        max_pos_needed = start_pos + C + K
+        required_length = max_pos_needed + 1
+        if required_length > self.freqs_cis.shape[0]:
+            self.freqs_cis = precompute_freqs_cis(
+                self.params.dim // self.params.n_heads,
+                required_length,
+            ).to(embeddings.device)
+
+        pos_indices = build_explicit_block_latent_inference_freq_indices(
+            context_len=C,
+            block_size=K,
+            time_len=T_time,
+            start_pos=start_pos,
+        )
+        pos_index_tensor = torch.tensor(
+            pos_indices, dtype=torch.long, device=embeddings.device
+        )
+        freqs_cis = self.freqs_cis.index_select(0, pos_index_tensor)
+
+        mask = build_explicit_block_latent_inference_mask(
+            context_len=C,
+            block_size=K,
+            time_len=T_time,
+            block_mode=block_mode,
+            device=embeddings.device,
+            dtype=embeddings.dtype,
+        )
+
+        for layer in self.layers:
+            embeddings = layer(
+                embeddings,
+                start_pos,
+                freqs_cis,
+                mask,
+                context_len=C,
+                pred_len=K,
+                block_mode=block_mode,
+            )
+        embeddings = self.norm(embeddings)
+        embeddings = embeddings[:, T_time:]  # drop the time token
+        context_hidden = embeddings[:, :C]
+        pred_hidden = embeddings[:, C:]      # [B, K, D]
+        energies = self.final_layer(embeddings)
+        energies = energies[:, C:]           # [B, K, 1]
+
         if return_context_hidden and return_pred_hidden:
             return energies, context_hidden, pred_hidden
         if return_context_hidden:

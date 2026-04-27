@@ -182,15 +182,17 @@ def main(args):
     # Defaults: training_objective=dense_next_token -> dense_token;
     # training_objective=blockwise -> mtp_mcmc (this is the "current
     # dev-blockwise behaviour" the user runs today).
+    # Default mapping training_objective -> block_mode:
+    #   * dense_next_token -> dense_token (main-branch EBT semantics)
+    #   * blockwise        -> mtp_mcmc    (current dev-blockwise behaviour)
+    # The two new modes (future_latent_non_causal / blockwise) are explicit
+    # opt-ins that the user must request via --block_mode; both REQUIRE the
+    # blockwise dataset/loss path so they share block_targets with mtp_mcmc.
     if args.block_mode is None:
         if args.training_objective == "blockwise":
             args.block_mode = "mtp_mcmc"
         else:
             args.block_mode = "dense_token"
-    if args.block_mode in ("future_latent_non_causal", "blockwise"):
-        raise NotImplementedError(
-            f"--block_mode {args.block_mode!r} is reserved; its algorithm is not implemented yet."
-        )
     if args.block_mode == "mtp_mcmc" and args.training_objective != "blockwise":
         raise ValueError(
             "--block_mode mtp_mcmc requires --training_objective blockwise for training."
@@ -199,6 +201,12 @@ def main(args):
         raise ValueError(
             "--block_mode dense_token requires --training_objective dense_next_token for training."
         )
+    if args.block_mode in ("future_latent_non_causal", "blockwise"):
+        if args.training_objective != "blockwise":
+            raise ValueError(
+                f"--block_mode {args.block_mode!r} requires --training_objective blockwise "
+                f"so that block_targets [B, K, S] are produced by the dataloader."
+            )
     print(f"[block_mode] Using block_mode={args.block_mode!r} (training_objective={args.training_objective})")
 
     # assert not(args.random_num_mcmc_steps == True and args.reconstruct_loss_only_final_step == True), "cannot have both random_num_mcmc_steps and reconstruct_loss_only_final_step set"

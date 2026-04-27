@@ -32,6 +32,331 @@ BLOCK_MODE_CHOICES = (
     "blockwise",
 )
 
+# Block modes that use the new "K future latents per source position" semantic
+# with a single-token head (latent_token_head : D -> V).
+EXPLICIT_BLOCK_LATENT_MODES = ("future_latent_non_causal", "blockwise")
+
+
+def build_explicit_block_latent_mask(
+    *,
+    context_len: int,
+    block_size: int,
+    time_len: int,
+    block_mode: str,
+    device,
+    dtype,
+):
+    """Build the additive attention mask for the explicit-block-latent modes.
+
+    These modes (``future_latent_non_causal`` and ``blockwise``) use a sequence
+    layout that is fundamentally different from the legacy ``mtp_mcmc`` /
+    ``dense_token`` symmetric layout, so they get their own mask helper. This
+    helper does NOT touch any code path used by ``mtp_mcmc``.
+
+    Layout (token positions inside the returned ``(T, T)`` mask, 0-indexed):
+      ``[0, time_len)``                          → time tokens (only present
+                                                    when ``time_len > 0``,
+                                                    e.g. ``time_embed`` trunk)
+      ``[time_len, time_len + S)``               → context ``c_1 .. c_S``
+                                                    (S = ``context_len``)
+      ``[time_len + S, time_len + S + S * K)``   → predicted future latents in
+                                                    **position-major** order:
+            ``z_{1,1}, z_{1,2}, ..., z_{1,K},``
+            ``z_{2,1}, z_{2,2}, ..., z_{2,K},``
+            ``...,``
+            ``z_{S,1}, z_{S,2}, ..., z_{S,K}``
+        i.e. for source position ``t`` (1-indexed) and block offset
+        ``j`` (1-indexed), ``z_{t,j}`` lives at index
+        ``time_len + S + (t - 1) * K + (j - 1)``.
+
+    Visibility rules (queries -> keys):
+      * Time / context queries are causal among themselves and CANNOT see any
+        predicted latent. This preserves the standard "context is causal"
+        invariant.
+      * Pred query ``z_{t,j}`` always sees:
+            - all ``time_len`` time tokens
+            - context tokens ``c_1 .. c_t`` (i.e. context up to and including
+              the source position it is predicting from)
+        and is forbidden from seeing ``c_{t+1} .. c_S``.
+      * Pred -> pred visibility:
+            - ``future_latent_non_causal``: ``z_{t,j}`` only sees itself (no
+              communication between latents within the same block, and no
+              cross source position visibility).
+            - ``blockwise``: ``z_{t,j}`` sees ``z_{t,1} .. z_{t,j}`` (causal
+              within the block, still no cross source position visibility).
+        In particular, ``z_{u,*}`` is invisible to ``z_{t,*}`` whenever
+        ``u != t`` for both modes.
+
+    Returns:
+        Additive mask of shape ``(T, T)`` with values in ``{0, -inf}``,
+        ``dtype=dtype`` and on ``device``. Add it to attention scores before
+        softmax.
+    """
+    if block_mode not in EXPLICIT_BLOCK_LATENT_MODES:
+        raise ValueError(
+            "build_explicit_block_latent_mask only supports block_mode in "
+            f"{EXPLICIT_BLOCK_LATENT_MODES}; got block_mode={block_mode!r}"
+        )
+    S = int(context_len)
+    K = int(block_size)
+    T_time = int(time_len)
+    if S <= 0 or K <= 0:
+        raise ValueError(
+            f"context_len and block_size must be positive; got context_len={S}, block_size={K}"
+        )
+    if T_time < 0:
+        raise ValueError(f"time_len must be >= 0; got time_len={T_time}")
+
+    T = T_time + S + S * K
+    ctx_total = T_time + S
+
+    allow = torch.zeros((T, T), dtype=torch.bool, device=device)
+
+    # 1. context queries (time + c_*) are causal among themselves and cannot
+    #    see pred latents. This matches the legacy "context never attends to
+    #    pred" invariant.
+    ctx_indices = torch.arange(ctx_total, device=device)
+    causal_ctx = ctx_indices.unsqueeze(1) >= ctx_indices.unsqueeze(0)
+    allow[:ctx_total, :ctx_total] = causal_ctx
+    # allow[:ctx_total, ctx_total:] is left False.
+
+    # 2. pred queries.
+    # pred_t_idx: 0-indexed source position of each pred latent (length S*K).
+    # pred_j_idx: 0-indexed block offset of each pred latent.
+    pred_t_idx = (
+        torch.arange(S, device=device).unsqueeze(1).expand(S, K).reshape(-1)
+    )
+    pred_j_idx = (
+        torch.arange(K, device=device).unsqueeze(0).expand(S, K).reshape(-1)
+    )
+
+    # 2a. pred -> time: always allowed (only present when time_len > 0).
+    if T_time > 0:
+        allow[ctx_total:, :T_time] = True
+
+    # 2b. pred -> context: z_{t,j} sees c_1..c_t ⇔ context_offset_idx <= t-1
+    #     where t is 1-indexed (so 0-indexed source_pos == t-1 == pred_t_idx).
+    ctx_offset = torch.arange(S, device=device)  # 0..S-1
+    pred_to_ctx = ctx_offset.unsqueeze(0) <= pred_t_idx.unsqueeze(1)
+    allow[ctx_total:, T_time:ctx_total] = pred_to_ctx
+
+    # 2c. pred -> pred:
+    same_t = pred_t_idx.unsqueeze(1) == pred_t_idx.unsqueeze(0)
+    if block_mode == "future_latent_non_causal":
+        # z_{t,j} sees only itself (same source position AND same block offset).
+        same_j = pred_j_idx.unsqueeze(1) == pred_j_idx.unsqueeze(0)
+        pred_to_pred = same_t & same_j
+    else:  # block_mode == "blockwise"
+        # z_{t,j} sees z_{t,1..j}: same source position AND key block offset
+        # <= query block offset.
+        causal_j = pred_j_idx.unsqueeze(0) <= pred_j_idx.unsqueeze(1)
+        pred_to_pred = same_t & causal_j
+    allow[ctx_total:, ctx_total:] = pred_to_pred
+
+    mask = torch.zeros((T, T), dtype=dtype, device=device)
+    mask = mask.masked_fill(~allow, float("-inf"))
+    return mask
+
+
+def build_explicit_block_latent_inference_mask(
+    *,
+    context_len: int,
+    block_size: int,
+    time_len: int,
+    block_mode: str,
+    device,
+    dtype,
+):
+    """Inference-time additive mask for the explicit-block-latent modes.
+
+    Use this when you only need to predict K future tokens at the *end* of
+    a context of length C (i.e. a single anchor source position ``t = C``).
+    The training mask
+    (``build_explicit_block_latent_mask``) creates one block of K latents
+    for each of the S source positions, which is unnecessary at inference
+    and would multiply attention cost by O(S). For a well-trained model the
+    training mask masks out cross source position attention anyway, so the
+    output of the K latents at source position ``t = C`` is mathematically
+    identical between the two layouts. This helper builds the smaller
+    layout directly.
+
+    Layout (token positions inside the returned ``(T, T)`` mask):
+      ``[0, time_len)``                          → time tokens
+      ``[time_len, time_len + C)``               → context ``c_1 .. c_C``
+                                                    (C = ``context_len``)
+      ``[time_len + C, time_len + C + K)``       → pred latents ``z_1..z_K``
+                                                    (= ``z_{C, 1..K}`` in
+                                                    training notation)
+
+    Visibility rules (queries -> keys):
+      * Time / context queries are causal among themselves and CANNOT see
+        any pred latent (same invariant as training).
+      * Pred query ``z_j`` sees:
+            - all time tokens
+            - ALL context tokens (since the anchor is the end of context).
+      * Pred -> pred visibility:
+            - ``future_latent_non_causal``: ``z_j`` sees only itself.
+            - ``blockwise``: ``z_j`` sees ``z_1..z_j`` (causal in offset).
+
+    Returns:
+        Additive mask of shape ``(T, T)`` with values in ``{0, -inf}``.
+    """
+    if block_mode not in EXPLICIT_BLOCK_LATENT_MODES:
+        raise ValueError(
+            "build_explicit_block_latent_inference_mask only supports "
+            f"block_mode in {EXPLICIT_BLOCK_LATENT_MODES}; got {block_mode!r}"
+        )
+    C = int(context_len)
+    K = int(block_size)
+    T_time = int(time_len)
+    if C <= 0 or K <= 0:
+        raise ValueError(
+            f"context_len and block_size must be positive; got C={C}, K={K}"
+        )
+    if T_time < 0:
+        raise ValueError(f"time_len must be >= 0; got time_len={T_time}")
+
+    T = T_time + C + K
+    ctx_total = T_time + C
+
+    allow = torch.zeros((T, T), dtype=torch.bool, device=device)
+
+    ctx_indices = torch.arange(ctx_total, device=device)
+    causal_ctx = ctx_indices.unsqueeze(1) >= ctx_indices.unsqueeze(0)
+    allow[:ctx_total, :ctx_total] = causal_ctx
+
+    if T_time > 0:
+        allow[ctx_total:, :T_time] = True
+    # All context visible to every pred latent (anchor is "end of context").
+    allow[ctx_total:, T_time:ctx_total] = True
+
+    block_idx = torch.arange(K, device=device)
+    if block_mode == "future_latent_non_causal":
+        # Only self.
+        pred_to_pred = block_idx.unsqueeze(1) == block_idx.unsqueeze(0)
+    else:  # blockwise
+        # Causal within the block.
+        pred_to_pred = block_idx.unsqueeze(0) <= block_idx.unsqueeze(1)
+    allow[ctx_total:, ctx_total:] = pred_to_pred
+
+    mask = torch.zeros((T, T), dtype=dtype, device=device)
+    mask = mask.masked_fill(~allow, float("-inf"))
+    return mask
+
+
+def build_explicit_block_latent_freq_indices(
+    *,
+    context_len: int,
+    block_size: int,
+    time_len: int,
+    start_pos: int = 0,
+):
+    """Rotary position indices for the explicit-block-latent layout.
+
+    Used by ``ar_ebt_time_embed`` (``time_len=1``) and ``ar_ebt_default``
+    (``time_len=0``) to gather the appropriate rows from the precomputed
+    ``freqs_cis`` table. Returns a Python ``list[int]`` so the caller can
+    pass it to ``torch.tensor`` or directly index into ``freqs_cis``.
+
+    Rotary positions follow the natural "predicted token would live here"
+    convention so the new modes inherit standard RoPE relative-position
+    behavior:
+
+      * ``time_embed`` trunk (``time_len = 1``):
+          - time      → position ``start_pos + 0``
+          - ``c_t``   → position ``start_pos + t``       (t in [1..S])
+          - ``z_{t,j}`` → position ``start_pos + t + j`` (t in [1..S],
+                                                          j in [1..K])
+        Maximum position used: ``start_pos + S + K``.
+
+      * ``default`` trunk (``time_len = 0``):
+          - ``c_t``   → position ``start_pos + (t - 1)``
+          - ``z_{t,j}`` → position ``start_pos + (t - 1) + j``
+        Maximum position used: ``start_pos + S + K - 1``.
+
+    These match the semantics used by the legacy paths (time at 0; context at
+    1..S for time_embed and 0..S-1 for default; pred latents shifted forward
+    by their offset).
+    """
+    S = int(context_len)
+    K = int(block_size)
+    T_time = int(time_len)
+    if S <= 0 or K <= 0:
+        raise ValueError(
+            f"context_len and block_size must be positive; got context_len={S}, block_size={K}"
+        )
+    if T_time < 0:
+        raise ValueError(f"time_len must be >= 0; got time_len={T_time}")
+
+    sp = int(start_pos)
+    indices = []
+    if T_time > 0:
+        # All time tokens map to rotary position 0 (relative).
+        indices.extend([sp] * T_time)
+        # Context c_t at position t (1-indexed t).
+        indices.extend(sp + t for t in range(1, S + 1))
+        # Pred z_{t,j} at position t + j (position-major: t outer, j inner).
+        indices.extend(
+            sp + t + j for t in range(1, S + 1) for j in range(1, K + 1)
+        )
+    else:
+        # Context c_t at position t-1 (matches legacy default trunk).
+        indices.extend(sp + (t - 1) for t in range(1, S + 1))
+        # Pred z_{t,j} at position (t-1) + j.
+        indices.extend(
+            sp + (t - 1) + j
+            for t in range(1, S + 1)
+            for j in range(1, K + 1)
+        )
+    return indices
+
+
+def build_explicit_block_latent_inference_freq_indices(
+    *,
+    context_len: int,
+    block_size: int,
+    time_len: int,
+    start_pos: int = 0,
+):
+    """Rotary position indices for the inference layout.
+
+    Inference layout has C context tokens followed by K pred latents anchored
+    at the end of context, so positions are:
+
+      * ``time_embed`` trunk (``time_len = 1``):
+          - time      → ``start_pos + 0``
+          - ``c_t``   → ``start_pos + t``       (t in [1..C])
+          - ``z_j``   → ``start_pos + C + j``   (j in [1..K]); equivalently
+                        ``z_j`` is treated as ``z_{C, j}`` with rotary
+                        position ``C + j``.
+      * ``default`` trunk (``time_len = 0``):
+          - ``c_t``   → ``start_pos + (t - 1)``
+          - ``z_j``   → ``start_pos + (C - 1) + j``
+
+    Maximum position used: ``start_pos + C + K`` (or ``... + K - 1`` for
+    default).
+    """
+    C = int(context_len)
+    K = int(block_size)
+    T_time = int(time_len)
+    if C <= 0 or K <= 0:
+        raise ValueError(
+            f"context_len and block_size must be positive; got C={C}, K={K}"
+        )
+    if T_time < 0:
+        raise ValueError(f"time_len must be >= 0; got time_len={T_time}")
+
+    sp = int(start_pos)
+    indices = []
+    if T_time > 0:
+        indices.extend([sp] * T_time)
+        indices.extend(sp + t for t in range(1, C + 1))
+        indices.extend(sp + C + j for j in range(1, K + 1))
+    else:
+        indices.extend(sp + (t - 1) for t in range(1, C + 1))
+        indices.extend(sp + (C - 1) + j for j in range(1, K + 1))
+    return indices
+
 
 @dataclass
 class EBTModelArgs:

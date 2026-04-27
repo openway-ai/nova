@@ -134,6 +134,12 @@ BLOCK_MODE_CHOICES = (
     "blockwise",
 )
 
+# Block modes that use the new "K future latents per source position" semantic
+# at inference time. Mirrors utils.EXPLICIT_BLOCK_LATENT_MODES; redeclared
+# here to keep generate.py importable in environments where utils.py is not
+# on the python path.
+EXPLICIT_BLOCK_LATENT_MODES_INFER = ("future_latent_non_causal", "blockwise")
+
 
 def _resolve_inference_strategy(hparams, infer_block_size=None):
     """Resolve the *inference strategy* (sequential vs direct_block vs refine).
@@ -184,12 +190,17 @@ def _check_inference_block_mode_compat(attention_block_mode, inference_strategy,
     silent fallback is allowed; if a combination is not yet implemented,
     we raise ``NotImplementedError`` with a pointer at the user.
     """
-    if attention_block_mode in ("future_latent_non_causal", "blockwise"):
-        raise NotImplementedError(
-            f"Inference for block_mode={attention_block_mode!r} is not implemented yet. "
-            f"Train with a supported block_mode or wait for the corresponding attention "
-            f"dispatch to be added."
-        )
+    if attention_block_mode not in BLOCK_MODE_CHOICES:
+        raise ValueError(f"Unsupported block_mode={attention_block_mode!r}")
+
+    if attention_block_mode in EXPLICIT_BLOCK_LATENT_MODES_INFER:
+        # The new modes use a C+K trunk layout at inference time; both
+        # sequential (K=1) and direct_block (K>1) are natively supported by
+        # EBT_NLP.forward + ebt_refine_block_explicit_block_latent. Refine
+        # is also fine: it just runs MCMC on the K latents anchored at the
+        # end of the (real) context.
+        return
+
     if attention_block_mode not in ("dense_token", "mtp_mcmc"):
         raise ValueError(f"Unsupported block_mode={attention_block_mode!r}")
 
@@ -395,17 +406,38 @@ def generate_text(model, batch, hparams):
                     hparams.model_name == "ebt"
                     and infer_block_use_refine
                     and infer_block_refine_steps > 0
-                    and hasattr(model, "ebt_refine_block_fast")
                     and block_size > 0
                 ):
-                    refined_block_logits, refined_block_ids = model.ebt_refine_block_fast(
-                        context_ids=tokens[:, :cur_pos],
-                        draft_block_ids=draft_block_ids,
-                        refine_steps=infer_block_refine_steps,
-                        init_logit_scale=infer_block_init_logit_scale,
-                        start_pos=0,
-                        learning=False,
-                    )
+                    # Dispatch refine entry point on the attention-semantic
+                    # block_mode so training and inference stay in sync. The
+                    # explicit-block-latent modes use a C+K layout; mtp_mcmc /
+                    # dense_token use the legacy symmetric prefix trick.
+                    if attention_block_mode in EXPLICIT_BLOCK_LATENT_MODES_INFER:
+                        if not hasattr(model, "ebt_refine_block_explicit_block_latent"):
+                            raise NotImplementedError(
+                                f"Model lacks ebt_refine_block_explicit_block_latent; "
+                                f"refine for block_mode={attention_block_mode!r} unavailable."
+                            )
+                        refined_block_logits, refined_block_ids = model.ebt_refine_block_explicit_block_latent(
+                            context_ids=tokens[:, :cur_pos],
+                            draft_block_ids=draft_block_ids,
+                            refine_steps=infer_block_refine_steps,
+                            init_logit_scale=infer_block_init_logit_scale,
+                            start_pos=0,
+                            learning=False,
+                        )
+                    elif hasattr(model, "ebt_refine_block_fast"):
+                        refined_block_logits, refined_block_ids = model.ebt_refine_block_fast(
+                            context_ids=tokens[:, :cur_pos],
+                            draft_block_ids=draft_block_ids,
+                            refine_steps=infer_block_refine_steps,
+                            init_logit_scale=infer_block_init_logit_scale,
+                            start_pos=0,
+                            learning=False,
+                        )
+                    else:
+                        refined_block_logits = draft_block_logits
+                        refined_block_ids = draft_block_ids
                     commit_block_ids = refined_block_ids
                     commit_block_logits = refined_block_logits
 

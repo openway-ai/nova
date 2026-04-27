@@ -12,6 +12,7 @@ import os
 import inspect
 from utils import setup_ebt, init_whole_model_weights
 from utils import MLP, Memory_Augmented_MLP, Memory_Gating_MLP, mask_q_tokens
+from utils import EXPLICIT_BLOCK_LATENT_MODES
 from replay_buffer import CausalReplayBuffer
 from metrics import calculate_bpb_score
 
@@ -48,6 +49,22 @@ class EBT_NLP(LightningModule):
         )
         init_whole_model_weights(
             self.blockwise_joint_head,
+            self.hparams.weight_initialization_method,
+            weight_initialization_gain=self.hparams.weight_initialization_gain,
+        )
+
+        # Single-token head used by the explicit-block-latent modes
+        # (future_latent_non_causal / blockwise). Each future latent's hidden
+        # state is mapped through this head to produce a single token's logits;
+        # there is no joint multi-offset projection here. Kept independent of
+        # `blockwise_joint_head` so mtp_mcmc behavior is byte-identical.
+        self.block_latent_token_head = nn.Linear(
+            self.hparams.embedding_dim,
+            self.vocab_size,
+            bias=False,
+        )
+        init_whole_model_weights(
+            self.block_latent_token_head,
             self.hparams.weight_initialization_method,
             weight_initialization_gain=self.hparams.weight_initialization_gain,
         )
@@ -165,16 +182,30 @@ class EBT_NLP(LightningModule):
         batch_size = x.shape[0]
         seq_length = x.shape[1]
         if block_size is None:
-            block_size = getattr(self.hparams, "block_size", seq_length)
+            # Default block_size differs by block_mode:
+            #   * dense_token / mtp_mcmc: legacy symmetric layout, defaults
+            #     to seq_length (S=K, the historical contract).
+            #   * future_latent_non_causal / blockwise: this entry point is
+            #     the inference C+K layout (training uses
+            #     forward_explicit_block_latent_logits directly), so the
+            #     natural default is K=1 (sequential decoding).
+            if self._block_mode in EXPLICIT_BLOCK_LATENT_MODES:
+                block_size = getattr(self.hparams, "block_size", 1)
+            else:
+                block_size = getattr(self.hparams, "block_size", seq_length)
         block_size = int(block_size)
         if block_size <= 0:
             raise ValueError(f"block_size must be > 0, got {block_size}")
 
-        # block_mode dispatch: dense_token and mtp_mcmc both require
-        # context_len == pred_len inside the trunk. Equivalently, block_size
-        # must equal seq_length for this forward path. Other modes raise
-        # NotImplementedError so callers cannot silently fall back to a
-        # different attention semantic than the one the model was trained on.
+        # block_mode dispatch:
+        #   * dense_token / mtp_mcmc: legacy symmetric path. Requires
+        #     block_size == seq_length inside the trunk. This path is byte-
+        #     identical to the previous mtp_mcmc behavior.
+        #   * future_latent_non_causal / blockwise: new modes. We always use
+        #     the inference layout here (C context tokens + K = block_size
+        #     latents) so this entry point can be used directly for sequential
+        #     (K=1) and direct_block (K>1) inference. Training does NOT call
+        #     forward(); it goes through forward_explicit_block_latent_logits.
         if self._block_mode in ("dense_token", "mtp_mcmc"):
             if block_size != seq_length:
                 raise NotImplementedError(
@@ -184,9 +215,20 @@ class EBT_NLP(LightningModule):
                     f"or train a blockwise-mode checkpoint to enable non-symmetric block "
                     f"prediction. Got block_size={block_size}, seq_length={seq_length}."
                 )
-        elif self._block_mode in ("future_latent_non_causal", "blockwise"):
-            raise NotImplementedError(
-                f"EBT_NLP.forward does not implement block_mode={self._block_mode!r} yet."
+        elif self._block_mode in EXPLICIT_BLOCK_LATENT_MODES:
+            ebt_type = getattr(self.hparams, "ebt_type", "default")
+            if ebt_type not in ("default", "time_embed"):
+                raise NotImplementedError(
+                    f"block_mode={self._block_mode!r} is currently only supported for "
+                    f"ebt_type in [default, time_embed]; got ebt_type={ebt_type}."
+                )
+            return self._forward_explicit_block_latent_inference(
+                real_embeddings_input=real_embeddings_input,
+                block_size=block_size,
+                start_pos=start_pos,
+                learning=learning,
+                return_raw_logits=return_raw_logits,
+                no_randomness=no_randomness,
             )
         else:
             raise ValueError(f"Unknown block_mode={self._block_mode!r} on EBT_NLP")
@@ -616,6 +658,657 @@ class EBT_NLP(LightningModule):
             return multi_offset_logits_per_step, predicted_energies, pred_hiddens_per_step
         return multi_offset_logits_per_step, predicted_energies
 
+    # ------------------------------------------------------------------
+    # Explicit-block-latent paths (future_latent_non_causal / blockwise).
+    # ------------------------------------------------------------------
+    # These paths are intentionally kept independent of the dense_token /
+    # mtp_mcmc paths above so that any change here is guaranteed to leave
+    # mtp_mcmc behavior byte-identical. New helpers, new MCMC loop, new
+    # head, new inference entry points.
+    #
+    # Latent shape convention (logical):
+    #     predicted_tokens / pred_hidden : [B, S, K, V] / [B, S, K, D]
+    # Internally we flatten to position-major [B, S*K, *] for the trunk:
+    #     flatten order: outer source position t (0..S-1), inner block
+    #     offset j (0..K-1). i.e. for position-major index p, t = p // K,
+    #     j = p % K. This MUST match `build_explicit_block_latent_mask`
+    #     and `build_explicit_block_latent_freq_indices` in utils.py.
+    #
+    # Each future latent z_{t,j} predicts a single token corresponding to
+    # block_targets[:, j, t] (using the dataset convention that
+    # block_targets has shape [B, K, S]).
+    # ------------------------------------------------------------------
+
+    def _explicit_block_latent_pred_hidden_to_logits(self, pred_hidden, S, K):
+        """Map a position-major pred_hidden ``[B, S*K, D]`` to logits
+        ``[B, K, S, V]`` aligned with ``block_targets [B, K, S]``.
+
+        Steps:
+          1. ``self.block_latent_token_head`` : ``[B, S*K, V]`` (single-token
+             head; not the joint head used by mtp_mcmc).
+          2. Reshape to ``[B, S, K, V]`` (position-major: outer t, inner j).
+          3. Permute to ``[B, K, S, V]`` to match ``block_targets``.
+        """
+        B, P, _ = pred_hidden.shape
+        if P != S * K:
+            raise ValueError(
+                f"pred_hidden length mismatch: expected S*K={S*K}, got {P}"
+            )
+        logits = self.block_latent_token_head(pred_hidden)  # [B, S*K, V]
+        logits = logits.reshape(B, S, K, self.vocab_size)   # [B, S, K, V]
+        logits = logits.permute(0, 2, 1, 3).contiguous()    # [B, K, S, V]
+        return logits
+
+    def _run_explicit_block_latent_mcmc(
+        self,
+        real_embeddings_input,
+        predicted_tokens,
+        block_size,
+        start_pos=0,
+        learning=True,
+        return_raw_logits=False,
+        no_randomness=True,
+        alpha=None,
+        langevin_dynamics_noise_std=None,
+        mcmc_steps=None,
+        return_pred_hidden=False,
+    ):
+        """MCMC loop dedicated to the explicit-block-latent modes.
+
+        Operates on a flattened [B, P, V] latent where ``P`` is either
+        ``S * K`` (training layout, with S = real_embeddings_input.shape[1])
+        or ``K`` (inference layout). The trunk picks the correct sequence
+        layout by inspecting ``pred_len``; see
+        ``EBTTimeConcat._forward_explicit_block_latent`` /
+        ``EBTDefault._forward_explicit_block_latent``.
+
+        Energies of all P pred latents are summed before back-propagation,
+        consistent with EBT/MCMC where all pred-token energies contribute
+        to the gradient on the latents.
+
+        IMPORTANT: this function is NOT used by mtp_mcmc; mtp_mcmc still
+        uses ``_run_mcmc_on_given_pred_tokens`` which is left untouched.
+        """
+        if self._block_mode not in EXPLICIT_BLOCK_LATENT_MODES:
+            raise ValueError(
+                "_run_explicit_block_latent_mcmc must only be called under "
+                f"block_mode in {EXPLICIT_BLOCK_LATENT_MODES}; got {self._block_mode!r}"
+            )
+        if predicted_tokens.dim() != 3 or predicted_tokens.shape[-1] != self.vocab_size:
+            raise ValueError(
+                "predicted_tokens must be [B, P, V] with V == vocab_size; "
+                f"got shape={tuple(predicted_tokens.shape)}, vocab_size={self.vocab_size}"
+            )
+        K = int(block_size)
+        if K <= 0:
+            raise ValueError(f"block_size must be > 0, got {K}")
+        B, P, V = predicted_tokens.shape
+        S = real_embeddings_input.shape[1]
+        if P == S * K:
+            layout = "training"
+        elif P == K:
+            layout = "inference"
+        else:
+            raise ValueError(
+                "explicit-block-latent MCMC requires pred_len in {S*K, K}; "
+                f"got pred_len={P}, S={S}, K={K}."
+            )
+
+        if alpha is None:
+            alpha = torch.clamp(self.alpha, min=0.0001)
+        if langevin_dynamics_noise_std is None:
+            langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
+        if mcmc_steps is None:
+            mcmc_steps = self._build_mcmc_steps(no_randomness=no_randomness)
+
+        if return_pred_hidden and not self._transformer_accepts_return_pred_hidden:
+            raise NotImplementedError(
+                f"Transformer {type(self.transformer).__name__} does not support return_pred_hidden=True"
+            )
+
+        predicted_distributions = []
+        predicted_energies = []
+        predicted_hiddens = []
+
+        with torch.set_grad_enabled(True):
+            for i, mcmc_step in enumerate(mcmc_steps):
+                if self.hparams.no_mcmc_detach:
+                    predicted_tokens.requires_grad_().reshape(B, P, V)
+                else:
+                    predicted_tokens = predicted_tokens.detach().requires_grad_().reshape(B, P, V)
+
+                if self.hparams.langevin_dynamics_noise != 0:
+                    ld_noise = torch.randn_like(predicted_tokens.detach()) * langevin_dynamics_noise_std
+                    predicted_tokens = predicted_tokens + ld_noise
+
+                if self.hparams.normalize_initial_condition:
+                    if self.hparams.normalize_initial_condition_only_first_step:
+                        if mcmc_step == 0:
+                            predicted_tokens = self.softmax(predicted_tokens)
+                    else:
+                        predicted_tokens = self.softmax(predicted_tokens)
+
+                    if self.hparams.vocab_to_embed_uses_prob_dist:
+                        predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight)
+                    else:
+                        predicted_embeddings = self.vocab_to_embed(predicted_tokens)
+                else:
+                    predicted_embeddings = self.vocab_to_embed(predicted_tokens)
+
+                # all_embeddings: [B, S + P, D]
+                all_embeddings = torch.cat((real_embeddings_input, predicted_embeddings), dim=1)
+                trunk_kwargs = dict(
+                    start_pos=start_pos,
+                    mcmc_step=mcmc_step,
+                    context_len=S,
+                    pred_len=P,
+                    block_size=K,
+                    block_mode=self._block_mode,
+                )
+                energy_preds = self.transformer(all_embeddings, **trunk_kwargs)
+                # energy_preds: [B, P, 1]
+                energy_preds_flat = energy_preds.reshape(-1, 1)
+                predicted_energies.append(energy_preds_flat)
+
+                if self.hparams.truncate_mcmc:
+                    if i == (len(mcmc_steps) - 1):
+                        predicted_tokens_grad = torch.autograd.grad(
+                            [energy_preds_flat.sum()], [predicted_tokens], create_graph=learning
+                        )[0]
+                    else:
+                        predicted_tokens_grad = torch.autograd.grad(
+                            [energy_preds_flat.sum()], [predicted_tokens], create_graph=False
+                        )[0]
+                else:
+                    predicted_tokens_grad = torch.autograd.grad(
+                        [energy_preds_flat.sum()], [predicted_tokens], create_graph=learning
+                    )[0]
+
+                if self.hparams.clamp_futures_grad:
+                    min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha)
+                    predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min=-min_and_max, max=min_and_max)
+
+                if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
+                    raise ValueError("NaN or Inf gradients detected during explicit-block-latent MCMC.")
+
+                predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad
+                if self.hparams.absolute_clamp != 0.0:
+                    predicted_tokens = torch.clamp(
+                        predicted_tokens, min=-self.hparams.absolute_clamp, max=self.hparams.absolute_clamp
+                    )
+                if self.hparams.sharpen_predicted_distribution != 0.0:
+                    predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
+
+                if return_pred_hidden:
+                    # Re-run trunk on the post-update latent so pred_hidden
+                    # depends on alpha (mirrors the dense-blockwise pattern
+                    # used by mtp_mcmc).
+                    post_pred_embeddings = self._logits_to_pred_embeddings(predicted_tokens, mcmc_step)
+                    post_all = torch.cat((real_embeddings_input, post_pred_embeddings), dim=1)
+                    post_kwargs = dict(trunk_kwargs)
+                    post_kwargs["return_pred_hidden"] = True
+                    post_out = self.transformer(post_all, **post_kwargs)
+                    if isinstance(post_out, tuple) and len(post_out) == 2:
+                        _, pred_hidden = post_out
+                    else:
+                        raise RuntimeError(
+                            "Trunk did not return (energies, pred_hidden) for explicit-block-latent path"
+                        )
+                    predicted_hiddens.append(pred_hidden)
+
+                if return_raw_logits:
+                    predicted_tokens_for_loss = predicted_tokens
+                else:
+                    predicted_tokens_for_loss = self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size)
+                predicted_distributions.append(predicted_tokens_for_loss)
+
+        if return_pred_hidden:
+            return predicted_tokens, predicted_distributions, predicted_energies, predicted_hiddens
+        return predicted_tokens, predicted_distributions, predicted_energies
+
+    def forward_explicit_block_latent_hidden(self, input_ids, block_size, no_randomness):
+        """Training-time pred-hidden extraction for the new modes.
+
+        Returns:
+            pred_hiddens_per_step: list[Tensor] each [B, S*K, D] in
+                position-major order.
+            predicted_energies: list[Tensor] each [B*S*K, 1].
+        """
+        if input_ids.dim() != 2:
+            raise ValueError(f"Expected input_ids [B, S], got shape {tuple(input_ids.shape)}")
+        if self._block_mode not in EXPLICIT_BLOCK_LATENT_MODES:
+            raise ValueError(
+                "forward_explicit_block_latent_hidden only valid for block_mode in "
+                f"{EXPLICIT_BLOCK_LATENT_MODES}; got {self._block_mode!r}"
+            )
+        K = int(block_size)
+        if K <= 0:
+            raise ValueError(f"block_size must be > 0, got {K}")
+        S = int(input_ids.shape[1])
+
+        real_embeddings_input = self.embeddings(input_ids)  # [B, S, D]
+        alpha = torch.clamp(self.alpha, min=0.0001)
+        langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
+        # Initialize S*K latents. Position-major flattening matches the trunk
+        # mask / freq-index helpers in utils.py.
+        predicted_tokens = self.corrupt_embeddings(real_embeddings_input, target_length=S * K)
+
+        _, _, predicted_energies, pred_hiddens_per_step = self._run_explicit_block_latent_mcmc(
+            real_embeddings_input=real_embeddings_input,
+            predicted_tokens=predicted_tokens,
+            block_size=K,
+            start_pos=0,
+            learning=True,
+            return_raw_logits=True,
+            no_randomness=no_randomness,
+            alpha=alpha,
+            langevin_dynamics_noise_std=langevin_dynamics_noise_std,
+            return_pred_hidden=True,
+        )
+        return pred_hiddens_per_step, predicted_energies
+
+    def forward_explicit_block_latent_logits(self, input_ids, block_size, no_randomness, return_hidden=False):
+        """Training-time per-MCMC-step logits for the new modes.
+
+        Returns:
+            logits_per_step: list[Tensor] each [B, K, S, V] aligned with
+                ``block_targets [B, K, S]`` (so the last axis is the vocab
+                axis). Each latent z_{t,j} is mapped through
+                ``block_latent_token_head`` independently.
+            predicted_energies: list[Tensor] each [B*S*K, 1].
+            pred_hiddens_per_step (only if return_hidden=True): list of
+                [B, S*K, D].
+        """
+        if input_ids.dim() != 2:
+            raise ValueError(f"Expected input_ids [B, S], got shape {tuple(input_ids.shape)}")
+        K = int(block_size)
+        if K <= 0:
+            raise ValueError(f"block_size must be > 0, got {K}")
+        S = int(input_ids.shape[1])
+
+        pred_hiddens_per_step, predicted_energies = self.forward_explicit_block_latent_hidden(
+            input_ids=input_ids,
+            block_size=K,
+            no_randomness=no_randomness,
+        )
+
+        logits_per_step = []
+        for pred_hidden in pred_hiddens_per_step:
+            logits = self._explicit_block_latent_pred_hidden_to_logits(pred_hidden, S=S, K=K)
+            logits_per_step.append(logits)
+
+        if return_hidden:
+            return logits_per_step, predicted_energies, pred_hiddens_per_step
+        return logits_per_step, predicted_energies
+
+    def _forward_explicit_block_latent_inference(
+        self,
+        real_embeddings_input,
+        block_size,
+        start_pos=0,
+        learning=False,
+        return_raw_logits=False,
+        no_randomness=True,
+    ):
+        """Inference-time forward for new modes via the C+K trunk layout.
+
+        Builds K future latents anchored at the end of context, runs MCMC,
+        and produces per-step predicted distributions of shape ``[B, K, V]``
+        (one prediction per latent), matching the legacy ``(predicted_distributions,
+        predicted_energies)`` return shape used by ``call_model_forward_decode``.
+
+        After MCMC, the K latent hidden states are mapped through the single-
+        token head ``block_latent_token_head`` to yield the *real* per-latent
+        logits (since MCMC operates on the prob-dist surrogate, the trunk's
+        pred_hidden is the natural output for downstream sampling).
+        """
+        K = int(block_size)
+        if K <= 0:
+            raise ValueError(f"block_size must be > 0, got {K}")
+        if real_embeddings_input.dim() != 3:
+            raise ValueError(
+                f"Expected real_embeddings_input [B, C, D], got shape {tuple(real_embeddings_input.shape)}"
+            )
+
+        alpha = torch.clamp(self.alpha, min=0.0001)
+        langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
+        # Initialize exactly K latents (one per future block offset).
+        predicted_tokens = self.corrupt_embeddings(real_embeddings_input, target_length=K)
+
+        _, _, predicted_energies, pred_hiddens_per_step = self._run_explicit_block_latent_mcmc(
+            real_embeddings_input=real_embeddings_input,
+            predicted_tokens=predicted_tokens,
+            block_size=K,
+            start_pos=start_pos,
+            learning=learning,
+            return_raw_logits=return_raw_logits,
+            no_randomness=no_randomness,
+            alpha=alpha,
+            langevin_dynamics_noise_std=langevin_dynamics_noise_std,
+            return_pred_hidden=True,
+        )
+
+        # Map each step's [B, K, D] pred_hidden through the single-token head
+        # to produce [B, K, V] logits. These are the inference logits used
+        # by sampling code; they are consistent with training where each
+        # latent is supervised by exactly one target token.
+        logits_per_step = []
+        for pred_hidden in pred_hiddens_per_step:
+            if pred_hidden.shape[1] != K:
+                raise RuntimeError(
+                    f"pred_hidden length mismatch in inference: expected K={K}, got {pred_hidden.shape[1]}"
+                )
+            logits_per_step.append(self.block_latent_token_head(pred_hidden))  # [B, K, V]
+
+        return logits_per_step, predicted_energies
+
+    def ebt_refine_block_explicit_block_latent(
+        self,
+        context_ids,
+        draft_block_ids,
+        refine_steps=None,
+        init_logit_scale=8.0,
+        start_pos=0,
+        learning=False,
+    ):
+        """Block refinement entry point for the new explicit-block-latent
+        modes. Mirrors :meth:`ebt_refine_block_fast` but uses the C+K trunk
+        layout instead of the symmetric ``[ctx, draft[:-1]]`` prefix trick.
+
+        Inputs:
+            context_ids:     [B, C]  context token ids (real, not optimized)
+            draft_block_ids: [B, K]  draft token ids used to seed the K
+                                     future latents.
+
+        Returns:
+            refined_block_logits: [B, K, V]
+            refined_block_ids:    [B, K]
+        """
+        if self._block_mode not in EXPLICIT_BLOCK_LATENT_MODES:
+            raise ValueError(
+                "ebt_refine_block_explicit_block_latent only valid for block_mode in "
+                f"{EXPLICIT_BLOCK_LATENT_MODES}; got {self._block_mode!r}"
+            )
+        if draft_block_ids.shape[1] == 0:
+            empty_logits = torch.empty(
+                draft_block_ids.shape[0], 0, self.vocab_size,
+                device=draft_block_ids.device, dtype=self.embeddings.weight.dtype,
+            )
+            return empty_logits, draft_block_ids
+        if context_ids.shape[1] == 0:
+            raise ValueError("ebt_refine_block_explicit_block_latent requires at least one context token")
+
+        K = int(draft_block_ids.shape[1])
+        real_embeddings_input = self.embeddings(context_ids)  # [B, C, D]
+        # Seed K latents from the draft tokens: peaked logits then run MCMC.
+        block_logits = self._draft_block_ids_to_initial_logits(
+            draft_block_ids, init_logit_scale=init_logit_scale,
+        ).detach()
+        init_block_logits = block_logits.detach().clone()
+
+        alpha = torch.clamp(self.alpha, min=0.0001)
+        noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
+
+        requested_steps = int(refine_steps) if refine_steps is not None else int(self.hparams.mcmc_num_steps)
+        if requested_steps <= 0:
+            refined_block_ids = torch.argmax(block_logits, dim=-1)
+            return block_logits, refined_block_ids
+        effective_steps = min(requested_steps, int(self.hparams.mcmc_num_steps))
+        mcmc_steps = list(range(effective_steps))
+        diagnose = bool(getattr(self.hparams, "infer_block_diagnose", False))
+
+        def _block_energy_mean(logits, step_idx):
+            with torch.no_grad():
+                block_embeds = self._logits_to_pred_embeddings(logits, step_idx)
+                all_embeddings = torch.cat((real_embeddings_input, block_embeds), dim=1)
+                energy_preds = self.transformer(
+                    all_embeddings,
+                    start_pos=start_pos,
+                    mcmc_step=step_idx,
+                    context_len=real_embeddings_input.shape[1],
+                    pred_len=block_embeds.shape[1],
+                    block_size=K,
+                    block_mode=self._block_mode,
+                )
+                return energy_preds.mean().item()
+
+        initial_energy_mean = _block_energy_mean(init_block_logits, mcmc_steps[0])
+        last_grad_norm = 0.0
+
+        with torch.set_grad_enabled(True):
+            for i, mcmc_step in enumerate(mcmc_steps):
+                block_logits = block_logits.detach().requires_grad_()
+                cur_block_logits = block_logits
+                if self.hparams.langevin_dynamics_noise != 0:
+                    ld_noise = torch.randn_like(cur_block_logits.detach()) * noise_std
+                    cur_block_logits = cur_block_logits + ld_noise
+
+                block_embeds = self._logits_to_pred_embeddings(cur_block_logits, mcmc_step)
+                all_embeddings = torch.cat((real_embeddings_input, block_embeds), dim=1)
+                energy_preds = self.transformer(
+                    all_embeddings,
+                    start_pos=start_pos,
+                    mcmc_step=mcmc_step,
+                    context_len=real_embeddings_input.shape[1],
+                    pred_len=block_embeds.shape[1],
+                    block_size=K,
+                    block_mode=self._block_mode,
+                )
+                energy_block = energy_preds.reshape(-1, 1)
+
+                block_grad = torch.autograd.grad(
+                    [energy_block.sum()], [cur_block_logits], create_graph=learning
+                )[0]
+                last_grad_norm = block_grad.norm().item()
+                if self.hparams.clamp_futures_grad:
+                    min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha)
+                    block_grad = torch.clamp(block_grad, min=-min_and_max, max=min_and_max)
+                if torch.isnan(block_grad).any() or torch.isinf(block_grad).any():
+                    raise ValueError("NaN or Inf gradients detected during explicit-block-latent block refinement.")
+
+                block_logits = cur_block_logits - alpha * block_grad
+                if self.hparams.absolute_clamp != 0.0:
+                    block_logits = torch.clamp(
+                        block_logits, min=-self.hparams.absolute_clamp, max=self.hparams.absolute_clamp,
+                    )
+                if self.hparams.sharpen_predicted_distribution != 0.0:
+                    block_logits = block_logits / self.hparams.sharpen_predicted_distribution
+                block_logits = block_logits.detach()
+
+        # After MCMC, reconstruct the *real* per-latent token logits from
+        # the post-update pred_hidden (consistent with training where each
+        # latent is decoded by `block_latent_token_head`).
+        with torch.no_grad():
+            block_embeds = self._logits_to_pred_embeddings(block_logits, mcmc_steps[-1])
+            all_embeddings = torch.cat((real_embeddings_input, block_embeds), dim=1)
+            _, pred_hidden = self.transformer(
+                all_embeddings,
+                start_pos=start_pos,
+                mcmc_step=mcmc_steps[-1],
+                context_len=real_embeddings_input.shape[1],
+                pred_len=block_embeds.shape[1],
+                block_size=K,
+                block_mode=self._block_mode,
+                return_pred_hidden=True,
+            )
+            refined_block_logits = self.block_latent_token_head(pred_hidden)  # [B, K, V]
+            refined_block_ids = torch.argmax(refined_block_logits, dim=-1)
+
+        if diagnose:
+            final_energy_mean = _block_energy_mean(block_logits, mcmc_steps[-1])
+            delta_norm = (block_logits - init_block_logits).norm().item()
+            max_show = min(2, draft_block_ids.shape[0])
+            for b in range(max_show):
+                print(f"draft_block_ids[{b}]: {draft_block_ids[b].tolist()}", flush=True)
+                print(f"refined_block_ids[{b}]: {refined_block_ids[b].tolist()}", flush=True)
+            print(f"||refined_logits - init_logits||: {delta_norm:.6f}", flush=True)
+            print(f"block initial energy: {initial_energy_mean:.6f}", flush=True)
+            print(f"block final energy: {final_energy_mean:.6f}", flush=True)
+            print(f"block logits grad.norm(): {last_grad_norm:.6f}", flush=True)
+
+        return refined_block_logits, refined_block_ids
+
+    def _forward_loss_wrapper_explicit_block_latent(self, x, phase, token_bytes, no_randomness):
+        """Blockwise loss path for the new explicit-block-latent modes.
+
+        Constraints versus mtp_mcmc:
+          * Each future latent z_{t,j} corresponds to exactly one target
+            token: ``block_targets[:, j-1, t-1]`` (1-indexed t,j; equivalently
+            the (j, t) entry of the [B, K, S] tensor).
+          * Logits come from ``block_latent_token_head`` applied to each
+            latent independently — there is no joint multi-offset projection.
+          * Attention semantics inside the trunk are governed by ``self._block_mode``
+            (future_latent_non_causal vs blockwise) via the new mask helpers.
+
+        The mtp_mcmc loss path below is left completely untouched.
+        """
+        if not isinstance(x, dict):
+            raise ValueError("Expected dense blockwise batch to be a dict with keys: input_ids and block_targets")
+
+        def _maybe_squeeze_loader_dim(tensor):
+            if tensor is None:
+                return None
+            if isinstance(tensor, torch.Tensor) and tensor.dim() > 1 and tensor.shape[0] == 1:
+                return tensor.squeeze(dim=0)
+            return tensor
+
+        input_ids = _maybe_squeeze_loader_dim(x["input_ids"])
+        block_targets = _maybe_squeeze_loader_dim(x["block_targets"])
+        target_offsets = _maybe_squeeze_loader_dim(x.get("target_offsets"))
+
+        if input_ids.dim() != 2:
+            raise ValueError(f"Expected input_ids to be 2D [B, S_eff], got shape {tuple(input_ids.shape)}")
+        if block_targets.dim() != 3:
+            raise ValueError(f"Expected block_targets to be 3D [B, K, S_eff], got shape {tuple(block_targets.shape)}")
+        if block_targets.shape[0] != input_ids.shape[0]:
+            raise ValueError(
+                f"Batch mismatch between input_ids and block_targets: {tuple(input_ids.shape)} vs {tuple(block_targets.shape)}"
+            )
+        if block_targets.shape[2] != input_ids.shape[1]:
+            raise ValueError(
+                f"S_eff mismatch between input_ids and block_targets: input_ids.shape[1]={input_ids.shape[1]}, "
+                f"block_targets.shape[2]={block_targets.shape[2]}"
+            )
+
+        num_offsets = int(block_targets.shape[1])  # = K
+        S_eff = int(input_ids.shape[1])
+        if target_offsets is None:
+            target_offsets = torch.arange(1, num_offsets + 1, device=input_ids.device, dtype=torch.long)
+
+        logits_per_step, predicted_energies, pred_hiddens_per_step = self.forward_explicit_block_latent_logits(
+            input_ids=input_ids,
+            block_size=num_offsets,
+            no_randomness=no_randomness,
+            return_hidden=True,
+        )
+        # Flatten targets to match the [B, K, S, V] -> [B*K*S, V] layout.
+        next_token_indices = block_targets.reshape(-1)
+        reconstruction_loss = 0
+        total_mcmc_steps = len(predicted_energies)
+        final_cce_loss = None
+
+        for mcmc_step, (predicted_distribution, predicted_energy) in enumerate(zip(logits_per_step, predicted_energies)):
+            predicted_distribution = predicted_distribution.reshape(-1, self.vocab_size)
+
+            if self.hparams.soften_target_prob_dist != 0.0:
+                if total_mcmc_steps <= 1:
+                    label_smoothing = 0.0
+                else:
+                    label_smoothing = ((total_mcmc_steps - 1) - mcmc_step) / (total_mcmc_steps - 1) * self.hparams.soften_target_prob_dist
+                cce_loss = F.cross_entropy(
+                    predicted_distribution,
+                    next_token_indices,
+                    label_smoothing=label_smoothing,
+                    ignore_index=-1,
+                )
+            else:
+                predicted_distribution = self.log_softmax(predicted_distribution)
+                cce_loss = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1)
+
+            if self.hparams.truncate_mcmc:
+                if mcmc_step == (total_mcmc_steps - 1):
+                    reconstruction_loss = cce_loss
+                    final_reconstruction_loss = cce_loss.detach()
+                    final_cce_loss = cce_loss.detach()
+            else:
+                reconstruction_loss += cce_loss
+                if mcmc_step == (total_mcmc_steps - 1):
+                    final_reconstruction_loss = cce_loss.detach()
+                    final_cce_loss = cce_loss.detach()
+                    reconstruction_loss = reconstruction_loss / total_mcmc_steps
+
+            if mcmc_step == 0:
+                initial_loss = cce_loss.detach()
+                initial_pred_energies = predicted_energy.squeeze().mean().detach()
+            if mcmc_step == (total_mcmc_steps - 1):
+                final_pred_energies = predicted_energy.squeeze().mean().detach()
+
+        initial_final_pred_energies_gap = initial_pred_energies - final_pred_energies
+        ppl_loss = torch.exp(final_reconstruction_loss).detach()
+        total_loss = self.hparams.reconstruction_coeff * reconstruction_loss
+        contrastive_loss = 0.0
+
+        if token_bytes is not None:
+            bpb_loss = calculate_bpb_score(next_token_indices, final_cce_loss, token_bytes)
+        else:
+            bpb_loss = 0
+
+        # Per-offset loss logging, computed on the final MCMC step's logits
+        # in the canonical [B, K, S, V] layout. This is the same logging
+        # format mtp_mcmc uses, so downstream dashboards keep working.
+        offset_loss_log_dict = {}
+        final_step_logits = logits_per_step[-1].detach()       # [B, K, S, V]
+        final_step_targets = block_targets.detach()            # [B, K, S]
+        for offset_idx in range(num_offsets):
+            offset_value = int(target_offsets[offset_idx].item())
+            offset_logits = final_step_logits[:, offset_idx, :, :].reshape(-1, self.vocab_size)
+            offset_targets = final_step_targets[:, offset_idx, :].reshape(-1)
+            offset_loss = F.cross_entropy(
+                offset_logits,
+                offset_targets,
+                ignore_index=-1,
+            )
+            offset_loss_log_dict[f"offset_{offset_value}_loss"] = offset_loss
+
+        if getattr(self.hparams, "debug_blockwise_shapes", False):
+            print(
+                f"[blockwise-debug][phase={phase}][block_mode={self._block_mode}] "
+                f"explicit_block_latent=True, input_ids.shape={tuple(input_ids.shape)}, "
+                f"block_targets.shape={tuple(block_targets.shape)}, "
+                f"offsets={target_offsets.tolist()}, "
+                f"logits_last_step.shape={tuple(logits_per_step[-1].shape)}, "
+                f"alpha={self.alpha.detach().item():.6f}",
+                flush=True,
+            )
+            print(
+                f"[blockwise-debug][phase={phase}][block_mode={self._block_mode}] "
+                f"post_update_pred_hidden_last_step.shape={tuple(pred_hiddens_per_step[-1].shape)} "
+                f"(position-major flatten of [B, S_eff={S_eff}, K={num_offsets}, D])",
+                flush=True,
+            )
+            print(
+                f"[blockwise-debug][phase={phase}][block_mode={self._block_mode}] "
+                f"aggregated_loss={total_loss.detach().item():.6f}",
+                flush=True,
+            )
+            print(
+                f"[blockwise-debug][phase={phase}][block_mode={self._block_mode}] offset_losses="
+                f"{ {k: round(v.item(), 6) for k, v in offset_loss_log_dict.items()} }",
+                flush=True,
+            )
+
+        log_dict = {
+            'loss': total_loss,
+            'initial_loss': initial_loss,
+            'final_step_loss': final_reconstruction_loss,
+            'contrastive_loss': contrastive_loss,
+            'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
+            'perplexity': ppl_loss,
+            'bpb': bpb_loss,
+        }
+        log_dict.update(offset_loss_log_dict)
+        return log_dict
+
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
         no_randomness = False if phase == "train" else True
         training_objective = getattr(self.hparams, "training_objective", "dense_next_token")
@@ -627,6 +1320,18 @@ class EBT_NLP(LightningModule):
                 raise NotImplementedError("contrastive_loss is not supported for training_objective=blockwise")
             if self.hparams.execution_mode == "finetune":
                 raise NotImplementedError("execution_mode=finetune is not supported for training_objective=blockwise yet")
+
+            # block_mode dispatch within the blockwise training_objective:
+            #   * mtp_mcmc        -> existing dense-blockwise + joint head path
+            #     (kept byte-identical below).
+            #   * future_latent_non_causal / blockwise -> dedicated path that
+            #     uses block_latent_token_head and the K-future-latents-per-
+            #     source-position semantic (see
+            #     forward_explicit_block_latent_logits above).
+            if self._block_mode in EXPLICIT_BLOCK_LATENT_MODES:
+                return self._forward_loss_wrapper_explicit_block_latent(
+                    x=x, phase=phase, token_bytes=token_bytes, no_randomness=no_randomness,
+                )
 
             if not isinstance(x, dict):
                 raise ValueError("Expected dense blockwise batch to be a dict with keys: input_ids and block_targets")
