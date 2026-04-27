@@ -195,10 +195,6 @@ GRADIENT_CLIP_VAL=1.0
 # VAL_CHECK_INTERVAL=1000
 VAL_CHECK_INTERVAL=2000
 LIMIT_VAL_BATCHES=50
-# NUM_WORKERS: passed to train.py --num_workers but NOT used by nanochat dataloader
-# (hardcoded num_workers=0 in dataset.py because nanochat generator holds GPU state).
-# Kept for compatibility with the CLI arg parser.
-NUM_WORKERS=19
 SAVE_TOP_K=2
 
 ################################################################################
@@ -531,7 +527,6 @@ $([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 --warm_up_base_lr_divider ${WARM_UP_BASE_LR_DIVIDER} \
 \
 --dataset_name "nanochat" \
---num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
 --limit_val_batches ${LIMIT_VAL_BATCHES} \
 --val_sanity 1 \

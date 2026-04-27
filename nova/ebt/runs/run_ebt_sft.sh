@@ -101,7 +101,6 @@ MAX_SCHEDULING_STEPS=3000
 ################################################################################
 VAL_CHECK_INTERVAL=500
 LIMIT_VAL_BATCHES=50
-NUM_WORKERS=8
 
 ################################################################################
 # 优化选项配置 (SFT: 所有绝对 LR 同比降低)
@@ -253,7 +252,6 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --max_steps ${MAX_STEPS} \
 --max_scheduling_steps ${MAX_SCHEDULING_STEPS} \
 --dataset_name "nanochat_sft" \
---num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
 --limit_val_batches ${LIMIT_VAL_BATCHES} \
 --val_sanity 1 \

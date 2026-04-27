@@ -183,8 +183,9 @@ def main(args):
         num_gpus = int(args.gpus)
     print("devices/args.gpus: ", args.gpus)
 
-    args.total_num_workers = args.num_workers * num_gpus
-    print("num_nodes", args.num_nodes, "total num_workers across all GPUs", args.total_num_workers, "num workers per GPU", args.num_workers, "num_GPUs", num_gpus)
+    # NOTE: num_workers is NOT configurable — nanochat DataLoader hardcodes num_workers=0
+    # because the generator holds GPU state (pre-allocated CUDA buffers) that cannot be
+    # pickled into worker processes. See dataset.py generate_dataloader() for details.
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     assert (device == torch.device('cuda') and num_gpus > 0), "using cpu instead of cuda. if you would like to proceed please remove this line and change code below to not use GPUs, otherwise check packages to ensure torch/others have cuda support"
@@ -701,9 +702,11 @@ if __name__ == '__main__':
 
     #DATASET AND DATALOADER #########################################################
 
-    parser.add_argument("--num_workers", help="num_workers per GPU. idea to do per GPU gotten from https://discuss.pytorch.org/t/guidelines-for-assigning-num-workers-to-dataloader/813/", type=int, default=4)
-
-    parser.add_argument("--prefetch_factor", help="prefetch factor for dataloader", type=int, default=None)
+    # NOTE: --num_workers and --prefetch_factor have been removed.
+    # The nanochat DataLoader hardcodes num_workers=0 because its generator holds
+    # GPU state (pre-allocated CUDA buffers) that cannot be pickled into worker
+    # processes. pin_memory=False because data is already on GPU.
+    # See dataset.py generate_dataloader() for details.
     
     parser.add_argument("--dataset_name", help="dataset name", default="ucf101")
     

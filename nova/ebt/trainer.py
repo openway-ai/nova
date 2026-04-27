@@ -1735,14 +1735,6 @@ class ModelTrainer(LightningModule):
             # Default: use val_dataloader for pretrain mode
             return self.val_dataloader()
         
-    # def train_dataloader(self):
-    #     return DataLoader(self.train_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = not self.hparams.no_shuffle, prefetch_factor=self.hparams.prefetch_factor)
-
-    # def val_dataloader(self):
-    #     return DataLoader(self.val_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
-
-    # def test_dataloader(self):
-    #     return DataLoader(self.test_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
 
     def log_metrics(self, metrics_dict, phase, log_torchmetrics = True):
         # first log torchmetrics if there are any

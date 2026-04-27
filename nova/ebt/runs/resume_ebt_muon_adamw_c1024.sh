@@ -76,7 +76,6 @@ GRADIENT_CLIP_VAL=1.0
 ################################################################################
 VAL_CHECK_INTERVAL=2000
 LIMIT_VAL_BATCHES=50
-NUM_WORKERS=8
 SAVE_TOP_K=2
 
 ################################################################################
@@ -188,7 +187,6 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --warm_up_steps ${WARM_UP_STEPS} \
 --warm_up_base_lr_divider ${WARM_UP_BASE_LR_DIVIDER} \
 --dataset_name "nanochat" \
---num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
 --limit_val_batches ${LIMIT_VAL_BATCHES} \
 --val_sanity 0 \
