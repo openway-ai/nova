@@ -262,9 +262,21 @@ class EBT_NLP(LightningModule):
             contrastive_loss = 0.0
         
         if token_bytes is not None:
-            bpb_loss = calculate_bpb_score(next_token_indices, cce_loss.detach(), token_bytes)
+            # Compute per-token loss (reduction='none') for accurate BPB.
+            # Passing scalar mean loss (cce_loss) is incorrect because
+            # calculate_bpb_score multiplies loss by (num_bytes > 0) mask and sums,
+            # yielding mean_loss × count rather than sum(per_token_loss[valid]).
+            # predicted_distribution from the last MCMC step is already (-1, vocab_size).
+            if self.hparams.soften_target_prob_dist != 0.0:
+                per_token_ce = F.cross_entropy(predicted_distribution, next_token_indices,
+                                                label_smoothing=label_smoothing, ignore_index=-1, reduction='none')
+            else:
+                per_token_ce = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1, reduction='none')
+            bpb_loss, bpb_nats, bpb_bytes = calculate_bpb_score(next_token_indices, per_token_ce.detach(), token_bytes)
         else:
             bpb_loss = 0
+            bpb_nats = 0
+            bpb_bytes = 0
 
         log_dict = {
             'loss': total_loss,
@@ -273,7 +285,9 @@ class EBT_NLP(LightningModule):
             'contrastive_loss' : contrastive_loss,
             'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
             'perplexity': ppl_loss,
-            'bpb': bpb_loss  # Renamed from 'bpb_loss' for cleaner logging
+            'bpb': bpb_loss,
+            'bpb_nats': bpb_nats,    # accumulated nats for epoch-level BPB
+            'bpb_bytes': bpb_bytes,  # accumulated bytes for epoch-level BPB
         }
         return log_dict
     

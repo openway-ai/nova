@@ -533,6 +533,11 @@ class ModelTrainer(LightningModule):
         if self._rng_resume_state:
             print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
 
+    def on_validation_epoch_start(self):
+        """Reset BPB accumulators at the start of each validation epoch."""
+        self._val_bpb_nats = 0.0
+        self._val_bpb_bytes = 0
+
     def validation_step(self, batch, batch_idx):
         # Move token_bytes to the same device as the model if needed
         token_bytes = self.token_bytes
@@ -540,14 +545,48 @@ class ModelTrainer(LightningModule):
             token_bytes = token_bytes.to(self.device)
         eval_step_dict = self.eval_step(batch, "valid", token_bytes)
         self.log_metrics(eval_step_dict, "valid")
+
+        # 累积 BPB 的 nats/bytes，用于 epoch-level 正确计算
+        # (BPB = sum(nats) / (log2 * sum(bytes)), 不能对 per-batch BPB 做算术平均)
+        bpb_nats = eval_step_dict.get('bpb_nats', 0)
+        bpb_bytes = eval_step_dict.get('bpb_bytes', 0)
+        if isinstance(bpb_nats, torch.Tensor):
+            bpb_nats = bpb_nats.item()
+        if isinstance(bpb_bytes, torch.Tensor):
+            bpb_bytes = bpb_bytes.item()
+        self._val_bpb_nats += bpb_nats
+        self._val_bpb_bytes += bpb_bytes
+
         # 缓存最新 valid 指标，供 train 进度条显示
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
         for k, v in eval_step_dict.items():
+            # 跳过 BPB 累积中间量，它们不应作为独立指标显示
+            if k in ('bpb_nats', 'bpb_bytes'):
+                continue
             if isinstance(v, torch.Tensor) and v.dim() == 0:
                 self._last_valid_metrics[k] = v.detach().item()
             elif isinstance(v, (int, float)):
                 self._last_valid_metrics[k] = v
+
+    def on_validation_epoch_end(self):
+        """Compute epoch-level BPB from accumulated nats/bytes and override the cached value."""
+        import math
+        if self._val_bpb_bytes > 0:
+            epoch_bpb = self._val_bpb_nats / (math.log(2) * self._val_bpb_bytes)
+        else:
+            epoch_bpb = float('inf')
+        # 用 epoch-level BPB 覆盖 _last_valid_metrics 中的 per-batch 值
+        if not hasattr(self, '_last_valid_metrics'):
+            self._last_valid_metrics = {}
+        self._last_valid_metrics['bpb'] = epoch_bpb
+
+        # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
+        if self.logger is not None:
+            try:
+                self.logger.experiment.log({'valid_bpb': epoch_bpb}, step=self.global_step)
+            except Exception:
+                pass
 
     def on_test_epoch_start(self):
         """Reset test metrics at the start of test epoch"""
@@ -1715,6 +1754,16 @@ class ModelTrainer(LightningModule):
         scalar_metrics = {}
         keys = list(metrics_dict.keys()) # Iterate over a copy of the keys to avoid modification issues during iteration
         for key in keys:
+            # 跳过 BPB 相关指标，它们不应通过 Lightning log_dict 上报：
+            # - bpb_nats/bpb_bytes: BPB 累积中间量
+            # - bpb (非 train 阶段): BPB 是比率指标 (nats/bytes)，
+            #   Lightning 的 on_epoch=True 会对 per-batch bpb 做算术平均，这是数学错误的
+            #   正确做法是在 on_validation_epoch_end 中从累积 nats/bytes 重新计算
+            if key in ('bpb_nats', 'bpb_bytes'):
+                continue
+            if key == 'bpb' and phase != 'train':
+                continue
+
             value = metrics_dict[key]
             # if 'image' in key: # images
             #     image = self.to_pil(value)
