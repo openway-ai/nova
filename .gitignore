@@ -5,28 +5,30 @@ report.md
 eval_bundle/
 *.DS_Store
 
+**/docs/
+
 # Secrets
 .env
 
 # Claude
 .claude/
 CLAUDE.md
-nova/ebt/.claude/
-nova/ebt/CLAUDE.md
-nova/mdlm/.claude/
-nova/mdlm/CLAUDE.md
+openebm/elm/.claude/
+openebm/elm/CLAUDE.md
+openebm/dlm/mdlm/.claude/
+openebm/dlm/mdlm/CLAUDE.md
 
 # Pycache
 __pycache__/
-nova/ebt/__pycache__/
-nova/ebt/nanolightning/__pycache__/
-nova/mdlm/__pycache__/
-nova/mdlm/outputs/
+openebm/elm/__pycache__/
+openebm/elm/nanolightning/__pycache__/
+openebm/dlm/mdlm/__pycache__/
+openebm/dlm/mdlm/outputs/
 
 # Logs
 wandb/
-nova/ebt/logs/
-nova/ebt/lightning_logs/
+openebm/elm/logs/
+openebm/elm/lightning_logs/
 *.log
 logs/
 
@@ -50,15 +52,15 @@ tmp_*/
 *.jpeg
 
 # Externel code
-nanochat/external/
+nanochat/nanochat/external/
 
 # User prompts
 prompt/
 
 # uv
 uv.lock
-nova/ebt/uv.lock
-nova/mdlm/uv.lock
+openebm/elm/uv.lock
+openebm/dlm/mdlm/uv.lock
 
 
 
