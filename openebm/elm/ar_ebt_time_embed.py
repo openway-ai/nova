@@ -343,7 +343,7 @@ class Attention(nn.Module):
         self.head_dim = args.dim // args.n_heads
         self.use_ve = args.use_ve and has_ve is not None and has_ve(layer_id, args.n_layers)
         if self.use_ve:
-            self.ve_gate_channels = min(32, args.dim)
+            self.ve_gate_channels = 12
             self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_local_kv_heads, bias=False)
             nn.init.zeros_(self.ve_gate.weight)
         else:
@@ -441,7 +441,7 @@ class Attention(nn.Module):
         xv = xv.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
         if ve is not None and self.ve_gate is not None:
             ve = ve.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[:, :, :self.ve_gate_channels]))
+            gate = 3 * torch.sigmoid(self.ve_gate(x[:, :, :self.ve_gate_channels]))
             xv = xv + gate.unsqueeze(-1) * ve
         
         # _o is for original attention stuff
@@ -726,8 +726,9 @@ class EBTTimeConcat(nn.Module):
             n_kv_heads = params.n_heads if params.n_kv_heads is None else params.n_kv_heads
             self.kv_dim = n_kv_heads * (params.dim // params.n_heads)
             self.value_embeds = build_value_embeds(params.n_layers, params.vocab_size, self.kv_dim)
+            ve_init_bound = math.sqrt(3.0) * (params.dim ** -0.5)
             for ve in self.value_embeds.values():
-                nn.init.xavier_normal_(ve.weight)
+                nn.init.uniform_(ve.weight, -ve_init_bound, ve_init_bound)
         else:
             self.value_embeds = None
             self.kv_dim = None
