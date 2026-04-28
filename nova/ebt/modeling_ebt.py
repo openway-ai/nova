@@ -31,7 +31,10 @@ class EBT_NLP(LightningModule):
 
         self.vocab_size = self.tokenizer.get_vocab_size() # len(self.tokenizer) # self.vocab_size = self.tokenizer.vocab_size caused errors since is smaller than len(self.tokenizer), is 50254 for neox-20b, len tokenizer is 50277 so decided to use that
         
-        self.alpha = nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size)), requires_grad=self.hparams.mcmc_step_size_learnable)
+        # alpha 拆分为 alpha_base(固定，由 mcmc_step_size 传入) * alpha_scale(可学习)
+        # 有效步长 = alpha_base * alpha_scale，alpha_scale 初始值 1.0，在 bf16 下精确可表示
+        self.alpha_base = float(self.hparams.mcmc_step_size)  # 固定缩放因子，来自启动脚本
+        self.alpha_scale = nn.Parameter(torch.tensor(1.0), requires_grad=self.hparams.mcmc_step_size_learnable)
         self.langevin_dynamics_noise_std = nn.Parameter(torch.tensor(float(self.hparams.langevin_dynamics_noise)), requires_grad=False) # if using self.hparams.langevin_dynamics_noise_learnable this will be turned on in warm_up_finished func
 
         self.embeddings = nn.Embedding(self.vocab_size, self.hparams.embedding_dim)
@@ -68,8 +71,8 @@ class EBT_NLP(LightningModule):
             self.parameters_not_to_check = set() # dont check these since may be frozen or dont want them to update
         
     @torch.compiler.disable
-    def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps, 
-                      langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits):
+    def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps,
+                      langevin_dynamics_noise_std, alpha_scale, start_pos, learning, return_raw_logits):
         batch_size = predicted_tokens.shape[0]
         seq_length = predicted_tokens.shape[1]
         
@@ -116,14 +119,17 @@ class EBT_NLP(LightningModule):
         # predicted_tokens_grad has shape B, S, V
         
         if self.hparams.clamp_futures_grad:
-            min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
+            # 使用非随机化的有效 alpha 来 clamp: alpha_base * clamp(alpha_scale)
+            effective_alpha_for_clamp = self.alpha_base * torch.clamp(self.alpha_scale, min=0.0001)
+            min_and_max = self.hparams.clamp_futures_grad_max_change / effective_alpha_for_clamp
             # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
             predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
             
         if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
             raise ValueError("NaN or Inf gradients detected during MCMC.")
         
-        predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after  
+        # MCMC 更新: alpha 拆分为 alpha_base(固定) * alpha_scale(可学习)，bf16 安全
+        predicted_tokens = predicted_tokens - self.alpha_base * alpha_scale * predicted_tokens_grad
         
         if self.hparams.absolute_clamp != 0.0:
             predicted_tokens = torch.clamp(predicted_tokens, min = -self.hparams.absolute_clamp, max = self.hparams.absolute_clamp)
@@ -147,14 +153,14 @@ class EBT_NLP(LightningModule):
         seq_length = x.shape[1]
         
         model_dtype = self.embeddings.weight.dtype
-        alpha = torch.clamp(self.alpha, min=0.0001)
+        alpha_scale = torch.clamp(self.alpha_scale, min=0.0001)
         if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
-            expanded_alpha = alpha.expand(batch_size, seq_length, 1)
+            expanded_alpha_scale = alpha_scale.expand(batch_size, seq_length, 1)
 
             scale = self.hparams.randomize_mcmc_step_size_scale
-            low = alpha / scale
-            high = alpha * scale
-            alpha = low + torch.rand_like(expanded_alpha) * (high - low)
+            low = alpha_scale / scale
+            high = alpha_scale * scale
+            alpha_scale = low + torch.rand_like(expanded_alpha_scale) * (high - low)
 
         # Same pattern as alpha: detach+cast to model_dtype so no float32 cast
         # node enters the create_graph=True autograd graph.
@@ -192,7 +198,7 @@ class EBT_NLP(LightningModule):
                 
                 predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
-                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits
+                    langevin_dynamics_noise_std, alpha_scale, start_pos, learning, return_raw_logits
                 )
                 predicted_energies.append(energy_preds)
                 predicted_distributions.append(predicted_tokens_for_loss)
@@ -370,8 +376,9 @@ class EBT_NLP(LightningModule):
         real_embeddings_input = self.embeddings(original_real_input_ids)  # (B, S, D)
         original_predicted_tokens = self.corrupt_embeddings(real_embeddings_input)  # (B, S, V)
 
-        alpha = self.alpha * self.hparams.infer_ebt_override_alpha if 0 < self.hparams.infer_ebt_override_alpha < 1 else (
-            torch.tensor(self.hparams.infer_ebt_override_alpha, device=self.device) if self.hparams.infer_ebt_override_alpha >= 1 else self.alpha
+        effective_alpha = self.alpha_base * torch.clamp(self.alpha_scale, min=0.0001)
+        alpha = effective_alpha * self.hparams.infer_ebt_override_alpha if 0 < self.hparams.infer_ebt_override_alpha < 1 else (
+            torch.tensor(self.hparams.infer_ebt_override_alpha, device=self.device) if self.hparams.infer_ebt_override_alpha >= 1 else effective_alpha
         )
 
         noise = (torch.tensor(
@@ -575,13 +582,13 @@ class EBT_NLP(LightningModule):
             pred_state = initial_pred_tokens
             for step_idx in range(self.hparams.mcmc_num_steps):
                 if self.hparams.infer_steps_final_landscape and step_idx != (self.hparams.mcmc_num_steps - 1):
-                    alpha = self.alpha if self.hparams.infer_alpha_final_landscape else adjusted_alpha
+                    alpha = self.alpha_base * torch.clamp(self.alpha_scale, min=0.0001) if self.hparams.infer_alpha_final_landscape else adjusted_alpha
                     pred_state = do_mcmc_step(step_idx, pred_state, alpha)
                     pred_states_list.append(pred_state)
                 else:
                     inner_steps = self.hparams.infer_ebt_num_steps if self.hparams.infer_ebt_num_steps != 1 else (self.hparams.randomize_mcmc_num_steps_min if self.hparams.randomize_mcmc_num_steps_min != 0 else 1)
                     for _ in range(inner_steps):
-                        alpha = self.alpha if (self.hparams.infer_alpha_final_landscape and step_idx != (self.hparams.mcmc_num_steps - 1)) else adjusted_alpha
+                        alpha = self.alpha_base * torch.clamp(self.alpha_scale, min=0.0001) if (self.hparams.infer_alpha_final_landscape and step_idx != (self.hparams.mcmc_num_steps - 1)) else adjusted_alpha
                         pred_state = do_mcmc_step(step_idx, pred_state, alpha)
                         pred_states_list.append(pred_state)
 

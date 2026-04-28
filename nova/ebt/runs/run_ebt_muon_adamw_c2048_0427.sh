@@ -300,7 +300,6 @@ echo "  1. EBT 核心参数 (MCMC) 保持官方推荐值不变"
 echo "  2. 优化器/LR调度/Weight Decay 对齐 NanoChat base_train.py"
 echo "  3. Alpha LR 仍由 MCMC_STEP_SIZE_LR_MULTIPLIER × PEAK_LR 控制 (EBT 特有)"
 echo "  4. 监控关键指标: train_loss, Alpha_MCMC, Global_LR"
-echo "  5. 参数设定对齐 run_ebt_2node_8gpu.sh"
 
 echo ""
 read -p "按 Enter 开始训练，或 Ctrl+C 取消..."

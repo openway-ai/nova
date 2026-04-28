@@ -1183,7 +1183,7 @@ class ModelTrainer(LightningModule):
         alpha_lr = self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate
 
         # --- 参数收集 ---
-        alpha_params = [self.model.alpha]
+        alpha_params = [self.model.alpha_scale]
         embedding_params = list(self.model.embeddings.parameters())
 
         vocab_to_embed_params = []
@@ -1372,7 +1372,7 @@ class ModelTrainer(LightningModule):
 
             if use_layered_lr:
                 # 分层参数组 (参考 NanoChat base_train.py)
-                alpha_param = [self.model.alpha]
+                alpha_param = [self.model.alpha_scale]
                 embedding_params = list(self.model.embeddings.parameters())
 
                 # vocab_to_embed 参数 (类似 unembedding)
@@ -1425,8 +1425,8 @@ class ModelTrainer(LightningModule):
                 print(f"  - Transformer Scalar LR: {self.hparams.peak_learning_rate * scalar_lr_mult}")
             else:
                 # 原始实现
-                alpha_param = self.model.alpha
-                other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha'])]
+                alpha_param = self.model.alpha_scale
+                other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha_scale'])]
                 assert len(other_params) > 1, "Could not gather model params correctly please investigate"
 
                 optimizer_parameters = [
@@ -1449,9 +1449,9 @@ class ModelTrainer(LightningModule):
         
     def configure_optimizers_vid(self):
         if self.hparams.model_name == "ebt":
-            alpha_param = self.model.alpha
+            alpha_param = self.model.alpha_scale
             encoder_params = list(self.model.image_encoder.parameters())
-            other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha', 'image_encoder'])]
+            other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha_scale', 'image_encoder'])]
             assert len(other_params) > 1, "Could not gather model params correctly please investigate"
             
             optimizer_parameters = [
@@ -1476,8 +1476,8 @@ class ModelTrainer(LightningModule):
         
     def configure_optimizers_img(self):
         if self.hparams.model_name == "ebt":
-            alpha_param = self.model.alpha
-            other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha', 'image_encoder', 'text_encoder'])]
+            alpha_param = self.model.alpha_scale
+            other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha_scale', 'image_encoder', 'text_encoder'])]
             assert len(other_params) > 1, "Could not gather model params correctly please investigate"
             
             optimizer_parameters = [
@@ -1832,8 +1832,9 @@ class ModelTrainer(LightningModule):
                 self.log("Alpha_LR", alpha_lr, on_step=True, on_epoch=False)
 
         # Alpha (MCMC step size) 值 (仅 train 阶段，避免 validation 阶段 warning)
+        # 记录可学习参数 alpha_scale（bf16 安全的小数值）
         if phase == "train" and self.hparams.mcmc_step_size_learnable:
-            self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach(),
+            self.log("Alpha_Scale", self.model.alpha_scale.detach(),
                      on_step=True, on_epoch=False)
 
         # Langevin dynamics noise (仅 train 阶段)
