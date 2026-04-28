@@ -60,3 +60,39 @@ class DiskAwareCheckpoint(ModelCheckpoint):
 
         # 调用父类保存方法
         super()._save_checkpoint(trainer, filepath)
+
+    def _temporarily_align_completed_for_save(self, trainer):
+        """让 checkpoint 看到 completed 已更新后的边界，避免 resume 错一批。"""
+        epoch_loop = getattr(getattr(trainer, "fit_loop", None), "epoch_loop", None)
+        batch_progress = getattr(epoch_loop, "batch_progress", None)
+        if batch_progress is None:
+            return False
+
+        total = getattr(batch_progress, "total", None)
+        current = getattr(batch_progress, "current", None)
+        if total is None or current is None:
+            return False
+
+        should_align = (
+            total.processed == total.ready
+            and total.completed + 1 == total.processed
+            and current.processed == current.ready
+            and current.completed + 1 == current.processed
+        )
+        if not should_align:
+            return False
+
+        batch_progress.increment_completed()
+        return True
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        aligned = self._temporarily_align_completed_for_save(trainer)
+        try:
+            super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
+        finally:
+            if aligned:
+                epoch_loop = getattr(getattr(trainer, "fit_loop", None), "epoch_loop", None)
+                batch_progress = getattr(epoch_loop, "batch_progress", None)
+                if batch_progress is not None:
+                    batch_progress.total.completed -= 1
+                    batch_progress.current.completed -= 1
