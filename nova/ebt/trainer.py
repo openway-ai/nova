@@ -1180,7 +1180,7 @@ class ModelTrainer(LightningModule):
             scalar_lr_mult = getattr(self.hparams, 'scalar_lr_mult', 0.5)
             scalar_lr = self.hparams.peak_learning_rate * scalar_lr_mult
 
-        alpha_lr = self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate
+        alpha_lr = self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate / self.model.alpha_base
 
         # --- 参数收集 ---
         alpha_params = [self.model.alpha_scale]
@@ -1340,7 +1340,7 @@ class ModelTrainer(LightningModule):
         print(f"  Muon params: {num_muon_params:,} ({num_muon_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
         print(f"  AdamW params: {num_adamw_params:,} ({num_adamw_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
         print(f"  Muon LR: {muon_lr}, momentum: {muon_momentum}, ns_steps: {muon_ns_steps}, beta2: {muon_beta2}")
-        print(f"  Alpha LR: {alpha_lr} (AdamW) [EBT 特有]")
+        print(f"  Alpha Scale LR: {alpha_lr} (AdamW) [EBT 特有]")
         print(f"  Embedding LR: {embedding_lr} (AdamW)")
         print(f"  vocab_to_embed LR: {vocab_to_embed_lr} (AdamW) [EBT 特有, MCMC 内部]")
         print(f"  Scalar LR: {scalar_lr} (AdamW)")
@@ -1397,7 +1397,7 @@ class ModelTrainer(LightningModule):
                 optimizer_parameters = [
                     # Alpha: 高学习率，无 weight decay
                     {'params': alpha_param, 'weight_decay': 0.0,
-                     'lr': self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate},
+                     'lr': self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate / self.model.alpha_base},
                     # Embedding: 中等学习率，无 weight decay
                     # {'params': embedding_params, 'weight_decay': self.hparams.weight_decay,
                     {'params': embedding_params, 'weight_decay': 0.0,
@@ -1418,7 +1418,7 @@ class ModelTrainer(LightningModule):
                 optimizer_parameters = [p for p in optimizer_parameters if len(p['params']) > 0]
 
                 print(f"[Option 1] 分层学习率已启用:")
-                print(f"  - Alpha LR: {self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate}")
+                print(f"  - Alpha Scale LR: {self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate / self.model.alpha_base}")
                 print(f"  - Embedding LR: {self.hparams.peak_learning_rate * embedding_lr_mult}")
                 print(f"  - vocab_to_embed LR: {self.hparams.peak_learning_rate * vocab_to_embed_lr_mult}")
                 print(f"  - Transformer Matrix LR: {self.hparams.peak_learning_rate}")
@@ -1430,7 +1430,7 @@ class ModelTrainer(LightningModule):
                 assert len(other_params) > 1, "Could not gather model params correctly please investigate"
 
                 optimizer_parameters = [
-                    {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},
+                    {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate/self.model.alpha_base},
                     {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate}
                 ]
 
@@ -1455,7 +1455,7 @@ class ModelTrainer(LightningModule):
             assert len(other_params) > 1, "Could not gather model params correctly please investigate"
             
             optimizer_parameters = [
-                {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},  # No weight decay for alpha
+                {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate/self.model.alpha_base},  # No weight decay for alpha_scale
                 {'params': encoder_params, 'weight_decay': 0.0, 'lr': 0.0},
                 {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate}  # Weight decay for other parameters
             ]
@@ -1481,7 +1481,7 @@ class ModelTrainer(LightningModule):
             assert len(other_params) > 1, "Could not gather model params correctly please investigate"
             
             optimizer_parameters = [
-                {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},  # No weight decay for alpha
+                {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate/self.model.alpha_base},  # No weight decay for alpha_scale
                 {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate} # Weight decay for other parameters
             ]
             
@@ -1829,7 +1829,7 @@ class ModelTrainer(LightningModule):
             # Alpha 参数的学习率 (第一个参数组)
             if len(optimizer.param_groups) > 1:
                 alpha_lr = optimizer.param_groups[0]['lr']
-                self.log("Alpha_LR", alpha_lr, on_step=True, on_epoch=False)
+                self.log("Alpha_Scale_LR", alpha_lr, on_step=True, on_epoch=False)
 
         # Alpha (MCMC step size) 值 (仅 train 阶段，避免 validation 阶段 warning)
         # 记录可学习参数 alpha_scale（bf16 安全的小数值）
