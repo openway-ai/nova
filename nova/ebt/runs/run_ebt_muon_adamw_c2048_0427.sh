@@ -34,7 +34,7 @@ TRAIN_SCRIPT="${NOVA_HOME}/nova/ebt/train.py"
 cd "${NOVA_HOME}"
 
 ### 基础配置 ###
-RUN_PREFIX="local-1node-bf16mixed"
+RUN_PREFIX="local-1node-bf16true"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -44,7 +44,7 @@ HOME="${NANOCHAT_HOME}"
 export NANOCHAT_BASE_DIR="${HOME}/.cache/nanochat"
 
 # PyTorch 内存优化
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.6"
+export PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.6"
 
 # WandB 配置
 export WANDB_API_KEY="968275bc822c87ac741ecce2f06cdfb54dbc1608"
@@ -55,7 +55,8 @@ export WANDB_MODE="offline"
 # 本地单节点通常无 InfiniBand，禁用 IB 避免警告
 ################################################################################
 
-export NCCL_DEBUG=INFO
+# export NCCL_DEBUG=INFO
+export NCCL_DEBUG=WARN
 export NCCL_IB_DISABLE=1
 
 ################################################################################
@@ -432,7 +433,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} "${TRAIN_SCRIPT}" \
   --log_model_archi \
   --set_matmul_precision "medium" \
   --float_precision "bf16-true" \
-  --manual_gc_collect_every_n_steps 100 \
+  --manual_gc_collect_every_n_steps -1 \
   --save_top_k_ckpts "${SAVE_TOP_K}" \
   --save_periodic_steps 1000 \
   ${WANDB_FLAGS} \

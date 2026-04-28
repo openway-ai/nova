@@ -33,7 +33,7 @@ TRAIN_SCRIPT="${NOVA_HOME}/nova/ebt/train.py"
 cd "${NOVA_HOME}"
 
 ### 基础配置 ###
-RUN_PREFIX="2node-8gpu-bf16mixed"
+RUN_PREFIX="2node-8gpu-bf16true-muon_lr0.06"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -63,6 +63,7 @@ export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=0
 export NCCL_IB_TIMEOUT=60
 export NCCL_IB_RETRY_CNT=20
+export NCCL_DEBUG=WARN
 
 ################################################################################
 # 多机节点与 GPU 配置
@@ -155,9 +156,9 @@ SAVE_TOP_K=2
 ################################################################################
 
 OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.05 \
---optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 \
+--optimizer muon_adamw --muon_lr 0.06 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 \
 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling \
---muon_momentum_warmup_steps 300"
+--muon_momentum_warmup_steps 0"
 
 ################################################################################
 # torch.compile 配置
@@ -257,7 +258,7 @@ torchrun \
   --log_model_archi \
   --set_matmul_precision "medium" \
   --float_precision "bf16-true" \
-  --manual_gc_collect_every_n_steps 100 \
+  --manual_gc_collect_every_n_steps -1 \
   --save_top_k_ckpts "${SAVE_TOP_K}" \
   --save_periodic_steps 1000 \
   ${WANDB_FLAGS} \

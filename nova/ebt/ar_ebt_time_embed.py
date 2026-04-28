@@ -456,7 +456,13 @@ class Attention(nn.Module):
                 #this mask needs to be seqlen, seqlen, was S, S
                 o_mask = mask[:-1, :-1] #set to S-1, S-1 like 0 -inf -inf; 0 0 -inf, etc
                 scores_o = scores_o + o_mask  # (bs, n_local_heads, seqlen, seqlen)
-            scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
+            # NOTE: Do NOT cast to float32 before softmax when using bf16-true
+            # precision. The .float()/.type_as() pair inserts bf16↔float32 cast
+            # nodes into the autograd graph. Under EBT's create_graph=True MCMC
+            # step, second-order backward must propagate through these casts,
+            # which raises "Expected BFloat16, got Float". Keeping softmax in
+            # the native dtype (bf16) avoids the dtype mismatch entirely.
+            scores_o = F.softmax(scores_o, dim=-1)
             output_o = torch.matmul(scores_o, values_o)  # (bs, n_local_heads, seqlen, head_dim)
             output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1) # has B, S-1, D after
         
@@ -535,11 +541,13 @@ class Attention(nn.Module):
             if mask is not None:
                 p_mask = mask[self.time_offset:, :]  #S-1, S+1 like 0 0 0 -inf -inf -inf; 0 0 0 0 -inf -inf; etc
                 scores_p = scores_p + p_mask
-            if scores_p.dtype != torch.float32:
-                scores_p = scores_p.float()
+            # NOTE: Keep softmax in native dtype (e.g. bf16) instead of
+            # casting to float32 and back. The .float()/.to() pair inserts
+            # dtype-cast nodes into the autograd graph; under EBT's
+            # create_graph=True MCMC step, second-order backward propagates
+            # float32 gradients through bf16 weights, raising
+            # "Expected BFloat16, got Float".
             scores_p = F.softmax(scores_p, dim=-1)
-            if scores_p.dtype != xq_p.dtype:
-                scores_p = scores_p.to(xq_p.dtype)
             
             #Q: why do I need to extract superdiagonal why cant i just do matmul after? A: its bc would need same subsequence in value matrix but dont have it, have original subsequence and then seperately all next preds
             scores_p_superdiagonal = scores_p.diagonal(offset=self.time_offset, dim1=2, dim2=3) # is B, N, S; basically how much each token on this superdiag should attent to itself; clone since dont want mask to change this

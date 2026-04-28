@@ -146,6 +146,7 @@ class EBT_NLP(LightningModule):
         batch_size = x.shape[0]
         seq_length = x.shape[1]
         
+        model_dtype = self.embeddings.weight.dtype
         alpha = torch.clamp(self.alpha, min=0.0001)
         if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
             expanded_alpha = alpha.expand(batch_size, seq_length, 1)
@@ -155,7 +156,9 @@ class EBT_NLP(LightningModule):
             high = alpha * scale
             alpha = low + torch.rand_like(expanded_alpha) * (high - low)
 
-        langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
+        # Same pattern as alpha: detach+cast to model_dtype so no float32 cast
+        # node enters the create_graph=True autograd graph.
+        langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001).detach().to(model_dtype)
 
         predicted_tokens = self.corrupt_embeddings(real_embeddings_input) # B, S, V
         if replay_buffer_logits is not None: # using replay buffer, use the logits instead of corruption
@@ -298,7 +301,7 @@ class EBT_NLP(LightningModule):
         elif self.hparams.denoising_initial_condition == "random_noise":
             predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=embeddings.dtype, device=self.device) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
-            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device)
+            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=embeddings.dtype, device=self.device)
         else:
             raise NotImplementedError(f"{self.hparams.denoising_initial_condition} denoising_initial_condition not yet supported")
         
@@ -311,10 +314,11 @@ class EBT_NLP(LightningModule):
         
         next_token_indices_2d = next_token_indices.reshape(batch_size, seq_length)
         
+        model_dtype = self.embeddings.weight.dtype
         if self.hparams.discrete_contrastive_loss_true_logit_val != 0: # NOTE from experience this doesnt work very well and it not recommended compared to just one hot encoding
             true_logit_value = self.hparams.discrete_contrastive_loss_true_logit_val
             false_logit_value = -1 * true_logit_value
-            true_token_logits = torch.full((batch_size, seq_length, self.vocab_size), false_logit_value, device=next_token_indices.device)
+            true_token_logits = torch.full((batch_size, seq_length, self.vocab_size), false_logit_value, dtype=model_dtype, device=next_token_indices.device)
             
             batch_idx = torch.arange(batch_size, device=next_token_indices.device).view(-1, 1).expand(-1, seq_length)
             seq_idx = torch.arange(seq_length, device=next_token_indices.device).view(1, -1).expand(batch_size, -1)
@@ -331,7 +335,7 @@ class EBT_NLP(LightningModule):
                 true_embeddings = self.vocab_to_embed(true_token_logits)
         else:
             assert self.hparams.normalize_initial_condition, "if not using normalize initial condition must set logit val"
-            true_token_one_hot = torch.zeros((batch_size, seq_length, self.vocab_size), device=next_token_indices.device)
+            true_token_one_hot = torch.zeros((batch_size, seq_length, self.vocab_size), dtype=model_dtype, device=next_token_indices.device)
             batch_idx = torch.arange(batch_size, device=next_token_indices.device).view(-1, 1).expand(-1, seq_length)
             seq_idx = torch.arange(seq_length, device=next_token_indices.device).view(1, -1).expand(batch_size, -1)
             true_token_one_hot[batch_idx, seq_idx, next_token_indices_2d] = 1.0

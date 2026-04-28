@@ -306,7 +306,12 @@ class Attention(nn.Module):
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:            
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        # NOTE: Keep softmax in native dtype (e.g. bf16) instead of casting to
+        # float32 and back. The .float()/.type_as() pair inserts dtype-cast
+        # nodes into the autograd graph; under EBT's create_graph=True MCMC
+        # step, second-order backward propagates float32 gradients through
+        # bf16 weights, raising "Expected BFloat16, got Float".
+        scores = F.softmax(scores, dim=-1)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1) # has b, s, d after
         return self.wo(output)
