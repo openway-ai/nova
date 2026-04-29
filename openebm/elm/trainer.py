@@ -1638,6 +1638,17 @@ class ModelTrainer(LightningModule):
                 device=self.device,
                 resume_state_dict=resume_state,
             )
+        elif getattr(self.hparams, 'dataset_name', 'nanochat') == 'sudoku_sft':
+            from openebm.elm.data.sudoku_dataset import generate_sudoku_sft_dataloader
+            train_dataloader = generate_sudoku_sft_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches,
+                split="train",
+                device=self.device,
+                resume_state_dict=resume_state,
+            )
         else:
             train_dataloader = generate_dataloader(
                 tokenizer=tokenizer,
@@ -1663,6 +1674,16 @@ class ModelTrainer(LightningModule):
 
         if getattr(self.hparams, 'dataset_name', 'nanochat') == 'nanochat_sft':
             val_dataloader = generate_sft_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.val_steps,
+                split="val",
+                device=self.device,
+            )
+        elif getattr(self.hparams, 'dataset_name', 'nanochat') == 'sudoku_sft':
+            from openebm.elm.data.sudoku_dataset import generate_sudoku_sft_dataloader
+            val_dataloader = generate_sudoku_sft_dataloader(
                 tokenizer=tokenizer,
                 batch_size=self.hparams.batch_size_per_device,
                 max_len=self.hparams.context_length,
