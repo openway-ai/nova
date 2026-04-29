@@ -27,7 +27,7 @@
 
 ### 基础配置 ###
 # RUN_PREFIX 用于 exp_id 生成（如需手动指定 EXP_ID，设置 EXP_ID 环境变量）
-RUN_PREFIX="${RUN_PREFIX:-ebt-d26-ctx2048}"
+RUN_PREFIX="${RUN_PREFIX:-ebt-d26-ctx2048-ve}"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -44,7 +44,7 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 
 # WandB 配置
-export WANDB_API_KEY="Your WandB API Key"
+# export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"
 
 mkdir -p logs/slurm/nlp/
@@ -104,7 +104,11 @@ USE_MCMC_TIME_EMBED=false          # false: shared transition kernel, supports a
 NUM_GPUS=8
 DEVICE_BATCH_SIZE=1
 # DEVICE_BATCH_SIZE=2
+# GRAD_ACCUM=24
+# GRAD_ACCUM=12
+# GRAD_ACCUM=1
 GRAD_ACCUM=32
+
 CONTEXT_LENGTH=2048
 
 # NUM_GPUS=8
@@ -556,6 +560,7 @@ $([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 \
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
+--use_ve \
 --set_matmul_precision "medium" \
 --float_precision "bf16-mixed" \
 --manual_gc_collect_every_n_steps -1 \
@@ -565,9 +570,12 @@ ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}
 
+# --use_ve \
+
 # --manual_gc_collect_every_n_steps -1 \
 
 # --float_precision "bf16-mixed" \
+# --cpu_offload_optimizer \
 # --gradient_checkpointing \
 # --manual_gc_collect_every_n_steps 50 \
 

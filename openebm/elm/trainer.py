@@ -1163,10 +1163,17 @@ class ModelTrainer(LightningModule):
         if hasattr(self.model, 'vocab_to_embed') and self.model.vocab_to_embed is not None:
             vocab_to_embed_params = list(self.model.vocab_to_embed.parameters())
 
+        # VE 参数单独收集，分配给 AdamW (不能放入 Muon)
+        ve_embed_params = []
+        ve_gate_params = []
         transformer_matrix_params = []
         transformer_scalar_params = []
         for name, param in self.model.transformer.named_parameters():
-            if param.ndim >= 2:
+            if 'value_embeds.' in name:
+                ve_embed_params.append(param)
+            elif 've_gate.' in name:
+                ve_gate_params.append(param)
+            elif param.ndim >= 2:
                 transformer_matrix_params.append(param)
             else:
                 transformer_scalar_params.append(param)
@@ -1193,6 +1200,18 @@ class ModelTrainer(LightningModule):
         if transformer_scalar_params:
             param_groups.append(dict(
                 kind='adamw', params=transformer_scalar_params,
+                lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        # VE embedding 参数: AdamW, 使用 embedding_lr (与 NanoChat 一致)
+        if ve_embed_params:
+            param_groups.append(dict(
+                kind='adamw', params=ve_embed_params,
+                lr=embedding_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        # VE gate 参数: AdamW, 使用 scalar_lr
+        if ve_gate_params:
+            param_groups.append(dict(
+                kind='adamw', params=ve_gate_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
 
@@ -1301,17 +1320,24 @@ class ModelTrainer(LightningModule):
 
         # --- 日志 ---
         num_muon_params = sum(p.numel() for p in transformer_matrix_params)
+        num_ve_params = (
+            sum(p.numel() for p in ve_embed_params) +
+            sum(p.numel() for p in ve_gate_params)
+        )
         num_adamw_params = (
             sum(p.numel() for p in alpha_params) +
             sum(p.numel() for p in embedding_params) +
             sum(p.numel() for p in vocab_to_embed_params) +
-            sum(p.numel() for p in transformer_scalar_params)
+            sum(p.numel() for p in transformer_scalar_params) +
+            num_ve_params
         )
         print(f"=" * 80)
         print(f"[Muon+AdamW] 混合优化器已启用:")
         print(f"  Muon groups: {len(shape_groups)} (按 shape 分组)")
         print(f"  Muon params: {num_muon_params:,} ({num_muon_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
         print(f"  AdamW params: {num_adamw_params:,} ({num_adamw_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
+        if num_ve_params > 0:
+            print(f"  VE params: {num_ve_params:,} (AdamW, embedding_lr)")
         print(f"  Muon LR: {muon_lr}, momentum: {muon_momentum}, ns_steps: {muon_ns_steps}, beta2: {muon_beta2}")
         print(f"  Alpha LR: {alpha_lr} (AdamW) [EBT 特有]")
         print(f"  Embedding LR: {embedding_lr} (AdamW)")

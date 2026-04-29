@@ -3,7 +3,7 @@ VE (Value Embedding) 核心模块
 
 实现 GPT 风格的 Value Embedding，为每个启用层建立 nn.Embedding(vocab_size, kv_dim) 表：
 - real 分支：用离散 token id 查表
-- predicted 分支：用 soft 分布加权
+- predicted 分支：用 argmax 离散化后查表（避免 softmax+matmul 大张量）
 
 通过 --use_ve 参数控制是否启用该功能。
 """
@@ -35,8 +35,9 @@ def build_layer_ve(value_embeds, layer_id, real_token_ids, predicted_tokens, ext
     """
     为指定层构建 VE 张量。
 
-    real 分支使用离散 token ID 直接查表；
-    predicted 分支使用 softmax 后的概率分布加权嵌入表。
+    real 分支和 predicted 分支均使用离散 token ID 直接查表。
+    predicted 分支通过 argmax 将连续概率分布离散化，避免 softmax+matmul
+    产生的 (B, S, vocab_size) 大张量，节省 ~3.5 GB 激活值显存。
     """
     layer_key = str(layer_id)
     if layer_key not in value_embeds:
@@ -45,10 +46,8 @@ def build_layer_ve(value_embeds, layer_id, real_token_ids, predicted_tokens, ext
     value_table = value_embeds[layer_key]
 
     ve_real = value_table(real_token_ids)
-    ve_pred = torch.matmul(
-        torch.softmax(predicted_tokens, dim=-1),
-        value_table.weight,
-    )
+    pred_ids = predicted_tokens.argmax(dim=-1)  # (B, S) 离散化
+    ve_pred = value_table(pred_ids)              # 直接查表
 
     if extra_prefix_tokens > 0:
         batch_size = real_token_ids.shape[0]

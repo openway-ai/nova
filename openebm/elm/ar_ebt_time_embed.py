@@ -729,6 +729,7 @@ class EBTTimeConcat(nn.Module):
             ve_init_bound = math.sqrt(3.0) * (params.dim ** -0.5)
             for ve in self.value_embeds.values():
                 nn.init.uniform_(ve.weight, -ve_init_bound, ve_init_bound)
+                ve.to(dtype=torch.bfloat16)
         else:
             self.value_embeds = None
             self.kv_dim = None
