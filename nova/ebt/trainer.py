@@ -1935,6 +1935,11 @@ class ModelTrainer(LightningModule):
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
 
                 # --- 打印 ---
+                alpha_val_str = ""
+                if self.hparams.mcmc_step_size_learnable:
+                    alpha_val = self.model.alpha.detach()
+                    alpha_grad_str = f" grad={self.model.alpha.grad.item():.6f}" if self.model.alpha.grad is not None else " grad=None"
+                    alpha_val_str = f" | alpha: {alpha_val.item():.6f} ({alpha_val.dtype}){alpha_grad_str}"
                 print(
                     f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
                     f"loss: {loss_val:.6f}"
@@ -1945,6 +1950,7 @@ class ModelTrainer(LightningModule):
                     f"mfu: {mfu:.2f} | "
                     f"epoch: {epoch} | "
                     f"total time: {total_min:.2f}m"
-                    f"{eta_str}",
+                    f"{eta_str}"
+                    f"{alpha_val_str}",
                     flush=True,
                 )
