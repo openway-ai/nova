@@ -27,11 +27,11 @@ import gc
 # from data.nlp.planbench_dataloader import PlanBenchDataset
 # from data.nlp.synthetic_dataset import NLPSyntheticDataset
 
-from openebm.elm.collector import NLP_HF_Collator
+from collector import NLP_HF_Collator
 from datasets import load_dataset, load_from_disk
 import os
 # from model.vid.ebt import EBT_VID
-from openebm.elm.modeling_ebt import EBT_NLP
+from modeling_ebt import EBT_NLP
 # from model.img.ebt_t2i import EBT_IMG_T2I
 # from model.img.ebt_denoise import EBT_IMG_Denoise
 
@@ -49,8 +49,8 @@ try:
     from lightning.pytorch import LightningModule
 except ImportError:
     from pytorch_lightning import LightningModule
-from openebm.elm.dataset import IterableDataset, generate_dataloader
-from openebm.elm.dataset_sft import generate_sft_dataloader
+from dataset import IterableDataset, generate_dataloader
+from dataset_sft import generate_sft_dataloader
 
 
 # Simple GSM8K Dataset class for inference
@@ -82,16 +82,20 @@ class GSM8KDataset(torch.utils.data.Dataset):
             raise ValueError(f"Execution mode not supported: {self.hparams.execution_mode}")
 
 # from utils import save_frames, denormalize, load_image_encoder, center_crop_arr
-from openebm.elm.generate import generate_text, get_ppl
+from generate import generate_text, get_ppl
 # from inference.vid.generate_video import generate_video
 # from inference.img.generate_image import generate_image
-from openebm.elm.optimization import WarmUpCosineAnnealingLR, WarmUpLinearWarmdownLR, LARS, exclude_bias_and_norm, StableAdamW, StableAdamWUnfused
-from openebm.elm import logger as text_logger
-from openebm.elm.metrics import get_torchmetrics
+from optimization import WarmUpCosineAnnealingLR, WarmUpLinearWarmdownLR, LARS, exclude_bias_and_norm, StableAdamW, StableAdamWUnfused
+import logger as text_logger
+from metrics import get_torchmetrics
 import sys
 from transformers import AutoTokenizer
 
 import ipdb
+import os, sys
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
@@ -428,6 +432,22 @@ class ModelTrainer(LightningModule):
                 gc.collect()
                 torch.cuda.empty_cache()
 
+        # --- Muon momentum 预热调度 (参考 NanoChat base_train.py:360-363) ---
+        # Muon momentum 从 0.85 线性预热到 0.95，前 300 步完成
+        # 通过 --muon_momentum_warmup_steps 控制（默认 300，设 0 禁用）
+        muon_warmup_steps = getattr(self.hparams, 'muon_momentum_warmup_steps', 300)
+        if muon_warmup_steps > 0 and self.global_step <= muon_warmup_steps:
+            if hasattr(self, 'trainer') and self.trainer.optimizers:
+                optimizer = self.trainer.optimizers[0]
+                if hasattr(optimizer, 'param_groups'):
+                    target_momentum = getattr(self.hparams, 'muon_momentum', 0.95)
+                    base_momentum = 0.85
+                    frac = min(self.global_step / muon_warmup_steps, 1.0)
+                    current_momentum = (1 - frac) * base_momentum + frac * target_momentum
+                    for group in optimizer.param_groups:
+                        if group.get('kind') == 'muon':
+                            group['momentum'] = current_momentum
+
         # Record step end time for dt calculation
         import time as _time
         now = _time.time()
@@ -487,28 +507,6 @@ class ModelTrainer(LightningModule):
         print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
 
     def on_load_checkpoint(self, checkpoint):
-        # --- 修复 torch.compile _orig_mod 前缀不匹配 ---
-        if 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-            has_orig_mod_keys = any('_orig_mod.' in k for k in state_dict)
-            model_has_orig_mod = any('_orig_mod.' in k for k in self.state_dict())
-
-            if has_orig_mod_keys and not model_has_orig_mod:
-                new_state_dict = {}
-                for k, v in state_dict.items():
-                    new_state_dict[k.replace('._orig_mod.', '.')] = v
-                checkpoint['state_dict'] = new_state_dict
-                print(f"[Checkpoint] Stripped '_orig_mod' prefix from {len(state_dict)} keys")
-            elif not has_orig_mod_keys and model_has_orig_mod:
-                new_state_dict = {}
-                for k, v in state_dict.items():
-                    if k.startswith('model.'):
-                        new_state_dict['model._orig_mod.' + k[len('model.'):]] = v
-                    else:
-                        new_state_dict[k] = v
-                checkpoint['state_dict'] = new_state_dict
-                print(f"[Checkpoint] Added '_orig_mod' prefix to {len(state_dict)} keys")
-
         # 从 checkpoint 恢复 per-rank dataloader 位置 + RNG 状态
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -528,22 +526,17 @@ class ModelTrainer(LightningModule):
             self._rng_resume_state = None
 
         if self._dataloader_resume_state:
-            if 'cursor' in self._dataloader_resume_state:
-                print(
-                    f"[Checkpoint] Rank {rank} 恢复 SFT dataloader state: "
-                    f"cursor={self._dataloader_resume_state.get('cursor')}, "
-                    f"consumed={self._dataloader_resume_state.get('consumed')}, "
-                    f"epoch={self._dataloader_resume_state.get('epoch')}, "
-                    f"it={self._dataloader_resume_state.get('it')}, "
-                    f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}"
-                )
-            else:
-                print(f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
-                      f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
-                      f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
-                      f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}")
+            print(f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
+                  f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
+                  f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
+                  f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}")
         if self._rng_resume_state:
             print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
+
+    def on_validation_epoch_start(self):
+        """Reset BPB accumulators at the start of each validation epoch."""
+        self._val_bpb_nats = 0.0
+        self._val_bpb_bytes = 0
 
     def validation_step(self, batch, batch_idx):
         # Move token_bytes to the same device as the model if needed
@@ -552,14 +545,48 @@ class ModelTrainer(LightningModule):
             token_bytes = token_bytes.to(self.device)
         eval_step_dict = self.eval_step(batch, "valid", token_bytes)
         self.log_metrics(eval_step_dict, "valid")
+
+        # 累积 BPB 的 nats/bytes，用于 epoch-level 正确计算
+        # (BPB = sum(nats) / (log2 * sum(bytes)), 不能对 per-batch BPB 做算术平均)
+        bpb_nats = eval_step_dict.get('bpb_nats', 0)
+        bpb_bytes = eval_step_dict.get('bpb_bytes', 0)
+        if isinstance(bpb_nats, torch.Tensor):
+            bpb_nats = bpb_nats.item()
+        if isinstance(bpb_bytes, torch.Tensor):
+            bpb_bytes = bpb_bytes.item()
+        self._val_bpb_nats += bpb_nats
+        self._val_bpb_bytes += bpb_bytes
+
         # 缓存最新 valid 指标，供 train 进度条显示
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
         for k, v in eval_step_dict.items():
+            # 跳过 BPB 累积中间量，它们不应作为独立指标显示
+            if k in ('bpb_nats', 'bpb_bytes'):
+                continue
             if isinstance(v, torch.Tensor) and v.dim() == 0:
                 self._last_valid_metrics[k] = v.detach().item()
             elif isinstance(v, (int, float)):
                 self._last_valid_metrics[k] = v
+
+    def on_validation_epoch_end(self):
+        """Compute epoch-level BPB from accumulated nats/bytes and override the cached value."""
+        import math
+        if self._val_bpb_bytes > 0:
+            epoch_bpb = self._val_bpb_nats / (math.log(2) * self._val_bpb_bytes)
+        else:
+            epoch_bpb = float('inf')
+        # 用 epoch-level BPB 覆盖 _last_valid_metrics 中的 per-batch 值
+        if not hasattr(self, '_last_valid_metrics'):
+            self._last_valid_metrics = {}
+        self._last_valid_metrics['bpb'] = epoch_bpb
+
+        # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
+        if self.logger is not None:
+            try:
+                self.logger.experiment.log({'valid_bpb': epoch_bpb}, step=self.global_step)
+            except Exception:
+                pass
 
     def on_test_epoch_start(self):
         """Reset test metrics at the start of test epoch"""
@@ -765,7 +792,7 @@ class ModelTrainer(LightningModule):
                         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else None
                         if tokenizer is not None:
                             # Wrap nanochat tokenizer if needed
-                            from openebm.elm.nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
+                            from nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
                             if hasattr(tokenizer, 'enc') and hasattr(tokenizer.enc, 'encode'):
                                 # It's a RustBPETokenizer, wrap it for HF compatibility
                                 tokenizer = NanoChatTokenizerWrapper(tokenizer_obj=tokenizer)
@@ -1163,17 +1190,10 @@ class ModelTrainer(LightningModule):
         if hasattr(self.model, 'vocab_to_embed') and self.model.vocab_to_embed is not None:
             vocab_to_embed_params = list(self.model.vocab_to_embed.parameters())
 
-        # VE 参数单独收集，分配给 AdamW (不能放入 Muon)
-        ve_embed_params = []
-        ve_gate_params = []
         transformer_matrix_params = []
         transformer_scalar_params = []
         for name, param in self.model.transformer.named_parameters():
-            if 'value_embeds.' in name:
-                ve_embed_params.append(param)
-            elif 've_gate.' in name:
-                ve_gate_params.append(param)
-            elif param.ndim >= 2:
+            if param.ndim >= 2:
                 transformer_matrix_params.append(param)
             else:
                 transformer_scalar_params.append(param)
@@ -1200,18 +1220,6 @@ class ModelTrainer(LightningModule):
         if transformer_scalar_params:
             param_groups.append(dict(
                 kind='adamw', params=transformer_scalar_params,
-                lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
-            ))
-        # VE embedding 参数: AdamW, 使用 embedding_lr (与 NanoChat 一致)
-        if ve_embed_params:
-            param_groups.append(dict(
-                kind='adamw', params=ve_embed_params,
-                lr=embedding_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
-            ))
-        # VE gate 参数: AdamW, 使用 scalar_lr
-        if ve_gate_params:
-            param_groups.append(dict(
-                kind='adamw', params=ve_gate_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
 
@@ -1320,24 +1328,17 @@ class ModelTrainer(LightningModule):
 
         # --- 日志 ---
         num_muon_params = sum(p.numel() for p in transformer_matrix_params)
-        num_ve_params = (
-            sum(p.numel() for p in ve_embed_params) +
-            sum(p.numel() for p in ve_gate_params)
-        )
         num_adamw_params = (
             sum(p.numel() for p in alpha_params) +
             sum(p.numel() for p in embedding_params) +
             sum(p.numel() for p in vocab_to_embed_params) +
-            sum(p.numel() for p in transformer_scalar_params) +
-            num_ve_params
+            sum(p.numel() for p in transformer_scalar_params)
         )
         print(f"=" * 80)
         print(f"[Muon+AdamW] 混合优化器已启用:")
         print(f"  Muon groups: {len(shape_groups)} (按 shape 分组)")
         print(f"  Muon params: {num_muon_params:,} ({num_muon_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
         print(f"  AdamW params: {num_adamw_params:,} ({num_adamw_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
-        if num_ve_params > 0:
-            print(f"  VE params: {num_ve_params:,} (AdamW, embedding_lr)")
         print(f"  Muon LR: {muon_lr}, momentum: {muon_momentum}, ns_steps: {muon_ns_steps}, beta2: {muon_beta2}")
         print(f"  Alpha LR: {alpha_lr} (AdamW) [EBT 特有]")
         print(f"  Embedding LR: {embedding_lr} (AdamW)")
@@ -1636,18 +1637,6 @@ class ModelTrainer(LightningModule):
                 max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches,
                 split="train",
                 device=self.device,
-                resume_state_dict=resume_state,
-            )
-        elif getattr(self.hparams, 'dataset_name', 'nanochat') == 'sudoku_sft':
-            from openebm.elm.data.sudoku_dataset import generate_sudoku_sft_dataloader
-            train_dataloader = generate_sudoku_sft_dataloader(
-                tokenizer=tokenizer,
-                batch_size=self.hparams.batch_size_per_device,
-                max_len=self.hparams.context_length,
-                max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches,
-                split="train",
-                device=self.device,
-                resume_state_dict=resume_state,
             )
         else:
             train_dataloader = generate_dataloader(
@@ -1674,16 +1663,6 @@ class ModelTrainer(LightningModule):
 
         if getattr(self.hparams, 'dataset_name', 'nanochat') == 'nanochat_sft':
             val_dataloader = generate_sft_dataloader(
-                tokenizer=tokenizer,
-                batch_size=self.hparams.batch_size_per_device,
-                max_len=self.hparams.context_length,
-                max_iter=self.hparams.val_steps,
-                split="val",
-                device=self.device,
-            )
-        elif getattr(self.hparams, 'dataset_name', 'nanochat') == 'sudoku_sft':
-            from openebm.elm.data.sudoku_dataset import generate_sudoku_sft_dataloader
-            val_dataloader = generate_sudoku_sft_dataloader(
                 tokenizer=tokenizer,
                 batch_size=self.hparams.batch_size_per_device,
                 max_len=self.hparams.context_length,
@@ -1719,7 +1698,7 @@ class ModelTrainer(LightningModule):
             )
         elif self.hparams.execution_mode == "inference" and self.hparams.dataset_name == "nanochat_shard_eval":
             # Custom NanoChat shard evaluation dataset
-            from openebm.elm.dataset_nanochat_eval import NanoChatShardEvalDataset, collate_fn_nanochat_eval
+            from dataset_nanochat_eval import NanoChatShardEvalDataset, collate_fn_nanochat_eval
 
             # Parse shard indices from comma-separated string
             shard_indices_str = getattr(self.hparams, 'eval_shard_indices', '0,15')
@@ -1756,14 +1735,6 @@ class ModelTrainer(LightningModule):
             # Default: use val_dataloader for pretrain mode
             return self.val_dataloader()
         
-    # def train_dataloader(self):
-    #     return DataLoader(self.train_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = not self.hparams.no_shuffle, prefetch_factor=self.hparams.prefetch_factor)
-
-    # def val_dataloader(self):
-    #     return DataLoader(self.val_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
-
-    # def test_dataloader(self):
-    #     return DataLoader(self.test_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
 
     def log_metrics(self, metrics_dict, phase, log_torchmetrics = True):
         # first log torchmetrics if there are any
@@ -1775,6 +1746,16 @@ class ModelTrainer(LightningModule):
         scalar_metrics = {}
         keys = list(metrics_dict.keys()) # Iterate over a copy of the keys to avoid modification issues during iteration
         for key in keys:
+            # 跳过 BPB 相关指标，它们不应通过 Lightning log_dict 上报：
+            # - bpb_nats/bpb_bytes: BPB 累积中间量
+            # - bpb (非 train 阶段): BPB 是比率指标 (nats/bytes)，
+            #   Lightning 的 on_epoch=True 会对 per-batch bpb 做算术平均，这是数学错误的
+            #   正确做法是在 on_validation_epoch_end 中从累积 nats/bytes 重新计算
+            if key in ('bpb_nats', 'bpb_bytes'):
+                continue
+            if key == 'bpb' and phase != 'train':
+                continue
+
             value = metrics_dict[key]
             # if 'image' in key: # images
             #     image = self.to_pil(value)
@@ -1954,6 +1935,11 @@ class ModelTrainer(LightningModule):
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
 
                 # --- 打印 ---
+                alpha_val_str = ""
+                if self.hparams.mcmc_step_size_learnable:
+                    alpha_val = self.model.alpha.detach()
+                    alpha_grad_str = f" grad={self.model.alpha.grad.item():.6f}" if self.model.alpha.grad is not None else " grad=None"
+                    alpha_val_str = f" | alpha: {alpha_val.item():.6f} ({alpha_val.dtype}){alpha_grad_str}"
                 print(
                     f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
                     f"loss: {loss_val:.6f}"
@@ -1964,6 +1950,7 @@ class ModelTrainer(LightningModule):
                     f"mfu: {mfu:.2f} | "
                     f"epoch: {epoch} | "
                     f"total time: {total_min:.2f}m"
-                    f"{eta_str}",
+                    f"{eta_str}"
+                    f"{alpha_val_str}",
                     flush=True,
                 )
