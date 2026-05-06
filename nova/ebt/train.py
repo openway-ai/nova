@@ -214,8 +214,25 @@ def main(args):
     #     assert args.random_num_mcmc_steps, "random_num_mcmc_steps needs to be True"
     #NOTE should uncomment if add above hparams back
     
-    args.num_nodes = int(os.getenv('SLURM_JOB_NUM_NODES', 1)) # may not exist if not using slurm so default to 1; multi node only supports slurm as of now
-    print(f"SLURM_JOB_NUM_NODES: {args.num_nodes}")
+    # 按优先级推导 num_nodes:
+    # 1. SLURM_JOB_NUM_NODES  —— Slurm 环境
+    # 2. NODE_COUNT            —— rjob/平台注入的环境变量（本集群使用）
+    # 3. WORLD_SIZE / LOCAL_WORLD_SIZE —— torchrun 自动注入
+    # 4. 默认为 1
+    if os.getenv('SLURM_JOB_NUM_NODES') is not None:
+        args.num_nodes = int(os.getenv('SLURM_JOB_NUM_NODES'))
+        print(f"num_nodes={args.num_nodes} (from SLURM_JOB_NUM_NODES)")
+    elif os.getenv('NODE_COUNT') is not None:
+        args.num_nodes = int(os.getenv('NODE_COUNT'))
+        print(f"num_nodes={args.num_nodes} (from NODE_COUNT)")
+    elif os.getenv('WORLD_SIZE') is not None and os.getenv('LOCAL_WORLD_SIZE') is not None:
+        world_size = int(os.getenv('WORLD_SIZE'))
+        local_world_size = int(os.getenv('LOCAL_WORLD_SIZE'))
+        args.num_nodes = max(1, world_size // local_world_size)
+        print(f"num_nodes={args.num_nodes} (inferred from WORLD_SIZE={world_size} / LOCAL_WORLD_SIZE={local_world_size})")
+    else:
+        args.num_nodes = 1
+        print("num_nodes=1 (default, no distributed env vars found)")
     print("torch.cuda.device_count()", torch.cuda.device_count())
     if args.gpus == "-1":
         num_gpus = args.num_nodes * torch.cuda.device_count()
@@ -226,8 +243,9 @@ def main(args):
         num_gpus = int(args.gpus)
     print("devices/args.gpus: ", args.gpus)
 
-    args.total_num_workers = args.num_workers * num_gpus
-    print("num_nodes", args.num_nodes, "total num_workers across all GPUs", args.total_num_workers, "num workers per GPU", args.num_workers, "num_GPUs", num_gpus)
+    # NOTE: num_workers is NOT configurable — nanochat DataLoader hardcodes num_workers=0
+    # because the generator holds GPU state (pre-allocated CUDA buffers) that cannot be
+    # pickled into worker processes. See dataset.py generate_dataloader() for details.
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     assert (device == torch.device('cuda') and num_gpus > 0), "using cpu instead of cuda. if you would like to proceed please remove this line and change code below to not use GPUs, otherwise check packages to ensure torch/others have cuda support"
@@ -374,12 +392,11 @@ def main(args):
 def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", periodic_checkpoint=None):
     torch.autograd.set_detect_anomaly(args.detect_anomaly) #NOTE seems pl detect anomaly is not working so manually set it here
 
-    if args.find_unused_parameters or args.distributed_strategy == "ddp": 
-            # Enable find_unused_parameters=True by default for DDP to handle conditional parameters in EBT
-            args.distributed_strategy = DDPStrategy(find_unused_parameters = True)
-        # else:
-        #     pass
-        # if having issues with strategy try 'ddp_spawn' instead of 'ddp'
+    if args.find_unused_parameters or args.distributed_strategy == "ddp":
+            args.distributed_strategy = DDPStrategy(
+                find_unused_parameters=True,
+                gradient_as_bucket_view=True,
+            )
     args.overfit_batches = int(args.overfit_batches) if int(args.overfit_batches) == args.overfit_batches else args.overfit_batches
     profiler = None if args.profiler == "" else args.profiler
     gradient_clip_val = args.gradient_clip_val if args.gradient_clip_val > 0 else None
@@ -554,6 +571,9 @@ if __name__ == '__main__':
     parser.add_argument("--clamp_max_after_warm_up", help="clamps the absolute value of predicted_tokens to be within range [-val, val], after warming up. not used anymore", type=float, default=0.0)
 
     parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
+
+    parser.add_argument("--use_mcmc_time_embed", action="store_true", default=False,
+        help="Enable MCMC step time embedding (only for ebt_type=time_embed). When False, all steps share the same transition kernel, enabling arbitrary step count at inference.")
 
     parser.add_argument("--ebt_norm", help="type of norm to use for energy based transformer, NOTE is only supported for ebt_time_embed. not used anymore didnt work better than default rms from llama2", choices=["rms", "none", "layer", "ebm_backwards_norm", "dyt"], type=str, default="rms")
 
@@ -750,6 +770,7 @@ if __name__ == '__main__':
     parser.add_argument("--adamw_vocab_to_embed_lr", help="[Muon] vocab_to_embed 绝对 LR (EBT 特有, 建议保守 0.01)", type=float, default=-1)
     parser.add_argument("--adamw_scalar_lr", help="[Muon] transformer scalar 绝对 LR (NanoChat 默认 0.04)", type=float, default=-1)
     parser.add_argument("--adamw_dmodel_lr_scaling", help="[Muon] 是否对 AdamW LR 做 dmodel scaling: lr × (dim/768)^-0.5", action="store_true", default=False)
+    parser.add_argument("--muon_momentum_warmup_steps", help="[Muon] Momentum 从 0.85 线性预热到 muon_momentum 的步数 (NanoChat 默认 300, 设 0 禁用)", type=int, default=300)
 
     # Option 1: 分层学习率参数
     parser.add_argument("--layered_lr", help="[Option 1] 启用分层学习率，不同参数类型使用不同学习率", action="store_true", default=False)
@@ -768,9 +789,11 @@ if __name__ == '__main__':
 
     #DATASET AND DATALOADER #########################################################
 
-    parser.add_argument("--num_workers", help="num_workers per GPU. idea to do per GPU gotten from https://discuss.pytorch.org/t/guidelines-for-assigning-num-workers-to-dataloader/813/", type=int, default=4)
-
-    parser.add_argument("--prefetch_factor", help="prefetch factor for dataloader", type=int, default=None)
+    # NOTE: --num_workers and --prefetch_factor have been removed.
+    # The nanochat DataLoader hardcodes num_workers=0 because its generator holds
+    # GPU state (pre-allocated CUDA buffers) that cannot be pickled into worker
+    # processes. pin_memory=False because data is already on GPU.
+    # See dataset.py generate_dataloader() for details.
     
     parser.add_argument("--dataset_name", help="dataset name", default="ucf101")
     
@@ -953,6 +976,9 @@ if __name__ == '__main__':
     parser.add_argument("--compile_mode", help="torch.compile 模式: full (编译整个模型), transformer_only (仅编译 transformer，推荐), disabled", type=str, default="transformer_only", choices=["full", "transformer_only", "disabled"])
     parser.add_argument("--compile_backend", help="torch.compile 后端: inductor (默认), eager, aot_eager", type=str, default="inductor")
     parser.add_argument("--compile_dynamic", help="允许动态形状 (可能降低加速效果)", action="store_true", default=False)
+
+    parser.add_argument("--gradient_checkpointing", help="启用 gradient checkpointing 以节省显存 (用计算换显存)", action="store_true", default=False)
+    parser.add_argument("--use_sdpa_attention", help="使用 SDPA 注意力变体 (ar_ebt_time_embed_sdpa_math.py), 大幅减少 Path B 中间张量显存占用", action="store_true", default=False)
 
     #SLURM#########################################################################
 

@@ -19,7 +19,7 @@ HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export NANOCHAT_OFFLINE_MODE=1
 export OMP_NUM_THREADS=1
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 # =============================================================================
 # 参数配置

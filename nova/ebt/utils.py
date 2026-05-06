@@ -380,6 +380,8 @@ class EBTModelArgs:
     # nova/ebt/ar_ebt_time_embed.py and ar_ebt_default.py for the exact
     # mapping from block_mode -> attention implementation.
     block_mode: str = "dense_token"
+    use_mcmc_time_embed: bool = False
+    use_sdpa_attention: bool = False
 
 # nanochat depth-based auto-scaling
 # base_dim = depth * aspect_ratio # aspect_ratio = 64
@@ -780,8 +782,9 @@ def analyse_tokens(input_tensor, tokenizer):
 def setup_ebt(hparams): # specifically for EBT not for baseline transformer
     # to prevent circular import
 
-    max_seq_len = hparams.context_length+1 # for next pred in context 
-    max_seq_len = max_seq_len + 1 if hparams.ebt_type == "time_embed" else max_seq_len # need +1 since cat time embed on sequence dim
+    max_seq_len = hparams.context_length+1 # for next pred in context
+    use_mcmc_time_embed = getattr(hparams, 'use_mcmc_time_embed', False)
+    max_seq_len = max_seq_len + 1 if (hparams.ebt_type == "time_embed" and use_mcmc_time_embed) else max_seq_len # need +1 only when time embed is actually used
 
     adaln_zero_init = True if hparams.ebt_type == "adaln_zero" else False
     block_mode = getattr(hparams, "block_mode", "dense_token")
@@ -789,14 +792,33 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
         raise ValueError(
             f"Unknown block_mode={block_mode!r}; must be one of {BLOCK_MODE_CHOICES}"
         )
-    transformer_args = EBTModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=max_seq_len, weight_initialization = hparams.weight_initialization_method, adaln_zero_init=adaln_zero_init, ebt_norm=hparams.ebt_norm, ffn_dim_multiplier=hparams.ffn_dim_multiplier, ebt_act_func=hparams.ebt_act_func, weight_initialization_gain=hparams.weight_initialization_gain, dyt_alpha_init=hparams.dyt_alpha_init, debug_blockwise_shapes=getattr(hparams, "debug_blockwise_shapes", False), block_mode=block_mode)
+    use_sdpa_attention = getattr(hparams, 'use_sdpa_attention', False)
+    transformer_args = EBTModelArgs(
+        dim=hparams.embedding_dim,
+        n_layers=hparams.num_transformer_blocks,
+        n_heads=hparams.multiheaded_attention_heads,
+        max_batch_size=hparams.batch_size_per_device,
+        max_seq_len=max_seq_len,
+        weight_initialization=hparams.weight_initialization_method,
+        adaln_zero_init=adaln_zero_init,
+        ebt_norm=hparams.ebt_norm,
+        ffn_dim_multiplier=hparams.ffn_dim_multiplier,
+        ebt_act_func=hparams.ebt_act_func,
+        weight_initialization_gain=hparams.weight_initialization_gain,
+        dyt_alpha_init=hparams.dyt_alpha_init,
+        debug_blockwise_shapes=getattr(hparams, "debug_blockwise_shapes", False),
+        block_mode=block_mode,
+        use_mcmc_time_embed=use_mcmc_time_embed,
+        use_sdpa_attention=use_sdpa_attention,
+    )
     
     if hparams.ebt_type == "default": # causal decoder trans for ebm https://arxiv.org/abs/2406.08862
         from ar_ebt_default import EBTDefault
         ebt = EBTDefault(params=transformer_args)
     elif hparams.ebt_type == "time_embed": # time embed
         from ar_ebt_time_embed import EBTTimeConcat
-        ebt = EBTTimeConcat(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps)
+        gradient_checkpointing = getattr(hparams, 'gradient_checkpointing', False)
+        ebt = EBTTimeConcat(params=transformer_args, max_mcmc_steps=hparams.mcmc_num_steps, gradient_checkpointing=gradient_checkpointing, use_mcmc_time_embed=use_mcmc_time_embed)
     else: # adaln or adaln_zero
         from ar_ebt_adaln import EBTAdaLN
         ebt = EBTAdaLN(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps)

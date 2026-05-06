@@ -57,7 +57,7 @@ class BackwardRMSNormFunction(torch.autograd.Function):
         eps = ctx.eps
 
         # Compute RMS of grad_output over last dim
-        rms = torch.rsqrt(grad_output.float().pow(2).mean(dim=-1, keepdim=True) + eps)
+        rms = torch.rsqrt(grad_output.pow(2).mean(dim=-1, keepdim=True) + eps)
 
         # Normalized gradient wrt the input
         grad_input = grad_output * rms * weight  # shape matches grad_output
@@ -222,100 +222,76 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
-        output = self._norm(x.float()).type_as(x)
+        output = self._norm(x)
         return output * self.weight
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+    Precompute the cosine and sine frequency tensors for rotary embeddings.
 
-    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-    and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
+    Returns a tuple of (cos, sin) tensors with shape (end, dim//2), stored as
+    float32 but applied via real-valued arithmetic to avoid dtype casting in
+    the forward/backward graph.
 
     Args:
-        dim (int): Dimension of the frequency tensor.
-        end (int): End index for precomputing frequencies.
-        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
+        dim (int): Head dimension.
+        end (int): Maximum sequence length.
+        theta (float, optional): RoPE base. Defaults to 10000.0.
 
     Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.
-
-    
-        
-
+        Tuple[torch.Tensor, torch.Tensor]: (cos, sin) each of shape (end, dim//2).
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    """
-    Reshape frequency tensor for broadcasting it with another tensor.
-
-    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
-    for the purpose of broadcasting the frequency tensor during element-wise operations.
-
-    Args:
-        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
-        x (torch.Tensor): Target tensor for broadcasting compatibility.
-
-    Returns:
-        torch.Tensor: Reshaped frequency tensor.
-
-    Raises:
-        AssertionError: If the frequency tensor doesn't match the expected shape.
-        AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
-    """
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs)  # (end, dim//2)
+    return freqs.cos(), freqs.sin()  # both float32, shape (end, dim//2)
 
 
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: Tuple[torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply rotary embeddings to input tensors using the given frequency tensor.
+    Apply rotary embeddings using real-valued cos/sin arithmetic.
 
-    This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
-    frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
-    is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
-    returned as real tensors.
+    Avoids any dtype casting so the computation stays in the model's native
+    dtype (e.g. bfloat16) throughout, which is important for keeping the
+    MCMC autograd graph in low precision.
 
     Args:
-        xq (torch.Tensor): Query tensor to apply rotary embeddings.
-        xk (torch.Tensor): Key tensor to apply rotary embeddings.
-        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
+        xq (torch.Tensor): Query tensor, shape (..., seq, n_heads, head_dim).
+        xk (torch.Tensor): Key tensor, shape (..., seq, n_kv_heads, head_dim).
+        freqs_cis (Tuple[torch.Tensor, torch.Tensor]): (cos, sin) each of
+            shape (seq, head_dim//2), precomputed by precompute_freqs_cis.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-
-        
-
+        Tuple[torch.Tensor, torch.Tensor]: Rotated xq and xk in original dtype.
     """
-    if xq.dtype == torch.float32:
-        xq_ = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2))
-    else:
-        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    if xk.dtype == torch.float32:
-        xk_ = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2))
-    else:
-        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    # xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    # xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    cos, sin = freqs_cis  # (seq, head_dim//2)
+    # cast cos/sin to match input dtype (e.g. bfloat16) to avoid float32 intermediates
+    cos = cos.to(dtype=xq.dtype)
+    sin = sin.to(dtype=xq.dtype)
+
+    # xq/xk: (bs, seq, n_heads, head_dim) → split last dim into pairs
+    # cos/sin: (seq, head_dim//2) → broadcast over bs and n_heads
+    # reshape: (bs, seq, n_heads, head_dim//2, 2)
+    xq_r = xq.reshape(*xq.shape[:-1], -1, 2)   # (..., head_dim//2, 2)
+    xk_r = xk.reshape(*xk.shape[:-1], -1, 2)
+
+    xq0, xq1 = xq_r[..., 0], xq_r[..., 1]      # (..., head_dim//2)
+    xk0, xk1 = xk_r[..., 0], xk_r[..., 1]
+
+    # cos/sin need shape (1, seq, 1, head_dim//2) for broadcasting
+    cos = cos.unsqueeze(0).unsqueeze(2)          # (1, seq, 1, head_dim//2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+
+    xq_out = torch.stack([xq0 * cos - xq1 * sin,
+                          xq0 * sin + xq1 * cos], dim=-1).flatten(-2)
+    xk_out = torch.stack([xk0 * cos - xk1 * sin,
+                          xk0 * sin + xk1 * cos], dim=-1).flatten(-2)
+    return xq_out, xk_out
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -373,8 +349,10 @@ class Attention(nn.Module):
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
         init_whole_model_weights(self.wo, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
         
+        self.time_offset = 2 if args.use_mcmc_time_embed else 1
+        self.use_sdpa_attention = args.use_sdpa_attention
         self.register_buffer('superdiag_rows', torch.arange(args.max_seq_len - 1))
-        self.register_buffer('superdiag_cols', torch.arange(2, args.max_seq_len + 1))
+        self.register_buffer('superdiag_cols', torch.arange(self.time_offset, args.max_seq_len + self.time_offset - 1))
         # self.wq = ColumnParallelLinear(
         #     args.dim,
         #     args.n_heads * self.head_dim,
@@ -425,7 +403,7 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         mask: Optional[torch.Tensor],
         context_len: int,
         pred_len: int,
@@ -478,6 +456,7 @@ class Attention(nn.Module):
         if block_mode not in ("dense_token", "mtp_mcmc"):
             raise ValueError(f"Unsupported block_mode={block_mode!r}")
 
+
         # dense_token and mtp_mcmc share the legacy symmetric attention math.
         # pred_len == context_len is a shape invariant under these modes; it
         # is NOT used to pick between algorithms.
@@ -488,114 +467,185 @@ class Attention(nn.Module):
                 f"pred_len={pred_len}. Non-symmetric layouts are reserved for "
                 f"the 'blockwise' mode which is not implemented yet."
             )
-        if 1 + context_len + pred_len != full_seqlen:
+        leading_time = full_seqlen == (1 + context_len + pred_len)
+        plain_cat = full_seqlen == (context_len + pred_len)
+        if not leading_time and not plain_cat:
             raise ValueError(
-                f"Invalid layout: expected 1 + context_len + pred_len == "
-                f"full_seqlen, got 1 + {context_len} + {pred_len} != {full_seqlen}"
+                f"Invalid symmetric layout: full_seqlen={full_seqlen}, "
+                f"context_len={context_len}, pred_len={pred_len}"
             )
 
-        context_with_time_len = context_len + 1
+        cos, sin = freqs_cis
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
         xq = xq.view(bsz, full_seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
 
-        # Context path includes the prepended time embedding.
-        xq_o = xq[:, :context_with_time_len, :, :]
-        xk_o = xk[:, :context_with_time_len, :, :]
-        xv_o = xv[:, :context_with_time_len, :, :]
+        if leading_time:
+            context_with_time_len = context_len + 1
+            xq_o = xq[:, :context_with_time_len, :, :]
+            xk_o = xk[:, :context_with_time_len, :, :]
+            xv_o = xv[:, :context_with_time_len, :, :]
+            xq_p = xq[:, context_with_time_len:, :, :]
+            xk_p = xk[:, context_with_time_len:, :, :]
+            xv_p = xv[:, context_with_time_len:, :, :]
+            n_ctx = context_with_time_len
+            xq_o, xk_o = apply_rotary_emb(
+                xq_o,
+                xk_o,
+                freqs_cis=(cos[:context_with_time_len], sin[:context_with_time_len]),
+            )
+            xq_p, xk_p = apply_rotary_emb(
+                xq_p,
+                xk_p,
+                freqs_cis=(cos[2 : context_with_time_len + 1], sin[2 : context_with_time_len + 1]),
+            )
+            p_mask_start_row = 2
+            pred_superdiag_offset = 2
+        else:
+            n_ctx = context_len
+            xq_o = xq[:, :n_ctx, :, :]
+            xk_o = xk[:, :n_ctx, :, :]
+            xv_o = xv[:, :n_ctx, :, :]
+            xq_p = xq[:, n_ctx:, :, :]
+            xk_p = xk[:, n_ctx:, :, :]
+            xv_p = xv[:, n_ctx:, :, :]
+            xq_o, xk_o = apply_rotary_emb(
+                xq_o, xk_o, freqs_cis=(cos[:n_ctx], sin[:n_ctx])
+            )
+            xq_p, xk_p = apply_rotary_emb(
+                xq_p,
+                xk_p,
+                freqs_cis=(
+                    cos[self.time_offset : n_ctx + 1],
+                    sin[self.time_offset : n_ctx + 1],
+                ),
+            )
+            p_mask_start_row = self.time_offset
+            pred_superdiag_offset = self.time_offset
 
-        # Predicted block path has exactly pred_len positions.
-        xq_p = xq[:, context_with_time_len:, :, :]
-        xk_p = xk[:, context_with_time_len:, :, :]
-        xv_p = xv[:, context_with_time_len:, :, :]
+        o_mask = None
+        if mask is not None:
+            o_mask = mask[:-1, :-1]
 
-        xq_o, xk_o = apply_rotary_emb(xq_o, xk_o, freqs_cis=freqs_cis[:context_with_time_len])
-        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[2:context_with_time_len + 1])
-
-        xq_o = xq_o.transpose(1, 2)
+        xq_ot = xq_o.transpose(1, 2)
         keys_o = xk_o.transpose(1, 2)
         values_o = xv_o.transpose(1, 2)
-        scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores_o = scores_o + mask[:-1, :-1]
-        scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
-        output_o = torch.matmul(scores_o, values_o)
-        output_o = output_o.transpose(1, 2).contiguous().view(bsz, context_with_time_len, -1)
 
-        xq_p = xq_p.transpose(1, 2)
+        if self.use_sdpa_attention:
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_math=True,
+                enable_mem_efficient=False,
+                enable_cudnn=False,
+            ):
+                output_o = F.scaled_dot_product_attention(
+                    xq_ot, keys_o, values_o, is_causal=True
+                )
+            output_o = output_o.transpose(1, 2).contiguous().view(bsz, n_ctx, -1)
+        else:
+            scores_o = torch.matmul(xq_ot, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if o_mask is not None:
+                scores_o = scores_o + o_mask
+            scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_ot)
+            output_o = torch.matmul(scores_o, values_o)
+            output_o = output_o.transpose(1, 2).contiguous().view(bsz, n_ctx, -1)
+
+        xq_pt = xq_p.transpose(1, 2)
         keys_p = xk_p.transpose(1, 2)
         values_p = xv_p.transpose(1, 2)
-        scores_p = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
-        temp_append = torch.zeros(
-            (scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1),
-            dtype=scores_p.dtype,
-            device=scores_p.device,
-        )
-        scores_p = torch.cat((scores_p, temp_append), dim=-1)
+        n_pred = pred_len
+        Kkv = keys_o.shape[2]
 
-        insertion_superdiagonal = (xq_p * keys_p).sum(dim=3) / math.sqrt(self.head_dim)
-        insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype)
+        if self.use_sdpa_attention:
+            keys_all = torch.cat([keys_o, keys_p], dim=2)
+            values_all = torch.cat([values_o, values_p], dim=2)
+            orig_rows = torch.arange(n_pred, device=x.device).unsqueeze(1)
+            orig_cols = torch.arange(Kkv, device=x.device).unsqueeze(0)
+            orig_mask_part = torch.where(
+                orig_cols <= orig_rows + (self.time_offset - 1),
+                x.new_zeros(1),
+                x.new_full((1,), float("-inf")),
+            )
+            self_mask_part = x.new_full((n_pred, n_pred), float("-inf"))
+            self_mask_part.fill_diagonal_(0.0)
+            mask_p = torch.cat([orig_mask_part, self_mask_part], dim=1)
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_math=True,
+                enable_mem_efficient=False,
+                enable_cudnn=False,
+            ):
+                output_p = F.scaled_dot_product_attention(
+                    xq_pt, keys_all, values_all, attn_mask=mask_p
+                )
+            output_p = output_p.transpose(1, 2).contiguous().view(bsz, n_pred, -1)
+        else:
+            scores_p = torch.matmul(xq_pt, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)
+            temp_append = torch.zeros(
+                (scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1),
+                dtype=scores_p.dtype,
+                device=scores_p.device,
+            )
+            scores_p = torch.cat((scores_p, temp_append), dim=-1)
 
-        seq_len_minus_1 = scores_p.shape[2]
-        superdiag_rows = self.superdiag_rows[:seq_len_minus_1]
-        superdiag_cols = self.superdiag_cols[:seq_len_minus_1]
+            insertion_superdiagonal = (xq_pt * keys_p).sum(dim=3) / math.sqrt(self.head_dim)
+            insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype)
 
-        zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device)
-        diagonal_removal_mask = torch.ones_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
-        diagonal_removal_mask[:, :, superdiag_rows, superdiag_cols] = zero_superdiag
-        scores_p = scores_p * diagonal_removal_mask
+            seq_len_minus_1 = scores_p.shape[2]
+            superdiag_rows = self.superdiag_rows[:seq_len_minus_1]
+            superdiag_cols = self.superdiag_cols[:seq_len_minus_1]
 
-        diagonal_addition_mask = torch.zeros_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
-        diagonal_addition_mask[:, :, superdiag_rows, superdiag_cols] = insertion_superdiagonal
-        scores_p = scores_p + diagonal_addition_mask
+            zero_superdiag = torch.zeros_like(
+                insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device
+            )
+            diagonal_removal_mask = torch.ones_like(
+                scores_p, dtype=scores_p.dtype, device=scores_p.device
+            )
+            diagonal_removal_mask[:, :, superdiag_rows, superdiag_cols] = zero_superdiag
+            scores_p = scores_p * diagonal_removal_mask
 
-        if mask is not None:
-            scores_p = scores_p + mask[2:, :]
-        scores_p = F.softmax(scores_p.float(), dim=-1).type_as(xq_p)
+            diagonal_addition_mask = torch.zeros_like(
+                scores_p, dtype=scores_p.dtype, device=scores_p.device
+            )
+            diagonal_addition_mask[:, :, superdiag_rows, superdiag_cols] = insertion_superdiagonal
+            scores_p = scores_p + diagonal_addition_mask
 
-        scores_p_superdiagonal = scores_p.diagonal(offset=2, dim1=2, dim2=3).clone()
-        scores_p = scores_p * diagonal_removal_mask
-        scores_p = scores_p[:, :, :, :-1]
-        output_p = torch.matmul(scores_p, values_o)
-        next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim=-1)
-        output_p = output_p + next_pred_self_attention
-        output_p = output_p.transpose(1, 2).contiguous().view(bsz, pred_len, -1)
-        output = torch.cat((output_o, output_p), dim=1)  # B, (S+1)+K, D
+            if mask is not None:
+                scores_p = scores_p + mask[p_mask_start_row:, :]
+            scores_p = F.softmax(scores_p.float(), dim=-1).type_as(xq_pt)
 
+            scores_p_superdiagonal = scores_p.diagonal(
+                offset=pred_superdiag_offset, dim1=2, dim2=3
+            ).clone()
+            scores_p = scores_p * diagonal_removal_mask
+            scores_p = scores_p[:, :, :, :-1]
+            output_p = torch.matmul(scores_p, values_o)
+            next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim=-1)
+            output_p = output_p + next_pred_self_attention
+            output_p = output_p.transpose(1, 2).contiguous().view(bsz, n_pred, -1)
+
+        output = torch.cat((output_o, output_p), dim=1)
         return self.wo(output)
 
     def _forward_explicit_block_latent(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         mask: torch.Tensor,
     ):
-        """Plain full-sequence SDPA for the future_latent / blockwise modes.
-
-        This is intentionally a *separate* implementation from the legacy
-        symmetric path used by ``dense_token`` / ``mtp_mcmc``. It does NOT
-        use the superdiagonal trick — that trick was specific to the
-        symmetric "one latent per source position" layout and would not
-        encode the per-(t, j) visibility rules of the new modes.
-
-        ``mask`` must be the full ``(T, T)`` additive mask produced by
-        ``build_explicit_block_latent_mask`` and ``freqs_cis`` must already
-        be a ``(T, head_dim/2)`` slice with the right rotary position per
-        token (built by the caller via
-        ``build_explicit_block_latent_freq_indices``).
-        """
+        """Plain full-sequence SDPA for the future_latent / blockwise modes."""
         bsz, T, _ = x.shape
         if mask is None:
             raise ValueError(
                 "explicit-block-latent attention requires a non-None mask "
                 "(use utils.build_explicit_block_latent_mask)."
             )
-        if freqs_cis.shape[0] != T:
+        cos_f, sin_f = freqs_cis
+        if cos_f.shape[0] != T or sin_f.shape[0] != T:
             raise ValueError(
                 "freqs_cis length mismatch for explicit-block-latent attention: "
-                f"got freqs_cis length {freqs_cis.shape[0]}, expected {T}."
+                f"got cos/sin length {cos_f.shape[0]}/{sin_f.shape[0]}, expected {T}."
             )
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -603,17 +653,14 @@ class Attention(nn.Module):
         xk = xk.view(bsz, T, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, T, self.n_local_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=(cos_f, sin_f))
 
-        xq = xq.transpose(1, 2)            # [B, H, T, D]
-        keys = xk.transpose(1, 2)          # [B, H_kv, T, D]
-        values = xv.transpose(1, 2)        # [B, H_kv, T, D]
-        # The legacy code in this file assumes n_kv_heads == n_heads (no
-        # repeat_kv), so we follow the same assumption to keep behavior
-        # consistent across modes.
+        xq = xq.transpose(1, 2)
+        keys = xk.transpose(1, 2)
+        values = xv.transpose(1, 2)
 
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        scores = scores + mask  # additive: 0 where allowed, -inf where forbidden
+        scores = scores + mask
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)
         output = output.transpose(1, 2).contiguous().view(bsz, T, -1)
@@ -738,7 +785,7 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         mask: Optional[torch.Tensor],
         context_len: int,
         pred_len: int,
@@ -762,12 +809,14 @@ class TransformerBlock(nn.Module):
 
 
 class EBTTimeConcat(nn.Module):
-    def __init__(self, params: EBTModelArgs, max_mcmc_steps):
+    def __init__(self, params: EBTModelArgs, max_mcmc_steps, gradient_checkpointing=False, use_mcmc_time_embed=False):
         """
         Initialize a Transformer model.
 
         Args:
             params (EBTModelArgs): Model configuration parameters.
+            use_mcmc_time_embed (bool): If True, use per-step time embeddings (original behavior).
+                If False, all MCMC steps share the same transition kernel, enabling arbitrary inference steps.
 
         Attributes:
             params (EBTModelArgs): Model configuration parameters.
@@ -781,6 +830,8 @@ class EBTTimeConcat(nn.Module):
         super().__init__()
         self.params = params
         self.n_layers = params.n_layers
+        self.gradient_checkpointing = gradient_checkpointing
+        self.use_mcmc_time_embed = use_mcmc_time_embed
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
@@ -799,11 +850,14 @@ class EBTTimeConcat(nn.Module):
         else:
             raise ValueError(f"Invalid ebt_norm value: {params.ebt_norm}")
 
-        self.freqs_cis = precompute_freqs_cis(
+        freqs_cos, freqs_sin = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len
         )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
-        self.time_embeddings = nn.Embedding(max_mcmc_steps, params.dim)
+        if self.use_mcmc_time_embed:
+            self.time_embeddings = nn.Embedding(max_mcmc_steps, params.dim)
 
         self.final_layer = nn.Linear(params.dim, 1, bias = False)
         init_whole_model_weights(self.final_layer, self.params.weight_initialization)
@@ -861,7 +915,6 @@ class EBTTimeConcat(nn.Module):
             raise ValueError(
                 f"context_len + pred_len must equal embeddings length, got {context_len}+{pred_len}!={embeddings.shape[1]}"
             )
-        # Shape invariant for dense_token / mtp_mcmc.
         if pred_len != context_len:
             raise ValueError(
                 f"block_mode={block_mode!r} requires symmetric context/pred layout, "
@@ -869,25 +922,36 @@ class EBTTimeConcat(nn.Module):
                 f"Non-symmetric block prediction will be enabled by block_mode='blockwise' "
                 f"once implemented."
             )
+
         _bsz = embeddings.shape[0]
-        mcmc_step = torch.full(size=(_bsz,), fill_value=mcmc_step, device=embeddings.device, dtype=torch.long)
-        time_embeddings = self.time_embeddings(mcmc_step).unsqueeze(dim=1)  # (B, 1, D)
-        embeddings = torch.cat((time_embeddings, embeddings), dim=1)  # (B, 1+S+K, D)
 
-        self.freqs_cis = self.freqs_cis.to(embeddings.device)
+        if self.use_mcmc_time_embed:
+            mcmc_step_t = torch.full(
+                size=(_bsz,),
+                fill_value=mcmc_step,
+                device=embeddings.device,
+                dtype=torch.long,
+            )
+            time_embeddings = self.time_embeddings(mcmc_step_t).unsqueeze(dim=1)
+            embeddings = torch.cat((time_embeddings, embeddings), dim=1)
+            legacy_seqlen = context_len + 2
+        else:
+            _, raw_len = embeddings.shape[:2]
+            legacy_seqlen = (raw_len + 2) // 2
 
-        # Rotary length for the symmetric EBT layout: context_with_time + 1
-        # extra slot for the pred superdiagonal shift.
-        legacy_seqlen = context_len + 2
         required_length = start_pos + legacy_seqlen
-        if required_length > self.freqs_cis.shape[0]:
-            new_freqs_cis = precompute_freqs_cis(
+        if required_length > self.freqs_cos.shape[0]:
+            new_cos, new_sin = precompute_freqs_cis(
                 self.params.dim // self.params.n_heads,
                 required_length,
-            ).to(embeddings.device)
-            self.freqs_cis = new_freqs_cis
+            )
+            self.freqs_cos = new_cos.to(embeddings.device)
+            self.freqs_sin = new_sin.to(embeddings.device)
 
-        freqs_cis = self.freqs_cis[start_pos : start_pos + legacy_seqlen]
+        freqs_cis = (
+            self.freqs_cos[start_pos : start_pos + legacy_seqlen],
+            self.freqs_sin[start_pos : start_pos + legacy_seqlen],
+        )
 
         mask = None
         if legacy_seqlen > 1:
@@ -906,7 +970,8 @@ class EBTTimeConcat(nn.Module):
                 block_mode=block_mode,
             )
         embeddings = self.norm(embeddings)
-        embeddings = embeddings[:, 1:]  # remove time embedding
+        if self.use_mcmc_time_embed:
+            embeddings = embeddings[:, 1:]  # remove time embedding
         context_hidden = embeddings[:, :context_len]
         pred_hidden = embeddings[:, context_len:]
         energies = self.final_layer(embeddings)
@@ -1019,29 +1084,36 @@ class EBTTimeConcat(nn.Module):
                 f"S + S * K = {S + S * K}, got {full_len}."
             )
 
-        # ------ time embedding (prepended as a single token like legacy) ------
+        # ------ optional time embedding (prepended like the legacy path) ------
         bsz = embeddings.shape[0]
-        mcmc_step_t = torch.full(
-            size=(bsz,),
-            fill_value=mcmc_step,
-            device=embeddings.device,
-            dtype=torch.long,
-        )
-        time_embeddings = self.time_embeddings(mcmc_step_t).unsqueeze(dim=1)  # (B, 1, D)
-        embeddings = torch.cat((time_embeddings, embeddings), dim=1)
-        T_time = 1
+        if self.use_mcmc_time_embed:
+            mcmc_step_t = torch.full(
+                size=(bsz,),
+                fill_value=mcmc_step,
+                device=embeddings.device,
+                dtype=torch.long,
+            )
+            time_embeddings = self.time_embeddings(mcmc_step_t).unsqueeze(dim=1)  # (B, 1, D)
+            embeddings = torch.cat((time_embeddings, embeddings), dim=1)
+            T_time = 1
+        else:
+            T_time = 0
         T = T_time + S + S * K
         assert embeddings.shape[1] == T
 
         # ------ rotary frequencies (gather per-token positions) ------
-        self.freqs_cis = self.freqs_cis.to(embeddings.device)
+        device = embeddings.device
+        self.freqs_cos = self.freqs_cos.to(device)
+        self.freqs_sin = self.freqs_sin.to(device)
         max_pos_needed = start_pos + S + K
         required_length = max_pos_needed + 1
-        if required_length > self.freqs_cis.shape[0]:
-            self.freqs_cis = precompute_freqs_cis(
+        if required_length > self.freqs_cos.shape[0]:
+            new_cos, new_sin = precompute_freqs_cis(
                 self.params.dim // self.params.n_heads,
                 required_length,
-            ).to(embeddings.device)
+            )
+            self.freqs_cos = new_cos.to(device)
+            self.freqs_sin = new_sin.to(device)
 
         pos_indices = build_explicit_block_latent_freq_indices(
             context_len=S,
@@ -1050,9 +1122,12 @@ class EBTTimeConcat(nn.Module):
             start_pos=start_pos,
         )
         pos_index_tensor = torch.tensor(
-            pos_indices, dtype=torch.long, device=embeddings.device
+            pos_indices, dtype=torch.long, device=device
         )
-        freqs_cis = self.freqs_cis.index_select(0, pos_index_tensor)
+        freqs_cis = (
+            self.freqs_cos.index_select(0, pos_index_tensor),
+            self.freqs_sin.index_select(0, pos_index_tensor),
+        )
 
         mask = build_explicit_block_latent_mask(
             context_len=S,
@@ -1118,26 +1193,33 @@ class EBTTimeConcat(nn.Module):
             )
 
         bsz = embeddings.shape[0]
-        mcmc_step_t = torch.full(
-            size=(bsz,),
-            fill_value=mcmc_step,
-            device=embeddings.device,
-            dtype=torch.long,
-        )
-        time_embeddings = self.time_embeddings(mcmc_step_t).unsqueeze(dim=1)
-        embeddings = torch.cat((time_embeddings, embeddings), dim=1)
-        T_time = 1
+        if self.use_mcmc_time_embed:
+            mcmc_step_t = torch.full(
+                size=(bsz,),
+                fill_value=mcmc_step,
+                device=embeddings.device,
+                dtype=torch.long,
+            )
+            time_embeddings = self.time_embeddings(mcmc_step_t).unsqueeze(dim=1)
+            embeddings = torch.cat((time_embeddings, embeddings), dim=1)
+            T_time = 1
+        else:
+            T_time = 0
         T = T_time + C + K
         assert embeddings.shape[1] == T
 
-        self.freqs_cis = self.freqs_cis.to(embeddings.device)
+        device = embeddings.device
+        self.freqs_cos = self.freqs_cos.to(device)
+        self.freqs_sin = self.freqs_sin.to(device)
         max_pos_needed = start_pos + C + K
         required_length = max_pos_needed + 1
-        if required_length > self.freqs_cis.shape[0]:
-            self.freqs_cis = precompute_freqs_cis(
+        if required_length > self.freqs_cos.shape[0]:
+            new_cos, new_sin = precompute_freqs_cis(
                 self.params.dim // self.params.n_heads,
                 required_length,
-            ).to(embeddings.device)
+            )
+            self.freqs_cos = new_cos.to(device)
+            self.freqs_sin = new_sin.to(device)
 
         pos_indices = build_explicit_block_latent_inference_freq_indices(
             context_len=C,
@@ -1146,9 +1228,12 @@ class EBTTimeConcat(nn.Module):
             start_pos=start_pos,
         )
         pos_index_tensor = torch.tensor(
-            pos_indices, dtype=torch.long, device=embeddings.device
+            pos_indices, dtype=torch.long, device=device
         )
-        freqs_cis = self.freqs_cis.index_select(0, pos_index_tensor)
+        freqs_cis = (
+            self.freqs_cos.index_select(0, pos_index_tensor),
+            self.freqs_sin.index_select(0, pos_index_tensor),
+        )
 
         mask = build_explicit_block_latent_inference_mask(
             context_len=C,

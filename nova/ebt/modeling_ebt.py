@@ -33,7 +33,7 @@ class EBT_NLP(LightningModule):
 
         self.vocab_size = self.tokenizer.get_vocab_size() # len(self.tokenizer) # self.vocab_size = self.tokenizer.vocab_size caused errors since is smaller than len(self.tokenizer), is 50254 for neox-20b, len tokenizer is 50277 so decided to use that
         
-        self.alpha = nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size)), requires_grad=self.hparams.mcmc_step_size_learnable)
+        self.alpha = nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size), dtype=torch.float32), requires_grad=self.hparams.mcmc_step_size_learnable)
         self.langevin_dynamics_noise_std = nn.Parameter(torch.tensor(float(self.hparams.langevin_dynamics_noise)), requires_grad=False) # if using self.hparams.langevin_dynamics_noise_learnable this will be turned on in warm_up_finished func
 
         self.embeddings = nn.Embedding(self.vocab_size, self.hparams.embedding_dim)
@@ -107,12 +107,24 @@ class EBT_NLP(LightningModule):
             self.replay_buffer = CausalReplayBuffer(max_size=replay_buffer_max_size, sample_size=self.replay_buffer_samples)
 
         # DEBUGGING CODE ################################################################################################################################################
+        self._alpha_debug_step = 0  # counter for alpha diagnostic prints
         if self.hparams.debug_unused_parameters:
             self.used_parameters = set()
             self.parameters_not_to_check = set() # dont check these since may be frozen or dont want them to update
-        
+
+    def _apply(self, fn):
+        """Override to ensure alpha always stays in float32 regardless of model dtype.
+
+        _apply is the lowest-level method called by all dtype/device conversions
+        (to, cuda, float, etc.). Lightning's to() bypasses nn.Module.to() when a
+        trainer is present, so overriding to() is insufficient.
+        """
+        result = super()._apply(fn)
+        result.alpha.data = result.alpha.data.to(dtype=torch.float32)
+        return result
+
     @torch.compiler.disable
-    def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps, 
+    def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps,
                       langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits):
         batch_size = predicted_tokens.shape[0]
         seq_length = predicted_tokens.shape[1]
@@ -141,28 +153,51 @@ class EBT_NLP(LightningModule):
             predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
         
         all_embeddings = torch.cat((real_embeddings_input.detach(), predicted_embeddings), dim = 1) # B, 2*S, D
-        
-        energy_preds = self.transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step, block_mode=self._block_mode) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+        context_len = real_embeddings_input.shape[1]
+        pred_len = seq_length
+        # create_graph=True 的 autograd.grad 与 compiled graph 不兼容
+        transformer = getattr(self, 'transformer_eager', self.transformer)
+        energy_preds = transformer(
+            all_embeddings,
+            start_pos=start_pos,
+            mcmc_step=mcmc_step,
+            context_len=context_len,
+            pred_len=pred_len,
+            block_mode=self._block_mode,
+        )
         energy_preds = energy_preds.reshape(-1, 1)
         
-        if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
-            if i == (num_mcmc_steps - 1):
-                predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            energy_f32 = energy_preds.float()
+            if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
+                if i == (num_mcmc_steps - 1):
+                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
+                else:
+                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=False)[0]
             else:
-                predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=False)[0]
-        else:
-            predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+                predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
         # predicted_tokens_grad has shape B, S, V
         
         if self.hparams.clamp_futures_grad:
-            min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
+            min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha.float()) # use self.alpha and not random alpha to clamp
             # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
             predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
             
         if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
             raise ValueError("NaN or Inf gradients detected during MCMC.")
         
-        predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after  
+        predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after
+
+        # [DEBUG] check alpha
+        # if mcmc_step == 0 and self.training and self._alpha_debug_step <= 5:
+        #     print(
+        #         f"[ALPHA_DEBUG] _mcmc_step_excluded mcmc_step={mcmc_step} | "
+        #         f"alpha dtype={alpha.dtype} alpha_min={alpha.item() if alpha.numel() == 1 else alpha.min().item():.8f} | "
+        #         f"predicted_tokens_grad dtype={predicted_tokens_grad.dtype} grad_abs_mean={predicted_tokens_grad.abs().mean().item():.8f} | "
+        #         f"predicted_tokens dtype={predicted_tokens.dtype} | "
+        #         f"create_graph={learning}",
+        #         flush=True,
+        #     )
         
         if self.hparams.absolute_clamp != 0.0:
             predicted_tokens = torch.clamp(predicted_tokens, min = -self.hparams.absolute_clamp, max = self.hparams.absolute_clamp)
@@ -181,6 +216,7 @@ class EBT_NLP(LightningModule):
         real_embeddings_input = self.embeddings(x)
         batch_size = x.shape[0]
         seq_length = x.shape[1]
+        model_dtype = self.embeddings.weight.dtype
         if block_size is None:
             # Default block_size differs by block_mode:
             #   * dense_token / mtp_mcmc: legacy symmetric layout, defaults
@@ -238,7 +274,7 @@ class EBT_NLP(LightningModule):
                 f"block_size != seq_length is currently only supported for ebt_type in [default, time_embed]; got ebt_type={self.hparams.ebt_type}, block_size={block_size}, seq_length={seq_length}"
             )
 
-        alpha = torch.clamp(self.alpha, min=0.0001)
+        alpha = torch.clamp(self.alpha, min=0.0001).float()
         if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
             expanded_alpha = alpha.expand(batch_size, block_size, 1)
             scale = self.hparams.randomize_mcmc_step_size_scale
@@ -246,7 +282,10 @@ class EBT_NLP(LightningModule):
             high = alpha * scale
             alpha = low + torch.rand_like(expanded_alpha) * (high - low)
 
-        langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
+        # noise is intentionally detached and cast to model_dtype to avoid inserting
+        # a float32 node into the create_graph=True autograd graph.
+        langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001).detach().to(model_dtype)
+
         predicted_tokens = self.corrupt_embeddings(real_embeddings_input, target_length=block_size) # B, K, V
         if replay_buffer_logits is not None: # using replay buffer, use the logits instead of corruption
             if block_size != seq_length:
@@ -338,6 +377,8 @@ class EBT_NLP(LightningModule):
             optimize_mask_float = optimize_mask.to(dtype=predicted_tokens.dtype)
             fixed_logits = predicted_tokens.detach()
 
+        transformer_body = getattr(self, "transformer_eager", self.transformer)
+
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
                 if self.hparams.no_mcmc_detach:
@@ -373,27 +414,29 @@ class EBT_NLP(LightningModule):
                     pred_len=predicted_embeddings.shape[1],
                     block_mode=self._block_mode,
                 )
-                energy_preds = self.transformer(
+                energy_preds = transformer_body(
                     all_embeddings,
                     **base_transformer_kwargs,
                 ) # checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
                 energy_preds = energy_preds.reshape(-1, 1)
                 predicted_energies.append(energy_preds)
 
-                if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
-                    if i == (len(mcmc_steps) - 1):
-                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+                with torch.amp.autocast(device_type='cuda', enabled=False):
+                    energy_f32 = energy_preds.float()
+                    if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
+                        if i == (len(mcmc_steps) - 1):
+                            predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
+                        else:
+                            predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=False)[0]
                     else:
-                        predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=False)[0]
-                else:
-                    predicted_tokens_grad = torch.autograd.grad([energy_preds.sum()], [predicted_tokens], create_graph=learning)[0]
+                        predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
                 # predicted_tokens_grad has shape B, S, V
 
                 if optimize_mask_float is not None:
                     predicted_tokens_grad = predicted_tokens_grad * optimize_mask_float
 
                 if self.hparams.clamp_futures_grad:
-                    min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
+                    min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha.float())
                     predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
 
                 if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
@@ -414,7 +457,7 @@ class EBT_NLP(LightningModule):
                     post_transformer_kwargs = dict(base_transformer_kwargs)
                     post_transformer_kwargs["return_context_hidden"] = return_context_hidden
                     post_transformer_kwargs["return_pred_hidden"] = return_pred_hidden
-                    post_transformer_out = self.transformer(
+                    post_transformer_out = transformer_body(
                         post_update_all_embeddings,
                         **post_transformer_kwargs,
                     )
@@ -1249,9 +1292,11 @@ class EBT_NLP(LightningModule):
         contrastive_loss = 0.0
 
         if token_bytes is not None:
-            bpb_loss = calculate_bpb_score(next_token_indices, final_cce_loss, token_bytes)
+            bpb_loss, bpb_nats, bpb_bytes = calculate_bpb_score(next_token_indices, final_cce_loss, token_bytes)
         else:
             bpb_loss = 0
+            bpb_nats = 0
+            bpb_bytes = 0
 
         # Per-offset loss logging, computed on the final MCMC step's logits
         # in the canonical [B, K, S, V] layout. This is the same logging
@@ -1305,6 +1350,8 @@ class EBT_NLP(LightningModule):
             'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
             'perplexity': ppl_loss,
             'bpb': bpb_loss,
+            'bpb_nats': bpb_nats,
+            'bpb_bytes': bpb_bytes,
         }
         log_dict.update(offset_loss_log_dict)
         return log_dict
@@ -1418,9 +1465,11 @@ class EBT_NLP(LightningModule):
             contrastive_loss = 0.0
 
             if token_bytes is not None:
-                bpb_loss = calculate_bpb_score(next_token_indices, final_cce_loss, token_bytes)
+                bpb_loss, bpb_nats, bpb_bytes = calculate_bpb_score(next_token_indices, final_cce_loss, token_bytes)
             else:
                 bpb_loss = 0
+                bpb_nats = 0
+                bpb_bytes = 0
 
             offset_loss_log_dict = {}
             final_step_logits = multi_offset_logits_per_step[-1].detach()  # [B, K, S_eff, V]
@@ -1475,7 +1524,9 @@ class EBT_NLP(LightningModule):
                 'contrastive_loss' : contrastive_loss,
                 'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
                 'perplexity': ppl_loss,
-                'bpb': bpb_loss
+                'bpb': bpb_loss,
+                'bpb_nats': bpb_nats,
+                'bpb_bytes': bpb_bytes,
             }
             log_dict.update(offset_loss_log_dict)
             return log_dict
@@ -1543,9 +1594,21 @@ class EBT_NLP(LightningModule):
             contrastive_loss = 0.0
         
         if token_bytes is not None:
-            bpb_loss = calculate_bpb_score(next_token_indices, cce_loss.detach(), token_bytes)
+            # Compute per-token loss (reduction='none') for accurate BPB.
+            # Passing scalar mean loss (cce_loss) is incorrect because
+            # calculate_bpb_score multiplies loss by (num_bytes > 0) mask and sums,
+            # yielding mean_loss × count rather than sum(per_token_loss[valid]).
+            # predicted_distribution from the last MCMC step is already (-1, vocab_size).
+            if self.hparams.soften_target_prob_dist != 0.0:
+                per_token_ce = F.cross_entropy(predicted_distribution, next_token_indices,
+                                                label_smoothing=label_smoothing, ignore_index=-1, reduction='none')
+            else:
+                per_token_ce = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1, reduction='none')
+            bpb_loss, bpb_nats, bpb_bytes = calculate_bpb_score(next_token_indices, per_token_ce.detach(), token_bytes)
         else:
             bpb_loss = 0
+            bpb_nats = 0
+            bpb_bytes = 0
 
         log_dict = {
             'loss': total_loss,
@@ -1554,7 +1617,9 @@ class EBT_NLP(LightningModule):
             'contrastive_loss' : contrastive_loss,
             'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
             'perplexity': ppl_loss,
-            'bpb': bpb_loss  # Renamed from 'bpb_loss' for cleaner logging
+            'bpb': bpb_loss,
+            'bpb_nats': bpb_nats,    # accumulated nats for epoch-level BPB
+            'bpb_bytes': bpb_bytes,  # accumulated bytes for epoch-level BPB
         }
         return log_dict
     
@@ -1565,9 +1630,17 @@ class EBT_NLP(LightningModule):
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(size=(embeddings.shape[0], target_length, self.vocab_size), device = self.device) * self.hparams.gaussian_random_noise_scaling
+            predicted_tokens = torch.randn(
+                size=(embeddings.shape[0], target_length, self.vocab_size),
+                dtype=embeddings.dtype,
+                device=self.device,
+            ) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
-            predicted_tokens = torch.zeros(size=(embeddings.shape[0], target_length, self.vocab_size), device = self.device)
+            predicted_tokens = torch.zeros(
+                size=(embeddings.shape[0], target_length, self.vocab_size),
+                dtype=embeddings.dtype,
+                device=self.device,
+            )
         else:
             raise NotImplementedError(f"{self.hparams.denoising_initial_condition} denoising_initial_condition not yet supported")
         
@@ -1828,7 +1901,8 @@ class EBT_NLP(LightningModule):
                 return energies
 
         # ebt_type
-        if self.hparams.ebt_type == "default":
+        if self.hparams.ebt_type == "default" or (self.hparams.ebt_type == "time_embed" and not getattr(self.hparams, 'use_mcmc_time_embed', False)):
+            # default mode or time_embed without time embedding: shared transition kernel, arbitrary step count
             total_steps = self.hparams.infer_ebt_num_steps if self.hparams.infer_ebt_num_steps > 1 else self.hparams.mcmc_num_steps
             pred_state = initial_pred_tokens
             for step_idx in range(total_steps):

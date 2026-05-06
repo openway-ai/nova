@@ -89,7 +89,6 @@ BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-2}"
 ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-2}"
 MAX_STEPS="${MAX_STEPS:-50000}"
 WARMUP_STEPS="${WARMUP_STEPS:-1000}"
-NUM_WORKERS="${NUM_WORKERS:-12}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-1000}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-100}"
 
@@ -149,7 +148,6 @@ CMD=(
   --max_steps "$MAX_STEPS"
   --max_scheduling_steps "$MAX_STEPS"           # LR scheduler horizon
   --warm_up_steps "$WARMUP_STEPS"
-  --num_workers "$NUM_WORKERS"
 
   # --- Validation / logging -------------------------------------------------
   --val_check_interval "$VAL_CHECK_INTERVAL"
