@@ -38,7 +38,7 @@ class BackwardRMSNormFunction(torch.autograd.Function):
         eps = ctx.eps
 
         # Compute RMS of grad_output over last dim
-        rms = torch.rsqrt(grad_output.float().pow(2).mean(dim=-1, keepdim=True) + eps)
+        rms = torch.rsqrt(grad_output.pow(2).mean(dim=-1, keepdim=True) + eps)
 
         # Normalized gradient wrt the input
         grad_input = grad_output * rms * weight  # shape matches grad_output
@@ -203,100 +203,76 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
-        output = self._norm(x.float()).type_as(x)
+        output = self._norm(x)
         return output * self.weight
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+    Precompute the cosine and sine frequency tensors for rotary embeddings.
 
-    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-    and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
+    Returns a tuple of (cos, sin) tensors with shape (end, dim//2), stored as
+    float32 but applied via real-valued arithmetic to avoid dtype casting in
+    the forward/backward graph.
 
     Args:
-        dim (int): Dimension of the frequency tensor.
-        end (int): End index for precomputing frequencies.
-        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
+        dim (int): Head dimension.
+        end (int): Maximum sequence length.
+        theta (float, optional): RoPE base. Defaults to 10000.0.
 
     Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.
-
-    
-        
-
+        Tuple[torch.Tensor, torch.Tensor]: (cos, sin) each of shape (end, dim//2).
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    """
-    Reshape frequency tensor for broadcasting it with another tensor.
-
-    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
-    for the purpose of broadcasting the frequency tensor during element-wise operations.
-
-    Args:
-        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
-        x (torch.Tensor): Target tensor for broadcasting compatibility.
-
-    Returns:
-        torch.Tensor: Reshaped frequency tensor.
-
-    Raises:
-        AssertionError: If the frequency tensor doesn't match the expected shape.
-        AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
-    """
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs)  # (end, dim//2)
+    return freqs.cos(), freqs.sin()  # both float32, shape (end, dim//2)
 
 
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: Tuple[torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply rotary embeddings to input tensors using the given frequency tensor.
+    Apply rotary embeddings using real-valued cos/sin arithmetic.
 
-    This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
-    frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
-    is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
-    returned as real tensors.
+    Avoids any dtype casting so the computation stays in the model's native
+    dtype (e.g. bfloat16) throughout, which is important for keeping the
+    MCMC autograd graph in low precision.
 
     Args:
-        xq (torch.Tensor): Query tensor to apply rotary embeddings.
-        xk (torch.Tensor): Key tensor to apply rotary embeddings.
-        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
+        xq (torch.Tensor): Query tensor, shape (..., seq, n_heads, head_dim).
+        xk (torch.Tensor): Key tensor, shape (..., seq, n_kv_heads, head_dim).
+        freqs_cis (Tuple[torch.Tensor, torch.Tensor]): (cos, sin) each of
+            shape (seq, head_dim//2), precomputed by precompute_freqs_cis.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-
-        
-
+        Tuple[torch.Tensor, torch.Tensor]: Rotated xq and xk in original dtype.
     """
-    if xq.dtype == torch.float32:
-        xq_ = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2))
-    else:
-        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    if xk.dtype == torch.float32:
-        xk_ = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2))
-    else:
-        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    # xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    # xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    cos, sin = freqs_cis  # (seq, head_dim//2)
+    # cast cos/sin to match input dtype (e.g. bfloat16) to avoid float32 intermediates
+    cos = cos.to(dtype=xq.dtype)
+    sin = sin.to(dtype=xq.dtype)
+
+    # xq/xk: (bs, seq, n_heads, head_dim) → split last dim into pairs
+    # cos/sin: (seq, head_dim//2) → broadcast over bs and n_heads
+    # reshape: (bs, seq, n_heads, head_dim//2, 2)
+    xq_r = xq.reshape(*xq.shape[:-1], -1, 2)   # (..., head_dim//2, 2)
+    xk_r = xk.reshape(*xk.shape[:-1], -1, 2)
+
+    xq0, xq1 = xq_r[..., 0], xq_r[..., 1]      # (..., head_dim//2)
+    xk0, xk1 = xk_r[..., 0], xk_r[..., 1]
+
+    # cos/sin need shape (1, seq, 1, head_dim//2) for broadcasting
+    cos = cos.unsqueeze(0).unsqueeze(2)          # (1, seq, 1, head_dim//2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+
+    xq_out = torch.stack([xq0 * cos - xq1 * sin,
+                          xq0 * sin + xq1 * cos], dim=-1).flatten(-2)
+    xk_out = torch.stack([xk0 * cos - xk1 * sin,
+                          xk0 * sin + xk1 * cos], dim=-1).flatten(-2)
+    return xq_out, xk_out
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -362,6 +338,7 @@ class Attention(nn.Module):
         init_whole_model_weights(self.wo, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
         
         self.time_offset = 2 if args.use_mcmc_time_embed else 1
+        self.use_sdpa_attention = args.use_sdpa_attention
         self.register_buffer('superdiag_rows', torch.arange(args.max_seq_len - 1))
         self.register_buffer('superdiag_cols', torch.arange(self.time_offset, args.max_seq_len + self.time_offset - 1))
         # self.wq = ColumnParallelLinear(
@@ -455,9 +432,10 @@ class Attention(nn.Module):
         xv_p = xv[:, original_seqlen:, :, :]
         
         
-        xq_o, xk_o = apply_rotary_emb(xq_o, xk_o, freqs_cis=freqs_cis[:original_seqlen])
+        cos, sin = freqs_cis
+        xq_o, xk_o = apply_rotary_emb(xq_o, xk_o, freqs_cis=(cos[:original_seqlen], sin[:original_seqlen]))
 
-        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[self.time_offset:original_seqlen+1]) # use time_offset since are the next preds and also have time embeddings (offset=2) or not (offset=1)
+        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=(cos[self.time_offset:original_seqlen+1], sin[self.time_offset:original_seqlen+1])) # use time_offset since are the next preds and also have time embeddings (offset=2) or not (offset=1)
         # I tested this compared to prepending row on S dimension and the tensors were the same
 
         # self.cache_k = self.cache_k.to(xq)
@@ -473,75 +451,104 @@ class Attention(nn.Module):
         # keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
         # values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
         
-        #original attn calc is more normal############################################
+        #original attn calc############################################
 
         # seqlen here is S-1 which = original_seqlen
+        # Use F.scaled_dot_product_attention to avoid materialising the full [B, N, S, S]
+        # attention score matrix, which OOMs at context=2048.
         xq_o = xq_o.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys_o = xk_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
         values_o = xv_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim) # B, N, S-1, S-1
-        if mask is not None:
-            #this mask needs to be seqlen, seqlen, was S, S
-            o_mask = mask[:-1, :-1] #set to S-1, S-1 like 0 -inf -inf; 0 0 -inf, etc   
-            scores_o = scores_o + o_mask  # (bs, n_local_heads, seqlen, seqlen)
-        scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
-        output_o = torch.matmul(scores_o, values_o)  # (bs, n_local_heads, seqlen, head_dim)
-        output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1) # has B, S-1, D after
+
+        if self.use_sdpa_attention:            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False, enable_cudnn=False):
+                output_o = F.scaled_dot_product_attention(xq_o, keys_o, values_o, is_causal=True)
+            output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1)
+        else:
+            scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim) # B, N, S-1, S-1
+            if mask is not None:
+                #this mask needs to be seqlen, seqlen, was S, S
+                o_mask = mask[:-1, :-1] #set to S-1, S-1 like 0 -inf -inf; 0 0 -inf, etc
+                scores_o = scores_o + o_mask  # (bs, n_local_heads, seqlen, seqlen)
+            scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
+            output_o = torch.matmul(scores_o, values_o)  # (bs, n_local_heads, seqlen, head_dim)
+            output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1) # has B, S-1, D after
         
         #pred sequence attn calc is for energy-based transformer ########################################################################################
         
-        # seqlen here is S-1 which = original_seqlen
-        xq_p = xq_p.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys_p = xk_p.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        
-        values_p = xv_p.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        scores_p = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim) # B, N, S-1, S; this uses xq_p and keys_o since for every next pred calcs similarity to all prev words; right S is because have extra condition
-
-        temp_append = torch.zeros((scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1), dtype=scores_p.dtype, device=scores_p.device) # B, N, S-1, 1; is used since context_length = original_length +1, superdiag needs this
-        scores_p = torch.cat((scores_p, temp_append), dim = -1)# is B, N, S-1, S; represents for each next pred (S-1 row) attending to all previous words (S-1) and then itself +1
-        
-        insertion_superdiagonal = (xq_p * keys_p).sum(dim = 3) / math.sqrt(self.head_dim)
-        insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype) # for if using non 32 precision
-        # bs, n, s-1 ; this calcs attn score of next preds with themselves, is like grabbing diag of matmul
-        
-        seq_len_minus_1 = scores_p.shape[2]
-        superdiag_rows = self.superdiag_rows[:seq_len_minus_1]
-        superdiag_cols = self.superdiag_cols[:seq_len_minus_1]
-  
-        # first remove superdiagonal values so doesnt use attention to future tokens--prevents leakage of probability mass
-        zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device) # for zeroing out superdiag since dont want to include in matmul, do this in differentiable way
-        diagonal_removal_mask = torch.ones_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
-        diagonal_removal_mask[:, :, superdiag_rows, superdiag_cols] = zero_superdiag
-        scores_p = scores_p * diagonal_removal_mask        
-        
-        # then set diagonal to next pred self attention scores in differentiable way
-        diagonal_addition_mask = torch.zeros_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
-        diagonal_addition_mask[:, :, superdiag_rows, superdiag_cols] = insertion_superdiagonal
-        scores_p = scores_p + diagonal_addition_mask         
-        
-        if mask is not None:
-            p_mask = mask[self.time_offset:, :]  #S-1, S+1 like 0 0 0 -inf -inf -inf; 0 0 0 0 -inf -inf; etc
-            scores_p = scores_p + p_mask
-        if scores_p.dtype != torch.float32:
-            scores_p = scores_p.float()
-        scores_p = F.softmax(scores_p, dim=-1)
-        if scores_p.dtype != xq_p.dtype:
-            scores_p = scores_p.to(xq_p.dtype)
-        
-        #Q: why do I need to extract superdiagonal why cant i just do matmul after? A: its bc would need same subsequence in value matrix but dont have it, have original subsequence and then seperately all next preds
-        scores_p_superdiagonal = scores_p.diagonal(offset=self.time_offset, dim1=2, dim2=3) # is B, N, S; basically how much each token on this superdiag should attent to itself; clone since dont want mask to change this
-        
-        scores_p = scores_p * diagonal_removal_mask # keeps scores_p as is except for superdiagonal which is next preds attention to selves, cant multiply these naively by values_p or values_o
-        
-        scores_p = scores_p[:, :, :, :-1] # B, N, S-1, S now; next preds/scores_p_superdiagonal was why needed extra col earlier (temp_append)
-        output_p = torch.matmul(scores_p, values_o) # B, N, S-1, H; is how next preds attend to all original previous tokens;
-        
-        #next_pred_self_attention is to get self attention based on extracted superdiagonal and the values matrix (for predictions)
-        next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim = -1) # B, N, S-1, H this is for weighted sum of each next pred to its final embed rep.
-        
-        output_p = output_p + next_pred_self_attention # B, N, S-1, H adding this is adding the aspect of each next pred embedding attending to itself
+        xq_p = xq_p.transpose(1, 2)  # (bs, n_local_heads, pred_seqlen, head_dim)
+        keys_p = xk_p.transpose(1, 2) # (bs, n_local_heads, pred_seqlen, head_dim)
+        values_p = xv_p.transpose(1, 2) # (bs, n_local_heads, pred_seqlen, head_dim)
         n_pred = full_seqlen - original_seqlen
-        output_p = output_p.transpose(1, 2).contiguous().view(bsz, n_pred, -1) # after this is B, S-1, D
+
+        if self.use_sdpa_attention:
+            K = original_seqlen           # number of orig tokens
+            pred_seqlen = n_pred          # number of pred tokens
+
+            keys_all   = torch.cat([keys_o,   keys_p],   dim=2)
+            values_all = torch.cat([values_o, values_p], dim=2)
+            orig_rows = torch.arange(pred_seqlen, device=x.device).unsqueeze(1)  # [pred_seqlen, 1]
+            orig_cols = torch.arange(K,           device=x.device).unsqueeze(0)  # [1, K]
+            orig_mask_part = torch.where(
+                orig_cols <= orig_rows + (self.time_offset - 1),
+                x.new_zeros(1),
+                x.new_full((1,), float('-inf'))
+            )  # [pred_seqlen, K]
+
+            self_mask_part = x.new_full((pred_seqlen, pred_seqlen), float('-inf'))
+            self_mask_part.fill_diagonal_(0.0)  # each pred token attends only to itself
+
+            mask_p = torch.cat([orig_mask_part, self_mask_part], dim=1)  # [pred_seqlen, K + pred_seqlen]
+
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False, enable_cudnn=False):
+                output_p = F.scaled_dot_product_attention(xq_p, keys_all, values_all, attn_mask=mask_p)
+            output_p = output_p.transpose(1, 2).contiguous().view(bsz, n_pred, -1)
+        else:
+            scores_p = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim) # B, N, S-1, S; this uses xq_p and keys_o since for every next pred calcs similarity to all prev words; right S is because have extra condition
+
+            temp_append = torch.zeros((scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1), dtype=scores_p.dtype, device=scores_p.device) # B, N, S-1, 1; is used since context_length = original_length +1, superdiag needs this
+            scores_p = torch.cat((scores_p, temp_append), dim = -1)# is B, N, S-1, S; represents for each next pred (S-1 row) attending to all previous words (S-1) and then itself +1
+            
+            insertion_superdiagonal = (xq_p * keys_p).sum(dim = 3) / math.sqrt(self.head_dim)
+            insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype) # for if using non 32 precision
+            # bs, n, s-1 ; this calcs attn score of next preds with themselves, is like grabbing diag of matmul
+            
+            seq_len_minus_1 = scores_p.shape[2]
+            superdiag_rows = self.superdiag_rows[:seq_len_minus_1]
+            superdiag_cols = self.superdiag_cols[:seq_len_minus_1]
+      
+            # first remove superdiagonal values so doesnt use attention to future tokens--prevents leakage of probability mass
+            zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device) # for zeroing out superdiag since dont want to include in matmul, do this in differentiable way
+            diagonal_removal_mask = torch.ones_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
+            diagonal_removal_mask[:, :, superdiag_rows, superdiag_cols] = zero_superdiag
+            scores_p = scores_p * diagonal_removal_mask
+            
+            # then set diagonal to next pred self attention scores in differentiable way
+            diagonal_addition_mask = torch.zeros_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
+            diagonal_addition_mask[:, :, superdiag_rows, superdiag_cols] = insertion_superdiagonal
+            scores_p = scores_p + diagonal_addition_mask
+            
+            if mask is not None:
+                p_mask = mask[self.time_offset:, :]  #S-1, S+1 like 0 0 0 -inf -inf -inf; 0 0 0 0 -inf -inf; etc
+                scores_p = scores_p + p_mask
+            if scores_p.dtype != torch.float32:
+                scores_p = scores_p.float()
+            scores_p = F.softmax(scores_p, dim=-1)
+            if scores_p.dtype != xq_p.dtype:
+                scores_p = scores_p.to(xq_p.dtype)
+            
+            #Q: why do I need to extract superdiagonal why cant i just do matmul after? A: its bc would need same subsequence in value matrix but dont have it, have original subsequence and then seperately all next preds
+            scores_p_superdiagonal = scores_p.diagonal(offset=self.time_offset, dim1=2, dim2=3) # is B, N, S; basically how much each token on this superdiag should attent to itself; clone since dont want mask to change this
+            
+            scores_p = scores_p * diagonal_removal_mask # keeps scores_p as is except for superdiagonal which is next preds attention to selves, cant multiply these naively by values_p or values_o
+            
+            scores_p = scores_p[:, :, :, :-1] # B, N, S-1, S now; next preds/scores_p_superdiagonal was why needed extra col earlier (temp_append)
+            output_p = torch.matmul(scores_p, values_o) # B, N, S-1, H; is how next preds attend to all original previous tokens;
+            
+            #next_pred_self_attention is to get self attention based on extracted superdiagonal and the values matrix (for predictions)
+            next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim = -1) # B, N, S-1, H this is for weighted sum of each next pred to its final embed rep.
+            
+            output_p = output_p + next_pred_self_attention # B, N, S-1, H adding this is adding the aspect of each next pred embedding attending to itself
+            output_p = output_p.transpose(1, 2).contiguous().view(bsz, n_pred, -1) # after this is B, S-1, D
         
         #return linear projection of concatted outputs ########################################################################################
         
@@ -669,7 +676,6 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        use_create_graph: bool = False,
         ve: Optional[torch.Tensor] = None,
     ):
         """
@@ -680,10 +686,6 @@ class TransformerBlock(nn.Module):
             start_pos (int): Starting position for attention caching.
             freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
             mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
-            use_create_graph (bool): 是否处于 create_graph=True 的 MCMC 步骤中。
-                当为 True 时禁用 Gradient Checkpointing，避免双倍激活值显存占用。
-                原因：create_graph=True 要求保留重计算图的中间激活值，
-                GC 的重计算不仅不能节省显存，反而会额外保存一份激活值。
 
         Returns:
             torch.Tensor: Output tensor after applying attention and feedforward layers.
@@ -751,9 +753,11 @@ class EBTTimeConcat(nn.Module):
         else:
             raise ValueError(f"Invalid ebt_norm value: {params.ebt_norm}")
 
-        self.freqs_cis = precompute_freqs_cis(
+        freqs_cos, freqs_sin = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len
         )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
         if self.use_mcmc_time_embed:
             self.time_embeddings = nn.Embedding(max_mcmc_steps, params.dim)
@@ -761,15 +765,7 @@ class EBTTimeConcat(nn.Module):
         self.final_layer = nn.Linear(params.dim, 1, bias = False)
         init_whole_model_weights(self.final_layer, self.params.weight_initialization)
 
-    def forward(
-        self,
-        embeddings: torch.Tensor,
-        start_pos: int,
-        mcmc_step=0,
-        use_create_graph: bool = False,
-        real_token_ids: Optional[torch.Tensor] = None,
-        predicted_tokens: Optional[torch.Tensor] = None,
-    ):
+    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0):
         """
         Perform a forward pass through the Transformer model.
 
@@ -777,11 +773,6 @@ class EBTTimeConcat(nn.Module):
             embeds (torch.Tensor): Embeddings (instead of tokens since is for vision).
             start_pos (int): Starting position for attention caching.
             mcmc_step (int): Current MCMC step index, used for time embeddings.
-            use_create_graph (bool): 是否处于需要 create_graph=True 的 MCMC 最后一步。
-                该参数会透传给每个 TransformerBlock，用于决定是否启用 Gradient Checkpointing。
-                - False（默认）：非最后一步或推理阶段，GC 可以正常节省显存
-                - True：最后一步且 learning=True，禁用 GC 以避免双倍激活值开销
-                  （create_graph=True 要求保留重计算图，GC 重计算反而增加显存）
 
         Returns:
             torch.Tensor: Output energies after applying the Transformer model.
@@ -800,19 +791,20 @@ class EBTTimeConcat(nn.Module):
             seqlen = (seqlen+3) // 2 # passed in seqlen is 2(S-1)+1+1(time) so add 3 div 2 = S+1
         else:
             seqlen = (seqlen+2) // 2 # passed in seqlen is 2(S-1) so add 2 div 2 = S
-        self.freqs_cis = self.freqs_cis.to(embeddings.device)
-
-        # 动态扩展 freqs_cis 如果需要的长度超过预计算的长度
+        # 动态扩展 freqs_cos/freqs_sin 如果需要的长度超过预计算的长度
         required_length = start_pos + seqlen
-        if required_length > self.freqs_cis.shape[0]:
-            # 重新计算更长的 freqs_cis
-            new_freqs_cis = precompute_freqs_cis(
+        if required_length > self.freqs_cos.shape[0]:
+            new_cos, new_sin = precompute_freqs_cis(
                 self.params.dim // self.params.n_heads,
                 required_length
-            ).to(embeddings.device)
-            self.freqs_cis = new_freqs_cis
+            )
+            self.freqs_cos = new_cos.to(embeddings.device)
+            self.freqs_sin = new_sin.to(embeddings.device)
 
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        freqs_cis = (
+            self.freqs_cos[start_pos : start_pos + seqlen],
+            self.freqs_sin[start_pos : start_pos + seqlen],
+        )
 
         mask = None
         if seqlen > 1:
@@ -831,7 +823,6 @@ class EBTTimeConcat(nn.Module):
             # causal mask is like this by default 0, -inf, -inf
             #                         0, 0,    -inf
             #                         0, 0,    0
-                
 
             for i, layer in enumerate(self.layers):
                 ve = None
