@@ -4,7 +4,10 @@ import nltk
 import string
 from typing import List
 import torch.distributed as dist
-import ipdb
+try:
+    import ipdb  # type: ignore
+except ImportError:
+    ipdb = None
 import math
 
 custom_nltk_path = "/mnt/shared-storage-user/lixueyan/datasets/nltk_data"

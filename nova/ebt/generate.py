@@ -151,7 +151,10 @@ def _resolve_inference_strategy(hparams, infer_block_size=None):
         infer_block_size = max(1, int(getattr(hparams, "infer_block_size", 1)))
     infer_block_mode = str(getattr(hparams, "infer_block_mode", "auto"))
     if infer_block_mode not in ("auto", "sequential", "direct_block"):
-        raise ValueError(f"Unsupported infer_block_mode: {infer_block_mode}. Expected 'auto', 'sequential' or 'direct_block'.")
+        raise ValueError(
+            f"Unsupported infer_block_mode: {infer_block_mode}. "
+            "Expected 'auto', 'sequential' or 'direct_block'."
+        )
     if infer_block_mode == "auto":
         return "direct_block" if infer_block_size > 1 else "sequential"
     return infer_block_mode
@@ -213,9 +216,9 @@ def _check_inference_block_mode_compat(attention_block_mode, inference_strategy,
         # direct_block path is reserved for the future 'blockwise'
         # block_mode.
         raise NotImplementedError(
-            f"direct_block inference with infer_block_size={infer_block_size} is not "
+            f"{inference_strategy} inference with infer_block_size={infer_block_size} is not "
             f"implemented for block_mode={attention_block_mode!r}. The non-symmetric "
-            f"block attention required for direct_block is reserved for block_mode='blockwise' "
+            f"block attention required for {inference_strategy} is reserved for block_mode='blockwise' "
             f"(not yet implemented). Use infer_block_mode=sequential, or reduce "
             f"infer_block_size to 1, or train a blockwise-mode checkpoint."
         )
@@ -282,12 +285,15 @@ def generate_text(model, batch, hparams):
     if infer_block_size > 1 and logprobs:
         raise NotImplementedError("logprobs=True is not supported in block inference mode yet")
     if infer_block_size > 1 and effective_block_mode == "direct_block" and hparams.model_name != "ebt":
-        raise NotImplementedError("direct_block inference mode is currently only supported for EBT models.")
+        raise NotImplementedError(
+            f"{effective_block_mode} inference mode is currently only supported for EBT models."
+        )
     if infer_block_size > 1 and effective_block_mode == "direct_block":
         ebt_type = str(getattr(hparams, "ebt_type", "default"))
         if ebt_type not in ("default", "time_embed"):
             raise NotImplementedError(
-                f"direct_block inference currently requires ebt_type in [default, time_embed]; got ebt_type={ebt_type}."
+                f"{effective_block_mode} inference currently requires ebt_type in "
+                f"[default, time_embed]; got ebt_type={ebt_type}."
             )
     # ppl = model.forward_loss_wrapper(questions, phase="test")['perplexity'].item() # just in case want to debug model PPL
 
@@ -531,8 +537,9 @@ def get_ppl(model, batch, hparams, token_bytes=None): # computes teacher-forced 
         full_ids = batch['input_ids'].squeeze(dim=1)
         if hparams.model_name == "ebt" and effective_block_mode == "direct_block" and infer_block_size > 1:
             # Blockwise teacher-forced:
-            # for each chunk starting at cur_pos, condition on real prefix full_ids[:, :cur_pos]
-            # and predict the next K tokens in one shot.
+            # direct_block: for each chunk starting at cur_pos, condition on the
+            # real prefix full_ids[:, :cur_pos] and predict the next K tokens in
+            # one shot.
             pad_token_id = model.tokenizer_pad_token_id
             if pad_token_id is None:
                 pad_token_id = -100
@@ -596,10 +603,15 @@ def get_ppl(model, batch, hparams, token_bytes=None): # computes teacher-forced 
     }
 
     if token_bytes is not None:
-        if hparams.model_name == "ebt" and effective_block_mode == "direct_block" and infer_block_size > 1:
-            # Next-token targets are all tokens after BOS-equivalent first token in full_ids.
-            next_token_indices = full_ids[:, 1:].reshape(-1)
-            # blockwise all_losses is built in the same left-to-right order; trim to target length if needed
+        # Teacher-forced targets are always the sequence shifted by one token.
+        next_token_indices = full_ids[:, 1:].reshape(-1)
+        if (
+            hparams.model_name == "ebt"
+            and effective_block_mode == "direct_block"
+            and infer_block_size > 1
+        ):
+            # Blockwise all_losses is built in left-to-right order; trim to
+            # target length if needed so bpb accounting stays aligned.
             if per_token_loss.numel() != next_token_indices.numel():
                 min_len = min(per_token_loss.numel(), next_token_indices.numel())
                 per_token_loss = per_token_loss[:min_len]

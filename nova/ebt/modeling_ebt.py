@@ -16,7 +16,10 @@ from utils import EXPLICIT_BLOCK_LATENT_MODES
 from replay_buffer import CausalReplayBuffer
 from metrics import calculate_bpb_score
 
-import ipdb
+try:
+    import ipdb  # type: ignore
+except ImportError:
+    ipdb = None
 
 class EBT_NLP(LightningModule):
     def __init__(self, hparams):
@@ -787,6 +790,7 @@ class EBT_NLP(LightningModule):
             raise ValueError(f"block_size must be > 0, got {K}")
         B, P, V = predicted_tokens.shape
         S = real_embeddings_input.shape[1]
+        model_dtype = self.embeddings.weight.dtype
         if P == S * K:
             layout = "training"
         elif P == K:
@@ -798,9 +802,13 @@ class EBT_NLP(LightningModule):
             )
 
         if alpha is None:
-            alpha = torch.clamp(self.alpha, min=0.0001)
+            alpha = torch.clamp(self.alpha, min=0.0001).float()
         if langevin_dynamics_noise_std is None:
-            langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
+            # Keep noise detached / model-typed so we do not inject a float32
+            # node into the create_graph=True MCMC graph.
+            langevin_dynamics_noise_std = torch.clamp(
+                self.langevin_dynamics_noise_std, min=0.000001
+            ).detach().to(model_dtype)
         if mcmc_steps is None:
             mcmc_steps = self._build_mcmc_steps(no_randomness=no_randomness)
 
@@ -809,6 +817,7 @@ class EBT_NLP(LightningModule):
                 f"Transformer {type(self.transformer).__name__} does not support return_pred_hidden=True"
             )
 
+        transformer_body = getattr(self, "transformer_eager", self.transformer)
         predicted_distributions = []
         predicted_energies = []
         predicted_hiddens = []
@@ -848,27 +857,29 @@ class EBT_NLP(LightningModule):
                     block_size=K,
                     block_mode=self._block_mode,
                 )
-                energy_preds = self.transformer(all_embeddings, **trunk_kwargs)
+                energy_preds = transformer_body(all_embeddings, **trunk_kwargs)
                 # energy_preds: [B, P, 1]
                 energy_preds_flat = energy_preds.reshape(-1, 1)
                 predicted_energies.append(energy_preds_flat)
 
-                if self.hparams.truncate_mcmc:
-                    if i == (len(mcmc_steps) - 1):
-                        predicted_tokens_grad = torch.autograd.grad(
-                            [energy_preds_flat.sum()], [predicted_tokens], create_graph=learning
-                        )[0]
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    energy_f32 = energy_preds_flat.float()
+                    if self.hparams.truncate_mcmc:
+                        if i == (len(mcmc_steps) - 1):
+                            predicted_tokens_grad = torch.autograd.grad(
+                                [energy_f32.sum()], [predicted_tokens], create_graph=learning
+                            )[0]
+                        else:
+                            predicted_tokens_grad = torch.autograd.grad(
+                                [energy_f32.sum()], [predicted_tokens], create_graph=False
+                            )[0]
                     else:
                         predicted_tokens_grad = torch.autograd.grad(
-                            [energy_preds_flat.sum()], [predicted_tokens], create_graph=False
+                            [energy_f32.sum()], [predicted_tokens], create_graph=learning
                         )[0]
-                else:
-                    predicted_tokens_grad = torch.autograd.grad(
-                        [energy_preds_flat.sum()], [predicted_tokens], create_graph=learning
-                    )[0]
 
                 if self.hparams.clamp_futures_grad:
-                    min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha)
+                    min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha.float())
                     predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min=-min_and_max, max=min_and_max)
 
                 if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
@@ -890,7 +901,7 @@ class EBT_NLP(LightningModule):
                     post_all = torch.cat((real_embeddings_input, post_pred_embeddings), dim=1)
                     post_kwargs = dict(trunk_kwargs)
                     post_kwargs["return_pred_hidden"] = True
-                    post_out = self.transformer(post_all, **post_kwargs)
+                    post_out = transformer_body(post_all, **post_kwargs)
                     if isinstance(post_out, tuple) and len(post_out) == 2:
                         _, pred_hidden = post_out
                     else:
@@ -1308,12 +1319,27 @@ class EBT_NLP(LightningModule):
             offset_value = int(target_offsets[offset_idx].item())
             offset_logits = final_step_logits[:, offset_idx, :, :].reshape(-1, self.vocab_size)
             offset_targets = final_step_targets[:, offset_idx, :].reshape(-1)
+            offset_loss_per_token = F.cross_entropy(
+                offset_logits,
+                offset_targets,
+                ignore_index=-1,
+                reduction="none",
+            )
             offset_loss = F.cross_entropy(
                 offset_logits,
                 offset_targets,
                 ignore_index=-1,
             )
             offset_loss_log_dict[f"offset_{offset_value}_loss"] = offset_loss
+            if token_bytes is not None:
+                offset_bpb, offset_bpb_nats, offset_bpb_bytes = calculate_bpb_score(
+                    offset_targets,
+                    offset_loss_per_token,
+                    token_bytes,
+                )
+                offset_loss_log_dict[f"offset_{offset_value}_bpb"] = offset_bpb
+                offset_loss_log_dict[f"offset_{offset_value}_bpb_nats"] = offset_bpb_nats
+                offset_loss_log_dict[f"offset_{offset_value}_bpb_bytes"] = offset_bpb_bytes
 
         if getattr(self.hparams, "debug_blockwise_shapes", False):
             print(
@@ -1478,12 +1504,27 @@ class EBT_NLP(LightningModule):
                 offset_value = int(target_offsets[offset_idx].item())
                 offset_logits = final_step_logits[:, offset_idx, :, :].reshape(-1, self.vocab_size)
                 offset_targets = final_step_targets[:, offset_idx, :].reshape(-1)
+                offset_loss_per_token = F.cross_entropy(
+                    offset_logits,
+                    offset_targets,
+                    ignore_index=-1,
+                    reduction="none",
+                )
                 offset_loss = F.cross_entropy(
                     offset_logits,
                     offset_targets,
                     ignore_index=-1,
                 )
                 offset_loss_log_dict[f"offset_{offset_value}_loss"] = offset_loss
+                if token_bytes is not None:
+                    offset_bpb, offset_bpb_nats, offset_bpb_bytes = calculate_bpb_score(
+                        offset_targets,
+                        offset_loss_per_token,
+                        token_bytes,
+                    )
+                    offset_loss_log_dict[f"offset_{offset_value}_bpb"] = offset_bpb
+                    offset_loss_log_dict[f"offset_{offset_value}_bpb_nats"] = offset_bpb_nats
+                    offset_loss_log_dict[f"offset_{offset_value}_bpb_bytes"] = offset_bpb_bytes
 
             if getattr(self.hparams, "debug_blockwise_shapes", False):
                 print(
@@ -1928,5 +1969,3 @@ class EBT_NLP(LightningModule):
         energies_list.append(final_pred_state_energies)
         return pred_state, energies_list, pred_states_list
         return pred_state, energies_list, pred_states_list
-
-

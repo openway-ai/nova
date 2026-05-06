@@ -73,6 +73,8 @@ def main(args):
     # --disable_wandb is an alias for --no_wandb
     if args.disable_wandb:
         args.no_wandb = True
+    if args.only_test and args.only_validate:
+        raise ValueError("--only_test and --only_validate are mutually exclusive")
 
     if(args.is_random_seed):
         seed_everything(random.randint(0,1000000), workers=True)
@@ -193,20 +195,38 @@ def main(args):
             args.block_mode = "mtp_mcmc"
         else:
             args.block_mode = "dense_token"
-    if args.block_mode == "mtp_mcmc" and args.training_objective != "blockwise":
-        raise ValueError(
-            "--block_mode mtp_mcmc requires --training_objective blockwise for training."
-        )
-    if args.block_mode == "dense_token" and args.training_objective != "dense_next_token":
-        raise ValueError(
-            "--block_mode dense_token requires --training_objective dense_next_token for training."
-        )
-    if args.block_mode in ("future_latent_non_causal", "blockwise"):
-        if args.training_objective != "blockwise":
+    if args.only_test or args.only_validate:
+        if args.block_mode in ("mtp_mcmc", "future_latent_non_causal", "blockwise"):
+            if args.training_objective != "blockwise":
+                print(
+                    f"[block_mode] eval_only=True: overriding training_objective "
+                    f"from {args.training_objective!r} to 'blockwise' for "
+                    f"block_mode={args.block_mode!r} evaluation compatibility."
+                )
+                args.training_objective = "blockwise"
+        elif args.block_mode == "dense_token":
+            if args.training_objective != "dense_next_token":
+                print(
+                    f"[block_mode] eval_only=True: overriding training_objective "
+                    f"from {args.training_objective!r} to 'dense_next_token' for "
+                    f"block_mode='dense_token' evaluation compatibility."
+                )
+                args.training_objective = "dense_next_token"
+    else:
+        if args.block_mode == "mtp_mcmc" and args.training_objective != "blockwise":
             raise ValueError(
-                f"--block_mode {args.block_mode!r} requires --training_objective blockwise "
-                f"so that block_targets [B, K, S] are produced by the dataloader."
+                "--block_mode mtp_mcmc requires --training_objective blockwise for training."
             )
+        if args.block_mode == "dense_token" and args.training_objective != "dense_next_token":
+            raise ValueError(
+                "--block_mode dense_token requires --training_objective dense_next_token for training."
+            )
+        if args.block_mode in ("future_latent_non_causal", "blockwise"):
+            if args.training_objective != "blockwise":
+                raise ValueError(
+                    f"--block_mode {args.block_mode!r} requires --training_objective blockwise "
+                    f"so that block_targets [B, K, S] are produced by the dataloader."
+                )
     print(f"[block_mode] Using block_mode={args.block_mode!r} (training_objective={args.training_objective})")
 
     # assert not(args.random_num_mcmc_steps == True and args.reconstruct_loss_only_final_step == True), "cannot have both random_num_mcmc_steps and reconstruct_loss_only_final_step set"
@@ -309,7 +329,7 @@ def main(args):
         if not param.requires_grad:
             print(f"Non-trainable parameters: {name} with shape {param.shape}")
     
-    if not args.only_test: #training and testing (if testing selected) as per usual
+    if not args.only_test and not args.only_validate: #training and testing (if testing selected) as per usual
         print("$$$$$$$$$$  STARTED TRAINING  $$$$$$$$$$")
         trainer = set_trainer(args, wandb_logger, checkpoint_callback, periodic_checkpoint=periodic_checkpoint)
         resume_training_ckpt = None if args.resume_training_ckpt == "" else args.resume_training_ckpt
@@ -333,6 +353,36 @@ def main(args):
             #warning reference - https://github.com/Lightning-AI/lightning/issues/12862
             best_model.eval()
             trainer.test(best_model)
+        clear_cache()
+    elif args.only_validate: # only validation
+        print("$$$$$$$$$$  ONLY VALIDATING MODEL ([NO]) TRAINING  $$$$$$$$$$")
+        assert args.only_validate_model_ckpt is not None, "Must supply pretrained model when only validating"
+
+        checkpoint = torch.load(args.only_validate_model_ckpt, weights_only=False)
+        pretrained_hparams = checkpoint['hyper_parameters']
+
+        default_args = vars(args).copy()
+        for key, value in default_args.items():
+            if key not in pretrained_hparams:
+                pretrained_hparams[key] = value
+                print(f"MISSING PARAMETER IN PRETRAINED CHECKPOINT: Using args set value for missing parameter in pretrained checkpoint '{key}': {value}")
+
+        model = ModelTrainer(pretrained_hparams)
+        model.load_state_dict(checkpoint['state_dict'])
+        model.eval()
+        model_trainer = ModelTrainer(args, trained_model=model.model)
+
+        trainer = set_trainer(args, wandb_logger, checkpoint_callback, stage="validate")
+        model_trainer.model.eval()
+        validate_results = trainer.validate(model_trainer)
+        if validate_results:
+            summary = dict(validate_results[0])
+            last_valid = getattr(model_trainer, "_last_valid_metrics", {})
+            for key, value in last_valid.items():
+                summary_key = f"valid_{key}"
+                if summary_key not in summary:
+                    summary[summary_key] = value
+            print(f"[VALIDATE_SUMMARY] {summary}")
         clear_cache()
     else: #only testing
         print("$$$$$$$$$$  ONLY TESTING MODEL ([NO]) TRAINING  $$$$$$$$$$")
@@ -849,6 +899,10 @@ if __name__ == '__main__':
     #TESTING / INFERENCE#########################################################
 
     parser.add_argument("--run_testing_after_training", help="evaluate on test dataset. by default is off since repo is mostly pre-training, and may not work :/", action="store_true", default=False)
+
+    parser.add_argument("--only_validate", help="just run validation no training, uses passed in model checkpoint", action="store_true", default=False)
+
+    parser.add_argument("--only_validate_model_ckpt", help="model ckpt when only validating", type=str, default=None)
 
     parser.add_argument("--only_test", help="just testing no training, used passed in model checkpoint", action="store_true", default=False)
 

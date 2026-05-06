@@ -2,6 +2,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -32,6 +33,87 @@ def _resolve_block_mode(explicit: Optional[str], fallback: str) -> str:
             f"Unknown block_mode={mode!r}; must be one of {BLOCK_MODE_CHOICES}"
         )
     return mode
+
+
+def _mask_to_sdpa_attn_mask(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Convert the repo's additive 0 / -inf masks into SDPA-friendly masks.
+
+    Bool masks are preferred here because they are more broadly supported by
+    optimized CUDA SDPA backends than dense additive float masks.
+    """
+    if mask is None:
+        return None
+    if mask.dtype == torch.bool:
+        return mask
+    if torch.is_floating_point(mask):
+        return torch.isfinite(mask)
+    raise TypeError(f"Unsupported attention mask dtype for SDPA: {mask.dtype}")
+
+
+def _run_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    attn_mask: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+    prefer_memory_efficient: bool = False,
+    allow_optimized_kernels: bool = True,
+) -> torch.Tensor:
+    """Run SDPA while preferring non-math CUDA backends when available."""
+    if not query.is_cuda:
+        return F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            is_causal=is_causal,
+        )
+
+    backend_attempts = []
+    if allow_optimized_kernels and prefer_memory_efficient:
+        backend_attempts.extend(
+            [
+                dict(
+                    enable_flash=True,
+                    enable_math=False,
+                    enable_mem_efficient=True,
+                    enable_cudnn=False,
+                ),
+                dict(
+                    enable_flash=False,
+                    enable_math=False,
+                    enable_mem_efficient=True,
+                    enable_cudnn=False,
+                ),
+            ]
+        )
+    backend_attempts.append(
+        dict(
+            enable_flash=False,
+            enable_math=True,
+            enable_mem_efficient=False,
+            enable_cudnn=False,
+        )
+    )
+
+    last_error = None
+    for backend_kwargs in backend_attempts:
+        try:
+            with torch.backends.cuda.sdp_kernel(**backend_kwargs):
+                return F.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    is_causal=is_causal,
+                )
+        except RuntimeError as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("No valid SDPA backend was available.")
 
 
 class BackwardRMSNormFunction(torch.autograd.Function):
@@ -659,10 +741,24 @@ class Attention(nn.Module):
         keys = xk.transpose(1, 2)
         values = xv.transpose(1, 2)
 
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        scores = scores + mask
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)
+        # EBT training uses autograd.grad(create_graph=True) in the MCMC loop,
+        # so this attention path must support double backward. The optimized
+        # CUDA SDPA kernels selected by flash / mem-efficient backends do not
+        # in this environment, so keep them for inference / no-grad only.
+        allow_optimized_kernels = not (
+            self.training
+            and torch.is_grad_enabled()
+            and (xq.requires_grad or keys.requires_grad or values.requires_grad)
+        )
+
+        output = _run_sdpa(
+            xq,
+            keys,
+            values,
+            attn_mask=_mask_to_sdpa_attn_mask(mask),
+            prefer_memory_efficient=True,
+            allow_optimized_kernels=allow_optimized_kernels,
+        )
         output = output.transpose(1, 2).contiguous().view(bsz, T, -1)
         return self.wo(output)
 
@@ -862,6 +958,57 @@ class EBTTimeConcat(nn.Module):
         self.final_layer = nn.Linear(params.dim, 1, bias = False)
         init_whole_model_weights(self.final_layer, self.params.weight_initialization)
 
+    def _run_layers(
+        self,
+        embeddings: torch.Tensor,
+        start_pos: int,
+        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
+        mask: Optional[torch.Tensor],
+        *,
+        context_len: int,
+        pred_len: int,
+        block_mode: str,
+    ) -> torch.Tensor:
+        """Apply transformer layers, optionally checkpointing each block."""
+        for layer in self.layers:
+            if (
+                self.gradient_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+                and embeddings.requires_grad
+            ):
+                def custom_forward(
+                    hidden_states: torch.Tensor,
+                    layer: TransformerBlock = layer,
+                ) -> torch.Tensor:
+                    return layer(
+                        hidden_states,
+                        start_pos,
+                        freqs_cis,
+                        mask,
+                        context_len=context_len,
+                        pred_len=pred_len,
+                        block_mode=block_mode,
+                    )
+
+                embeddings = checkpoint(
+                    custom_forward,
+                    embeddings,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                embeddings = layer(
+                    embeddings,
+                    start_pos,
+                    freqs_cis,
+                    mask,
+                    context_len=context_len,
+                    pred_len=pred_len,
+                    block_mode=block_mode,
+                )
+        return embeddings
+
     def forward(
         self,
         embeddings: torch.Tensor,
@@ -959,16 +1106,15 @@ class EBTTimeConcat(nn.Module):
             mask = torch.triu(mask, diagonal=1)
             mask = mask.type_as(embeddings)
 
-        for layer in self.layers:
-            embeddings = layer(
-                embeddings,
-                start_pos,
-                freqs_cis,
-                mask,
-                context_len=context_len,
-                pred_len=pred_len,
-                block_mode=block_mode,
-            )
+        embeddings = self._run_layers(
+            embeddings,
+            start_pos,
+            freqs_cis,
+            mask,
+            context_len=context_len,
+            pred_len=pred_len,
+            block_mode=block_mode,
+        )
         embeddings = self.norm(embeddings)
         if self.use_mcmc_time_embed:
             embeddings = embeddings[:, 1:]  # remove time embedding
@@ -1138,16 +1284,15 @@ class EBTTimeConcat(nn.Module):
             dtype=embeddings.dtype,
         )
 
-        for layer in self.layers:
-            embeddings = layer(
-                embeddings,
-                start_pos,
-                freqs_cis,
-                mask,
-                context_len=S,
-                pred_len=S * K,
-                block_mode=block_mode,
-            )
+        embeddings = self._run_layers(
+            embeddings,
+            start_pos,
+            freqs_cis,
+            mask,
+            context_len=S,
+            pred_len=S * K,
+            block_mode=block_mode,
+        )
         embeddings = self.norm(embeddings)
         embeddings = embeddings[:, T_time:]  # drop the time token
         context_hidden = embeddings[:, :S]
@@ -1244,16 +1389,15 @@ class EBTTimeConcat(nn.Module):
             dtype=embeddings.dtype,
         )
 
-        for layer in self.layers:
-            embeddings = layer(
-                embeddings,
-                start_pos,
-                freqs_cis,
-                mask,
-                context_len=C,
-                pred_len=K,
-                block_mode=block_mode,
-            )
+        embeddings = self._run_layers(
+            embeddings,
+            start_pos,
+            freqs_cis,
+            mask,
+            context_len=C,
+            pred_len=K,
+            block_mode=block_mode,
+        )
         embeddings = self.norm(embeddings)
         embeddings = embeddings[:, T_time:]  # drop the time token
         context_hidden = embeddings[:, :C]

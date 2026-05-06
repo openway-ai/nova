@@ -11,13 +11,28 @@ class Tee(object):
         if not os.path.exists(logfile):
             open(logfile, 'w').close()
         self.log = open(logfile, 'a')
+        self.encoding = getattr(terminal, "encoding", getattr(self.log, "encoding", "utf-8"))
+        self.errors = getattr(terminal, "errors", getattr(self.log, "errors", "strict"))
 
     def write(self, message):
         self.terminal.write(message)
         self.log.write(message)
 
     def flush(self):
+        if hasattr(self.terminal, "flush"):
+            self.terminal.flush()
         self.log.flush()
+
+    def isatty(self):
+        return bool(getattr(self.terminal, "isatty", lambda: False)())
+
+    def fileno(self):
+        if hasattr(self.terminal, "fileno"):
+            return self.terminal.fileno()
+        raise OSError("underlying terminal does not expose fileno()")
+
+    def __getattr__(self, name):
+        return getattr(self.terminal, name)
 
 
 class CustomStreamHandler(logging.StreamHandler):

@@ -91,7 +91,10 @@ from metrics import get_torchmetrics
 import sys
 from transformers import AutoTokenizer
 
-import ipdb
+try:
+    import ipdb  # type: ignore
+except ImportError:
+    ipdb = None
 import os, sys
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _PROJECT_ROOT not in sys.path:
@@ -574,8 +577,8 @@ class ModelTrainer(LightningModule):
 
     def on_validation_epoch_start(self):
         """Reset BPB accumulators at the start of each validation epoch."""
-        self._val_bpb_nats = 0.0
-        self._val_bpb_bytes = 0
+        self._val_bpb_nats_by_metric = {}
+        self._val_bpb_bytes_by_metric = {}
 
     def validation_step(self, batch, batch_idx):
         # Move token_bytes to the same device as the model if needed
@@ -587,21 +590,24 @@ class ModelTrainer(LightningModule):
 
         # 累积 BPB 的 nats/bytes，用于 epoch-level 正确计算
         # (BPB = sum(nats) / (log2 * sum(bytes)), 不能对 per-batch BPB 做算术平均)
-        bpb_nats = eval_step_dict.get('bpb_nats', 0)
-        bpb_bytes = eval_step_dict.get('bpb_bytes', 0)
-        if isinstance(bpb_nats, torch.Tensor):
-            bpb_nats = bpb_nats.item()
-        if isinstance(bpb_bytes, torch.Tensor):
-            bpb_bytes = bpb_bytes.item()
-        self._val_bpb_nats += bpb_nats
-        self._val_bpb_bytes += bpb_bytes
+        for key, value in eval_step_dict.items():
+            if key.endswith("bpb_nats"):
+                metric_name = key[:-5]  # strip "_nats"
+                if isinstance(value, torch.Tensor):
+                    value = value.item()
+                self._val_bpb_nats_by_metric[metric_name] = self._val_bpb_nats_by_metric.get(metric_name, 0.0) + value
+            elif key.endswith("bpb_bytes"):
+                metric_name = key[:-6]  # strip "_bytes"
+                if isinstance(value, torch.Tensor):
+                    value = value.item()
+                self._val_bpb_bytes_by_metric[metric_name] = self._val_bpb_bytes_by_metric.get(metric_name, 0) + value
 
         # 缓存最新 valid 指标，供 train 进度条显示
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
         for k, v in eval_step_dict.items():
             # 跳过 BPB 累积中间量，它们不应作为独立指标显示
-            if k in ('bpb_nats', 'bpb_bytes'):
+            if k.endswith('bpb_nats') or k.endswith('bpb_bytes'):
                 continue
             if isinstance(v, torch.Tensor) and v.dim() == 0:
                 self._last_valid_metrics[k] = v.detach().item()
@@ -611,19 +617,24 @@ class ModelTrainer(LightningModule):
     def on_validation_epoch_end(self):
         """Compute epoch-level BPB from accumulated nats/bytes and override the cached value."""
         import math
-        if self._val_bpb_bytes > 0:
-            epoch_bpb = self._val_bpb_nats / (math.log(2) * self._val_bpb_bytes)
-        else:
-            epoch_bpb = float('inf')
-        # 用 epoch-level BPB 覆盖 _last_valid_metrics 中的 per-batch 值
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
-        self._last_valid_metrics['bpb'] = epoch_bpb
+        logged_bpb_metrics = {}
+        metric_names = set(self._val_bpb_nats_by_metric.keys()) | set(self._val_bpb_bytes_by_metric.keys())
+        for metric_name in metric_names:
+            total_nats = self._val_bpb_nats_by_metric.get(metric_name, 0.0)
+            total_bytes = self._val_bpb_bytes_by_metric.get(metric_name, 0)
+            if total_bytes > 0:
+                epoch_bpb = total_nats / (math.log(2) * total_bytes)
+            else:
+                epoch_bpb = float('inf')
+            self._last_valid_metrics[metric_name] = epoch_bpb
+            logged_bpb_metrics[f"valid_{metric_name}"] = epoch_bpb
 
         # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
-        if self.logger is not None:
+        if self.logger is not None and logged_bpb_metrics:
             try:
-                self.logger.experiment.log({'valid_bpb': epoch_bpb}, step=self.global_step)
+                self.logger.experiment.log(logged_bpb_metrics, step=self.global_step)
             except Exception:
                 pass
 
@@ -1186,12 +1197,14 @@ class ModelTrainer(LightningModule):
         - alpha: AdamW, 高 LR (mcmc_step_size_lr_multiplier × peak_lr), 无 weight decay [EBT 特有]
         - embeddings: AdamW, 独立绝对 LR (对齐 NanoChat embedding_lr), 无 weight decay
         - vocab_to_embed: AdamW, 独立绝对 LR (EBT 特有, 保守), 无 weight decay
+        - blockwise 输出头: AdamW, 与 embedding/output head 同类, 无 weight decay
         - transformer 标量 (ndim < 2): AdamW, 独立绝对 LR, 无 weight decay
         - transformer 矩阵 (ndim >= 2): Muon, 按 shape 分组 (Muon 要求同组参数 shape 相同)
 
         LR 设计原理:
         - embedding 不在 MCMC 循环内, 梯度行为与 NanoChat 一致, 可用高 LR
         - vocab_to_embed 在 MCMC 循环内 (autograd.grad create_graph=True), 二阶梯度, 需保守
+        - blockwise 输出头是最终 token 分类头, 不应走 Muon
         - transformer scalar (RMSNorm) 在 MCMC 循环内, 需适度保守
         - 当 adamw_*_lr > 0 时使用绝对 LR, 否则 fallback 到 peak_lr × mult
 
@@ -1244,6 +1257,11 @@ class ModelTrainer(LightningModule):
         # --- 参数收集 ---
         alpha_params = [self.model.alpha]
         embedding_params = list(self.model.embeddings.parameters())
+        output_head_params = []
+        if hasattr(self.model, 'block_latent_token_head') and self.model.block_latent_token_head is not None:
+            output_head_params.extend(list(self.model.block_latent_token_head.parameters()))
+        if hasattr(self.model, 'blockwise_joint_head') and self.model.blockwise_joint_head is not None:
+            output_head_params.extend(list(self.model.blockwise_joint_head.parameters()))
 
         vocab_to_embed_params = []
         if hasattr(self.model, 'vocab_to_embed') and self.model.vocab_to_embed is not None:
@@ -1271,6 +1289,11 @@ class ModelTrainer(LightningModule):
                 kind='adamw', params=embedding_params,
                 lr=embedding_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
+        if output_head_params:
+            param_groups.append(dict(
+                kind='adamw', params=output_head_params,
+                lr=embedding_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
         if vocab_to_embed_params:
             param_groups.append(dict(
                 kind='adamw', params=vocab_to_embed_params,
@@ -1295,6 +1318,18 @@ class ModelTrainer(LightningModule):
                 ns_steps=muon_ns_steps, beta2=muon_beta2,
                 weight_decay=self.hparams.weight_decay,
             ))
+
+        covered_param_ids = {id(p) for group in param_groups for p in group['params']}
+        missing_trainable = [
+            name
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and id(param) not in covered_param_ids
+        ]
+        if missing_trainable:
+            raise RuntimeError(
+                "Muon+AdamW optimizer is missing trainable parameters: "
+                + ", ".join(sorted(missing_trainable))
+            )
 
         # --- 创建优化器 ---
         # PL 调用 optimizer.step(closure=closure), 但 MuonAdamW.step() 不接受 closure 参数
@@ -1820,9 +1855,9 @@ class ModelTrainer(LightningModule):
             # - bpb (非 train 阶段): BPB 是比率指标 (nats/bytes)，
             #   Lightning 的 on_epoch=True 会对 per-batch bpb 做算术平均，这是数学错误的
             #   正确做法是在 on_validation_epoch_end 中从累积 nats/bytes 重新计算
-            if key in ('bpb_nats', 'bpb_bytes'):
+            if key.endswith('bpb_nats') or key.endswith('bpb_bytes'):
                 continue
-            if key == 'bpb' and phase != 'train':
+            if key.endswith('bpb') and phase != 'train':
                 continue
 
             value = metrics_dict[key]
