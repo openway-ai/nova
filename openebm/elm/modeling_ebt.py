@@ -32,7 +32,14 @@ class EBT_NLP(LightningModule):
         self.vocab_size = self.tokenizer.get_vocab_size() # len(self.tokenizer) # self.vocab_size = self.tokenizer.vocab_size caused errors since is smaller than len(self.tokenizer), is 50254 for neox-20b, len tokenizer is 50277 so decided to use that
         self.hparams.vocab_size = self.vocab_size
         
-        self.alpha = nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size), dtype=torch.float32), requires_grad=self.hparams.mcmc_step_size_learnable)
+        if self.hparams.mcmc_step_size_learnable and getattr(self.hparams, 'mcmc_step_size_per_step', False):
+            self.alpha = nn.ParameterList([
+                nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size), dtype=torch.float32))
+                for _ in range(self.hparams.mcmc_num_steps)
+            ])
+        else:
+            self.alpha = nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size), dtype=torch.float32),
+                                      requires_grad=self.hparams.mcmc_step_size_learnable)
         self.langevin_dynamics_noise_std = nn.Parameter(torch.tensor(float(self.hparams.langevin_dynamics_noise)), requires_grad=False) # if using self.hparams.langevin_dynamics_noise_learnable this will be turned on in warm_up_finished func
 
         self.embeddings = nn.Embedding(self.vocab_size, self.hparams.embedding_dim)
@@ -142,10 +149,8 @@ class EBT_NLP(LightningModule):
         # predicted_tokens_grad has shape B, S, V
         
         if self.hparams.clamp_futures_grad:
-            if getattr(self.hparams, 'float_precision', '') == "bf16-true":
-                min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha.float())
-            else:
-                min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha)
+            _alpha_for_clamp = self.alpha[mcmc_step] if isinstance(self.alpha, nn.ParameterList) else self.alpha
+            min_and_max = self.hparams.clamp_futures_grad_max_change / torch.clamp(_alpha_for_clamp.float(), min=0.0001)
             # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
             predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
             
@@ -175,16 +180,18 @@ class EBT_NLP(LightningModule):
         batch_size = x.shape[0]
         seq_length = x.shape[1]
         
-        alpha = torch.clamp(self.alpha, min=0.0001)
-        if getattr(self.hparams, 'float_precision', '') == "bf16-true":
-            alpha = alpha.float()
-        if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
-            expanded_alpha = alpha.expand(batch_size, seq_length, 1)
+        model_dtype = self.embeddings.weight.dtype
+        if not isinstance(self.alpha, nn.ParameterList):
+            alpha = torch.clamp(self.alpha, min=0.0001).float()
+            if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
+                expanded_alpha = alpha.expand(batch_size, seq_length, 1)
 
-            scale = self.hparams.randomize_mcmc_step_size_scale
-            low = alpha / scale
-            high = alpha * scale
-            alpha = low + torch.rand_like(expanded_alpha) * (high - low)
+                scale = self.hparams.randomize_mcmc_step_size_scale
+                low = alpha / scale
+                high = alpha * scale
+                alpha = low + torch.rand_like(expanded_alpha) * (high - low)
+        else:
+            alpha = None  # will be resolved per step below
 
         langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
 
@@ -217,10 +224,14 @@ class EBT_NLP(LightningModule):
 
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
-                
+                if isinstance(self.alpha, nn.ParameterList):
+                    step_alpha = torch.clamp(self.alpha[mcmc_step], min=0.0001)
+                else:
+                    step_alpha = alpha
+
                 predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
-                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
+                    langevin_dynamics_noise_std, step_alpha, start_pos, learning, return_raw_logits,
                     real_token_ids=x
                 )
                 predicted_energies.append(energy_preds)
