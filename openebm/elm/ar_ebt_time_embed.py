@@ -728,8 +728,9 @@ class EBTTimeConcat(nn.Module):
             self.value_embeds = build_value_embeds(params.n_layers, params.vocab_size, self.kv_dim)
             ve_init_bound = math.sqrt(3.0) * (params.dim ** -0.5)
             for ve in self.value_embeds.values():
-                nn.init.uniform_(ve.weight, -ve_init_bound, ve_init_bound)
-                ve.to(dtype=torch.bfloat16)
+                nn.init.uniform_(ve["embed"].weight, -ve_init_bound, ve_init_bound)
+                proj_init_bound = math.sqrt(3.0) * (ve["embed"].embedding_dim ** -0.5)
+                nn.init.uniform_(ve["proj"].weight, -proj_init_bound, proj_init_bound)
         else:
             self.value_embeds = None
             self.kv_dim = None
