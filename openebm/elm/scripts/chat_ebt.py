@@ -155,6 +155,10 @@ class EBTChatEngine:
 
         self.hparams.tokenizer_obj = self.tokenizer
 
+        # 兼容旧 checkpoint：补齐新版 setup_ebt() 要求的属性
+        if not hasattr(self.hparams, 'use_ve'):
+            self.hparams.use_ve = False
+
         # 创建模型
         from openebm.elm.modeling_ebt import EBT_NLP
         self.model = EBT_NLP(self.hparams)
@@ -323,15 +327,31 @@ class EBTChatEngine:
         eos_reached = torch.tensor([False] * bsz, device=self.device)
         start_time = time.time()
 
-        # 【修复】stop_token_ids 只包含 <|assistant_end|>，不包含 bos_id/pad_id
-        # 原因：bos_id == pad_id，若加入 stop_token_ids，SFT 模型生成 bos 时会立即停止输出为空
+        # 【修复 v2】扩充 stop_token_ids 以应对过拟合 ckpt 在 OOD 输入上不输出 <|assistant_end|> 的情况
+        # 安全性：L322-324 已使用位置掩码 input_text_mask，prompt 区域的 bos/special tokens
+        # 不会被误判为"生成了停止信号"（仅对 cur_pos 及之后的位置生效）。
         stop_token_ids = set()
         inner_tok = getattr(self.tokenizer, 'tokenizer', None)
         if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
             asst_end_id = inner_tok.encode_special("<|assistant_end|>")
             if asst_end_id is not None:
                 stop_token_ids.add(asst_end_id)
-        # fallback：若无 <|assistant_end|>，用 pad_id 兜底
+            # 扩充：新一轮对话起始 token 也视为停止信号
+            try:
+                user_start_id = inner_tok.encode_special("<|user_start|>")
+                if user_start_id is not None:
+                    stop_token_ids.add(user_start_id)
+            except Exception:
+                pass
+        # 扩充：bos_id 作为停止信号（模型把生成结束表达为 bos 的情况）
+        if hasattr(inner_tok, 'get_bos_token_id'):
+            try:
+                bos_id_extra = inner_tok.get_bos_token_id()
+                if bos_id_extra is not None:
+                    stop_token_ids.add(bos_id_extra)
+            except Exception:
+                pass
+        # fallback：若没有任何 special token，用 pad_id 兜底
         if not stop_token_ids:
             stop_token_ids.add(pad_id)
 

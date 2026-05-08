@@ -1,33 +1,27 @@
 #!/bin/bash
 
 ################################################################################
-# EBT Sudoku SFT 训练脚本
-# 在已完成 base-train/sft-train 的 EBT 模型上进行 Sudoku SFT
-# 复现 EBT 论文 §4.3 数据受限实验
+# EBT Sudoku SFT V2 训练脚本
+# 改进：RRN 作训练集 + 对称增强 + 60% Sudoku / 40% 通用 SFT 混合
+# 修复 v1 过拟合问题（train_loss→0.01 而 valid_loss→1.5）
 ################################################################################
 
 set -e
 
 ### 基础配置 ###
-# EXP_ID 必须指定，指向 base_train 的实验目录
-export EXP_ID="d26-ctx2048-sudoku-20260430"
+
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
 
 ### 预训练权重 ###
-# base_train c2048 bpb 0.86
-# PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep9562_20260424_211606/s=step=12374-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7007.ckpt"
-
-# 用下面的ckpt运行的结果在/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-20260430
-# PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova-sft/nova/logs/ebt_runs/d26-ctx2048-20260422/sft_train/checkpoints/s=step=2984-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.5680.ckpt"
-
 # after sft_train c2048
 PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-20260426/sft_train.v4/checkpoints/s=step=562-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.2264.ckpt"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+export NANOCHAT_SFT_DATA_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/sft_data"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"
@@ -38,8 +32,13 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
-# Sudoku 数据缓存目录
-export SUDOKU_DATA_DIR="${SUDOKU_DATA_DIR:-/mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/data/sudoku_cache}"
+# Sudoku V2 数据缓存目录
+export SUDOKU_DATA_DIR_V2="${SUDOKU_DATA_DIR_V2:-/mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/data/sudoku_cache_v2}"
+
+# Sudoku 在 sudoku_mixed 数据集中的采样占比 (剩余为 nanochat 通用 SFT)
+export SUDOKU_RATIO="${SUDOKU_RATIO:-0.6}"
+
+export EXP_ID="d26-ctx2048-sudoku-mixed-${SUDOKU_RATIO}-20260508"
 
 ################################################################################
 # EBT 核心超参数 (对齐预训练配置)
@@ -59,15 +58,10 @@ NO_MCMC_DETACH=false
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)}
 NUM_GPUS=${NUM_GPUS:-8}
 
-# Sudoku 对话较短 (~300 tokens)，可以用较短的 context_length
-# CONTEXT_LENGTH=1024
+# V2 保持 2048 上下文（RRN 样本较长 + 多 prompt 模板 + 通用 SFT 样本更长）
 CONTEXT_LENGTH=2048
 DEVICE_BATCH_SIZE=1
 GRAD_ACCUM=32
-
-# DEVICE_BATCH_SIZE=2
-
-# GRAD_ACCUM=16
 
 ################################################################################
 # SFT 学习率配置
@@ -79,24 +73,23 @@ SFT_VOCAB_TO_EMBED_LR=0.001
 SFT_SCALAR_LR=0.004
 
 ################################################################################
-# 优化器配置
+# 优化器配置（v2: 启用 weight decay 抑制过拟合）
 ################################################################################
-WEIGHT_DECAY=0.0
+WEIGHT_DECAY=0.01
 BETA1=0.8
 BETA2=0.95
 GRADIENT_CLIP_VAL=1.0
 
 ################################################################################
-# 训练步数
+# 训练步数（v2: RRN 训练集较大，可训更久；更频繁验证捕获早停点）
 ################################################################################
-# SATNet train ~9000 samples, 较小数据集
-MAX_STEPS=2000
-MAX_SCHEDULING_STEPS=2000
+MAX_STEPS=3000
+MAX_SCHEDULING_STEPS=3000
 
 ################################################################################
 # 验证与数据加载配置
 ################################################################################
-VAL_CHECK_INTERVAL=200
+VAL_CHECK_INTERVAL=100
 LIMIT_VAL_BATCHES=50
 NUM_WORKERS=4
 
@@ -121,27 +114,29 @@ SAVE_TOP_K=2
 ################################################################################
 echo ""
 echo "=================================="
-echo "  检查 Sudoku 数据集"
+echo "  检查 Sudoku V2 数据集"
 echo "=================================="
-echo "数据集路径: ${SUDOKU_DATA_DIR}"
+echo "数据集路径: ${SUDOKU_DATA_DIR_V2}"
 
 MISSING=()
-[ ! -f "${SUDOKU_DATA_DIR}/satnet_train.pt" ] && MISSING+=("satnet_train.pt")
-[ ! -f "${SUDOKU_DATA_DIR}/satnet_val.pt" ] && MISSING+=("satnet_val.pt")
+[ ! -f "${SUDOKU_DATA_DIR_V2}/rrn_train.pt" ] && MISSING+=("rrn_train.pt")
+[ ! -f "${SUDOKU_DATA_DIR_V2}/rrn_val.pt" ] && MISSING+=("rrn_val.pt")
+[ ! -f "${SUDOKU_DATA_DIR_V2}/satnet_test.pt" ] && MISSING+=("satnet_test.pt")
 
 if [ ${#MISSING[@]} -gt 0 ]; then
-    echo "✗ 缺少以下数据文件:"
+    echo "✗ 缺少以下 V2 数据文件:"
     for f in "${MISSING[@]}"; do
         echo "  - $f"
     done
     echo ""
-    echo "请先运行数据准备脚本:"
-    echo "  python openebm/elm/data/prepare_sudoku_data.py --data_dir ${SUDOKU_DATA_DIR}"
+    echo "请先运行 V2 数据准备脚本:"
+    echo "  python openebm/elm/data/prepare_sudoku_data_v2.py --data_dir ${SUDOKU_DATA_DIR_V2}"
     exit 1
 fi
 
-echo "✓ satnet_train.pt"
-echo "✓ satnet_val.pt"
+echo "✓ rrn_train.pt"
+echo "✓ rrn_val.pt"
+echo "✓ satnet_test.pt"
 
 # 检查 checkpoint
 if [ ! -f "${PRETRAIN_CKPT}" ]; then
@@ -159,7 +154,7 @@ source "${SCRIPT_DIR}/utils/exp_layout.sh"
 
 export PRETRAIN_CKPT="${PRETRAIN_CKPT}"
 exp_init_sft "$0"
-export RUN_NAME="${EXP_ID}-sudoku-sft"
+export RUN_NAME="${EXP_ID}-sudoku-mixed-sft"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
 exp_save_hparams "${EXP_DIR}/sft_train" \
@@ -177,7 +172,8 @@ exp_save_hparams "${EXP_DIR}/sft_train" \
     "mcmc_lr_multiplier=${MCMC_STEP_SIZE_LR_MULTIPLIER}" \
     "pretrain_ckpt=${PRETRAIN_CKPT}" \
     "optimizer=muon_adamw" \
-    "dataset=sudoku_sft"
+    "dataset=sudoku_mixed" \
+    "sudoku_ratio=${SUDOKU_RATIO}"
 
 LOG_FILE="${EXP_LOG_FILE}"
 current_time=$(date +"%Y%m%d_%H%M%S")
@@ -186,12 +182,14 @@ current_time=$(date +"%Y%m%d_%H%M%S")
 # 显示配置
 ################################################################################
 echo "=================================="
-echo "  EBT Sudoku SFT 训练"
+echo "  EBT Sudoku SFT V2 训练"
 echo "=================================="
 echo "Pretrain ckpt: ${PRETRAIN_CKPT}"
-echo "Dataset:       sudoku_sft"
+echo "Dataset:       sudoku_mixed (sudoku_ratio=${SUDOKU_RATIO}, rest=nanochat SFT)"
 echo "Peak LR:       ${PEAK_LR}"
+echo "Weight decay:  ${WEIGHT_DECAY}"
 echo "Max steps:     ${MAX_STEPS}"
+echo "Val interval:  ${VAL_CHECK_INTERVAL}"
 echo "Log file:      ${LOG_FILE}"
 echo ""
 read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
@@ -201,7 +199,7 @@ read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
 ################################################################################
 cat << LOG_HEADER > "${LOG_FILE}"
 ################################################################################
-#                    EBT Sudoku SFT 训练日志
+#                    EBT Sudoku SFT V2 训练日志
 ################################################################################
 #
 # Run Name:        ${RUN_NAME}_${current_time}
@@ -225,12 +223,14 @@ echo "CUDA Available:   $(python3 -c 'import torch; print(torch.cuda.is_availabl
 echo "GPU Count:        $(python3 -c 'import torch; print(torch.cuda.device_count())' 2>/dev/null || echo '0')"
 echo ""
 echo "================================================================================"
-echo "[Sudoku SFT 训练配置]"
+echo "[Sudoku SFT V2 训练配置]"
 echo "================================================================================"
 echo "Pretrain Checkpoint: ${PRETRAIN_CKPT}"
-echo "Dataset:             sudoku_sft"
+echo "Dataset:             sudoku_mixed (sudoku_ratio=${SUDOKU_RATIO})"
 echo "Peak LR:             ${PEAK_LR}"
+echo "Weight Decay:        ${WEIGHT_DECAY}"
 echo "Max Steps:           ${MAX_STEPS}"
+echo "Val Check Interval:  ${VAL_CHECK_INTERVAL}"
 echo ""
 echo "================================================================================"
 echo "[开始训练]"
@@ -265,13 +265,14 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --beta2 ${BETA2} \
 --max_steps ${MAX_STEPS} \
 --max_scheduling_steps ${MAX_SCHEDULING_STEPS} \
---dataset_name "sudoku_sft" \
+--dataset_name "sudoku_mixed" \
+--sudoku_ratio ${SUDOKU_RATIO} \
 --num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
 --limit_val_batches ${LIMIT_VAL_BATCHES} \
 --val_sanity 1 \
 --validation_split_pct 0.1 \
---wandb_project 'nlp_sudoku_sft' \
+--wandb_project 'nlp_sudoku_sft_v2' \
 --log_model_archi \
 --set_matmul_precision "medium" \
 --save_top_k_ckpts ${SAVE_TOP_K} \
@@ -285,12 +286,12 @@ ${COMPILE_FLAGS}
 TRAIN_EXIT_CODE=$?
 set -e
 
-exp_save_status "${EXP_DIR}/sft_train" "sudoku_sft_train" "$TRAIN_EXIT_CODE"
+exp_save_status "${EXP_DIR}/sft_train" "sudoku_sft_v2_train" "$TRAIN_EXIT_CODE"
 
 if [ $TRAIN_EXIT_CODE -eq 0 ]; then
-    echo -e "\033[0;32m✓ Sudoku SFT 训练成功完成\033[0m"
+    echo -e "\033[0;32m✓ Sudoku SFT V2 训练成功完成\033[0m"
 else
-    echo -e "\033[0;31m✗ Sudoku SFT 训练异常退出 (exit code: $TRAIN_EXIT_CODE)\033[0m"
+    echo -e "\033[0;31m✗ Sudoku SFT V2 训练异常退出 (exit code: $TRAIN_EXIT_CODE)\033[0m"
 fi
 
 } 2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush() }' | tee -a "${LOG_FILE}"
