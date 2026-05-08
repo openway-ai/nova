@@ -699,6 +699,8 @@ if __name__ == '__main__':
     parser.add_argument("--prefetch_factor", help="prefetch factor for dataloader", type=int, default=None)
     
     parser.add_argument("--dataset_name", help="dataset name", default="ucf101")
+
+    parser.add_argument("--sudoku_ratio", help="Mixing ratio for sudoku_mixed dataset: P(sample from Sudoku v2) per step. The remainder samples from nanochat SFT.", type=float, default=0.6)
     
     parser.add_argument("--dataset_dir", help="dataset base directory", default="")
 

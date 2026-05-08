@@ -545,20 +545,83 @@ class ModelTrainer(LightningModule):
         if self._rng_resume_state:
             print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
         # Move token_bytes to the same device as the model if needed
         token_bytes = self.token_bytes
         if token_bytes is not None and token_bytes.device != self.device:
             token_bytes = token_bytes.to(self.device)
         eval_step_dict = self.eval_step(batch, "valid", token_bytes)
-        self.log_metrics(eval_step_dict, "valid")
+
+        # 方案A: 多 val dataloader 时按来源加后缀, 同时累计到 _val_source_buf 供 epoch 末聚合
+        sources = getattr(self, '_val_loader_sources', None)
+        if sources is not None and 0 <= dataloader_idx < len(sources):
+            src = sources[dataloader_idx]
+            tagged = {f"{k}_{src}": v for k, v in eval_step_dict.items()}
+            self.log_metrics(tagged, "valid")
+            # 收集 scalar 用于 epoch 末加权 mixed 指标
+            if not hasattr(self, '_val_source_buf'):
+                self._val_source_buf = {}
+            buf = self._val_source_buf.setdefault(src, {})
+            for k, v in eval_step_dict.items():
+                if isinstance(v, torch.Tensor) and v.dim() == 0:
+                    val = v.detach().float()
+                elif isinstance(v, (int, float)):
+                    val = torch.tensor(float(v), device=self.device)
+                else:
+                    continue
+                slot = buf.setdefault(k, {'sum': torch.zeros((), device=self.device),
+                                          'count': torch.zeros((), device=self.device)})
+                slot['sum'] = slot['sum'] + val
+                slot['count'] = slot['count'] + 1
+        else:
+            self.log_metrics(eval_step_dict, "valid")
+
         # 缓存最新 valid 指标，供 train 进度条显示
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
+        suffix = f"_{sources[dataloader_idx]}" if (sources is not None and 0 <= dataloader_idx < len(sources)) else ""
         for k, v in eval_step_dict.items():
             if isinstance(v, torch.Tensor) and v.dim() == 0:
-                self._last_valid_metrics[k] = v.detach().item()
+                self._last_valid_metrics[f"{k}{suffix}"] = v.detach().item()
             elif isinstance(v, (int, float)):
+                self._last_valid_metrics[f"{k}{suffix}"] = v
+
+    def on_validation_epoch_start(self):
+        # 方案A: 重置每来源累计 buffer
+        self._val_source_buf = {}
+
+    def on_validation_epoch_end(self):
+        # 方案A: 当存在多 val dataloader (sudoku_mixed) 时, 按 sudoku_ratio 加权得到 mixed 指标,
+        # 仍以 valid_loss / valid_bpb / valid_perplexity 等无后缀 key 暴露给 ModelCheckpoint
+        sources = getattr(self, '_val_loader_sources', None)
+        buf = getattr(self, '_val_source_buf', None)
+        if not sources or not buf:
+            return
+        ratio = float(getattr(self.hparams, 'sudoku_ratio', 0.6))
+        weights = {'sudoku': ratio, 'sft': 1.0 - ratio}
+        # 收集所有指标 key 的并集
+        all_keys = set()
+        for src in sources:
+            all_keys.update(buf.get(src, {}).keys())
+        mixed = {}
+        for k in all_keys:
+            total = 0.0
+            wsum = 0.0
+            for src in sources:
+                slot = buf.get(src, {}).get(k)
+                if slot is None or slot['count'].item() == 0:
+                    continue
+                mean = (slot['sum'] / slot['count']).item()
+                w = weights.get(src, 0.0)
+                total += w * mean
+                wsum += w
+            if wsum > 0:
+                mixed[k] = total / wsum  # 归一化以防某侧缺失
+        if mixed:
+            self.log_metrics(mixed, "valid")
+            if not hasattr(self, '_last_valid_metrics'):
+                self._last_valid_metrics = {}
+            for k, v in mixed.items():
                 self._last_valid_metrics[k] = v
 
     def on_test_epoch_start(self):
@@ -1649,6 +1712,18 @@ class ModelTrainer(LightningModule):
                 device=self.device,
                 resume_state_dict=resume_state,
             )
+        elif getattr(self.hparams, 'dataset_name', 'nanochat') == 'sudoku_mixed':
+            from openebm.elm.data.sudoku_mixed_dataset import generate_sudoku_mixed_dataloader
+            train_dataloader = generate_sudoku_mixed_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches,
+                split="train",
+                device=self.device,
+                resume_state_dict=resume_state,
+                sudoku_ratio=getattr(self.hparams, 'sudoku_ratio', 0.6),
+            )
         else:
             train_dataloader = generate_dataloader(
                 tokenizer=tokenizer,
@@ -1691,6 +1766,31 @@ class ModelTrainer(LightningModule):
                 split="val",
                 device=self.device,
             )
+        elif getattr(self.hparams, 'dataset_name', 'nanochat') == 'sudoku_mixed':
+            # 方案A: 验证阶段拆分为两个独立 dataloader,
+            # 分别评估 Sudoku v2 与 nanochat SFT, 再按 sudoku_ratio 加权得到 mixed 指标
+            from openebm.elm.data.sudoku_dataset_v2 import generate_sudoku_sft_v2_dataloader
+            from openebm.elm.dataset_sft import generate_sft_dataloader
+            sudoku_val_loader = generate_sudoku_sft_v2_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.val_steps,
+                split="val",
+                device=self.device,
+                augment=False,
+            )
+            sft_val_loader = generate_sft_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.val_steps,
+                split="val",
+                device=self.device,
+            )
+            # 顺序对应 self._val_loader_sources, validation_step 用 dataloader_idx 区分
+            self._val_loader_sources = ['sudoku', 'sft']
+            val_dataloader = [sudoku_val_loader, sft_val_loader]
         else:
             val_dataloader = generate_dataloader(
                 tokenizer=tokenizer,
@@ -1952,6 +2052,17 @@ class ModelTrainer(LightningModule):
                     valid_str += f" | valid_bpb: {valid_bpb_val:.4f}"
                 if valid_ppl_val is not None:
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
+                # 方案A: 当存在拆分来源时, 额外展示 sudoku / sft 各自指标
+                for src in ('sudoku', 'sft'):
+                    sub_loss = last_valid.get(f'loss_{src}', None)
+                    sub_bpb = last_valid.get(f'bpb_{src}', None)
+                    sub_ppl = last_valid.get(f'perplexity_{src}', None)
+                    if sub_loss is not None:
+                        valid_str += f" | {src}_loss: {sub_loss:.4f}"
+                    if sub_bpb is not None:
+                        valid_str += f" | {src}_bpb: {sub_bpb:.4f}"
+                    if sub_ppl is not None:
+                        valid_str += f" | {src}_ppl: {sub_ppl:.2f}"
 
                 # --- 打印 ---
                 print(
