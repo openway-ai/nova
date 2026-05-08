@@ -80,7 +80,8 @@ class EBT_NLP(LightningModule):
 
     @torch.compiler.disable
     def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps,
-                      langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits):
+                      langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
+                      real_token_ids=None):
         batch_size = predicted_tokens.shape[0]
         seq_length = predicted_tokens.shape[1]
         
@@ -112,7 +113,13 @@ class EBT_NLP(LightningModule):
         # create_graph=True 的 autograd.grad 与 compiled graph 不兼容
         # 所以若 transformer 已被 torch.compile 编译，MCMC 中需要用 eager 版本
         transformer = getattr(self, 'transformer_eager', self.transformer)
-        energy_preds = transformer(all_embeddings, start_pos = start_pos, mcmc_step=mcmc_step) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+        energy_preds = transformer(
+            all_embeddings,
+            start_pos=start_pos,
+            mcmc_step=mcmc_step,
+            real_token_ids=real_token_ids,
+            predicted_tokens=predicted_tokens,
+        ) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
         energy_preds = energy_preds.reshape(-1, 1)
         
         with torch.amp.autocast(device_type='cuda', enabled=False):
@@ -203,7 +210,8 @@ class EBT_NLP(LightningModule):
                 
                 predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
-                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits
+                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
+                    real_token_ids=x
                 )
                 predicted_energies.append(energy_preds)
                 predicted_distributions.append(predicted_tokens_for_loss)
@@ -357,7 +365,14 @@ class EBT_NLP(LightningModule):
 
         all_true_embeddings = torch.cat((real_embeddings_input, true_embeddings), dim=1)
         
-        real_energies = self.transformer(all_true_embeddings, start_pos=0, mcmc_step=self.hparams.mcmc_num_steps - 1) # NOTE if want to use this maybe check in better detail what ired does
+        true_pred_tokens = true_token_logits if self.hparams.discrete_contrastive_loss_true_logit_val != 0 else true_token_one_hot
+        real_energies = self.transformer(
+            all_true_embeddings,
+            start_pos=0,
+            mcmc_step=self.hparams.mcmc_num_steps - 1,
+            real_token_ids=input_ids,
+            predicted_tokens=true_pred_tokens,
+        ) # NOTE if want to use this maybe check in better detail what ired does
         real_energies = real_energies.reshape(-1, 1) # BS, 1
         fake_energies = predicted_energies[-1] # B*S, 1
         energy_stack = torch.cat([real_energies, fake_energies], dim=1)
@@ -414,10 +429,12 @@ class EBT_NLP(LightningModule):
 
             chunk_pred = repeated_pred[start:end]           # shape: (chunk_size, S, V)
             chunk_real_embeds = repeated_real_embeds[start:end]  # shape: (chunk_size, S, D)
-
+            chunk_real_ids = original_real_input_ids.repeat_interleave(G, dim=0)[start:end] if G > 1 else original_real_input_ids[start:end]
+            
             final_pred_chunk, energies_list_chunk, predicted_distributions_chunk = self._run_ebt_inference_steps(
                 chunk_pred, chunk_real_embeds,
-                alpha, noise, start_pos, learning
+                alpha, noise, start_pos, learning,
+                real_token_ids=chunk_real_ids
             )
             all_final_pred[start:end] = final_pred_chunk
 
@@ -495,7 +512,8 @@ class EBT_NLP(LightningModule):
         adjusted_alpha,
         noise,
         start_pos,
-        learning
+        learning,
+        real_token_ids=None
     ):
         energies_list = []
         pred_states_list = []
@@ -528,7 +546,13 @@ class EBT_NLP(LightningModule):
                     pred_embeds = self.vocab_to_embed(cur_pred_tokens)
 
                 combined_embeddings = torch.cat([real_embeds, pred_embeds], dim=1)  # (chunk_size, 2S, D)
-                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx)
+                energies = self.transformer(
+                    combined_embeddings,
+                    start_pos=start_pos,
+                    mcmc_step=step_idx,
+                    real_token_ids=real_token_ids,
+                    predicted_tokens=cur_pred_tokens,
+                )                
                 energies = energies.reshape(-1)
                 energies_list.append(energies.detach())
 
@@ -568,7 +592,13 @@ class EBT_NLP(LightningModule):
                 else:
                     pred_embeds = self.vocab_to_embed(cur_pred_tokens)
                 combined_embeddings = torch.cat([real_embeds, pred_embeds], dim=1)  # (chunk_size, 2S, D)
-                energies = self.transformer(combined_embeddings, start_pos=start_pos, mcmc_step=step_idx)
+                energies = self.transformer(
+                    combined_embeddings,
+                    start_pos=start_pos,
+                    mcmc_step=step_idx,
+                    real_token_ids=real_token_ids,
+                    predicted_tokens=cur_pred_tokens,
+                )
                 energies = energies.reshape(-1)
                 return energies
 
