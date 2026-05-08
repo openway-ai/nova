@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from nanolightning.torchlightning_module import LightningModule
+from openebm.elm.nanolightning.torchlightning_module import LightningModule
 # import torch.optim as optim
 # from torchmetrics import Accuracy
 # from transformers import AutoTokenizer
@@ -364,7 +364,7 @@ class EBT_NLP(LightningModule):
                 true_embeddings = self.vocab_to_embed(true_token_one_hot)
 
         all_true_embeddings = torch.cat((real_embeddings_input, true_embeddings), dim=1)
-        
+
         true_pred_tokens = true_token_logits if self.hparams.discrete_contrastive_loss_true_logit_val != 0 else true_token_one_hot
         real_energies = self.transformer(
             all_true_embeddings,
@@ -430,7 +430,7 @@ class EBT_NLP(LightningModule):
             chunk_pred = repeated_pred[start:end]           # shape: (chunk_size, S, V)
             chunk_real_embeds = repeated_real_embeds[start:end]  # shape: (chunk_size, S, D)
             chunk_real_ids = original_real_input_ids.repeat_interleave(G, dim=0)[start:end] if G > 1 else original_real_input_ids[start:end]
-            
+
             final_pred_chunk, energies_list_chunk, predicted_distributions_chunk = self._run_ebt_inference_steps(
                 chunk_pred, chunk_real_embeds,
                 alpha, noise, start_pos, learning,
@@ -552,7 +552,7 @@ class EBT_NLP(LightningModule):
                     mcmc_step=step_idx,
                     real_token_ids=real_token_ids,
                     predicted_tokens=cur_pred_tokens,
-                )                
+                )
                 energies = energies.reshape(-1)
                 energies_list.append(energies.detach())
 
