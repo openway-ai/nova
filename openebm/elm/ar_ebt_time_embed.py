@@ -765,7 +765,14 @@ class EBTTimeConcat(nn.Module):
         self.final_layer = nn.Linear(params.dim, 1, bias = False)
         init_whole_model_weights(self.final_layer, self.params.weight_initialization)
 
-    def forward(self, embeddings: torch.Tensor, start_pos: int, mcmc_step = 0):
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        start_pos: int,
+        mcmc_step=0,
+        real_token_ids: Optional[torch.Tensor] = None,
+        predicted_tokens: Optional[torch.Tensor] = None,
+    ):
         """
         Perform a forward pass through the Transformer model.
 
