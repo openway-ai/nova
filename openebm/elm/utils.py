@@ -450,7 +450,6 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
     max_seq_len = max_seq_len + 1 if (hparams.ebt_type == "time_embed" and use_mcmc_time_embed) else max_seq_len # need +1 only when time embed is actually used
 
     adaln_zero_init = True if hparams.ebt_type == "adaln_zero" else False
-
     missing_attrs = [name for name in ("use_ve", "vocab_size") if not hasattr(hparams, name)]
     if missing_attrs:
         missing = ", ".join(missing_attrs)

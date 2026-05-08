@@ -528,6 +528,7 @@ class ModelTrainer(LightningModule):
                         new_state_dict[k] = v
                 checkpoint['state_dict'] = new_state_dict
                 print(f"[Checkpoint] Added '_orig_mod' prefix to {len(state_dict)} keys")
+
         # 从 checkpoint 恢复 per-rank dataloader 位置 + RNG 状态
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0

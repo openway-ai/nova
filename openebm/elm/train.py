@@ -89,7 +89,7 @@ def main(args):
         run = None # need both lines since setup_wandb is a @rank_zero_only function
         run = setup_wandb(args)
 
-        wandb_logger = WandbLogger(save_dir=args.wandb_save_dir, name=f'{args.run_name}', entity=f'{args.wandb_entity}', project=f'{args.wandb_project}', offline = args.wandb_offline, experiment=run)        
+        wandb_logger = WandbLogger(save_dir=args.wandb_save_dir, name=f'{args.run_name}', entity=f'{args.wandb_entity}', project=f'{args.wandb_project}', offline = args.wandb_offline, experiment=run)
         if args.wandb_tags != None:
             wandb_logger.experiment.tags = args.wandb_tags
     else:
@@ -505,7 +505,7 @@ if __name__ == '__main__':
     parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
 
     parser.add_argument("--use_ve", help="启用 Value Embedding (VE)，为交替层添加可学习的值嵌入", action="store_true", default=False)
-    
+
     parser.add_argument("--use_mcmc_time_embed", action="store_true", default=False,
         help="Enable MCMC step time embedding (only for ebt_type=time_embed). When False, all steps share the same transition kernel, enabling arbitrary step count at inference.")
 
