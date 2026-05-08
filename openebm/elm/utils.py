@@ -456,7 +456,7 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
         missing = ", ".join(missing_attrs)
         raise AttributeError(f"hparams must define explicit VE attributes before setup_ebt(): {missing}")
     use_sdpa_attention = getattr(hparams, 'use_sdpa_attention', False)
-    transformer_args = EBTModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=max_seq_len, weight_initialization = hparams.weight_initialization_method, adaln_zero_init=adaln_zero_init, ebt_norm=hparams.ebt_norm, ffn_dim_multiplier=hparams.ffn_dim_multiplier, ebt_act_func=hparams.ebt_act_func, weight_initialization_gain=hparams.weight_initialization_gain, dyt_alpha_init=hparams.dyt_alpha_init, use_mcmc_time_embed=use_mcmc_time_embed, use_sdpa_attention=use_sdpa_attention)
+    transformer_args = EBTModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=max_seq_len, weight_initialization = hparams.weight_initialization_method, adaln_zero_init=adaln_zero_init, ebt_norm=hparams.ebt_norm, ffn_dim_multiplier=hparams.ffn_dim_multiplier, ebt_act_func=hparams.ebt_act_func, weight_initialization_gain=hparams.weight_initialization_gain, dyt_alpha_init=hparams.dyt_alpha_init, vocab_size=hparams.vocab_size, use_ve=hparams.use_ve, use_mcmc_time_embed=use_mcmc_time_embed, use_sdpa_attention=use_sdpa_attention)
     
     if hparams.ebt_type == "default": # causal decoder trans for ebm https://arxiv.org/abs/2406.08862
         from openebm.elm.ar_ebt_default import EBTDefault
@@ -475,7 +475,7 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
     return ebt
 
 def setup_transformer(hparams): # specifically for baseline transformer
-    from ar_transformer import Transformer, TransformerModelArgs
+    from openebm.elm.ar_transformer import Transformer, TransformerModelArgs
     transformer_args = TransformerModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=hparams.context_length, weight_initialization = hparams.weight_initialization_method, ffn_dim_multiplier=hparams.ffn_dim_multiplier, weight_initialization_gain=hparams.weight_initialization_gain)
     transformer = Transformer(params=transformer_args)
     return transformer

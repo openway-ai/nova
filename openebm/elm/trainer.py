@@ -823,7 +823,7 @@ class ModelTrainer(LightningModule):
                         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else None
                         if tokenizer is not None:
                             # Wrap nanochat tokenizer if needed
-                            from nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
+                            from openebm.elm.nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
                             if hasattr(tokenizer, 'enc') and hasattr(tokenizer.enc, 'encode'):
                                 # It's a RustBPETokenizer, wrap it for HF compatibility
                                 tokenizer = NanoChatTokenizerWrapper(tokenizer_obj=tokenizer)
