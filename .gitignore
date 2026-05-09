@@ -31,6 +31,7 @@ nova/ebt/logs/
 nova/ebt/lightning_logs/
 *.log
 logs/
+lightning_logs/
 
 # Temporary / Backup files
 tmp/
