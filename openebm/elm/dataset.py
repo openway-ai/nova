@@ -1,8 +1,7 @@
-from nanochat.dataloader import StatefulBestFitDataLoader, tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-
 import torch
+from nanochat.dataloader import StatefulBestFitDataLoader
+from torch.utils.data import DataLoader
 from torch.utils.data import IterableDataset as _IterableDataset
-from torch.utils.data import IterableDataset, DataLoader
 
 class IterableDataset(_IterableDataset):
     """

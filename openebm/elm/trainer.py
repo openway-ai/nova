@@ -92,6 +92,10 @@ import sys
 from transformers import AutoTokenizer
 
 import ipdb
+import sys
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
@@ -428,6 +432,22 @@ class ModelTrainer(LightningModule):
                 gc.collect()
                 torch.cuda.empty_cache()
 
+        # --- Muon momentum 预热调度 (参考 NanoChat base_train.py:360-363) ---
+        # Muon momentum 从 0.85 线性预热到 0.95，前 300 步完成
+        # 通过 --muon_momentum_warmup_steps 控制（默认 300，设 0 禁用）
+        muon_warmup_steps = getattr(self.hparams, 'muon_momentum_warmup_steps', 300)
+        if muon_warmup_steps > 0 and self.global_step <= muon_warmup_steps:
+            if hasattr(self, 'trainer') and self.trainer.optimizers:
+                optimizer = self.trainer.optimizers[0]
+                if hasattr(optimizer, 'param_groups'):
+                    target_momentum = getattr(self.hparams, 'muon_momentum', 0.95)
+                    base_momentum = 0.85
+                    frac = min(self.global_step / muon_warmup_steps, 1.0)
+                    current_momentum = (1 - frac) * base_momentum + frac * target_momentum
+                    for group in optimizer.param_groups:
+                        if group.get('kind') == 'muon':
+                            group['momentum'] = current_momentum
+
         # Record step end time for dt calculation
         import time as _time
         now = _time.time()
@@ -545,6 +565,11 @@ class ModelTrainer(LightningModule):
         if self._rng_resume_state:
             print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
 
+    def on_validation_epoch_start(self):
+        """Reset BPB accumulators at the start of each validation epoch."""
+        self._val_bpb_nats = 0.0
+        self._val_bpb_bytes = 0
+
     def validation_step(self, batch, batch_idx):
         # Move token_bytes to the same device as the model if needed
         token_bytes = self.token_bytes
@@ -552,14 +577,48 @@ class ModelTrainer(LightningModule):
             token_bytes = token_bytes.to(self.device)
         eval_step_dict = self.eval_step(batch, "valid", token_bytes)
         self.log_metrics(eval_step_dict, "valid")
+
+        # 累积 BPB 的 nats/bytes，用于 epoch-level 正确计算
+        # (BPB = sum(nats) / (log2 * sum(bytes)), 不能对 per-batch BPB 做算术平均)
+        bpb_nats = eval_step_dict.get('bpb_nats', 0)
+        bpb_bytes = eval_step_dict.get('bpb_bytes', 0)
+        if isinstance(bpb_nats, torch.Tensor):
+            bpb_nats = bpb_nats.item()
+        if isinstance(bpb_bytes, torch.Tensor):
+            bpb_bytes = bpb_bytes.item()
+        self._val_bpb_nats += bpb_nats
+        self._val_bpb_bytes += bpb_bytes
+
         # 缓存最新 valid 指标，供 train 进度条显示
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
         for k, v in eval_step_dict.items():
+            # 跳过 BPB 累积中间量，它们不应作为独立指标显示
+            if k in ('bpb_nats', 'bpb_bytes'):
+                continue
             if isinstance(v, torch.Tensor) and v.dim() == 0:
                 self._last_valid_metrics[k] = v.detach().item()
             elif isinstance(v, (int, float)):
                 self._last_valid_metrics[k] = v
+
+    def on_validation_epoch_end(self):
+        """Compute epoch-level BPB from accumulated nats/bytes and override the cached value."""
+        import math
+        if self._val_bpb_bytes > 0:
+            epoch_bpb = self._val_bpb_nats / (math.log(2) * self._val_bpb_bytes)
+        else:
+            epoch_bpb = float('inf')
+        # 用 epoch-level BPB 覆盖 _last_valid_metrics 中的 per-batch 值
+        if not hasattr(self, '_last_valid_metrics'):
+            self._last_valid_metrics = {}
+        self._last_valid_metrics['bpb'] = epoch_bpb
+
+        # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
+        if self.logger is not None:
+            try:
+                self.logger.experiment.log({'valid_bpb': epoch_bpb}, step=self.global_step)
+            except Exception:
+                pass
 
     def on_test_epoch_start(self):
         """Reset test metrics at the start of test epoch"""
@@ -1756,14 +1815,6 @@ class ModelTrainer(LightningModule):
             # Default: use val_dataloader for pretrain mode
             return self.val_dataloader()
         
-    # def train_dataloader(self):
-    #     return DataLoader(self.train_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = not self.hparams.no_shuffle, prefetch_factor=self.hparams.prefetch_factor)
-
-    # def val_dataloader(self):
-    #     return DataLoader(self.val_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
-
-    # def test_dataloader(self):
-    #     return DataLoader(self.test_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
 
     def log_metrics(self, metrics_dict, phase, log_torchmetrics = True):
         # first log torchmetrics if there are any
@@ -1775,6 +1826,16 @@ class ModelTrainer(LightningModule):
         scalar_metrics = {}
         keys = list(metrics_dict.keys()) # Iterate over a copy of the keys to avoid modification issues during iteration
         for key in keys:
+            # 跳过 BPB 相关指标，它们不应通过 Lightning log_dict 上报：
+            # - bpb_nats/bpb_bytes: BPB 累积中间量
+            # - bpb (非 train 阶段): BPB 是比率指标 (nats/bytes)，
+            #   Lightning 的 on_epoch=True 会对 per-batch bpb 做算术平均，这是数学错误的
+            #   正确做法是在 on_validation_epoch_end 中从累积 nats/bytes 重新计算
+            if key in ('bpb_nats', 'bpb_bytes'):
+                continue
+            if key == 'bpb' and phase != 'train':
+                continue
+
             value = metrics_dict[key]
             # if 'image' in key: # images
             #     image = self.to_pil(value)
@@ -1954,6 +2015,11 @@ class ModelTrainer(LightningModule):
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
 
                 # --- 打印 ---
+                alpha_val_str = ""
+                if self.hparams.mcmc_step_size_learnable:
+                    alpha_val = self.model.alpha.detach()
+                    alpha_grad_str = f" grad={self.model.alpha.grad.item():.6f}" if self.model.alpha.grad is not None else " grad=None"
+                    alpha_val_str = f" | alpha: {alpha_val.item():.6f} ({alpha_val.dtype}){alpha_grad_str}"
                 print(
                     f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
                     f"loss: {loss_val:.6f}"
@@ -1964,6 +2030,7 @@ class ModelTrainer(LightningModule):
                     f"mfu: {mfu:.2f} | "
                     f"epoch: {epoch} | "
                     f"total time: {total_min:.2f}m"
-                    f"{eta_str}",
+                    f"{eta_str}"
+                    f"{alpha_val_str}",
                     flush=True,
                 )
