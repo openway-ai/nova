@@ -3,7 +3,11 @@ Enhanced NanoChat evaluation dataset with dual-mode support:
 1. PPL mode: Full sequence for perplexity calculation
 2. Generation mode: Split sequence (first half as prompt, second half as ground truth)
 """
-import sys
+import os, sys
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 
 import torch
 from torch.utils.data import Dataset
