@@ -1,36 +1,33 @@
 #!/bin/bash
 
 ################################################################################
-# EBT d26 训练脚本 - Muon+AdamW 混合优化器 - 2节点 × 4卡 (每节点 < 8 GPU)
-#
-# 策略:
-#   1. 优化器: Muon+AdamW (复用 nanochat/optim.py)
-#      - Transformer 矩阵参数 → Muon (LR=0.02)
-#      - Embedding/Scalar/Alpha → AdamW (beta1=0.8, beta2=0.95)
-#   2. Weight Decay: 0.2 + 动态衰减到 0
-#   3. LR 调度: Linear Warmdown (后50%衰减到0)
-#   4. EBT 特有参数保持官方推荐 (MCMC step_size, alpha LR 等)
+# EBT d26 训练脚本 - 2节点 × 4卡
 #
 # 用法:
 #   通过 rjob 提交 (见配套的 rjob_ebt_2node_4gpu.sh)
 #   本地调试: NODE_RANK=0 NODE_COUNT=1 MASTER_ADDR=127.0.0.1 PROC_PER_NODE=4 bash run_ebt_2node_4gpu.sh
 #
-# 注意:
-#   每节点申请卡数 < 8，必须使用 nccl_auto_config.py 自动配置 NCCL 参数
-#
 ################################################################################
 
-source /root/miniconda3/etc/profile.d/conda.sh
-conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
-export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH}"
+# Conda 环境激活（仅远程集群需要，本地调试可跳过）
+if [[ -f /root/miniconda3/etc/profile.d/conda.sh ]]; then
+    source /root/miniconda3/etc/profile.d/conda.sh
+    conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
+    export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH}"
+fi
 
 ### 路径配置 ###
-NOVA_HOME="/mnt/shared-storage-user/luyudong/nova"
+# 自动推导 NOVA_HOME：基于本脚本所在位置向上 4 级到 nova 根目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NOVA_HOME="${NOVA_HOME:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
 NANOCHAT_HOME="/mnt/shared-storage-user/luyudong/nanochat"
 TRAIN_SCRIPT="${NOVA_HOME}/openebm/elm/train.py"
 
 # 进入工作目录
 cd "${NOVA_HOME}"
+
+# 确保 openebm 包可被 Python 导入
+export PYTHONPATH="${NOVA_HOME}:${PYTHONPATH}"
 
 ### 基础配置 ###
 RUN_PREFIX="2node-4gpu-bf16mixed"
@@ -43,10 +40,9 @@ HOME="${NANOCHAT_HOME}"
 export NANOCHAT_BASE_DIR="${HOME}/.cache/nanochat"
 
 # PyTorch 内存优化
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.6"
 
-# WandB 配置
-export WANDB_API_KEY="968275bc822c87ac741ecce2f06cdfb54dbc1608"
+# WandB 配置（offline 模式可以不提供 api key，同步时再提供即可）
 export WANDB_MODE="offline"
 
 ################################################################################
@@ -63,6 +59,7 @@ export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=0
 export NCCL_IB_TIMEOUT=60
 export NCCL_IB_RETRY_CNT=20
+export NCCL_DEBUG=WARN
 
 ################################################################################
 # 多机节点与 GPU 配置
@@ -103,6 +100,7 @@ NORMALIZE_INITIAL_CONDITION=true
 DENOISING_INITIAL_CONDITION="random_noise"
 MCMC_STEP_SIZE_LEARNABLE=true
 NO_MCMC_DETACH=false
+USE_SDPA_ATTENTION=false              # 启用 SDPA 注意力 (大幅减少 Path B 显存占用)，设为 true 启用
 
 ################################################################################
 # Batch 配置与训练步数自动计算
@@ -153,16 +151,26 @@ SAVE_TOP_K=2
 # 优化选项
 ################################################################################
 
-OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0 \
+OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.05 \
 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 \
---adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
+--adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling \
+--muon_momentum_warmup_steps 0"
 
 ################################################################################
 # torch.compile 配置
 ################################################################################
 
-COMPILE_FLAGS=""
-# COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
+# COMPILE_FLAGS=""
+COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
+
+################################################################################
+# SDPA 注意力配置
+################################################################################
+
+SDPA_FLAGS=""
+if [[ "${USE_SDPA_ATTENTION}" == "true" ]]; then
+    SDPA_FLAGS="--use_sdpa_attention"
+fi
 
 ################################################################################
 # WandB 训练标志
@@ -251,7 +259,10 @@ torchrun \
   --save_periodic_steps 1000 \
   ${WANDB_FLAGS} \
   ${OPTION_FLAGS} \
-  ${COMPILE_FLAGS}
+  ${COMPILE_FLAGS} \
+  ${SDPA_FLAGS}
+  
+# --use_ve \
 
 TRAIN_EXIT_CODE=$?
 set -e

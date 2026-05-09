@@ -1,62 +1,41 @@
-# Human-crafted
-# coding: utf-8
-import torch
+import json
 import os
+import random
+import shutil
+import sys
 from argparse import ArgumentParser
 
-import random
+import torch
+import wandb
 
 # 允许加载旧 checkpoint 中的自定义类
 try:
     from nanochat.tokenizer import RustBPETokenizer
     torch.serialization.add_safe_globals([RustBPETokenizer])
-except:
+except Exception:
     pass
 
 # 抑制 CUDA stream 不匹配警告（恢复训练时的已知问题）
 torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
-# from nanolightning.torchlightning_trainer import Trainer
-# from nanolightning.iteratabletrainer import IterableTrainer
-# from nanolightning.torchlightning_trainer import ModelSummary
-# from nanolightning.torchlightning_function import DDPStrategy
-# from nanolightning.torchlightning_function import seed_everything
-# from nanolightning.torchlightning_function import WandbLogger
-# from nanolightning.torchlightning_function import ModelCheckpoint
-# from nanolightning.torchlightning_function import rank_zero_only
-
 try:
     from lightning.pytorch import Trainer, seed_everything
+    from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary
+    from lightning.pytorch.loggers import WandbLogger
     from lightning.pytorch.strategies import DDPStrategy
     from lightning.pytorch.utilities.rank_zero import rank_zero_only
-    from lightning.pytorch.loggers import WandbLogger
-    from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary
 except ImportError:
     from pytorch_lightning import Trainer, seed_everything
+    from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
+    from pytorch_lightning.loggers import WandbLogger
     from pytorch_lightning.strategies import DDPStrategy
     from pytorch_lightning.utilities.rank_zero import rank_zero_only
-    from pytorch_lightning.loggers import WandbLogger
-    from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
 
-from openebm.elm.disk_aware_checkpoint import DiskAwareCheckpoint
-
-import sys
-import wandb
-import ast
-import math
-from tqdm import tqdm
-import json
-import shutil
 from openebm.elm import logger as text_logger
-
-# from torch.utils.tensorboard import SummaryWriter # need to implement, which involves maybe changing the forward function
-
-# from utils.dataloader_debugger import debug_dataloader
-# from utils import load_trained_pl_model
-from openebm.elm.utils import model_sizes, init_wandb_watch, call_style_gan_fvd
-from openebm.elm import logger
-from openebm.elm.trainer import ModelTrainer
+from openebm.elm.disk_aware_checkpoint import DiskAwareCheckpoint
 from openebm.elm.eval import nlp_eval_acc
+from openebm.elm.trainer import ModelTrainer
+from openebm.elm.utils import init_wandb_watch, model_sizes
 
 @rank_zero_only # to ensure only one wandb run is created, if didnt do that then each GPU would create its own wandb run
 def setup_wandb(args): 
