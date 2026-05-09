@@ -1,39 +1,36 @@
 #!/bin/bash
 
 ################################################################################
-# EBT d26 训练脚本 - Muon+AdamW 混合优化器 - 2节点 × 8卡
-#
-# 策略:
-#   1. 优化器: Muon+AdamW (复用 nanochat/optim.py)
-#      - Transformer 矩阵参数 → Muon (LR=0.02)
-#      - Embedding/Scalar/Alpha → AdamW (beta1=0.8, beta2=0.95)
-#   2. Weight Decay: 0.2 + 动态衰减到 0
-#   3. LR 调度: Linear Warmdown (后50%衰减到0)
-#   4. EBT 特有参数保持官方推荐 (MCMC step_size, alpha LR 等)
+# EBT d26 训练脚本 - 2节点 × 8卡
 #
 # 用法:
 #   通过 rjob 提交 (见配套的 rjob_ebt_2node_8gpu.sh)
 #   本地调试: NODE_RANK=0 NODE_COUNT=1 MASTER_ADDR=127.0.0.1 PROC_PER_NODE=8 bash run_ebt_2node_8gpu.sh
 #
-# 注意:
-#   每节点 8 卡时平台自动配置 NCCL 参数，无需手动调用 nccl_auto_config.py
-#
 ################################################################################
 
-source /root/miniconda3/etc/profile.d/conda.sh
-conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
-export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH}"
+# Conda 环境激活（仅远程集群需要，本地调试可跳过）
+if [[ -f /root/miniconda3/etc/profile.d/conda.sh ]]; then
+    source /root/miniconda3/etc/profile.d/conda.sh
+    conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
+    export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH}"
+fi
 
 ### 路径配置 ###
-NOVA_HOME="/mnt/shared-storage-user/luyudong/nova"
+# 自动推导 NOVA_HOME：基于本脚本所在位置向上 4 级到 nova 根目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NOVA_HOME="${NOVA_HOME:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
 NANOCHAT_HOME="/mnt/shared-storage-user/luyudong/nanochat"
 TRAIN_SCRIPT="${NOVA_HOME}/openebm/elm/train.py"
 
 # 进入工作目录
 cd "${NOVA_HOME}"
 
+# 确保 openebm 包可被 Python 导入
+export PYTHONPATH="${NOVA_HOME}:${PYTHONPATH}"
+
 ### 基础配置 ###
-RUN_PREFIX="2node-8gpu-bf16true"
+RUN_PREFIX="2node-8gpu-bf16mixed"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -45,8 +42,7 @@ export NANOCHAT_BASE_DIR="${HOME}/.cache/nanochat"
 # PyTorch 内存优化
 export PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.6"
 
-# WandB 配置
-export WANDB_API_KEY="968275bc822c87ac741ecce2f06cdfb54dbc1608"
+# WandB 配置（offline 模式可以不提供 api key，同步时再提供即可）
 export WANDB_MODE="offline"
 
 ################################################################################
@@ -265,6 +261,8 @@ torchrun \
   ${OPTION_FLAGS} \
   ${COMPILE_FLAGS} \
   ${SDPA_FLAGS}
+  
+# --use_ve \
 
 TRAIN_EXIT_CODE=$?
 set -e

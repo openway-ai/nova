@@ -460,7 +460,8 @@ class Attention(nn.Module):
         keys_o = xk_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
         values_o = xv_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
 
-        if self.use_sdpa_attention:            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False, enable_cudnn=False):
+        if self.use_sdpa_attention:
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False, enable_cudnn=False):
                 output_o = F.scaled_dot_product_attention(xq_o, keys_o, values_o, is_causal=True)
             output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1)
         else:
