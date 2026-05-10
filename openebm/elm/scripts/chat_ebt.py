@@ -437,6 +437,8 @@ def print_help():
     print("  /mcmc               - 切换 MCMC 显示")
     print("  /verbose            - 切换详细模式")
     print("  /energy             - 切换能量显示")
+    print("  /single             - 切换到单行输入模式")
+    print("  /multi              - 切换到多行输入模式 (空行结束)")
     print("  /status             - 显示当前设置")
     print("  /info               - 显示模型信息")
     print("  /help               - 显示此帮助")
@@ -547,7 +549,8 @@ def main():
     print_colored("EBT 对话终端已就绪!", Colors.GREEN)
     print("=" * 70)
     print("使用说明:")
-    print("  - 输入文本，按 Enter 开始生成")
+    print("  - 默认多行输入模式：输入多行文本后按两次 Enter (空行) 结束")
+    print("  - 输入 /single 切换到单行输入模式")
     print("  - 输入 /quit 或 /exit 退出")
     print("  - 输入 /help 查看所有命令")
     print("  - 输入 /mcmc 切换 MCMC 步骤显示")
@@ -563,10 +566,24 @@ def main():
     session_total_tokens = 0
     session_total_time = 0.0
     session_turns = 0
+    multiline_mode = True
 
     while True:
         try:
-            user_input = input(f'{Colors.BLUE}你:{Colors.RESET} ')
+            if multiline_mode:
+                print(f'{Colors.BLUE}你 (空行结束):{Colors.RESET}')
+                lines = []
+                while True:
+                    try:
+                        line = input()
+                        if line == '' and lines:
+                            break
+                        lines.append(line)
+                    except EOFError:
+                        break
+                user_input = '\n'.join(lines)
+            else:
+                user_input = input(f'{Colors.BLUE}你:{Colors.RESET} ')
 
             # 处理命令
             cmd = user_input.strip().lower()
@@ -608,6 +625,16 @@ def main():
                 engine.show_energy = not engine.show_energy
                 status = "开启" if engine.show_energy else "关闭"
                 print_colored(f'\n✓ 能量显示已{status}\n', Colors.GREEN)
+                continue
+
+            if cmd == '/single':
+                multiline_mode = False
+                print_colored('\n✓ 已切换到单行输入模式\n', Colors.GREEN)
+                continue
+
+            if cmd == '/multi':
+                multiline_mode = True
+                print_colored('\n✓ 已切换到多行输入模式 (空行结束)\n', Colors.GREEN)
                 continue
 
             if cmd.startswith('/temp '):

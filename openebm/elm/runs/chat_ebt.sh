@@ -55,7 +55,10 @@ DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx
 DEFAULT_CKPT="/mnt/shared-storage-user/luyudong/nova-sft/nova/logs/ebt_runs/d26-ctx2048-20260422/sft_train/checkpoints/s=step=2984-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.5680.ckpt"
 
 # sudoku
-DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-20260430/sft_train.v3/checkpoints/periodic-s=step=399-d26-ctx2048.ckpt"
+# DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-20260430/sft_train.v3/checkpoints/periodic-s=step=399-d26-ctx2048.ckpt"
+
+# sudoku
+DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-mixed-0.6-20260508/sft_train/checkpoints/s=step=2987-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=0.4782.ckpt"
 
 DEFAULT_TOKENIZER="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer"
 
