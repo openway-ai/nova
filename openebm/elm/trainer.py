@@ -1215,10 +1215,7 @@ class ModelTrainer(LightningModule):
         alpha_lr = self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate
 
         # --- 参数收集 ---
-        if isinstance(self.model.alpha, nn.ParameterList):
-            alpha_params = list(self.model.alpha.parameters())
-        else:
-            alpha_params = [self.model.alpha]
+        alpha_params = [self.model.alpha]
         embedding_params = list(self.model.embeddings.parameters())
 
         vocab_to_embed_params = []
@@ -1916,12 +1913,8 @@ class ModelTrainer(LightningModule):
 
         # Alpha (MCMC step size) 值 (仅 train 阶段，避免 validation 阶段 warning)
         if phase == "train" and self.hparams.mcmc_step_size_learnable:
-            if isinstance(self.model.alpha, nn.ParameterList):
-                for i, p in enumerate(self.model.alpha):
-                    self.log(f"Alpha_MCMC_Step_{i}", p.detach(), on_step=True, on_epoch=False, prog_bar=True)
-            else:
-                self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach(),
-                         on_step=True, on_epoch=False, prog_bar=True)
+            self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach(),
+                     on_step=True, on_epoch=False)
 
         # Langevin dynamics noise (仅 train 阶段)
         if phase == "train" and self.hparams.langevin_dynamics_noise_learnable:
