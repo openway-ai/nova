@@ -234,7 +234,7 @@ def main(args):
         print("$$$$$$$$$$  STARTED TRAINING  $$$$$$$$$$")
         trainer = set_trainer(args, wandb_logger, checkpoint_callback, periodic_checkpoint=periodic_checkpoint)
         resume_training_ckpt = None if args.resume_training_ckpt == "" else args.resume_training_ckpt
-        trainer.fit(model_trainer, ckpt_path=resume_training_ckpt)
+        trainer.fit(model_trainer, ckpt_path=resume_training_ckpt, weights_only=False)
         
         if args.run_testing_after_training:
             args.only_test_model_ckpt = checkpoint_callback.best_model_path
