@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import os
 import socket
+from typing import List, Optional, Tuple
 
 # Only clear distributed env vars if we are NOT a worker spawned by
 # torchrun / mp.spawn (those set WORLD_SIZE).
@@ -56,18 +57,53 @@ except Exception:  # pragma: no cover
     tqdm = None
 
 from openebm.elm.scripts.chat_ebt import EBTChatEngine
+from openebm.elm.data.sudoku_dataset_v2 import PROMPT_TEMPLATES as SUDOKU_PROMPT_TEMPLATES
 
 DEFAULT_DATA_DIR = Path('/mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/data/sudoku_cache_v2')
 DEFAULT_TOKENIZER = '/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer'
 DEFAULT_RUN_DIR = Path('/mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/runs/d26-ctx2048-sudoku-mixed-0.6-20260508')
 
-PROMPT_TEMPLATE = (
+LEGACY_ZH_PROMPT = (
     "请解决以下数独谜题。"
     "在每个9×9的网格中，请用1-9填充空格（用0表示），"
     "确保每行、每列以及每个3×3小方格中的数字都不重复。\n\n"
     "数独谜题：\n{puzzle}\n\n"
     "请直接给出完整的解答（每行用空格分隔数字）："
 )
+
+
+def _pick_prompt(prompt_style: str, puzzle_text: str, seed: int, sample_idx: int) -> Tuple[str, int, str]:
+    """Return (prompt_text, template_idx, style). template_idx is -1 for legacy_zh."""
+    if prompt_style == 'legacy_zh':
+        return LEGACY_ZH_PROMPT.format(puzzle=puzzle_text), -1, 'legacy_zh'
+    if prompt_style == 'random':
+        rng = random.Random(seed + sample_idx * 10007)
+        idx = rng.randrange(len(SUDOKU_PROMPT_TEMPLATES))
+        return SUDOKU_PROMPT_TEMPLATES[idx].format(puzzle=puzzle_text), idx, 'random'
+    return SUDOKU_PROMPT_TEMPLATES[0].format(puzzle=puzzle_text), 0, 'fixed'
+
+
+def _is_valid_sudoku_grid(pred: Optional[List[int]]) -> bool:
+    """True iff pred is a length-81 list of 1-9 with unique row/col/3x3 box digits."""
+    if pred is None or len(pred) != 81:
+        return False
+    if not all(isinstance(v, int) and 1 <= v <= 9 for v in pred):
+        return False
+    for r in range(9):
+        row = pred[r * 9:(r + 1) * 9]
+        if len(set(row)) != 9:
+            return False
+    for c in range(9):
+        col = [pred[r * 9 + c] for r in range(9)]
+        if len(set(col)) != 9:
+            return False
+    for br in range(3):
+        for bc in range(3):
+            box = [pred[(br * 3 + dr) * 9 + (bc * 3 + dc)]
+                   for dr in range(3) for dc in range(3)]
+            if len(set(box)) != 9:
+                return False
+    return True
 
 
 class _Tee:
@@ -314,6 +350,11 @@ def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_
     overall_parsed = 0
     overall_solved = 0
     overall_n = 0
+    overall_given_total = 0
+    overall_given_correct = 0
+    overall_filled_total = 0
+    overall_filled_correct = 0
+    overall_valid_sudoku = 0
 
     for split in splits:
         rows = _merge_shards(out_dir, split, world_size, keep_shards)
@@ -324,6 +365,11 @@ def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_
         solved = sum(1 for o in rows if o.get('fully_solved'))
         elapsed = sum(float(o.get('elapsed_s', 0.0)) for o in rows)
         tokens = sum(int(o.get('tokens_generated', 0)) for o in rows)
+        given_total = sum(int(o.get('given_total', 0)) for o in rows)
+        given_correct = sum(int(o.get('given_correct', 0)) for o in rows)
+        filled_total = sum(int(o.get('filled_total', 0)) for o in rows)
+        filled_correct = sum(int(o.get('filled_correct', 0)) for o in rows)
+        valid_sudoku = sum(1 for o in rows if o.get('is_valid_sudoku'))
         summary[split] = {
             'n': n,
             'cell_correct': c,
@@ -333,6 +379,14 @@ def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_
             'parsed_pct': (parsed / n) if n else 0.0,
             'fully_solved': solved,
             'fully_solved_pct': (solved / n) if n else 0.0,
+            'given_total': given_total,
+            'given_correct': given_correct,
+            'given_cell_acc': (given_correct / given_total) if given_total else 0.0,
+            'filled_total': filled_total,
+            'filled_correct': filled_correct,
+            'filled_cell_acc': (filled_correct / filled_total) if filled_total else 0.0,
+            'valid_sudoku': valid_sudoku,
+            'valid_sudoku_pct': (valid_sudoku / n) if n else 0.0,
             'elapsed_s': elapsed,
             'tokens_generated': tokens,
             'avg_tokens_per_sample': (tokens / n) if n else 0.0,
@@ -343,6 +397,11 @@ def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_
         overall_parsed += parsed
         overall_solved += solved
         overall_n += n
+        overall_given_total += given_total
+        overall_given_correct += given_correct
+        overall_filled_total += filled_total
+        overall_filled_correct += filled_correct
+        overall_valid_sudoku += valid_sudoku
 
     summary['overall'] = {
         'n': overall_n,
@@ -353,6 +412,14 @@ def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_
         'parsed_pct': (overall_parsed / overall_n) if overall_n else 0.0,
         'fully_solved': overall_solved,
         'fully_solved_pct': (overall_solved / overall_n) if overall_n else 0.0,
+        'given_total': overall_given_total,
+        'given_correct': overall_given_correct,
+        'given_cell_acc': (overall_given_correct / overall_given_total) if overall_given_total else 0.0,
+        'filled_total': overall_filled_total,
+        'filled_correct': overall_filled_correct,
+        'filled_cell_acc': (overall_filled_correct / overall_filled_total) if overall_filled_total else 0.0,
+        'valid_sudoku': overall_valid_sudoku,
+        'valid_sudoku_pct': (overall_valid_sudoku / overall_n) if overall_n else 0.0,
     }
 
     with open(out_dir / 'results' / 'summary.json', 'w') as f:
@@ -362,7 +429,8 @@ def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_
     with open(csv_path, 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['split', 'n', 'cell_correct', 'cell_total', 'cell_acc',
-                    'parsed', 'parsed_pct', 'fully_solved', 'fully_solved_pct'])
+                    'parsed', 'parsed_pct', 'fully_solved', 'fully_solved_pct',
+                    'given_cell_acc', 'filled_cell_acc', 'valid_sudoku_pct'])
         for split in list(splits) + ['overall']:
             s = summary.get(split, {})
             w.writerow([
@@ -375,6 +443,9 @@ def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_
                 f"{s.get('parsed_pct', 0.0):.6f}",
                 s.get('fully_solved', 0),
                 f"{s.get('fully_solved_pct', 0.0):.6f}",
+                f"{s.get('given_cell_acc', 0.0):.6f}",
+                f"{s.get('filled_cell_acc', 0.0):.6f}",
+                f"{s.get('valid_sudoku_pct', 0.0):.6f}",
             ])
 
     with open(out_dir / 'results' / 'timing.json', 'w') as f:
@@ -412,7 +483,8 @@ def parse_board(text):
     return nums[:81]
 
 
-def evaluate_sample(engine, sample, max_tokens: int = 256):
+def evaluate_sample(engine, sample, max_tokens: int = 256,
+                    prompt_style: str = 'fixed', seed: int = 0, sample_idx: int = 0):
     flat_puzzle = sample['puzzle']
     if hasattr(flat_puzzle, 'tolist'):
         flat_puzzle = flat_puzzle.tolist()
@@ -425,7 +497,7 @@ def evaluate_sample(engine, sample, max_tokens: int = 256):
         flat_solution = [v for row in flat_solution for v in row]
     puzzle_text = _format_board(flat_puzzle)
     solution_text = _format_board(flat_solution)
-    prompt = PROMPT_TEMPLATE.format(puzzle=puzzle_text)
+    prompt, tpl_idx, style = _pick_prompt(prompt_style, puzzle_text, seed, sample_idx)
 
     t0 = time.time()
     response, stats = engine.generate(
@@ -435,13 +507,25 @@ def evaluate_sample(engine, sample, max_tokens: int = 256):
     tokens_generated = int(stats.get('tokens_generated', 0)) if isinstance(stats, dict) else 0
 
     pred = parse_board(response)
+
+    # Cell accuracy — split into given vs filled.
     correct, total = 0, 81
+    given_mask = [v != 0 for v in flat_puzzle]
+    given_total = sum(given_mask)
+    filled_total = 81 - given_total
+    given_correct = 0
+    filled_correct = 0
     if pred is not None:
-        for r in range(9):
-            for c in range(9):
-                if pred[r * 9 + c] == flat_solution[r * 9 + c]:
-                    correct += 1
+        for i in range(81):
+            if pred[i] == flat_solution[i]:
+                correct += 1
+                if given_mask[i]:
+                    given_correct += 1
+                else:
+                    filled_correct += 1
     fully_solved = pred is not None and correct == total
+    valid = pred is not None and _is_valid_sudoku_grid(pred)
+
     return {
         'puzzle_text': puzzle_text,
         'solution_text': solution_text,
@@ -449,8 +533,16 @@ def evaluate_sample(engine, sample, max_tokens: int = 256):
         'pred': pred,
         'correct': correct,
         'total': total,
+        'given_total': given_total,
+        'given_correct': given_correct,
+        'filled_total': filled_total,
+        'filled_correct': filled_correct,
         'parsed': pred is not None,
         'fully_solved': fully_solved,
+        'is_valid_sudoku': valid,
+        'prompt_style': style,
+        'prompt_template_idx': tpl_idx,
+        'prompt_used': prompt,
         'elapsed_s': elapsed_s,
         'tokens_generated': tokens_generated,
     }
@@ -631,13 +723,25 @@ def _run_eval(args, rank: int, world_size: int):
 
         sample = splits[split_name][i]
         try:
-            res = evaluate_sample(engine, sample, max_tokens=args.max_tokens)
+            res = evaluate_sample(
+                engine, sample,
+                max_tokens=args.max_tokens,
+                prompt_style=args.prompt_style,
+                seed=args.seed,
+                sample_idx=i,
+            )
         except Exception as e:
             # Record a failed sample but keep going.
             res = {
                 'puzzle_text': '', 'solution_text': '', 'response': f'<error: {e}>',
-                'pred': None, 'correct': 0, 'total': 81, 'parsed': False,
-                'fully_solved': False, 'elapsed_s': 0.0, 'tokens_generated': 0,
+                'pred': None, 'correct': 0, 'total': 81,
+                'given_total': 0, 'given_correct': 0,
+                'filled_total': 0, 'filled_correct': 0,
+                'parsed': False,
+                'fully_solved': False, 'is_valid_sudoku': False,
+                'prompt_style': args.prompt_style, 'prompt_template_idx': -1,
+                'prompt_used': '',
+                'elapsed_s': 0.0, 'tokens_generated': 0,
             }
             if rank == 0:
                 print(f"[eval_sudoku_samples] sample error split={split_name} idx={i}: {e}")
@@ -647,7 +751,15 @@ def _run_eval(args, rank: int, world_size: int):
             obj = {
                 'split': split_name, 'idx': i, 'rank': rank,
                 'correct': res['correct'], 'total': res['total'],
+                'given_total': res['given_total'],
+                'given_correct': res['given_correct'],
+                'filled_total': res['filled_total'],
+                'filled_correct': res['filled_correct'],
                 'parsed': res['parsed'], 'fully_solved': res['fully_solved'],
+                'is_valid_sudoku': res['is_valid_sudoku'],
+                'prompt_style': res['prompt_style'],
+                'prompt_template_idx': res['prompt_template_idx'],
+                'prompt_used': res['prompt_used'],
                 'elapsed_s': round(res['elapsed_s'], 4),
                 'tokens_generated': res['tokens_generated'],
                 'response': res['response'], 'pred': res['pred'],
@@ -876,6 +988,12 @@ def _build_parser():
     parser.add_argument('--full_test', action='store_true')
     parser.add_argument('--max_tokens', type=int, default=256,
                         help='Decode budget per sample (~200 tokens covers an 81-cell solution).')
+    parser.add_argument('--prompt_style', default='fixed',
+                        choices=['fixed', 'random', 'legacy_zh'],
+                        help='Prompt style. Default "fixed" uses PROMPT_TEMPLATES[0] from '
+                             'sudoku_dataset_v2.py (matches training domain). '
+                             '"random" samples per-puzzle for distribution match. '
+                             '"legacy_zh" preserves the old Chinese prompt for historical reruns.')
     parser.add_argument('--resume', action='store_true',
                         help='Skip indices already present in per-rank JSONL shards.')
     parser.add_argument('--no_per_sample_print', action='store_true',
