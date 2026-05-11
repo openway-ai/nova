@@ -32,7 +32,14 @@ class EBT_NLP(LightningModule):
         self.vocab_size = self.tokenizer.get_vocab_size() # len(self.tokenizer) # self.vocab_size = self.tokenizer.vocab_size caused errors since is smaller than len(self.tokenizer), is 50254 for neox-20b, len tokenizer is 50277 so decided to use that
         self.hparams.vocab_size = self.vocab_size
         
-        self.alpha = nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size), dtype=torch.float32), requires_grad=self.hparams.mcmc_step_size_learnable)
+        if self.hparams.mcmc_step_size_learnable and getattr(self.hparams, 'mcmc_step_size_per_step', False):
+            self.alpha = nn.ParameterList([
+                nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size), dtype=torch.float32))
+                for _ in range(self.hparams.mcmc_num_steps)
+            ])
+        else:
+            self.alpha = nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size), dtype=torch.float32),
+                                      requires_grad=self.hparams.mcmc_step_size_learnable)
         self.langevin_dynamics_noise_std = nn.Parameter(torch.tensor(float(self.hparams.langevin_dynamics_noise)), requires_grad=False) # if using self.hparams.langevin_dynamics_noise_learnable this will be turned on in warm_up_finished func
 
         self.embeddings = nn.Embedding(self.vocab_size, self.hparams.embedding_dim)
@@ -96,11 +103,18 @@ class EBT_NLP(LightningModule):
             predicted_tokens = predicted_tokens + ld_noise
 
         if self.hparams.normalize_initial_condition:
-            if self.hparams.normalize_initial_condition_only_first_step:
-                if mcmc_step == 0:
+            if getattr(self.hparams, 'float_precision', '') == "bf16-true":
+                if self.hparams.normalize_initial_condition_only_first_step:
+                    if mcmc_step == 0:
+                        predicted_tokens = self.softmax(predicted_tokens)
+                else:
                     predicted_tokens = self.softmax(predicted_tokens)
             else:
-                predicted_tokens = self.softmax(predicted_tokens)
+                if self.hparams.normalize_initial_condition_only_first_step:
+                    if mcmc_step == 0:
+                        predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
+                else:
+                    predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
                 
             if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
                 predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
@@ -135,7 +149,8 @@ class EBT_NLP(LightningModule):
         # predicted_tokens_grad has shape B, S, V
         
         if self.hparams.clamp_futures_grad:
-            min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha.float()) # use self.alpha and not random alpha to clamp
+            _alpha_for_clamp = self.alpha[mcmc_step] if isinstance(self.alpha, nn.ParameterList) else self.alpha
+            min_and_max = self.hparams.clamp_futures_grad_max_change / torch.clamp(_alpha_for_clamp.float(), min=0.0001)
             # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
             predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
             
@@ -166,18 +181,19 @@ class EBT_NLP(LightningModule):
         seq_length = x.shape[1]
         
         model_dtype = self.embeddings.weight.dtype
-        alpha = torch.clamp(self.alpha, min=0.0001).float()
-        if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
-            expanded_alpha = alpha.expand(batch_size, seq_length, 1)
+        if not isinstance(self.alpha, nn.ParameterList):
+            alpha = torch.clamp(self.alpha, min=0.0001).float()
+            if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
+                expanded_alpha = alpha.expand(batch_size, seq_length, 1)
 
-            scale = self.hparams.randomize_mcmc_step_size_scale
-            low = alpha / scale
-            high = alpha * scale
-            alpha = low + torch.rand_like(expanded_alpha) * (high - low)
+                scale = self.hparams.randomize_mcmc_step_size_scale
+                low = alpha / scale
+                high = alpha * scale
+                alpha = low + torch.rand_like(expanded_alpha) * (high - low)
+        else:
+            alpha = None  # will be resolved per step below
 
-        # noise is intentionally detached and cast to model_dtype to avoid inserting
-        # a float32 node into the create_graph=True autograd graph.
-        langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001).detach().to(model_dtype)
+        langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
 
         predicted_tokens = self.corrupt_embeddings(real_embeddings_input) # B, S, V
         if replay_buffer_logits is not None: # using replay buffer, use the logits instead of corruption
@@ -208,10 +224,14 @@ class EBT_NLP(LightningModule):
 
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
-                
+                if isinstance(self.alpha, nn.ParameterList):
+                    step_alpha = torch.clamp(self.alpha[mcmc_step], min=0.0001)
+                else:
+                    step_alpha = alpha
+
                 predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
-                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
+                    langevin_dynamics_noise_std, step_alpha, start_pos, learning, return_raw_logits,
                     real_token_ids=x
                 )
                 predicted_energies.append(energy_preds)
@@ -319,7 +339,7 @@ class EBT_NLP(LightningModule):
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=embeddings.dtype, device=self.device) * self.hparams.gaussian_random_noise_scaling
+            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=torch.bfloat16, device=self.device) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
             predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device)
         else:
