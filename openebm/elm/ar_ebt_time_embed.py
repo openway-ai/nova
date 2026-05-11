@@ -22,10 +22,11 @@ class BackwardRMSNormFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, input_, weight, eps):
+    def forward(ctx, input_, weight, eps, use_fp32_norm):
         # Save for backward
         ctx.save_for_backward(weight)
         ctx.eps = eps
+        ctx.use_fp32_norm = use_fp32_norm
         return input_  # Identity forward
 
     @staticmethod
@@ -38,7 +39,10 @@ class BackwardRMSNormFunction(torch.autograd.Function):
         eps = ctx.eps
 
         # Compute RMS of grad_output over last dim
-        rms = torch.rsqrt(grad_output.pow(2).mean(dim=-1, keepdim=True) + eps)
+        if ctx.use_fp32_norm:
+            rms = torch.rsqrt(grad_output.float().pow(2).mean(dim=-1, keepdim=True) + eps)
+        else:
+            rms = torch.rsqrt(grad_output.pow(2).mean(dim=-1, keepdim=True) + eps)
 
         # Normalized gradient wrt the input
         grad_input = grad_output * rms * weight  # shape matches grad_output
@@ -50,7 +54,7 @@ class BackwardRMSNormFunction(torch.autograd.Function):
         sum_dims = list(range(grad_output.dim() - 1))
         grad_weight = (grad_output * rms).sum(dim=sum_dims)
 
-        return grad_input, grad_weight, None
+        return grad_input, grad_weight, None, None
 
 
 class BackwardRMSNorm(nn.Module):
@@ -58,15 +62,16 @@ class BackwardRMSNorm(nn.Module):
     nn.Module that applies identity in forward, RMSNorm in backward,
     with its own learnable weight.
     """
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, use_fp32_norm: bool = True):
         super().__init__()
         self.weight = nn.Parameter(torch.full((dim,), 0.01))
         # self.weight = nn.Parameter(torch.ones(dim))
 
         self.eps = eps
+        self.use_fp32_norm = use_fp32_norm
 
     def forward(self, x: torch.Tensor):
-        return BackwardRMSNormFunction.apply(x, self.weight, self.eps)
+        return BackwardRMSNormFunction.apply(x, self.weight, self.eps, self.use_fp32_norm)
     
 class BackwardLayerNormFunction(torch.autograd.Function):
     @staticmethod
@@ -132,12 +137,12 @@ class EBMBackwardsRMSNorm(nn.Module): # NOTE none of this worked well, could mak
       1) A standard (forward) RMSNorm.
       2) A backward-only RMSNorm (identity forward) with its own parameter.
     """
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, use_fp32_norm: bool = True):
         super().__init__()
         # Forward RMSNorm has its own weight_fwd
-        self.forward_rms = RMSNorm(dim, eps)
+        self.forward_rms = RMSNorm(dim, eps, use_fp32_norm=use_fp32_norm)
         # Backward RMSNorm has a separate weight_bwd
-        self.backward_rms = BackwardRMSNorm(dim, eps)
+        self.backward_rms = BackwardRMSNorm(dim, eps, use_fp32_norm=use_fp32_norm)
         # self.backward_ln = BackwardLayerNorm(dim, eps)
 
     def forward(self, x: torch.Tensor):
@@ -162,13 +167,15 @@ class DyT(nn.Module):
         return x * self.weight + self.bias
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, use_fp32_norm: bool = True):
         """
         Initialize the RMSNorm normalization layer.
 
         Args:
             dim (int): The dimension of the input tensor.
             eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
+            use_fp32_norm (bool): If True, compute normalization in FP32 then cast back.
+                Should be False for bf16-true to avoid FP32 graph nodes.
 
         Attributes:
             eps (float): A small value added to the denominator for numerical stability.
@@ -178,6 +185,7 @@ class RMSNorm(torch.nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self.use_fp32_norm = use_fp32_norm
 
     def _norm(self, x):
         """
@@ -203,7 +211,10 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
-        output = self._norm(x)
+        if self.use_fp32_norm:
+            output = self._norm(x.float()).type_as(x)
+        else:
+            output = self._norm(x)
         return output * self.weight
 
 
@@ -435,7 +446,7 @@ class Attention(nn.Module):
         cos, sin = freqs_cis
         xq_o, xk_o = apply_rotary_emb(xq_o, xk_o, freqs_cis=(cos[:original_seqlen], sin[:original_seqlen]))
 
-        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=(cos[self.time_offset:original_seqlen+1], sin[self.time_offset:original_seqlen+1])) # use time_offset since are the next preds and also have time embeddings (offset=2) or not (offset=1)
+        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=(cos[self.time_offset:original_seqlen+1], sin[self.time_offset:original_seqlen+1]))
         # I tested this compared to prepending row on S dimension and the tensors were the same
 
         # self.cache_k = self.cache_k.to(xq)
@@ -653,9 +664,10 @@ class TransformerBlock(nn.Module):
             weight_initialization_gain=args.weight_initialization_gain
         )
         self.layer_id = layer_id
+        use_fp32 = getattr(args, 'float_precision', '') != "bf16-true"
         if args.ebt_norm == "rms":
-            self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
-            self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+            self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps, use_fp32_norm=use_fp32)
+            self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps, use_fp32_norm=use_fp32)
         elif args.ebt_norm == "layer":
             self.attention_norm = nn.LayerNorm(args.dim)
             self.ffn_norm = nn.LayerNorm(args.dim)
@@ -666,8 +678,8 @@ class TransformerBlock(nn.Module):
             self.attention_norm = DyT(args.dim, alpha_init_value=args.dyt_alpha_init)
             self.ffn_norm = DyT(args.dim, alpha_init_value=args.dyt_alpha_init)
         elif args.ebt_norm == "ebm_backwards_norm":
-            self.attention_norm = EBMBackwardsRMSNorm(args.dim, eps=args.norm_eps)
-            self.ffn_norm = EBMBackwardsRMSNorm(args.dim, eps=args.norm_eps)
+            self.attention_norm = EBMBackwardsRMSNorm(args.dim, eps=args.norm_eps, use_fp32_norm=use_fp32)
+            self.ffn_norm = EBMBackwardsRMSNorm(args.dim, eps=args.norm_eps, use_fp32_norm=use_fp32)
         else:
             raise ValueError(f"Invalid ebt_norm value: {args.ebt_norm}")
 
@@ -741,8 +753,9 @@ class EBTTimeConcat(nn.Module):
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
 
+        use_fp32 = getattr(params, 'float_precision', '') != "bf16-true"
         if params.ebt_norm == "rms":
-            self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+            self.norm = RMSNorm(params.dim, eps=params.norm_eps, use_fp32_norm=use_fp32)
         elif params.ebt_norm == "layer":
             self.norm = nn.LayerNorm(params.dim)
         elif params.ebt_norm == "none":
@@ -750,7 +763,7 @@ class EBTTimeConcat(nn.Module):
         elif params.ebt_norm == "dyt":
             self.norm = DyT(params.dim, alpha_init_value=params.dyt_alpha_init, bias_learnable = False) # no learnable bias here since grad cant be computed for a final bias term in EBT
         elif params.ebt_norm == "ebm_backwards_norm":
-            self.norm = EBMBackwardsRMSNorm(params.dim, eps=params.norm_eps)
+            self.norm = EBMBackwardsRMSNorm(params.dim, eps=params.norm_eps, use_fp32_norm=use_fp32)
         else:
             raise ValueError(f"Invalid ebt_norm value: {params.ebt_norm}")
 
