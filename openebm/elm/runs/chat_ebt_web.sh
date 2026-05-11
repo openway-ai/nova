@@ -4,6 +4,9 @@
 #
 # 通过网页端与训练好的 EBT 模型进行交互式对话，支持流式输出和 /xx 命令
 #
+# 资源: 单卡推理（DEVICE 默认 cuda，非分布式）；无需多卡。
+# 集群 rjob: runs/rjob/rjob_chat_ebt_web.sh（--gpu=1）
+#
 # 使用方法:
 #   bash runs/chat_ebt_web.sh                        # 默认模式
 #   bash runs/chat_ebt_web.sh --show-mcmc            # 展示 MCMC 步骤
@@ -30,6 +33,7 @@ export PYTHONPATH="${REPO_ROOT}/nanochat:${REPO_ROOT}:${PYTHONPATH:-}"
 DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints_cp/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/last.ckpt"
 DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260408_230436/periodic-s=step=2999-lr5e-05.ckpt"
 DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260408_230436/periodic-s=step=1499-lr5e-05.ckpt"
+DEFAULT_CKPT="/mnt/shared-storage-user/luyudong/nova/logs/checkpoints/2node-8gpu-bf16mixed_0422_1706_d26_ctx2048_bs512_lr0.00025_2nodes_8gpus/periodic-s=step=6999-d26-ctx2048.ckpt"
 
 DEFAULT_TOKENIZER="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer"
 
@@ -38,7 +42,7 @@ CKPT_PATH="${CKPT_PATH:-$DEFAULT_CKPT}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$DEFAULT_TOKENIZER}"
 TEMPERATURE="${TEMPERATURE:-0.8}"
 TOP_P="${TOP_P:-0.9}"
-MAX_TOKENS="${MAX_TOKENS:-512}"
+MAX_TOKENS="${MAX_TOKENS:-128}"
 DTYPE="${DTYPE:-bfloat16}"
 DEVICE="${DEVICE:-cuda}"
 PORT="${PORT:-8000}"
@@ -175,12 +179,16 @@ export HF_HUB_OFFLINE=1
 export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
+# 确保 pip-installed 的 nvidia cuBLAS 优先于系统库，避免运行时 cublasCreate / CUBLAS_STATUS_INVALID_VALUE
+export LD_LIBRARY_PATH=/mnt/shared-storage-user/puyuan/conda_envs/nanochat/lib/python3.10/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=/mnt/shared-storage-user/puyuan/conda_envs/nanochat/lib:${LD_LIBRARY_PATH:-}
+
 # 清除分布式训练环境变量
 unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
 
 # 激活 conda 环境
+CONDA_ENV_PATH="/mnt/shared-storage-user/puyuan/conda_envs/nanochat"
 if command -v conda &> /dev/null; then
-    CONDA_ENV_PATH="/mnt/shared-storage-user/puyuan/conda_envs/nanochat"
     if [ -d "$CONDA_ENV_PATH" ]; then
         source $(conda info --base)/etc/profile.d/conda.sh
         conda activate "$CONDA_ENV_PATH" 2>/dev/null || true
@@ -211,10 +219,28 @@ OVERRIDE_FLAGS=""
 cd "$REPO_ROOT"
 
 # 运行 Python Web 服务
-PYTHON="${CONDA_ENV_PATH}/bin/python"
-if [ ! -x "$PYTHON" ]; then
-    PYTHON="python"
+PYTHON=""
+for candidate in     "${CONDA_ENV_PATH}/bin/python"     "/mnt/shared-storage-user/puyuan/conda_envs/nanochat/bin/python"     "/mnt/shared-storage-user/puyuan/conda_envs/lightrft/bin/python"     "python"; do
+    if [ -x "$candidate" ] || command -v "$candidate" >/dev/null 2>&1; then
+        if "$candidate" - <<'CHECK' >/dev/null 2>&1
+import fastapi
+import uvicorn
+import torch
+import rustbpe
+CHECK
+        then
+            PYTHON="$candidate"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PYTHON" ]; then
+    echo "❌ 错误: 没找到同时具备 fastapi/uvicorn/torch/rustbpe 的 Python 环境"
+    exit 1
 fi
+
+echo "Python: $PYTHON"
 $PYTHON -m openebm.elm.scripts.chat_ebt_web \
     --checkpoint "$CKPT_PATH" \
     --tokenizer "$TOKENIZER_PATH" \

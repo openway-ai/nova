@@ -30,6 +30,7 @@ from contextlib import asynccontextmanager, nullcontext
 from typing import Optional, List, Dict, Any, AsyncGenerator
 
 from openebm.elm.generate import call_model_forward_decode, _get_tokenizer, sample_top_p
+from openebm.elm.nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
 
 # 清除分布式训练环境变量
 for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT']:
@@ -109,7 +110,17 @@ class EBTChatEngine:
         if isinstance(self.hparams, dict):
             self.hparams = HParamsNamespace(self.hparams)
 
-        self.tokenizer = _get_tokenizer(self.hparams)
+        resolved_tokenizer_path = os.path.abspath(tokenizer_path) if tokenizer_path else None
+        if resolved_tokenizer_path and os.path.isdir(resolved_tokenizer_path):
+            os.environ['NANOCHAT_BASE_DIR'] = os.path.dirname(resolved_tokenizer_path.rstrip('/'))
+            self.hparams.tokenizer_path = resolved_tokenizer_path
+            self.hparams.tokenizer = resolved_tokenizer_path
+            self.tokenizer = NanoChatTokenizerWrapper(tokenizer_dir=resolved_tokenizer_path)
+            print(f"  Using NanoChat tokenizer from CLI path: {resolved_tokenizer_path}")
+        else:
+            if resolved_tokenizer_path:
+                print(f"  Tokenizer path not found, falling back to checkpoint hparams: {resolved_tokenizer_path}")
+            self.tokenizer = _get_tokenizer(self.hparams)
 
         vocab_size = self.tokenizer.get_vocab_size() if hasattr(self.tokenizer, 'get_vocab_size') else len(self.tokenizer)
         print(f"  Raw tokenizer vocab size: {vocab_size}")
@@ -122,6 +133,11 @@ class EBTChatEngine:
 
         self.hparams.tokenizer_obj = self.tokenizer
 
+        # setup_ebt() requires use_ve; older Lightning ckpts may omit it in hyper_parameters.
+        if not hasattr(self.hparams, "use_ve"):
+            raw_sd = checkpoint.get("state_dict", checkpoint)
+            self.hparams.use_ve = any("value_embeds" in k for k in raw_sd.keys())
+
         from openebm.elm.modeling_ebt import EBT_NLP
         self.model = EBT_NLP(self.hparams)
 
@@ -133,6 +149,10 @@ class EBTChatEngine:
                 new_key = new_key[6:]
             if new_key.startswith('_orig_mod.'):
                 new_key = new_key[10:]
+            if '._orig_mod.' in new_key:
+                new_key = new_key.replace('._orig_mod.', '.')
+            if new_key.startswith('transformer_eager.'):
+                new_key = 'transformer.' + new_key[len('transformer_eager.'):]
             new_state_dict[new_key] = v
 
         try:
@@ -200,7 +220,15 @@ class EBTChatEngine:
                         temperature: float = 0.8, top_p: float = 0.9):
         """生成器: 逐 token yield, 用于流式输出"""
         inner_tok = getattr(self.tokenizer, 'tokenizer', None)
-        if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
+        if inner_tok is not None and hasattr(inner_tok, 'render_for_completion'):
+            conversation = {
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": ""},
+                ]
+            }
+            prompt_tokens_list = inner_tok.render_for_completion(conversation)
+        elif inner_tok is not None and hasattr(inner_tok, 'encode_special'):
             bos_id = inner_tok.get_bos_token_id()
             user_start = inner_tok.encode_special("<|user_start|>")
             user_end = inner_tok.encode_special("<|user_end|>")
@@ -232,11 +260,13 @@ class EBTChatEngine:
         input_text_mask[0, :len(prompt_tokens_list)] = True
 
         # Stop tokens
+        # Stop once the assistant ends, or if the model tries to open a new user turn.
         stop_token_ids = set()
         if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
-            asst_end_id = inner_tok.encode_special("<|assistant_end|>")
-            if asst_end_id is not None:
-                stop_token_ids.add(asst_end_id)
+            for special in ("<|assistant_end|>", "<|assistant_start|>", "<|user_start|>", "<|user_end|>"):
+                sid = inner_tok.encode_special(special)
+                if sid is not None:
+                    stop_token_ids.add(sid)
         if not stop_token_ids:
             stop_token_ids.add(pad_id)
 
@@ -281,7 +311,10 @@ class EBTChatEngine:
         """多轮对话的流式生成"""
         inner_tok = getattr(self.tokenizer, 'tokenizer', None)
 
-        if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
+        if inner_tok is not None and hasattr(inner_tok, 'render_for_completion'):
+            conversation = {"messages": messages + [{"role": "assistant", "content": ""}]}
+            prompt_tokens_list = inner_tok.render_for_completion(conversation)
+        elif inner_tok is not None and hasattr(inner_tok, 'encode_special'):
             bos_id = inner_tok.get_bos_token_id()
             user_start = inner_tok.encode_special("<|user_start|>")
             user_end = inner_tok.encode_special("<|user_end|>")
@@ -331,9 +364,10 @@ class EBTChatEngine:
 
         stop_token_ids = set()
         if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
-            asst_end_id = inner_tok.encode_special("<|assistant_end|>")
-            if asst_end_id is not None:
-                stop_token_ids.add(asst_end_id)
+            for special in ("<|assistant_end|>", "<|assistant_start|>", "<|user_start|>", "<|user_end|>"):
+                sid = inner_tok.encode_special(special)
+                if sid is not None:
+                    stop_token_ids.add(sid)
         if not stop_token_ids:
             stop_token_ids.add(pad_id)
 
@@ -357,6 +391,13 @@ class EBTChatEngine:
                 next_token = next_token.reshape(-1)
                 next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
                 tokens[:, cur_pos] = next_token
+
+                if cur_pos < len(prompt_tokens_list) + 8:
+                    tok_id = next_token.item()
+                    tok_raw = self.tokenizer.decode([tok_id], skip_special_tokens=False)
+                    logger.info(
+                        f"[DEBUG token] pos={cur_pos} token_id={tok_id} raw={repr(tok_raw)}"
+                    )
 
                 is_stop = torch.zeros(bsz, dtype=torch.bool, device=self.device)
                 for sid in stop_token_ids:
@@ -441,7 +482,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 # ── GET / ── 内嵌 HTML UI ──
 @app.get("/")
 async def root():
-    return HTMLResponse(content=EBT_CHAT_HTML)
+    return HTMLResponse(content=EBT_CHAT_HTML, media_type="text/html; charset=utf-8")
 
 
 # ── POST /chat/completions ── 流式对话 ──
@@ -472,42 +513,26 @@ async def chat_completions(request: ChatRequest):
 
     async def stream_sse():
         async with generate_lock:
-            loop = asyncio.get_event_loop()
-            # 因为 EBT generate 是同步阻塞的 (GPU forward), 需要跑在线程池里
+            # 直接在主线程执行生成，避免 CUDA/cublas 句柄在线程池里初始化失败。
             gen = engine.generate_stream_multi_turn(messages_dicts, max_tokens=max_tok,
                                                      temperature=temp, top_p=top_p)
-            # 用 queue 桥接同步生成器 -> 异步 SSE
-            q: asyncio.Queue = asyncio.Queue()
-
-            def _run_gen():
-                try:
-                    for tok in gen:
-                        q.put_nowait(tok)
-                except Exception as e:
-                    q.put_nowait(e)
-                finally:
-                    q.put_nowait(None)  # sentinel
-
-            fut = loop.run_in_executor(None, _run_gen)
-
-            while True:
-                item = await q.get()
-                if item is None:
-                    break
-                if isinstance(item, Exception):
-                    yield f"data: {json.dumps({'error': str(item)})}\n\n"
-                    break
-                response_tokens.append(item)
-                yield f"data: {json.dumps({'token': item}, ensure_ascii=False)}\n\n"
-
-            await fut  # 确保线程结束
+            try:
+                for tok in gen:
+                    response_tokens.append(tok)
+                    yield f"data: {json.dumps({'token': tok}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0)
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
         full_response = "".join(response_tokens)
         logger.info(f"[ASSISTANT]: {full_response}")
         logger.info("=" * 40)
         yield f"data: {json.dumps({'done': True})}\n\n"
 
-    return StreamingResponse(stream_sse(), media_type="text/event-stream")
+    return StreamingResponse(
+        stream_sse(),
+        media_type="text/event-stream; charset=utf-8",
+    )
 
 
 # ── POST /command ── 处理 /xx 命令 ──
@@ -831,19 +856,46 @@ async function generateAssistantResponse() {
         });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const reader = resp.body.getReader();
-        const dec = new TextDecoder();
+        const dec = new TextDecoder('utf-8');
+        let sseBuf = '';
         let full = ''; el.textContent = '';
+        let serverDone = false;
         while (true) {
-            const {done, value} = await reader.read();
-            if (done) break;
-            for (const line of dec.decode(value).split('\n')) {
+            const { done, value } = await reader.read();
+            sseBuf += dec.decode(value ? value : new Uint8Array(), { stream: !done });
+            if (done) sseBuf += dec.decode();
+            for (;;) {
+                const nl = sseBuf.indexOf('\n');
+                if (nl < 0) break;
+                const line = sseBuf.slice(0, nl).replace(/\r$/, '');
+                sseBuf = sseBuf.slice(nl + 1);
                 if (!line.startsWith('data: ')) continue;
                 try {
                     const d = JSON.parse(line.slice(6));
                     if (d.token) { full += d.token; el.textContent = full; chatContainer.scrollTop = chatContainer.scrollHeight; }
-                    if (d.error) { el.innerHTML = '<div class="error-message">Error: ' + d.error + '</div>'; }
+                    if (d.error) {
+                        el.innerHTML = '<div class="error-message">Error: ' + d.error + '</div>';
+                        serverDone = true;
+                        break;
+                    }
+                    if (d.done) {
+                        serverDone = true;
+                        break;
+                    }
                 } catch(_){}
             }
+            if (serverDone || done) break;
+        }
+        if (serverDone) {
+            try { await reader.cancel(); } catch(_) {}
+        }
+        const tail = sseBuf.trim();
+        if (!serverDone && tail.startsWith('data: ')) {
+            try {
+                const d = JSON.parse(tail.slice(6));
+                if (d.token) { full += d.token; el.textContent = full; chatContainer.scrollTop = chatContainer.scrollHeight; }
+                if (d.error) { el.innerHTML = '<div class="error-message">Error: ' + d.error + '</div>'; }
+            } catch(_){}
         }
         const aidx = messages.length;
         messages.push({role:'assistant', content: full});
