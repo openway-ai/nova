@@ -1,6 +1,8 @@
-"""
-EBT CORE 评估脚本
-基于 nanochat 的 base_eval.py，适配 EBT 模型
+"""EBT CORE evaluation harness.
+
+Adapts nanochat's ``base_eval.py`` CORE evaluator to run against an EBT
+checkpoint. Supports single- and multi-GPU execution, greedy load-balanced task
+scheduling, and optional per-sample trajectory logging.
 """
 import os
 import sys
@@ -38,43 +40,44 @@ from nanochat.core_eval import (
 
 
 class EBTModelWrapper:
-    """将 EBT 模型包装为 nanochat 兼容的接口"""
+    """Wrap an EBT model so it exposes a nanochat-compatible eval interface."""
 
-    def __init__(self, model, tokenizer, device, max_seq_len=256):
+    def __init__(self, model: "Any", tokenizer: "Any", device: "Any", max_seq_len: int = 256) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.max_seq_len = max_seq_len
 
-    def __call__(self, input_ids, targets=None, loss_reduction='mean'):
-        """
-        前向传播，兼容 nanochat 的接口
+    def __call__(self, input_ids: "Any", targets: "Optional[Any]" = None, loss_reduction: str = 'mean') -> "Any":
+        """Run a forward pass compatible with nanochat's eval helpers.
 
-        Args:
-            input_ids: [batch_size, seq_len]
-            targets: [batch_size, seq_len] 或 None
-            loss_reduction: 'mean' 或 'none'
-
-        Returns:
-            如果 targets is None: 返回 logits [batch_size, seq_len, vocab_size]
-            否则: 返回 loss (scalar 或 [batch_size])
+        :param input_ids: token ids of shape ``[batch_size, seq_len]``.
+        :type input_ids: Any
+        :param targets: optional target ids of shape ``[batch_size, seq_len]``;
+            when ``None`` raw logits are returned.
+        :type targets: Optional[Any]
+        :param loss_reduction: ``'mean'`` or ``'none'`` passed to
+            ``F.cross_entropy``.
+        :type loss_reduction: str
+        :return: logits ``[batch_size, seq_len, vocab_size]`` when ``targets``
+            is ``None``, otherwise the computed loss.
+        :rtype: Any
         """
         with torch.no_grad():
-            # EBT forward 返回 (logits_list, energies)
+            # EBT.forward returns (logits_list, energies).
             outputs = self.model.forward(input_ids, start_pos=0, learning=False, return_raw_logits=True)
 
-            # 取最后一个 MCMC 步骤的 logits
+            # Take the final MCMC step's logits.
             if isinstance(outputs, tuple):
                 logits = outputs[0]
                 if isinstance(logits, list):
-                    logits = logits[-1]  # 最后一个 MCMC 步骤
+                    logits = logits[-1]
             else:
                 logits = outputs
 
             if targets is None:
                 return logits
 
-            # 计算损失
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
@@ -83,28 +86,44 @@ class EBTModelWrapper:
             )
             return loss
 
-    def get_device(self):
+    def get_device(self) -> "Any":
+        """Return the torch device this wrapper runs on.
+
+        :return: the underlying torch device.
+        :rtype: Any
+        """
         return self.device
 
 
-def load_ebt_model(ckpt_path, tokenizer_path, device, dtype=torch.bfloat16):
-    """加载 EBT checkpoint"""
+def load_ebt_model(ckpt_path: str, tokenizer_path: str, device: "Any", dtype: "torch.dtype" = torch.bfloat16) -> "Tuple[Any, Any, Any]":
+    """Load an EBT checkpoint ready for inference.
+
+    :param ckpt_path: path to the Lightning-style checkpoint.
+    :type ckpt_path: str
+    :param tokenizer_path: path to the tokenizer artefacts.
+    :type tokenizer_path: str
+    :param device: torch device to place the model on.
+    :type device: Any
+    :param dtype: inference dtype (``bfloat16`` by default).
+    :type dtype: torch.dtype
+    :return: tuple of ``(wrapped_model, tokenizer, hparams)``.
+    :rtype: Tuple[Any, Any, Any]
+    """
     print(f"Loading EBT checkpoint from: {ckpt_path}")
 
-    # 加载 checkpoint
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     hparams = checkpoint['hyper_parameters']
 
-    # 设置推理模式参数
+    # Switch to inference mode.
     hparams['execution_mode'] = 'inference'
     hparams['no_wandb'] = True
-    # 禁用 torch.compile — eval 不需要编译，且 compile + MCMC grad + mp.spawn 会导致 CUBLAS 错误
+    # NOTE: torch.compile is disabled here; compile + MCMC grad + mp.spawn
+    # combination triggers CUBLAS errors, and eval does not need compilation.
     hparams['compile_model'] = False
 
-    # 加载模型
     model_trainer = ModelTrainer(hparams)
 
-    # 复用 on_load_checkpoint 的 _orig_mod 前缀修复逻辑
+    # Reuse the ``_orig_mod`` prefix fix-up from on_load_checkpoint.
     state_dict = checkpoint['state_dict']
     has_orig_mod_keys = any('_orig_mod.' in k for k in state_dict)
     model_has_orig_mod = any('_orig_mod.' in k for k in model_trainer.state_dict())
@@ -128,44 +147,76 @@ def load_ebt_model(ckpt_path, tokenizer_path, device, dtype=torch.bfloat16):
     model.to(device=device, dtype=dtype)
     model.eval()
 
-    # 加载 tokenizer
     from nanochat.tokenizer import get_tokenizer
     tokenizer_obj = get_tokenizer()
     tokenizer_wrapper = NanoChatTokenizerWrapper(tokenizer_obj=tokenizer_obj)
 
-    # 获取最大序列长度
     max_seq_len = hparams.get('context_length', 256)
 
-    # 包装模型
     wrapped_model = EBTModelWrapper(model, tokenizer_wrapper, device, max_seq_len=max_seq_len)
 
     print(f"✓ Model loaded: {hparams['model_name']} (size: {hparams.get('model_size', 'unknown')})")
     print(f"✓ Context length: {max_seq_len}")
 
-    # 返回原始 RustBPETokenizer 给 eval 函数（nanochat core_eval 需要 .get_bos_token_id() 和 __call__(prompts, prepend=...) 接口）
+    # Return the raw RustBPETokenizer so nanochat's core_eval (which expects
+    # ``get_bos_token_id`` and ``__call__(prompts, prepend=...)``) works directly.
     return wrapped_model, tokenizer_obj, hparams
 
 
-def evaluate_task(model, tokenizer, data, device, task_meta, max_seq_len=None):
-    """适配 nanochat 的 evaluate_task，忽略 max_seq_len 参数（已通过 model.max_seq_len 传递）"""
+def evaluate_task(model: "Any", tokenizer: "Any", data: "Any", device: "Any", task_meta: "Any", max_seq_len: "Optional[int]" = None) -> "Any":
+    """Wrapper around nanochat's ``evaluate_task`` that ignores ``max_seq_len``.
+
+    The max sequence length is already threaded through ``model.max_seq_len``,
+    so the extra argument is accepted only for API symmetry.
+
+    :param model: wrapped EBT model.
+    :type model: Any
+    :param tokenizer: tokenizer used for rendering prompts.
+    :type tokenizer: Any
+    :param data: eval examples.
+    :type data: Any
+    :param device: torch device.
+    :type device: Any
+    :param task_meta: nanochat task metadata dict.
+    :type task_meta: Any
+    :param max_seq_len: ignored; kept for compatibility.
+    :type max_seq_len: Optional[int]
+    :return: whatever nanochat's ``evaluate_task`` returns.
+    :rtype: Any
+    """
     return _nanochat_evaluate_task(model, tokenizer, data, device, task_meta)
 
 
 @torch.no_grad()
-def evaluate_example_with_trajectory(idx, model, tokenizer, data, device, task_meta):
-    """
-    与 nanochat evaluate_example 逻辑一致，额外返回 trajectory dict。
-    不修改 nanochat 代码，复用其 render/batch/stack/forward 工具函数。
+def evaluate_example_with_trajectory(idx: int, model: "Any", tokenizer: "Any", data: "Any", device: "Any", task_meta: "Any") -> "Tuple[bool, Dict[str, Any]]":
+    """Evaluate a single example and return its per-sample trajectory.
 
-    Returns:
-        (is_correct: bool, trajectory: dict)
+    Mirrors nanochat's ``evaluate_example`` but additionally records a
+    trajectory dictionary (prompt, ground truth, prediction, per-option
+    losses) without modifying nanochat's own code.
+
+    :param idx: index of the example in ``data``.
+    :type idx: int
+    :param model: wrapped EBT model.
+    :type model: Any
+    :param tokenizer: tokenizer used for rendering prompts.
+    :type tokenizer: Any
+    :param data: list of eval examples.
+    :type data: Any
+    :param device: torch device.
+    :type device: Any
+    :param task_meta: nanochat task metadata dict.
+    :type task_meta: Any
+    :return: ``(is_correct, trajectory)``.
+    :rtype: Tuple[bool, Dict[str, Any]]
+    :raises ValueError: if ``task_meta['task_type']`` is unsupported.
     """
     item = data[idx]
     task_type = task_meta['task_type']
     num_fewshot = task_meta['num_fewshot']
     continuation_delimiter = task_meta['continuation_delimiter']
 
-    # Sample few-shot examples (excluding current item) — 与 nanochat 一致
+    # Sample few-shot examples (excluding current item) -- matches nanochat.
     fewshot_examples = []
     if num_fewshot > 0:
         rng = random.Random(1234 + idx)
@@ -173,7 +224,7 @@ def evaluate_example_with_trajectory(idx, model, tokenizer, data, device, task_m
         fewshot_indices = rng.sample(available_indices, num_fewshot)
         fewshot_examples = [data[i] for i in fewshot_indices]
 
-    # Render prompts and batch sequences based on task type
+    # Render prompts and batch sequences based on task type.
     if task_type == 'multiple_choice':
         prompts = render_prompts_mc(item, continuation_delimiter, fewshot_examples)
         tokens, start_idxs, end_idxs = batch_sequences_mc(tokenizer, prompts)
@@ -186,7 +237,7 @@ def evaluate_example_with_trajectory(idx, model, tokenizer, data, device, task_m
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
 
-    # max_seq_len truncation — 与 nanochat 一致
+    # max_seq_len truncation -- matches nanochat.
     if hasattr(model, 'max_seq_len') and model.max_seq_len is not None:
         max_tokens = model.max_seq_len
         new_tokens, new_start_idxs, new_end_idxs = [], [], []
@@ -239,7 +290,7 @@ def evaluate_example_with_trajectory(idx, model, tokenizer, data, device, task_m
         except Exception:
             pred_text = str(predicted_tokens.tolist())
 
-        trajectory["input"] = prompts[0]  # prompt_without
+        trajectory["input"] = prompts[0]
         trajectory["ground_truth"] = gt_text
         trajectory["prediction"] = pred_text
         trajectory["parsed_answer"] = pred_text
@@ -251,7 +302,7 @@ def evaluate_example_with_trajectory(idx, model, tokenizer, data, device, task_m
         gold_idx = item['gold']
         is_correct = pred_idx == gold_idx
 
-        # Trajectory: record choices and losses
+        # Trajectory: record choices and losses.
         if task_type == 'multiple_choice':
             choices = item.get('choices', [])
             trajectory["input"] = prompts[gold_idx] if gold_idx < len(prompts) else prompts[0]
@@ -259,7 +310,7 @@ def evaluate_example_with_trajectory(idx, model, tokenizer, data, device, task_m
             trajectory["prediction"] = choices[pred_idx] if pred_idx < len(choices) else str(pred_idx)
             trajectory["parsed_answer"] = pred_idx
             trajectory["metadata"]["num_choices"] = len(choices)
-        else:  # schema
+        else:
             context_options = item.get('context_options', [])
             continuation = item.get('continuation', '')
             trajectory["input"] = prompts[gold_idx] if gold_idx < len(prompts) else prompts[0]
@@ -279,17 +330,39 @@ def evaluate_example_with_trajectory(idx, model, tokenizer, data, device, task_m
     return is_correct, trajectory
 
 
-def evaluate_task_with_trajectory(model, tokenizer, data, device, task_meta,
-                                  output_dir=None, task_label=None,
-                                  num_trajectory_samples=10,
-                                  show_progress=True, progress_position=1):
-    """
-    替代 _nanochat_evaluate_task，循环中收集 trajectory 并写入 JSONL。
-    前 num_trajectory_samples 个样本调用 evaluate_example_with_trajectory，
-    剩余的调用原 evaluate_example（性能考虑）。
+def evaluate_task_with_trajectory(model: "Any", tokenizer: "Any", data: "Any", device: "Any", task_meta: "Any",
+                                  output_dir: "Optional[str]" = None, task_label: "Optional[str]" = None,
+                                  num_trajectory_samples: int = 10,
+                                  show_progress: bool = True, progress_position: int = 1) -> "Tuple[float, List[Dict[str, Any]]]":
+    """Evaluate a task while optionally persisting per-sample trajectories.
 
-    Returns:
-        (mean_correct: float, trajectories: list[dict])
+    Replaces ``_nanochat_evaluate_task``. The first ``num_trajectory_samples``
+    examples are evaluated with :func:`evaluate_example_with_trajectory` and
+    their trajectories are streamed to ``samples.jsonl``; remaining examples
+    fall back to the faster ``evaluate_example``.
+
+    :param model: wrapped EBT model.
+    :type model: Any
+    :param tokenizer: tokenizer used for rendering prompts.
+    :type tokenizer: Any
+    :param data: eval examples.
+    :type data: Any
+    :param device: torch device.
+    :type device: Any
+    :param task_meta: nanochat task metadata dict.
+    :type task_meta: Any
+    :param output_dir: directory under which to write trajectories.
+    :type output_dir: Optional[str]
+    :param task_label: label of the task (used in the output path).
+    :type task_label: Optional[str]
+    :param num_trajectory_samples: number of samples to log per task; ``0`` disables.
+    :type num_trajectory_samples: int
+    :param show_progress: whether to render a tqdm progress bar.
+    :type show_progress: bool
+    :param progress_position: tqdm ``position`` argument.
+    :type progress_position: int
+    :return: ``(mean_correct, trajectories)``.
+    :rtype: Tuple[float, List[Dict[str, Any]]]
     """
     n = len(data)
     correct = 0
@@ -329,31 +402,42 @@ def evaluate_task_with_trajectory(model, tokenizer, data, device, task_meta,
     return mean_correct, trajectories
 
 
-def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1,
-                  task_samples=None, output_dir=None, num_trajectory_samples=10):
-    """
-    运行完整的 CORE 评估
+def evaluate_core(model: "Any", tokenizer: "Any", device: "Any", eval_bundle_dir: str, max_per_task: int = -1,
+                  task_samples: "Optional[Dict[str, int]]" = None, output_dir: "Optional[str]" = None,
+                  num_trajectory_samples: int = 10) -> "Dict[str, Any]":
+    """Run the full CORE evaluation suite on a single device.
 
-    Args:
-        model: 模型
-        tokenizer: tokenizer
-        device: 设备
-        eval_bundle_dir: 评估数据目录
-        max_per_task: 全局默认每个任务的最大样本数，-1 表示全部
-        task_samples: 字典，指定每个任务的样本数，例如 {"hellaswag_zeroshot": 100}
-        output_dir: 输出目录（用于保存 trajectory）
-        num_trajectory_samples: 每个任务保存前 N 个样本的 trajectory (0=禁用)
+    :param model: wrapped EBT model.
+    :type model: Any
+    :param tokenizer: tokenizer used for rendering prompts.
+    :type tokenizer: Any
+    :param device: torch device.
+    :type device: Any
+    :param eval_bundle_dir: directory containing ``core.yaml`` and
+        ``eval_meta_data.csv``.
+    :type eval_bundle_dir: str
+    :param max_per_task: global default cap on examples per task; ``-1`` means
+        use all samples.
+    :type max_per_task: int
+    :param task_samples: per-task overrides, e.g. ``{"hellaswag_zeroshot": 100}``.
+    :type task_samples: Optional[Dict[str, int]]
+    :param output_dir: directory to write trajectories into.
+    :type output_dir: Optional[str]
+    :param num_trajectory_samples: number of trajectories per task; ``0`` disables.
+    :type num_trajectory_samples: int
+    :return: dictionary with ``results``, ``centered_results``, ``core_metric`` and ``timing``.
+    :rtype: Dict[str, Any]
     """
     config_path = os.path.join(eval_bundle_dir, "core.yaml")
     data_base_path = os.path.join(eval_bundle_dir, "eval_data")
     eval_meta_data = os.path.join(eval_bundle_dir, "eval_meta_data.csv")
 
-    # 加载配置
+    # Load config.
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     tasks = config['icl_tasks']
 
-    # 加载 random baseline
+    # Load random baselines for centered-accuracy normalisation.
     random_baselines = {}
     with open(eval_meta_data, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
@@ -362,7 +446,7 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1,
             random_baseline = row['Random baseline']
             random_baselines[task_name] = float(random_baseline)
 
-    # 评估每个任务
+    # Per-task result accumulators.
     results = {}
     centered_results = {}
     timing_records = []
@@ -388,18 +472,18 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1,
         tqdm.write(f"[{task_idx+1}/{len(tasks)}] Evaluating: {label}")
         tqdm.write(f"  Type: {task_meta['task_type']} | Few-shot: {task_meta['num_fewshot']}")
 
-        # 加载数据
+        # Load task data.
         data_path = os.path.join(data_base_path, task_meta['dataset_uri'])
         with open(data_path, 'r', encoding='utf-8') as f:
             data = [json.loads(line.strip()) for line in f]
 
-        # 确定该任务使用的样本数
+        # Decide how many samples to use for this task.
         task_max_samples = max_per_task
         if task_samples and label in task_samples:
             task_max_samples = task_samples[label]
             tqdm.write(f"  Using task-specific sample limit: {task_max_samples}")
 
-        # 子采样（用于快速测试）
+        # Subsample for quick smoke tests.
         if task_max_samples > 0:
             shuffle_rng = random.Random(1337)
             shuffle_rng.shuffle(data)
@@ -408,7 +492,7 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1,
         else:
             tqdm.write(f"  Total samples: {len(data)} (evaluating ALL samples)")
 
-        # 评估（使用带 trajectory 的版本）
+        # Evaluate (trajectory-aware variant).
         accuracy, _ = evaluate_task_with_trajectory(
             model, tokenizer, data, device, task_meta,
             output_dir=output_dir, task_label=label,
@@ -416,7 +500,7 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1,
             show_progress=True, progress_position=1)
         results[label] = accuracy
 
-        # 计算 centered result
+        # Compute centered (random-baseline-adjusted) accuracy.
         random_baseline = random_baselines.get(label, 50.0)
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result
@@ -434,7 +518,7 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1,
 
     task_pbar.close()
 
-    # 计算 CORE metric
+    # Aggregate the CORE metric across tasks.
     core_metric = sum(centered_results.values()) / len(centered_results)
 
     return {
@@ -446,19 +530,25 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1,
 
 
 def _greedy_assign_tasks(all_tasks, num_gpus, history_timing):
-    """
-    贪心调度：按预估耗时降序排列任务，每次将最重的任务分给累计负载最轻的 GPU。
-    如果没有历史 timing 数据，fall back 到 round-robin。
+    """Assign tasks to GPUs with greedy load balancing.
 
-    Args:
-        all_tasks: 任务列表 (core.yaml 中的 icl_tasks)
-        num_gpus: GPU 数量
-        history_timing: dict, 历史 timing 数据 (timing_summary.json 的内容), 或 None
+    Tasks are sorted by estimated duration (descending) and repeatedly placed
+    on the GPU with the smallest accumulated cost. When no historical timing
+    information is available the function falls back to round-robin.
 
-    Returns:
-        dict: {rank: [task_index, ...]} — 每个 GPU 分配的任务索引列表
+    :param all_tasks: list of tasks from ``core.yaml`` (``icl_tasks``).
+    :type all_tasks: list
+    :param num_gpus: number of GPUs participating in the eval.
+    :type num_gpus: int
+    :param history_timing: parsed historical ``timing_summary.json`` content
+        (dict or flat list), or ``None`` to force round-robin.
+    :type history_timing: Any
+    :return: tuple ``(assignment, used_greedy)`` where ``assignment`` maps
+        rank to a list of task indices and ``used_greedy`` indicates whether
+        greedy scheduling was applied.
+    :rtype: tuple
     """
-    # 尝试从历史 timing 中提取每个任务的耗时
+    # Attempt to read per-task durations from historical timing.
     per_task_duration = {}
     if history_timing is not None:
         per_task = history_timing.get("per_task", {})
@@ -480,15 +570,15 @@ def _greedy_assign_tasks(all_tasks, num_gpus, history_timing):
             else:
                 per_task_duration[label] = float(val)
 
-    # 如果没有任何历史 timing，fall back 到 round-robin
+    # Fall back to round-robin if no historical timing is available.
     if not per_task_duration:
         assignment = {r: [] for r in range(num_gpus)}
         for i in range(len(all_tasks)):
             assignment[i % num_gpus].append(i)
-        return assignment, False  # False = 没有使用贪心
+        return assignment, False
 
-    # 贪心调度
-    # 1. 为每个任务获取预估耗时 (未见过的任务用中位数)
+    # Greedy scheduling.
+    # 1. Estimate each task's duration (unseen tasks get the median).
     known_durations = list(per_task_duration.values())
     median_duration = sorted(known_durations)[len(known_durations) // 2] if known_durations else 60.0
 
@@ -498,11 +588,10 @@ def _greedy_assign_tasks(all_tasks, num_gpus, history_timing):
         cost = per_task_duration.get(label, median_duration)
         task_costs.append((i, label, cost))
 
-    # 2. 按耗时降序排列 (最重的任务优先分配)
+    # 2. Sort by estimated cost, heaviest first.
     task_costs.sort(key=lambda x: x[2], reverse=True)
 
-    # 3. 贪心分配：每次将最重的任务分给当前累计负载最轻的 GPU
-    # Min-heap of (cumulative_cost, rank)
+    # 3. Greedy placement using a (cumulative_cost, rank) min-heap.
     gpu_heap = [(0.0, r) for r in range(num_gpus)]
     heapq.heapify(gpu_heap)
     assignment = {r: [] for r in range(num_gpus)}
@@ -512,7 +601,7 @@ def _greedy_assign_tasks(all_tasks, num_gpus, history_timing):
         assignment[min_rank].append(task_idx)
         heapq.heappush(gpu_heap, (min_cost + cost, min_rank))
 
-    return assignment, True  # True = 使用了贪心调度
+    return assignment, True
 
 
 def _eval_worker(rank, world_size, ckpt_path, tokenizer_path, dtype,
@@ -520,17 +609,22 @@ def _eval_worker(rank, world_size, ckpt_path, tokenizer_path, dtype,
                  all_tasks, random_baselines, result_dict,
                  timing_list, output_dir, num_trajectory_samples,
                  per_rank_indices=None):
-    """多 GPU 评估的 worker 进程
+    """Worker entry point for multi-GPU CORE evaluation.
 
-    Args:
-        per_rank_indices: dict {rank: [task_index, ...]}，由主进程预先计算好的
-                          任务分配 (贪心调度)。如果为 None，fall back 到 round-robin。
+    :param rank: this worker's GPU rank.
+    :type rank: int
+    :param world_size: total number of GPUs.
+    :type world_size: int
+    :param per_rank_indices: pre-computed ``{rank: [task_index, ...]}`` from the
+        main process (greedy schedule). When ``None`` the worker falls back to
+        round-robin.
+    :type per_rank_indices: Any
     """
     device = torch.device(f'cuda:{rank}')
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('medium')
 
-    # 使用预计算的任务分配，或 fall back 到 round-robin
+    # Use the pre-computed assignment, else fall back to round-robin.
     if per_rank_indices is not None and rank in per_rank_indices:
         task_indices = list(per_rank_indices[rank])
     else:
@@ -558,12 +652,12 @@ def _eval_worker(rank, world_size, ckpt_path, tokenizer_path, dtype,
         print(f"[GPU {rank}] [{task_idx+1}/{len(all_tasks)}] Evaluating: {label}")
         sys.stdout.flush()
 
-        # 加载数据
+        # Load task data.
         data_path = os.path.join(data_base_path, task_meta['dataset_uri'])
         with open(data_path, 'r', encoding='utf-8') as f:
             data = [json.loads(line.strip()) for line in f]
 
-        # 确定样本数
+        # Decide sample count for this task.
         task_max_samples = max_per_task
         if task_samples and label in task_samples:
             task_max_samples = task_samples[label]
@@ -573,7 +667,8 @@ def _eval_worker(rank, world_size, ckpt_path, tokenizer_path, dtype,
             shuffle_rng.shuffle(data)
             data = data[:task_max_samples]
 
-        # 评估（使用带 trajectory 的版本，不显示 tqdm，trajectory 写到 rank 后缀文件）
+        # Evaluate (trajectory-aware); trajectories are written to rank-suffixed
+        # files and later merged by the main process. tqdm is suppressed here.
         traj_file = None
         if num_trajectory_samples > 0 and output_dir:
             traj_dir = os.path.join(output_dir, "trajectories", label)
@@ -600,7 +695,7 @@ def _eval_worker(rank, world_size, ckpt_path, tokenizer_path, dtype,
 
         accuracy = correct / n if n > 0 else 0.0
 
-        # centered result
+        # Centered (random-baseline-adjusted) accuracy.
         random_baseline = random_baselines.get(label, 50.0)
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
 
@@ -624,7 +719,35 @@ def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
                            eval_bundle_dir, max_per_task, task_samples,
                            output_dir=None, num_trajectory_samples=10,
                            history_timing_path=None):
-    """多 GPU 并行评估：使用贪心调度按预估耗时均衡分配任务到各 GPU"""
+    """Run the CORE evaluation suite in parallel across multiple GPUs.
+
+    Uses :func:`_greedy_assign_tasks` to spread tasks across ranks based on
+    estimated duration and spawns one worker per GPU via ``mp.spawn``.
+
+    :param num_gpus: number of GPUs to use.
+    :type num_gpus: int
+    :param ckpt_path: EBT checkpoint path.
+    :type ckpt_path: str
+    :param tokenizer_path: tokenizer path.
+    :type tokenizer_path: str
+    :param dtype: inference dtype.
+    :type dtype: torch.dtype
+    :param eval_bundle_dir: directory containing ``core.yaml``.
+    :type eval_bundle_dir: str
+    :param max_per_task: global cap on examples per task (``-1`` for all).
+    :type max_per_task: int
+    :param task_samples: per-task sample overrides.
+    :type task_samples: Any
+    :param output_dir: directory to write trajectories into.
+    :type output_dir: Any
+    :param num_trajectory_samples: trajectories per task (``0`` disables).
+    :type num_trajectory_samples: int
+    :param history_timing_path: path to historical ``timing_summary.json`` for
+        greedy scheduling (optional).
+    :type history_timing_path: Any
+    :return: aggregated results dict matching :func:`evaluate_core`.
+    :rtype: dict
+    """
     config_path = os.path.join(eval_bundle_dir, "core.yaml")
     eval_meta_data = os.path.join(eval_bundle_dir, "eval_meta_data.csv")
 
@@ -638,7 +761,7 @@ def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
         for row in reader:
             random_baselines[row['Eval Task']] = float(row['Random baseline'])
 
-    # 加载历史 timing 用于贪心调度
+    # Load historical timing for greedy scheduling.
     history_timing = None
     if history_timing_path and os.path.isfile(history_timing_path):
         try:
@@ -647,7 +770,7 @@ def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
         except Exception as e:
             print(f"  Warning: could not load history timing for scheduling: {e}")
 
-    # 贪心调度 (或 fall back 到 round-robin)
+    # Greedy scheduling (or fall back to round-robin).
     assignment, used_greedy = _greedy_assign_tasks(all_tasks, num_gpus, history_timing)
 
     print(f"\n{'='*80}")
@@ -657,7 +780,7 @@ def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
     print(f"{'='*80}")
     for rank in range(num_gpus):
         task_names = [all_tasks[i]['label'] for i in assignment[rank]]
-        # 显示预估耗时 (如果有历史 timing)
+        # Show estimated duration when historical timing is available.
         if used_greedy and history_timing is not None:
             per_task = history_timing.get("per_task", {})
             if not per_task and "records" in history_timing:
@@ -675,17 +798,17 @@ def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
             print(f"  GPU {rank}: {len(task_names)} tasks -- {', '.join(task_names)}")
     print()
 
-    # 共享结果字典和 timing 列表
+    # Shared result dict and timing list across worker processes.
     manager = mp.Manager()
     result_dict = manager.dict()
     timing_list = manager.list()
 
-    # 将每个 rank 的任务索引列表转为 manager.list 以便跨进程传递
+    # Convert each rank's task list into a manager.dict entry for IPC.
     per_rank_indices = manager.dict()
     for rank in range(num_gpus):
         per_rank_indices[rank] = assignment[rank]
 
-    # 使用 mp.spawn — 传递预计算好的任务分配
+    # Spawn worker processes with the precomputed task assignment.
     mp.spawn(
         _eval_worker,
         args=(num_gpus, ckpt_path, tokenizer_path, dtype,
@@ -697,7 +820,7 @@ def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
         join=True,
     )
 
-    # 合并各 rank 的 trajectory JSONL → samples.jsonl
+    # Merge per-rank trajectory JSONL files into a single samples.jsonl per task.
     if num_trajectory_samples > 0 and output_dir:
         traj_base = os.path.join(output_dir, "trajectories")
         if os.path.isdir(traj_base):
@@ -717,7 +840,7 @@ def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
                     for rf in rank_files:
                         os.remove(rf)
 
-    # 汇总结果
+    # Collect aggregate results.
     results = {}
     centered_results = {}
     for label, (acc, centered) in result_dict.items():
@@ -726,7 +849,7 @@ def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
 
     core_metric = sum(centered_results.values()) / len(centered_results) if centered_results else 0.0
 
-    # 收集 timing
+    # Collect timing records across ranks.
     timing_records = list(timing_list)
 
     return {
@@ -738,19 +861,33 @@ def evaluate_core_multigpu(num_gpus, ckpt_path, tokenizer_path, dtype,
 
 
 def _find_latest_timing(ebt_dir):
-    """在 {ebt_dir}/logs/core_eval/ 下查找最新的 timing_summary.json"""
+    """Return the newest ``timing_summary.json`` under ``{ebt_dir}/logs/core_eval/``.
+
+    :param ebt_dir: ELM package directory whose ``logs/core_eval`` subtree is
+        searched.
+    :type ebt_dir: str
+    :return: path to the latest ``timing_summary.json`` by mtime, or ``None``
+        if none exists.
+    :rtype: Any
+    """
     search_dir = os.path.join(ebt_dir, "logs", "core_eval")
     if not os.path.isdir(search_dir):
         return None
     candidates = sorted(glob_module.glob(os.path.join(search_dir, "**/timing_summary.json"), recursive=True))
     if not candidates:
         return None
-    # Return the latest by modification time
+    # Return the latest by modification time.
     return max(candidates, key=os.path.getmtime)
 
 
 def _print_eta_table(history_timing_path, tasks):
-    """Load historical timing and print an ETA estimation table."""
+    """Load historical timing and print an ETA estimation table.
+
+    :param history_timing_path: path to a ``timing_summary.json`` file.
+    :type history_timing_path: str
+    :param tasks: list of task dicts from ``core.yaml``.
+    :type tasks: list
+    """
     try:
         with open(history_timing_path, 'r', encoding='utf-8') as f:
             history = json.load(f)
@@ -789,30 +926,31 @@ def _print_eta_table(history_timing_path, tasks):
 
 
 def main():
+    """CLI entry point for running the EBT CORE evaluation."""
     parser = argparse.ArgumentParser(
         description="EBT CORE Evaluation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例用法:
+Example usage:
 
-1. 评估所有样本（完整 CORE score）:
+1. Evaluate all samples (full CORE score):
    python -m scripts.ebt_core_eval --ckpt-path model.ckpt --tokenizer-path tokenizer/ \\
        --eval-bundle-dir eval_bundle/ --output-dir output/ --max-per-task -1
 
-2. 快速测试（每个任务 100 个样本）:
+2. Quick test (100 samples per task):
    python -m scripts.ebt_core_eval --ckpt-path model.ckpt --tokenizer-path tokenizer/ \\
        --eval-bundle-dir eval_bundle/ --output-dir output/ --max-per-task 100
 
-3. 为特定任务设置不同样本数:
+3. Set different sample counts for specific tasks:
    python -m scripts.ebt_core_eval --ckpt-path model.ckpt --tokenizer-path tokenizer/ \\
        --eval-bundle-dir eval_bundle/ --output-dir output/ --max-per-task 100 \\
        --task-samples "hellaswag_zeroshot:500,arc_easy:200"
 
-4. 使用多个 GPU:
+4. Use multiple GPUs:
    python -m scripts.ebt_core_eval --ckpt-path model.ckpt --tokenizer-path tokenizer/ \\
        --eval-bundle-dir eval_bundle/ --output-dir output/ --gpus 4
 
-5. 保存 trajectory（每个任务前 20 个样本）:
+5. Save trajectory (first 20 samples per task):
    python -m scripts.ebt_core_eval --ckpt-path model.ckpt --tokenizer-path tokenizer/ \\
        --eval-bundle-dir eval_bundle/ --output-dir output/ --num-trajectory-samples 20
         """
@@ -837,7 +975,7 @@ def main():
                         help='Path to historical timing_summary.json for ETA estimation (auto-detect if empty)')
     args = parser.parse_args()
 
-    # 解析任务特定样本数
+    # Parse per-task sample overrides.
     task_samples_dict = {}
     if args.task_samples:
         for item in args.task_samples.split(','):
@@ -845,7 +983,7 @@ def main():
                 task_name, num_samples = item.split(':', 1)
                 task_samples_dict[task_name.strip()] = int(num_samples.strip())
 
-    # 设置设备和 GPU
+    # Resolve device / GPU configuration.
     if args.gpus == -1:
         if torch.cuda.is_available():
             num_gpus = torch.cuda.device_count()
@@ -859,20 +997,20 @@ def main():
 
     dtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
 
-    # 性能优化: 启用 TF32 (H200/A100 Tensor Core 加速)
+    # Enable TF32 for Tensor Core acceleration on H200/A100.
     torch.set_float32_matmul_precision('medium')
 
-    # 创建输出目录
+    # Ensure the output directory exists.
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ETA 预估：加载历史 timing
+    # ETA estimation: load historical timing if available.
     ebt_dir = str(Path(__file__).parent.parent)
     history_timing_path = args.history_timing
     if not history_timing_path:
         history_timing_path = _find_latest_timing(ebt_dir)
     if history_timing_path and os.path.isfile(history_timing_path):
         print(f"\nFound historical timing: {history_timing_path}")
-        # Load task list for ETA table
+        # Load task list for the ETA table.
         config_path = os.path.join(args.eval_bundle_dir, "core.yaml")
         if os.path.isfile(config_path):
             with open(config_path, 'r', encoding='utf-8') as f:
@@ -884,7 +1022,7 @@ def main():
     eval_start_time = time.time()
     eval_start_iso = datetime.now().isoformat()
 
-    # 多 GPU 路径
+    # Multi-GPU path.
     if num_gpus > 1 and 'core' in args.eval_modes:
         print(f"\nUsing multi-GPU evaluation with {num_gpus} GPUs")
         core_results = evaluate_core_multigpu(
@@ -900,7 +1038,7 @@ def main():
             history_timing_path=history_timing_path,
         )
     else:
-        # 单 GPU / CPU 路径
+        # Single-GPU / CPU path.
         if num_gpus >= 1:
             device = torch.device('cuda:0')
         else:
@@ -928,7 +1066,7 @@ def main():
     eval_end_iso = datetime.now().isoformat()
     total_seconds = round(eval_end_time - eval_start_time, 2)
 
-    # 打印和保存结果
+    # Print and persist results.
     if core_results:
         print("\n" + "="*80)
         print("CORE Evaluation Results")
@@ -941,7 +1079,7 @@ def main():
             centered = core_results['centered_results'][task_name]
             print(f"  {task_name:40s}: {accuracy:.4f} (centered: {centered:.4f})")
 
-        # 保存结果 (不含 timing，timing 单独写)
+        # Save results (timing is persisted separately below).
         results_to_save = {
             "results": core_results["results"],
             "centered_results": core_results["centered_results"],
@@ -952,7 +1090,7 @@ def main():
             json.dump(results_to_save, f, indent=2)
         print(f"\n-> Results saved to: {results_file}")
 
-        # 保存 CSV
+        # Save CSV.
         csv_file = os.path.join(args.output_dir, "core_results.csv")
         with open(csv_file, 'w', newline='') as f:
             writer = csv.writer(f)
@@ -967,7 +1105,7 @@ def main():
             writer.writerow(['OVERALL', '', '', f"{core_results['core_metric']:.4f}"])
         print(f"-> CSV saved to: {csv_file}")
 
-        # 保存 timing_summary.json
+        # Save timing_summary.json.
         timing_records = core_results.get("timing", [])
         per_task_timing = {}
         for rec in timing_records:
@@ -990,13 +1128,13 @@ def main():
             json.dump(timing_summary, f, indent=2)
         print(f"-> Timing saved to: {timing_file}")
 
-        # Trajectory 路径提示
+        # Hint at the trajectory output location.
         traj_dir = os.path.join(args.output_dir, "trajectories")
         if os.path.isdir(traj_dir):
             traj_tasks = [d for d in os.listdir(traj_dir) if os.path.isdir(os.path.join(traj_dir, d))]
             print(f"-> Trajectories saved for {len(traj_tasks)} tasks in: {traj_dir}/")
 
-        # 机器可解析汇总行
+        # Machine-parseable summary line.
         num_tasks = len(core_results['results'])
         avg_acc = np.mean(list(core_results['results'].values()))
         print(f"\n[EVAL_SUMMARY] dataset=core core_metric={core_results['core_metric']:.4f} avg_accuracy={avg_acc:.4f} num_tasks={num_tasks} total_time={total_seconds:.1f}s")

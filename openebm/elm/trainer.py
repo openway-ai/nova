@@ -1,49 +1,27 @@
+"""PyTorch Lightning trainer for Energy-Based Transformers (EBT).
+
+Wraps :class:`openebm.elm.modeling_ebt.EBT_NLP` in a :class:`LightningModule`
+that covers pretraining, SFT, and inference flows with DDP, wandb logging,
+``torch.compile``, MCMC replay buffers, and exact-resume state across ranks.
+"""
+
+import gc
+import os
+import sys
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import ipdb
 import torch
+import wandb
 from torch import nn
+from torch.distributed import all_reduce
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-# from torch.utils.data import random_split, Dataset
-# from torchvision import transforms
-# from torchvision.transforms import ToPILImage
-from torch.distributed import all_reduce
-import wandb
-import gc
+from transformers import AutoTokenizer
 
-# from data.vid.ucf_dataloader import *
-# from data.vid.kinetics_dataloader import *
-# from data.img.imagenet_dataloader import *
-# from data.img.coco_tiny_dataset import COCOTinyDataset
-# from data.img.coco_medium_dataset import COCOMediumDataset
-# from data.vid.aggregate_dataloader import *
-# from data.vid.vid_synthetic_dataset import VIDSyntheticDataset
-# from data.nlp.pajama_dataloader import RedPajamaDataset
-# from data.nlp.fineweb_dataloader import FineWebDataset
-# from data.nlp.collator import NLP_HF_Collator
-# from data.nlp.bigbench_dataloader import BigBenchDataset
-# from data.nlp.gsm8k_dataloader import GSM8KDataset
-# from data.nlp.lambada_dataset import LambadaDataset
-# from data.nlp.squad_dataloader import SQuADDataset
-# from data.nlp.ai2arc_dataloader import AI2ArcDataset
-# from data.nlp.planbench_dataloader import PlanBenchDataset
-# from data.nlp.synthetic_dataset import NLPSyntheticDataset
-
-from openebm.elm.collector import NLP_HF_Collator
 from datasets import load_dataset, load_from_disk
-import os
-# from model.vid.ebt import EBT_VID
+from openebm.elm.collector import NLP_HF_Collator
 from openebm.elm.modeling_ebt import EBT_NLP
-# from model.img.ebt_t2i import EBT_IMG_T2I
-# from model.img.ebt_denoise import EBT_IMG_Denoise
-
-# from model.vid.baseline_transformer import Baseline_Transformer_VID
-# from model.nlp.baseline_transformer import Baseline_Transformer_NLP
-
-# from model.img.dit_t2i import Diffusion_Transformer_IMG_T2I
-# from model.img.dit_denoise import Diffusion_Transformer_IMG_Denoise
-
-
-# from nanolightning.torchlightning_module import LightningModule
-# from nanolightning.iteratabledataset import generate_dataloader, IterableDataset
 
 try:
     from lightning.pytorch import LightningModule
@@ -53,9 +31,22 @@ from openebm.elm.dataset import IterableDataset, generate_dataloader
 from openebm.elm.dataset_sft import generate_sft_dataloader
 
 
-# Simple GSM8K Dataset class for inference
 class GSM8KDataset(torch.utils.data.Dataset):
-    def __init__(self, hparams, split):
+    """Minimal GSM8K dataset wrapper for inference.
+
+    Loads either a local offline copy or the HuggingFace hub version, and
+    formats each row as plain text according to ``hparams.execution_mode``.
+    """
+
+    def __init__(self, hparams: Any, split: str) -> None:
+        """Initialize the dataset.
+
+        :param hparams: Hparams providing ``execution_mode`` and optionally
+            ``dataset_dir``.
+        :type hparams: Any
+        :param split: HuggingFace split name (e.g. ``"train"``, ``"test"``).
+        :type split: str
+        """
         self.hparams = hparams
         local_dataset_path = "/mnt/shared-storage-user/puyuan/code/EBT/data/gsm8k_offline"
 
@@ -68,10 +59,24 @@ class GSM8KDataset(torch.utils.data.Dataset):
             dataset_dir = self.hparams.dataset_dir if hasattr(self.hparams, 'dataset_dir') and self.hparams.dataset_dir != "" else hf_home
             self.dataset = load_dataset("openai/gsm8k", "main", cache_dir=dataset_dir, token=hf_token, trust_remote_code=True)[split]
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of samples in the split.
+
+        :return: Sample count.
+        :rtype: int
+        """
         return len(self.dataset)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Any:
+        """Return the formatted sample at ``idx``.
+
+        :param idx: Sample index.
+        :type idx: int
+        :return: Formatted string or ``(question, answer)`` tuple depending on
+            ``hparams.execution_mode``.
+        :rtype: Any
+        :raises ValueError: When ``execution_mode`` is not supported.
+        """
         if self.hparams.execution_mode == "inference":
             return f"[[Question]]: {self.dataset[idx]['question']}\n[[Answer]]: ", self.dataset[idx]['answer']
         elif self.hparams.execution_mode == "pretrain":
@@ -81,118 +86,71 @@ class GSM8KDataset(torch.utils.data.Dataset):
         else:
             raise ValueError(f"Execution mode not supported: {self.hparams.execution_mode}")
 
-# from utils import save_frames, denormalize, load_image_encoder, center_crop_arr
 from openebm.elm.generate import generate_text, get_ppl
-# from inference.vid.generate_video import generate_video
-# from inference.img.generate_image import generate_image
 from openebm.elm.optimization import WarmUpCosineAnnealingLR, WarmUpLinearWarmdownLR, LARS, exclude_bias_and_norm, StableAdamW, StableAdamWUnfused
 from openebm.elm import logger as text_logger
 from openebm.elm.metrics import get_torchmetrics
-import sys
-from transformers import AutoTokenizer
-
-import ipdb
 
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
+
 class ModelTrainer(LightningModule):
-    def __init__(self, hparams, trained_model = None):
+    """LightningModule wrapping :class:`EBT_NLP` for EBT training and eval."""
+
+    def __init__(self, hparams: Any, trained_model: Optional[Any] = None) -> None:
+        """Initialize the trainer.
+
+        :param hparams: Training hparams (argparse Namespace or similar).
+        :type hparams: Any
+        :param trained_model: Optional pre-initialized model to wrap.
+        :type trained_model: Optional[Any]
+        """
         super().__init__()
-        if isinstance(hparams, dict):#passed in from model ckpt
+        if isinstance(hparams, dict):
+            # Passed in from model checkpoint reload.
             self.hparams.update(hparams)
         else:
             self.hparams.update(vars(hparams))
-        # self.txt_logger = hparams.txt_logger if txt_logger == None else txt_logger # txt_logger is no longer supported
 
-        # Initialize tracking for test metrics
+        # Test-time metric tracking.
         self.test_losses = []
         self.test_perplexities = []
 
-        # Training throughput tracking
+        # Training throughput tracking.
         self._train_step_start_time = None
-        self._train_start_time = None  # wall-clock start for ETA
+        self._train_start_time = None
 
-        # Dataloader resume state: 用于从 checkpoint 恢复 dataloader 位置
+        # Dataloader resume state used when restoring from checkpoint.
         self._dataloader_resume_state = None
 
         if self.hparams.modality == "NLP":
-            if "execution_mode" in self.hparams and "save_generation_logs_dir" in self.hparams and self.hparams.execution_mode == "inference": # two of these are sanity check for loading pretrained ckpt that may not have newer params
+            # The pair of attribute checks guards loading of older ckpts that
+            # may predate these fields.
+            if "execution_mode" in self.hparams and "save_generation_logs_dir" in self.hparams and self.hparams.execution_mode == "inference":
                 print("setting up infer logger")
                 self.infer_logger = text_logger.setup_jsonl_logger(log_filename = "results.jsonl", base_log_dir=self.hparams.save_generation_logs_dir)
-        # if self.hparams.modality == "VID": #is computer vision
-        #     self.image_dims = self.hparams.image_dims # list size two
-        #     self.num_generated_videos = 0
-        #     if self.hparams.custom_image_normalization:
-        #         self.transform = transforms.Compose([
-        #             transforms.Resize((self.image_dims[0], self.image_dims[1])),
-        #             transforms.ToTensor(),
-        #             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        #         ])
-
-        #         normal_lookup = { #NOTE is std, mean
-        #             "ucf101": ([1.04731617, 1.04372056, 1.02795228], [-0.40689788, -0.36098219, -0.25687788]),
-        #             "k400": ([1.00370078, 0.99871626, 0.97407404], [-0.24295556, -0.24931058, -0.13959686]),
-        #             "smth": ([0.90832217, 0.93885971, 0.93745849], [-0.06761328, -0.12692231, -0.01916805]),
-        #             "ImageNet": ([1, 1, 1], [0, 0, 0])
-        #         }
-
-        #         normal_lookup["something"] = normal_lookup["smth"]
-        #         normal_lookup["ImageNet1k"] = normal_lookup["ImageNet"]
-        #         self.normal_lookup = normal_lookup
-
-        #         if self.hparams.dataset_name in normal_lookup:
-        #             std, mean = normal_lookup[self.hparams.dataset_name]
-        #             self.transform.transforms.append(transforms.Normalize(mean=mean, std=std))
-        #         elif self.hparams.dataset_name in ["aggregate"]: # these are combined datasets
-        #             pass
-        #         else:
-        #             raise ValueError(f"{self.hparams.dataset_name} not in normal lookup")
-                    
-        #     else:
-        #         if self.hparams.vae_normalization:
-        #             self.transform = transforms.Compose([
-        #                 transforms.Resize((self.image_dims[0], self.image_dims[1])),
-        #                 transforms.ToTensor(),
-        #                 transforms.Normalize([0.5], [0.5])
-        #             ])
-        #         else: # imagenet standardization
-        #             self.transform = transforms.Compose([
-        #                 transforms.Resize((self.image_dims[0], self.image_dims[1])),
-        #                 transforms.ToTensor(),
-        #                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        #             ])
-        #     self.reset_image_encoder_decoder = False
-        # if self.hparams.modality == "IMG": # using transform from DiT codebase https://github.com/facebookresearch/DiT
-        #     self.transform = transforms.Compose([
-        #         transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, self.hparams.image_dims[0])),
-        #         # transforms.RandomHorizontalFlip(), # remove this since adds more modes
-        #         transforms.ToTensor(),
-        #         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-        #     ])
-
-        # self.to_pil = ToPILImage()
         self.full_ds = None
 
-        # IMPORTANT: Tokenizer configuration for NanoChat dataset
-        # The tokenizer is loaded via get_tokenizer() which uses NanoChat custom BPE tokenizer
-        # from $NANOCHAT_BASE_DIR/tokenizer/ (vocab_size=32768)
-        # The --tokenizer parameter passed from command line is IGNORED for NanoChat!
-        self.hparams.tokenizer_obj = tokenizer = get_tokenizer() # Store tokenizer object
-        # Keep tokenizer path as string for generate_text compatibility
+        # Tokenizer configuration for the NanoChat dataset.
+        # ``get_tokenizer()`` loads the NanoChat custom BPE tokenizer from
+        # ``$NANOCHAT_BASE_DIR/tokenizer/`` (vocab_size=32768).
+        # The ``--tokenizer`` CLI parameter is IGNORED for NanoChat.
+        self.hparams.tokenizer_obj = tokenizer = get_tokenizer()
+        # Keep tokenizer path as a string for ``generate_text`` compatibility.
         if not hasattr(self.hparams, 'tokenizer_path'):
             self.hparams.tokenizer_path = self.hparams.tokenizer if isinstance(self.hparams.tokenizer, str) else "EleutherAI/gpt-neox-20b"
 
-        # Load token_bytes for BPB (bits per byte) calculation
-        # token_bytes maps each token id to its byte length, used in validation/test metrics
+        # Load token_bytes for BPB (bits-per-byte) metric. The table maps each
+        # token id to its byte length; used in validation/test metrics. Moved
+        # to GPU on demand.
         try:
-            self.token_bytes = get_token_bytes(device="cpu")  # Will be moved to GPU when needed
+            self.token_bytes = get_token_bytes(device="cpu")
             print(f"  Token bytes loaded: shape={self.token_bytes.shape}")
         except Exception as e:
             print(f"  Warning: Could not load token_bytes: {e}")
             print(f"  BPB metrics will not be available")
             self.token_bytes = None
 
-        # Print tokenizer info for clarity
         print(f"=" * 80)
         print(f"TOKENIZER INFO:")
         print(f"  Actual tokenizer used: NanoChat custom BPE tokenizer")
@@ -205,100 +163,73 @@ class ModelTrainer(LightningModule):
             self.model = trained_model
         else:
             self.model = EBT_NLP(self.hparams)
-            # if self.hparams.model_name == "ebt":
-            #     if self.hparams.modality == "VID":
-            #         self.model = EBT_VID(self.hparams)
-            #     elif self.hparams.modality == "NLP":
-            #         self.model = EBT_NLP(self.hparams)
-            #     elif self.hparams.modality == "IMG": # these are bidirectional not AR
-            #         if self.hparams.image_task == "t2i":
-            #             self.model = EBT_IMG_T2I(self.hparams) 
-            #         elif self.hparams.image_task == "denoising":
-            #             self.model = EBT_IMG_Denoise(self.hparams)
-            #         else:
-            #             raise ValueError(f"task type: {self.hparams.image_task} not supported in base model trainer as a model as of now")
-            #     else:
-            #         raise ValueError(f"Modality: {self.hparams.modality} not supported as a base model trainer model as of now")
-            # elif self.hparams.model_name == "baseline_transformer":
-            #     if self.hparams.modality == "VID":
-            #         self.model = Baseline_Transformer_VID(self.hparams)
-            #     elif self.hparams.modality == "NLP":
-            #         self.model = Baseline_Transformer_NLP(self.hparams)
-            #     else:
-            #         raise ValueError(f"Modality: {self.hparams.modality} not supported as a base model trainer model as of now")
-            # elif self.hparams.model_name == "dit":
-            #     if self.hparams.modality == "IMG":
-            #         if self.hparams.image_task == "t2i":
-            #             self.model = Diffusion_Transformer_IMG_T2I(self.hparams) # this is bidirectional not AR
-            #         elif self.hparams.image_task == "denoising":
-            #             self.model = Diffusion_Transformer_IMG_Denoise(self.hparams) # this is bidirectional not AR
-            #     else:
-            #         raise ValueError(f"Modality: {self.hparams.modality} not supported as a base model trainer model as of now")
-            # else:
-            #     raise ValueError(f"do not recognize model name: {self.hparams.model_name}")
 
-        # torch.compile 支持
-        # EBT 训练时 autograd.grad(create_graph=True) 产生二阶梯度,
-        # torch.compile (aot_autograd) 不支持 double backward, 因此训练时跳过编译.
-        # 推理时 learning=False → create_graph=False, 可以安全编译.
+        # torch.compile support.
+        # EBT training uses ``autograd.grad(create_graph=True)`` to produce
+        # second-order gradients. ``torch.compile`` (aot_autograd) does not
+        # support double backward, so compilation is skipped during training.
+        # Inference uses ``learning=False`` → ``create_graph=False``, which is
+        # safe to compile.
         if self.hparams.compile_model:
             compile_mode = getattr(self.hparams, 'compile_mode', 'transformer_only')
             compile_backend = getattr(self.hparams, 'compile_backend', 'inductor')
             compile_dynamic = getattr(self.hparams, 'compile_dynamic', False)
 
             if compile_mode == 'full':
-                # 编译整个模型 (可能与 autograd.grad 不兼容)
+                # Compile the whole model (may be incompatible with autograd.grad).
                 print(f"\n{'='*80}")
-                print(f"[torch.compile] 开始编译整个模型...")
-                print(f"[torch.compile] 模式: full | 后端: {compile_backend} | 动态: {compile_dynamic}")
-                print(f"[torch.compile] 警告: EBT 的 MCMC 循环使用 autograd.grad，可能导致编译失败")
-                print(f"[torch.compile] 首次编译可能需要 5-15 分钟，请耐心等待...")
+                print(f"[torch.compile] compiling whole model...")
+                print(f"[torch.compile] mode: full | backend: {compile_backend} | dynamic: {compile_dynamic}")
+                print(f"[torch.compile] warning: EBT MCMC uses autograd.grad, compilation may fail")
+                print(f"[torch.compile] first compile can take 5-15 min")
                 print(f"{'='*80}\n")
                 import time
                 start_time = time.time()
                 self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
                 compile_time = time.time() - start_time
                 print(f"\n{'='*80}")
-                print(f"[torch.compile] ✓ 模型编译完成 (耗时: {compile_time:.1f}s)")
+                print(f"[torch.compile] model compile done (took: {compile_time:.1f}s)")
                 print(f"{'='*80}\n")
 
             elif compile_mode == 'transformer_only':
-                # 仅编译 transformer 部分 (避开 MCMC )
-                # 保留 eager 引用供 _mcmc_step_excluded 中 create_graph=True 时使用
-                print(f"[torch.compile] 仅编译 transformer 部分 (mode=transformer_only, backend={compile_backend})")
+                # Compile only the transformer (keeps MCMC in eager mode).
+                # Keep an eager reference used when ``_mcmc_step_excluded`` needs
+                # ``create_graph=True``.
+                print(f"[torch.compile] compiling transformer only (mode=transformer_only, backend={compile_backend})")
                 if hasattr(self.model, 'transformer'):
-                    self.model.transformer_eager = self.model.transformer  # 保留 eager 引用
+                    self.model.transformer_eager = self.model.transformer
                     self.model.transformer = torch.compile(
                         self.model.transformer,
                         backend=compile_backend,
                         dynamic=compile_dynamic
                     )
-                    print(f"[torch.compile] transformer 编译成功，transformer_eager 已保留用于 MCMC")
+                    print(f"[torch.compile] transformer compiled; transformer_eager retained for MCMC")
                 else:
-                    print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过编译")
+                    print(f"[torch.compile] warning: model has no transformer attribute, skipping compile")
 
             elif compile_mode == 'disabled':
-                print(f"[torch.compile] 编译已禁用")
+                print(f"[torch.compile] disabled")
 
             elif (self.hparams.execution_mode == "inference") or getattr(self.hparams, 'only_test', False):
-                # 推理模式: learning=False → 无 double backward, 可以安全编译
+                # Inference mode: ``learning=False`` means no double backward,
+                # so compilation is safe.
                 if compile_mode == 'full':
-                    print(f"[torch.compile] 推理模式: 编译整个模型 (backend={compile_backend})")
+                    print(f"[torch.compile] inference mode: compiling whole model (backend={compile_backend})")
                     self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
                 elif compile_mode == 'transformer_only':
                     if hasattr(self.model, 'transformer'):
-                        print(f"[torch.compile] 推理模式: 编译 transformer (backend={compile_backend})")
+                        print(f"[torch.compile] inference mode: compiling transformer (backend={compile_backend})")
                         self.model.transformer = torch.compile(
                             self.model.transformer, backend=compile_backend, dynamic=compile_dynamic
                         )
                     else:
-                        print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过")
+                        print(f"[torch.compile] warning: model has no 'transformer' attribute, skipping")
                 else:
-                    raise ValueError(f"未知 compile_mode: {compile_mode}")
+                    raise ValueError(f"Unknown compile_mode: {compile_mode}")
 
             else:
-                # 训练模式: 跳过编译 (EBT MCMC 需要 double backward)
-                print(f"[torch.compile] 训练模式下跳过编译 (EBT MCMC 需要 create_graph=True, aot_autograd 不支持 double backward)")
+                # Training mode: skip compile because EBT MCMC needs double backward.
+                print(f"[torch.compile] training mode: skipping compile (EBT MCMC needs create_graph=True; aot_autograd does not support double backward)")
 
         phases = ['train', 'valid', 'test']
         self.torchmetrics_dict = nn.ModuleDict()
@@ -313,12 +244,16 @@ class ModelTrainer(LightningModule):
                 self.torchmetrics_dict[f"{phase}_{metric}"] = get_torchmetrics(metric, self.hparams.metrics_average_type, self.hparams.num_classes, self.hparams.metrics_task)
 
         if self.hparams.wandb_watch:
-            for name, module in self.model.named_modules(): # for activation logging
+            # Tag every submodule with its name for activation logging.
+            for name, module in self.model.named_modules():
                 module.name = name
 
-        
-    def on_train_start(self):
-        # --- RNG 恢复 (在 val sanity check 之后、第一个 training step 之前) ---
+
+    def on_train_start(self) -> None:
+        """Restore RNG state and optionally arm parameter-usage hooks.
+
+        Runs after the val-sanity-check and before the first training step.
+        """
         import random
         rng = getattr(self, '_rng_resume_state', None)
         if rng is not None:
@@ -329,28 +264,49 @@ class ModelTrainer(LightningModule):
             self._rng_resume_state = None
             print(f"[Exact Resume] RNG states restored for rank {self.global_rank}")
 
-        if self.hparams.debug_unused_parameters: 
+        if self.hparams.debug_unused_parameters:
             for name, param in self.model.named_parameters():
-                if param.requires_grad and "image_encoder" not in name: # NOTE need to modify this code to exclude specific frozen portions
+                # Excludes image_encoder-style frozen sub-nets; extend this
+                # guard when additional frozen modules are introduced.
+                if param.requires_grad and "image_encoder" not in name:
                     print(f"registering param - {name}")
                     param.register_hook(self.create_hook(name))
                 else:
                     self.model.parameters_not_to_check.add(name)
 
-    def create_hook(self, name): #this is only used for debugging with `debug_unused_parameters`
+    def create_hook(self, name: str):
+        """Create a backward hook that records parameter usage.
+
+        Only used when ``debug_unused_parameters`` is set.
+
+        :param name: Parameter name to record on use.
+        :type name: str
+        :return: A backward hook callable.
+        :rtype: Callable
+        """
         def hook(grad):
-            self.model.used_parameters.add(name)  # Adjusted to self.model.used_parameters
+            self.model.used_parameters.add(name)
         return hook
-    
+
     @staticmethod
-    def wandb_activation_hook(run, step):
-        """ Weights & Biases stats logging hook (optimized). """
+    def wandb_activation_hook(run: Any, step: int):
+        """Return a forward hook that logs activation stats to W&B.
+
+        Logs mean/std/min/max of each activation; tuple outputs are skipped.
+
+        :param run: W&B run (typically ``self.logger``).
+        :type run: Any
+        :param step: Global step index used as the W&B ``step`` key.
+        :type step: int
+        :return: A forward hook callable.
+        :rtype: Callable
+        """
         def hook(module, input, output):
             if isinstance(output, tuple):
-                pass 
+                pass
             else:
                 try:
-                    # Optimize: Log stats on GPU instead of moving full tensor to CPU for Histogram
+                    # Aggregate on-device rather than copying the tensor to CPU.
                     data = output.detach().float()
                     run.experiment.log(
                         {
@@ -358,61 +314,84 @@ class ModelTrainer(LightningModule):
                             f"activations/{module.name}_std": data.std().item(),
                             f"activations/{module.name}_min": data.min().item(),
                             f"activations/{module.name}_max": data.max().item(),
-                        }, 
+                        },
                         step=step
                     )
                 except RuntimeError:
-                    # Skip logging for tensors without storage (e.g. inside torch.func.grad)
+                    # Tensors inside ``torch.func.grad`` have no storage.
                     pass
 
         return hook
-    
-    def training_step(self, batch, batch_idx):
-        # Activation logging only when wandb_watch is on AND level is "all"
-        if not self.hparams.no_wandb and self.hparams.wandb_watch and getattr(self.hparams, 'wandb_watch_level', 'parameters') == 'all' and self.global_step % self.hparams.wandb_watch_log_freq == 0: # activation logging
+
+    def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        """Run one training step and return the scalar loss.
+
+        :param batch: Training batch.
+        :type batch: Any
+        :param batch_idx: Global batch index.
+        :type batch_idx: int
+        :return: Loss tensor used by Lightning for backward.
+        :rtype: torch.Tensor
+        """
+        # Activation logging only when wandb_watch is on AND level is "all".
+        if not self.hparams.no_wandb and self.hparams.wandb_watch and getattr(self.hparams, 'wandb_watch_level', 'parameters') == 'all' and self.global_step % self.hparams.wandb_watch_log_freq == 0:
             hook_handles = []
             hook_function = self.wandb_activation_hook(run=self.logger, step=self.global_step)
             for module in self.model.modules():
-                if any(param.requires_grad for param in module.parameters(recurse=False)): # only do for unfrozen params that are training
+                # Only hook modules with trainable parameters.
+                if any(param.requires_grad for param in module.parameters(recurse=False)):
                     handle = module.register_forward_hook(hook_function)
                     hook_handles.append(handle)
-            
+
             eval_step_dict = self.eval_step(batch, "train")
             for handle in hook_handles:
                 handle.remove()
 
         else:
             eval_step_dict = self.eval_step(batch, "train")
-        
+
         self.log_metrics(eval_step_dict, "train")
-        return eval_step_dict['loss']   
-    
-    def on_after_backward(self):
+        return eval_step_dict['loss']
+
+    def on_after_backward(self) -> None:
+        """Log gradient norms and clip-rate when ``log_gradients`` is set."""
         if self.hparams.log_gradients:
             total_norm = 0.0
             num_parameters = 0
             num_grads_exceeding_clip_val = 0
-            total_gradients = 0 # this is different from num_parameters since .parameters is for tensors of params but doesnt count each invididual parameter
+            # ``total_gradients`` counts individual scalar grads, not param tensors.
+            total_gradients = 0
             for param in self.parameters():
                 if param.grad is not None:
                     param_norm = param.grad.data.norm(2)
-                    total_norm += param_norm  # Add the norm value to the total sum
+                    total_norm += param_norm
                     num_parameters += 1
-                    
+
                     total_gradients += torch.numel(param.grad)
                     num_grads_exceeding_clip_val += torch.sum(param.grad.abs() > self.hparams.gradient_clip_val)
-                    
+
             assert num_parameters > 0, "no gradients after backwards detected please investigate"
             average_norm = (total_norm / num_parameters).detach()
-            percentage_clipped = ((num_grads_exceeding_clip_val / total_gradients) * 100).detach()              
-            
-            things_to_log = {} 
+            percentage_clipped = ((num_grads_exceeding_clip_val / total_gradients) * 100).detach()
+
+            things_to_log = {}
             things_to_log['avg_gradient_norms'] = average_norm
             things_to_log['pct_gradient_clipped'] = percentage_clipped
             self.log_metrics(things_to_log, "train", log_torchmetrics = False)
-        
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
+
+    def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
+        """Post-step housekeeping: unused-param debug, GC, and timing tracking.
+
+        Note: when extending this hook, explicitly exclude frozen modules
+        (``requires_grad == False``) to avoid false positives.
+
+        :param outputs: Outputs returned by :meth:`training_step`.
+        :type outputs: Any
+        :param batch: Training batch.
+        :type batch: Any
+        :param batch_idx: Global batch index.
+        :type batch_idx: int
+        """
         if self.hparams.debug_unused_parameters:
             all_parameters = {name for name, _ in self.model.named_parameters()}
             unused_parameters = all_parameters - self.model.used_parameters - self.model.parameters_not_to_check
@@ -428,7 +407,7 @@ class ModelTrainer(LightningModule):
                 gc.collect()
                 torch.cuda.empty_cache()
 
-        # Record step end time for dt calculation
+        # Record step end time for dt calculation.
         import time as _time
         now = _time.time()
         if self._train_step_start_time is not None:
@@ -439,17 +418,16 @@ class ModelTrainer(LightningModule):
         if self._train_start_time is None:
             self._train_start_time = now
 
-    # def on_train_epoch_end(self): ## not effective for EBT
-    #     if self.hparams.optimizer != "adamw": # e.g. for lars need to manually update epoch
-    #         optimizer = self.trainer.optimizers[0]
-    #         optimizer.update_epoch(self.current_epoch)
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Persist per-rank dataloader and RNG state for exact resume.
 
-    def on_save_checkpoint(self, checkpoint):
-        # 保存 per-rank dataloader 位置 + RNG 状态到 checkpoint，用于精确续训
+        :param checkpoint: Checkpoint dict that Lightning is about to write.
+        :type checkpoint: Dict[str, Any]
+        """
         import torch.distributed as dist
         import random
 
-        # 1. 收集当前 rank 的 dataloader state（精确版，含 doc_buffer）
+        # 1) Snapshot this rank's dataloader state (exact, including buffers).
         local_dl_state = None
         try:
             train_dl = self.trainer.train_dataloader
@@ -460,16 +438,17 @@ class ModelTrainer(LightningModule):
                 elif hasattr(dataset, 'last_state_dict') and dataset.last_state_dict is not None:
                     local_dl_state = dataset.last_state_dict
         except Exception:
-            pass  # 非训练阶段可能没有 train_dataloader
+            # ``trainer.train_dataloader`` can be missing outside of training.
+            pass
 
-        # 2. 收集当前 rank 的 RNG state
+        # 2) Snapshot this rank's RNG state.
         local_rng_state = {
             'torch_cpu': torch.random.get_rng_state(),
             'torch_cuda': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
             'python': random.getstate(),
         }
 
-        # 3. DDP: all_gather 收集所有 rank 的状态到 rank 0
+        # 3) DDP: gather states from all ranks onto rank 0.
         if dist.is_initialized() and dist.get_world_size() > 1:
             all_dl_states = [None] * dist.get_world_size()
             dist.all_gather_object(all_dl_states, local_dl_state)
@@ -479,15 +458,22 @@ class ModelTrainer(LightningModule):
             all_dl_states = [local_dl_state]
             all_rng_states = [local_rng_state]
 
-        # 4. 写入 checkpoint
+        # 4) Write into the checkpoint dict.
         checkpoint['dataloader_state_dict_by_rank'] = all_dl_states
-        checkpoint['dataloader_state_dict'] = all_dl_states[0]  # 旧格式兼容
+        # Legacy key (kept for backwards compatibility).
+        checkpoint['dataloader_state_dict'] = all_dl_states[0]
         checkpoint['rng_states_by_rank'] = all_rng_states
 
-        print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
+        print(f"[Checkpoint] saved per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
 
-    def on_load_checkpoint(self, checkpoint):
-        # --- 修复 torch.compile _orig_mod 前缀不匹配 ---
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Load dataloader/RNG state from ``checkpoint`` with compat shims.
+
+        :param checkpoint: Checkpoint dict loaded from disk.
+        :type checkpoint: Dict[str, Any]
+        """
+        # Compatibility: strip/add ``_orig_mod.`` prefixes introduced by
+        # ``torch.compile`` so either side of the mismatch loads cleanly.
         if 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
             has_orig_mod_keys = any('_orig_mod.' in k for k in state_dict)
@@ -509,18 +495,18 @@ class ModelTrainer(LightningModule):
                 checkpoint['state_dict'] = new_state_dict
                 print(f"[Checkpoint] Added '_orig_mod' prefix to {len(state_dict)} keys")
 
-        # 从 checkpoint 恢复 per-rank dataloader 位置 + RNG 状态
+        # Restore per-rank dataloader position + RNG state.
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
 
-        # Dataloader state: 优先 per-rank，回退旧格式
+        # Prefer the per-rank format; fall back to the legacy single-entry key.
         if 'dataloader_state_dict_by_rank' in checkpoint:
             states = checkpoint['dataloader_state_dict_by_rank']
             self._dataloader_resume_state = states[rank] if rank < len(states) else None
         elif 'dataloader_state_dict' in checkpoint:
             self._dataloader_resume_state = checkpoint['dataloader_state_dict']
 
-        # RNG state: per-rank
+        # Per-rank RNG state.
         if 'rng_states_by_rank' in checkpoint:
             rng_states = checkpoint['rng_states_by_rank']
             self._rng_resume_state = rng_states[rank] if rank < len(rng_states) else None
@@ -530,7 +516,7 @@ class ModelTrainer(LightningModule):
         if self._dataloader_resume_state:
             if 'cursor' in self._dataloader_resume_state:
                 print(
-                    f"[Checkpoint] Rank {rank} 恢复 SFT dataloader state: "
+                    f"[Checkpoint] Rank {rank} restoring SFT dataloader state: "
                     f"cursor={self._dataloader_resume_state.get('cursor')}, "
                     f"consumed={self._dataloader_resume_state.get('consumed')}, "
                     f"epoch={self._dataloader_resume_state.get('epoch')}, "
@@ -538,21 +524,28 @@ class ModelTrainer(LightningModule):
                     f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}"
                 )
             else:
-                print(f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
+                print(f"[Checkpoint] Rank {rank} restoring dataloader state: "
                       f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
                       f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
                       f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}")
         if self._rng_resume_state:
-            print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
+            print(f"[Checkpoint] Rank {rank} restoring RNG state: keys={list(self._rng_resume_state.keys())}")
 
-    def validation_step(self, batch, batch_idx):
-        # Move token_bytes to the same device as the model if needed
+    def validation_step(self, batch: Any, batch_idx: int) -> None:
+        """Run one validation step and cache metrics for the progress bar.
+
+        :param batch: Validation batch.
+        :type batch: Any
+        :param batch_idx: Batch index.
+        :type batch_idx: int
+        """
         token_bytes = self.token_bytes
         if token_bytes is not None and token_bytes.device != self.device:
             token_bytes = token_bytes.to(self.device)
         eval_step_dict = self.eval_step(batch, "valid", token_bytes)
         self.log_metrics(eval_step_dict, "valid")
-        # 缓存最新 valid 指标，供 train 进度条显示
+        # Cache the latest validation metrics so the training progress bar
+        # can display them.
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
         for k, v in eval_step_dict.items():
@@ -561,23 +554,29 @@ class ModelTrainer(LightningModule):
             elif isinstance(v, (int, float)):
                 self._last_valid_metrics[k] = v
 
-    def on_test_epoch_start(self):
-        """Reset test metrics at the start of test epoch"""
+    def on_test_epoch_start(self) -> None:
+        """Reset per-epoch test metrics and print a header banner."""
         import time
         self.test_losses = []
         self.test_perplexities = []
         self.test_energies = {}
         self.test_start_time = time.time()
-        self.test_generation_count = 0  # track generated samples for GSM8K etc.
+        self.test_generation_count = 0
 
-        # Print header
         import sys
         sys.stdout.write(f"\n{'='*100}\n")
-        sys.stdout.write(f"{'🚀 STARTING EVALUATION':^100}\n")
+        sys.stdout.write(f"{'STARTING EVALUATION':^100}\n")
         sys.stdout.write(f"{'='*100}\n\n")
         sys.stdout.flush()
 
-    def test_step(self, batch, batch_idx):
+    def test_step(self, batch: Any, batch_idx: int) -> None:
+        """Run one test step (PPL and/or generation).
+
+        :param batch: Test batch.
+        :type batch: Any
+        :param batch_idx: Batch index.
+        :type batch_idx: int
+        """
         if self.hparams.execution_mode == "inference":
             if self.hparams.modality == "NLP":
                 # For GSM8K and other generation tasks that use DataLoader with collate_fn
@@ -802,54 +801,22 @@ class ModelTrainer(LightningModule):
                     filtered_outputs = {k: v for k, v in ppl_outputs.items() if 'energy' not in k}
                     self.log_metrics(filtered_outputs, "test")
 
-                # TODO
-                # outputs = get_ppl(self.model, batch, self.hparams)
-                # self.log_metrics(outputs, "test")
-            # elif self.hparams.modality == "VID":
-            #     if not self.reset_image_encoder_decoder: # this is done to prevent bug where loading ckpt image encoder doesnt work well, not sure why ckpt image decoder doesnt load well, maybe related to HF
-            #         self.model.image_encoder = load_image_encoder(self.hparams.backbone_type, self.hparams.vit_backbone_size).to(self.device)
-            #         self.model.image_encoder.eval()
-            #         self.reset_image_encoder_decoder = True
-
-            #     outputs = generate_video(self.model, batch, self.hparams, decode_frames = self.hparams.infer_generate_video) # outputs['video'] has shame shape as batch: B, S, C, W, H
-
-            #     if self.hparams.infer_generate_video:
-            #         denormalized_predicted_videos = denormalize(outputs['video'], self.hparams.dataset_name, self.device, self.hparams.custom_image_normalization, self.hparams.vae_normalization)
-            #         denormalized_batch = denormalize(batch, self.hparams.dataset_name, self.device, self.hparams.custom_image_normalization, self.hparams.vae_normalization)
-            #         batch_size = outputs['video'].shape[0]
-            #         if self.trainer.world_size > 1:
-            #             batch_size_tensor = torch.tensor(batch_size, device=self.device)
-            #             all_reduce(batch_size_tensor)
-            #             total_batch_size = batch_size_tensor.item()
-            #             video_start_idx = self.num_generated_videos + (self.global_rank * batch_size)
-            #         else:
-            #             total_batch_size = batch_size
-            #             video_start_idx = self.num_generated_videos
-
-            #         save_frames(denormalized_predicted_videos, self.hparams.save_generation_logs_dir, 'fake', video_start_idx) 
-            #         save_frames(denormalized_batch, self.hparams.save_generation_logs_dir, 'real', video_start_idx)
-            #         if self.hparams.debug_videos:
-            #             save_frames(denormalized_predicted_videos[0].unsqueeze(dim=0), self.hparams.save_generation_logs_dir, 'debug', video_start_idx)
-                    
-            #         self.num_generated_videos += total_batch_size
-            #     outputs.pop('video')
-            #     self.log_metrics(outputs, "test")
-            # elif self.hparams.modality == "IMG":
-            #     outputs = generate_image(self.model, batch, self.hparams)
-            #     self.log_metrics(outputs, "test")
-            
             else:
                 raise NotImplementedError(f"Inference mode not supported for modality {self.hparams.modality} yet")
-        else: # all other modes just get metrics
-            if self.hparams.modality == "NLP" and self.hparams.model_name == "ebt" and self.hparams.infer_ebt_advanced: # special case where we dont want to use inference mode but still use ebt advanced inference to get log ppl, energies, etc (that way dont need to generate text 1 by 1)
+        else:
+            # Non-inference mode: just compute metrics.
+            if self.hparams.modality == "NLP" and self.hparams.model_name == "ebt" and self.hparams.infer_ebt_advanced:
+                # Special case: avoid inference mode but still use EBT advanced
+                # inference to score log PPL / energies without emitting text
+                # one token at a time.
                 outputs = get_ppl(self.model, batch, self.hparams)
                 self.log_metrics(outputs, "test")
             else:
                 eval_step_dict = self.eval_step(batch, "test")
                 self.log_metrics(eval_step_dict, "test")
 
-    def on_test_epoch_end(self):
-        """Print comprehensive summary statistics at the end of test epoch"""
+    def on_test_epoch_end(self) -> None:
+        """Print a comprehensive summary of the test epoch."""
         import sys
         import numpy as np
         import time
@@ -997,29 +964,52 @@ class ModelTrainer(LightningModule):
         sys.stdout.write(f"{'='*100}\n\n")
         sys.stdout.flush()
 
-    def eval_step(self, batch, phase, token_bytes=None):
-        things_to_log = self.model.forward_loss_wrapper(batch, phase, token_bytes=token_bytes) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop
+    def eval_step(self, batch: Any, phase: str, token_bytes: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+        """Run the model's loss wrapper and return a log dict.
+
+        :param batch: Input batch.
+        :type batch: Any
+        :param phase: ``"train"`` / ``"valid"`` / ``"test"``.
+        :type phase: str
+        :param token_bytes: Optional per-token byte-length table used for BPB.
+        :type token_bytes: Optional[torch.Tensor]
+        :return: Dict with a ``"loss"`` key (required for backward) plus any
+            additional metrics the model chose to log.
+        :rtype: Dict[str, Any]
+        """
+        things_to_log = self.model.forward_loss_wrapper(batch, phase, token_bytes=token_bytes)
 
         if len(self.metrics) > 0:
             raise NotImplementedError("Need to implement torchmetrics stuff, i.e. looping through self.torchmetrics_dict.keys(), checking to make sure 'phase in key', and updating based off predicted and labels i.e. self.torchmetrics_dict[key].update(logits, labels), more info https://lightning.ai/docs/torchmetrics/stable/pages/lightning.html (just be careful make sure to detach logits before using them and only update current phase). recommended to possibly return things_to_log and logits from forward_loss_wrapper to do this easily")
 
         return things_to_log
-    
-    def forward(self, batch):
+
+    def forward(self, batch: Any) -> Any:
+        """Call the wrapped model directly.
+
+        :param batch: Input batch.
+        :type batch: Any
+        :return: Model output.
+        :rtype: Any
+        """
         return self.model(batch)
 
-    def configure_optimizers(self): # this is a PL hook that returns optimizer and lr scheduler
+    def configure_optimizers(self) -> Any:
+        """Lightning hook returning the optimizer and LR scheduler.
+
+        :return: Whatever :meth:`configure_optimizers_nlp` returns.
+        :rtype: Any
+        """
         return self.configure_optimizers_nlp()
-        # if self.hparams.modality == "NLP":
-        #     return self.configure_optimizers_nlp()
-        # elif self.hparams.modality == "VID":
-        #     return self.configure_optimizers_vid()
-        # elif self.hparams.modality == "IMG":
-        #     return self.configure_optimizers_img()
-        # else:
-        #     raise NotImplementedError(f"Modality {self.hparams.modality} does not have configure optimizers supported yet")
-        
-    def get_optimizer(self, optimizer_parameters): # function for once gotten optimizer_parameters to get optimizer, i.e. adamw, lars, etc
+
+    def get_optimizer(self, optimizer_parameters: Any) -> torch.optim.Optimizer:
+        """Build an optimizer matching ``self.hparams.optimizer``.
+
+        :param optimizer_parameters: Parameter groups / iterable.
+        :type optimizer_parameters: Any
+        :return: The configured optimizer.
+        :rtype: torch.optim.Optimizer
+        """
         if self.hparams.optimizer == "lars":
             lars_exclude_bias_and_norm = None if not self.hparams.lars_exclude_bias_bn_wd else exclude_bias_and_norm
             optimizer = LARS(optimizer_parameters, lr=self.hparams.peak_learning_rate, weight_decay=self.hparams.weight_decay, momentum=self.hparams.beta1, eta=self.hparams.lars_trust_coeff, weight_decay_filter=lars_exclude_bias_and_norm, lars_adaptation_filter=lars_exclude_bias_and_norm)
@@ -1028,19 +1018,27 @@ class ModelTrainer(LightningModule):
         else:
             optimizer = torch.optim.AdamW(optimizer_parameters, betas=[self.hparams.beta1, self.hparams.beta2])
         return optimizer
-    
-    def on_warm_up_finished(self):
+
+    def on_warm_up_finished(self) -> None:
+        """Forward the warmup-finished signal to the model when supported."""
         if hasattr(self.model, 'warm_up_finished'):
             self.model.warm_up_finished()
             print("Warm up finished, calling self.model.warm_up_finished()")
         else:
             print("Warm up finished, no self.model.warm_up_finished() exists so not doing anything")
-    
-    def get_lr_scheduler(self, optimizer):
-        # Option 2: 动态 Weight Decay
+
+    def get_lr_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
+        """Build an LR scheduler based on ``self.hparams`` flags.
+
+        :param optimizer: Optimizer to attach the scheduler to.
+        :type optimizer: torch.optim.Optimizer
+        :return: The configured scheduler (raw or wrapped with warmup).
+        :rtype: Any
+        """
+        # Dynamic weight decay paired with the LR schedule.
         enable_wd_decay = getattr(self.hparams, 'dynamic_wd', False)
 
-        # Option 3: Linear Warmdown LR 调度
+        # Linear warmup / constant / linear warmdown schedule toggle.
         use_linear_warmdown = getattr(self.hparams, 'linear_warmdown', False)
 
         if use_linear_warmdown:
@@ -1060,7 +1058,7 @@ class ModelTrainer(LightningModule):
                 resume_warmup_steps=resume_warmup_steps
             )
         else:
-            # 原始 Cosine Annealing 调度
+            # Cosine annealing schedule with optional linear warmup.
             cosine_annealing_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
                 T_max=self.hparams.max_scheduling_steps - self.hparams.warm_up_steps,
@@ -1078,11 +1076,18 @@ class ModelTrainer(LightningModule):
                 enable_wd_decay=enable_wd_decay
             )
         return lr_scheduler
-    
-    def get_optimizer_scheduler_dict(self, optimizer_parameters):
+
+    def get_optimizer_scheduler_dict(self, optimizer_parameters: Any) -> Dict[str, Any]:
+        """Package optimizer + scheduler into Lightning's expected dict.
+
+        :param optimizer_parameters: Parameter groups / iterable.
+        :type optimizer_parameters: Any
+        :return: Dict with ``optimizer`` and ``lr_scheduler`` entries
+            (stepped every training step).
+        :rtype: Dict[str, Any]
+        """
         optimizer = self.get_optimizer(optimizer_parameters)
         lr_scheduler = self.get_lr_scheduler(optimizer)
-        # lr_schedule will work each step
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
@@ -1092,49 +1097,64 @@ class ModelTrainer(LightningModule):
             }
         }
 
-    def _configure_muon_adamw_optimizer(self):
-        """
-        Muon + AdamW 混合优化器 (复用 nanochat/optim.py 的 MuonAdamW)
+    def _configure_muon_adamw_optimizer(self) -> Any:
+        """Build the Muon + AdamW hybrid optimizer from ``nanochat/optim.py``.
 
-        参数分组策略 (参考 NanoChat gpt.py:setup_optimizer):
-        - alpha: AdamW, 高 LR (mcmc_step_size_lr_multiplier × peak_lr), 无 weight decay [EBT 特有]
-        - embeddings: AdamW, 独立绝对 LR (对齐 NanoChat embedding_lr), 无 weight decay
-        - vocab_to_embed: AdamW, 独立绝对 LR (EBT 特有, 保守), 无 weight decay
-        - transformer 标量 (ndim < 2): AdamW, 独立绝对 LR, 无 weight decay
-        - transformer 矩阵 (ndim >= 2): Muon, 按 shape 分组 (Muon 要求同组参数 shape 相同)
+        Parameter grouping strategy (mirrors NanoChat's ``setup_optimizer``):
 
-        LR 设计原理:
-        - embedding 不在 MCMC 循环内, 梯度行为与 NanoChat 一致, 可用高 LR
-        - vocab_to_embed 在 MCMC 循环内 (autograd.grad create_graph=True), 二阶梯度, 需保守
-        - transformer scalar (RMSNorm) 在 MCMC 循环内, 需适度保守
-        - 当 adamw_*_lr > 0 时使用绝对 LR, 否则 fallback 到 peak_lr × mult
+        - ``alpha``: AdamW, high LR (``mcmc_step_size_lr_multiplier * peak_lr``),
+          no weight decay. EBT-specific.
+        - ``embeddings``: AdamW with an independent absolute LR that matches
+          NanoChat's ``embedding_lr``; no weight decay.
+        - ``vocab_to_embed``: AdamW with a conservative independent LR
+          (EBT-specific); no weight decay.
+        - Transformer scalar params (``ndim < 2``): AdamW with independent LR;
+          no weight decay.
+        - Transformer matrix params (``ndim >= 2``): Muon, grouped by tensor
+          shape (Muon requires uniform shapes for stacking).
 
-        注意: 使用 MuonAdamW (单 GPU 版), 不用 DistMuonAdamW,
-        因为 PL DDP 已经处理梯度同步, DistMuonAdamW 自己管理分布式通信会冲突。
+        LR design notes:
+
+        - ``embeddings`` live outside the MCMC loop, so their gradient behavior
+          matches NanoChat and they can safely use a larger LR.
+        - ``vocab_to_embed`` is inside the MCMC loop
+          (``autograd.grad(create_graph=True)`` second-order gradients) so we
+          use a conservative LR.
+        - Transformer scalars (RMSNorm) are inside the MCMC loop and need a
+          moderately conservative LR.
+        - When ``adamw_*_lr > 0``, an absolute LR is used; otherwise it falls
+          back to ``peak_lr * mult``.
+
+        Uses ``MuonAdamW`` (single-GPU variant) rather than ``DistMuonAdamW``
+        because PyTorch Lightning DDP already handles gradient synchronization
+        and ``DistMuonAdamW`` would double-manage distributed communication.
+
+        :return: The configured optimizer instance.
+        :rtype: Any
         """
         from nanochat.optim import MuonAdamW
 
-        # --- Muon 超参数 ---
         muon_lr = getattr(self.hparams, 'muon_lr', 0.02)
         muon_momentum = getattr(self.hparams, 'muon_momentum', 0.95)
         muon_ns_steps = getattr(self.hparams, 'muon_ns_steps', 5)
         muon_beta2 = getattr(self.hparams, 'muon_beta2', 0.95)
         adam_betas = (self.hparams.beta1, self.hparams.beta2)
 
-        # --- AdamW LR: 绝对值 or fallback to peak_lr × mult ---
+        # AdamW LR: use the absolute value when provided, otherwise fall back
+        # to ``peak_lr * mult``.
         adamw_embedding_lr = getattr(self.hparams, 'adamw_embedding_lr', -1)
         adamw_vocab_to_embed_lr = getattr(self.hparams, 'adamw_vocab_to_embed_lr', -1)
         adamw_scalar_lr = getattr(self.hparams, 'adamw_scalar_lr', -1)
         use_dmodel_scaling = getattr(self.hparams, 'adamw_dmodel_lr_scaling', False)
 
-        # dmodel scaling: lr × (dim/768)^-0.5 (参考 NanoChat gpt.py:362)
+        # ``dmodel`` scaling: ``lr * (dim / 768) ** -0.5`` (NanoChat gpt.py:362).
         dmodel_scale = 1.0
         if use_dmodel_scaling:
             model_dim = self.hparams.embedding_dim
             dmodel_scale = (model_dim / 768) ** -0.5
             print(f"[Muon+AdamW] dmodel LR scaling: (dim={model_dim}/768)^-0.5 = {dmodel_scale:.4f}")
 
-        # 计算各组 LR
+        # Compute per-group LR.
         if adamw_embedding_lr > 0:
             embedding_lr = adamw_embedding_lr * dmodel_scale
         else:
@@ -1155,7 +1175,7 @@ class ModelTrainer(LightningModule):
 
         alpha_lr = self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate
 
-        # --- 参数收集 ---
+        # Parameter collection.
         alpha_params = [self.model.alpha]
         embedding_params = list(self.model.embeddings.parameters())
 
@@ -1163,7 +1183,8 @@ class ModelTrainer(LightningModule):
         if hasattr(self.model, 'vocab_to_embed') and self.model.vocab_to_embed is not None:
             vocab_to_embed_params = list(self.model.vocab_to_embed.parameters())
 
-        # VE 参数单独收集，分配给 AdamW (不能放入 Muon)
+        # VE parameters are collected separately and routed to AdamW (they
+        # cannot be placed in a Muon group).
         ve_embed_params = []
         ve_gate_params = []
         transformer_matrix_params = []
@@ -1178,10 +1199,9 @@ class ModelTrainer(LightningModule):
             else:
                 transformer_scalar_params.append(param)
 
-        # --- 构建 param_groups ---
+        # Build param_groups.
         param_groups = []
 
-        # AdamW groups
         if alpha_params:
             param_groups.append(dict(
                 kind='adamw', params=alpha_params,
@@ -1202,20 +1222,20 @@ class ModelTrainer(LightningModule):
                 kind='adamw', params=transformer_scalar_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
-        # VE embedding 参数: AdamW, 使用 embedding_lr (与 NanoChat 一致)
+        # VE embedding params: AdamW at ``embedding_lr`` (matches NanoChat).
         if ve_embed_params:
             param_groups.append(dict(
                 kind='adamw', params=ve_embed_params,
                 lr=embedding_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
-        # VE gate 参数: AdamW, 使用 scalar_lr
+        # VE gate params: AdamW at ``scalar_lr``.
         if ve_gate_params:
             param_groups.append(dict(
                 kind='adamw', params=ve_gate_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
 
-        # Muon groups: 按 shape 分组 (Muon 要求同组参数 shape 相同用于 stack)
+        # Muon groups: shape-bucketed so Muon can stack parameters.
         shape_groups = {}
         for p in transformer_matrix_params:
             shape_groups.setdefault(p.shape, []).append(p)
@@ -1229,13 +1249,13 @@ class ModelTrainer(LightningModule):
                 weight_decay=self.hparams.weight_decay,
             ))
 
-        # --- 创建优化器 ---
-        # PL 调用 optimizer.step(closure=closure), 但 MuonAdamW.step() 不接受 closure 参数
-        # 包装一下使其兼容 PL 的调用约定
+        # Lightning calls ``optimizer.step(closure=closure)`` but
+        # ``MuonAdamW.step()`` does not accept a closure kwarg. Wrap to
+        # bridge the calling convention.
         use_cpu_offload = getattr(self.hparams, 'cpu_offload_optimizer', False)
         if use_cpu_offload:
             class PLMuonAdamW(MuonAdamW):
-                """MuonAdamW + CPU offload: AdamW 和 Muon 优化器状态均存放在 CPU。"""
+                """MuonAdamW variant keeping optimizer state on CPU (AdamW + Muon)."""
 
                 @torch.no_grad()
                 def step(self, closure=None):
@@ -1243,12 +1263,12 @@ class ModelTrainer(LightningModule):
                         with torch.enable_grad():
                             closure()
 
-                    # 遍历所有 param group，按 kind 分别处理
+                    # Dispatch per param group by kind.
                     for group in self.param_groups:
                         kind = group.get('kind')
 
                         if kind == 'adamw':
-                            # AdamW: 逐参数搬运 exp_avg / exp_avg_sq
+                            # AdamW: move exp_avg / exp_avg_sq per parameter.
                             for p in group['params']:
                                 if p.grad is None:
                                     continue
@@ -1260,7 +1280,7 @@ class ModelTrainer(LightningModule):
                                         state[k] = state[k].to(p.device, non_blocking=False)
 
                         elif kind == 'muon':
-                            # Muon: group-level buffer 存在 params[0] 的 state 里
+                            # Muon: group-level buffers live on params[0]'s state.
                             if not group['params']:
                                 continue
                             p0 = group['params'][0]
@@ -1271,10 +1291,10 @@ class ModelTrainer(LightningModule):
                                 if k in state and state[k].device.type == 'cpu':
                                     state[k] = state[k].to(p0.device, non_blocking=False)
 
-                    # 执行实际的优化器 step（fused kernel 要求 state 在 GPU 上）
+                    # Actual optimizer step — fused kernels require state on GPU.
                     super().step()
 
-                    # step 完成后，将所有 state 搬回 CPU
+                    # Move all state back to CPU once the step is done.
                     for group in self.param_groups:
                         kind = group.get('kind')
 
@@ -1301,7 +1321,7 @@ class ModelTrainer(LightningModule):
                     torch.cuda.synchronize()
         else:
             class PLMuonAdamW(MuonAdamW):
-                """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
+                """MuonAdamW wrapper compatible with Lightning's ``optimizer.step(closure=closure)``."""
                 @torch.no_grad()
                 def step(self, closure=None):
                     if closure is not None:
@@ -1311,14 +1331,13 @@ class ModelTrainer(LightningModule):
 
         optimizer = PLMuonAdamW(param_groups)
 
-        # 设置 initial_lr (PL LR scheduler 需要)
+        # Lightning's LR scheduler needs ``initial_lr`` on every group.
         for group in optimizer.param_groups:
             group['initial_lr'] = group['lr']
 
-        # --- LR Scheduler ---
         lr_scheduler = self.get_lr_scheduler(optimizer)
 
-        # --- 日志 ---
+        # Logging.
         num_muon_params = sum(p.numel() for p in transformer_matrix_params)
         num_ve_params = (
             sum(p.numel() for p in ve_embed_params) +
@@ -1332,16 +1351,16 @@ class ModelTrainer(LightningModule):
             num_ve_params
         )
         print(f"=" * 80)
-        print(f"[Muon+AdamW] 混合优化器已启用:")
-        print(f"  Muon groups: {len(shape_groups)} (按 shape 分组)")
+        print(f"[Muon+AdamW] hybrid optimizer enabled:")
+        print(f"  Muon groups: {len(shape_groups)} (grouped by shape)")
         print(f"  Muon params: {num_muon_params:,} ({num_muon_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
         print(f"  AdamW params: {num_adamw_params:,} ({num_adamw_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
         if num_ve_params > 0:
             print(f"  VE params: {num_ve_params:,} (AdamW, embedding_lr)")
         print(f"  Muon LR: {muon_lr}, momentum: {muon_momentum}, ns_steps: {muon_ns_steps}, beta2: {muon_beta2}")
-        print(f"  Alpha LR: {alpha_lr} (AdamW) [EBT 特有]")
+        print(f"  Alpha LR: {alpha_lr} (AdamW) [EBT-specific]")
         print(f"  Embedding LR: {embedding_lr} (AdamW)")
-        print(f"  vocab_to_embed LR: {vocab_to_embed_lr} (AdamW) [EBT 特有, MCMC 内部]")
+        print(f"  vocab_to_embed LR: {vocab_to_embed_lr} (AdamW) [EBT-specific, inside MCMC]")
         print(f"  Scalar LR: {scalar_lr} (AdamW)")
         if use_dmodel_scaling:
             print(f"  dmodel scaling: {dmodel_scale:.4f} (dim={self.hparams.embedding_dim})")
@@ -1358,72 +1377,82 @@ class ModelTrainer(LightningModule):
             }
         }
 
-    def configure_optimizers_nlp(self):
+    def configure_optimizers_nlp(self) -> Any:
+        """Build the optimizer + LR scheduler for NLP training.
+
+        Supports three paths:
+
+        - Muon + AdamW hybrid (``--optimizer muon_adamw``).
+        - Layered LR (``--layered_lr``) with separate groups for
+          ``alpha`` / embedding / ``vocab_to_embed`` / matrix / scalar params.
+        - Baseline single-group AdamW.
+
+        :return: Dict accepted by Lightning's ``configure_optimizers``.
+        :rtype: Any
+        """
         if self.hparams.model_name == "ebt":
-            # Muon + AdamW 混合优化器 - 通过 --optimizer muon_adamw 启用
+            # Muon + AdamW hybrid, gated on ``--optimizer muon_adamw``.
             use_muon = getattr(self.hparams, 'optimizer', 'adamw') == 'muon_adamw'
 
             if use_muon:
                 return self._configure_muon_adamw_optimizer()
 
-            # Option 1: 分层学习率 - 通过 --layered_lr 启用
+            # Layered-LR path, gated on ``--layered_lr``.
             use_layered_lr = getattr(self.hparams, 'layered_lr', False)
 
             if use_layered_lr:
-                # 分层参数组 (参考 NanoChat base_train.py)
+                # Layered parameter groups (mirrors NanoChat base_train.py).
                 alpha_param = [self.model.alpha]
                 embedding_params = list(self.model.embeddings.parameters())
 
-                # vocab_to_embed 参数 (类似 unembedding)
+                # ``vocab_to_embed`` acts as an unembedding projection.
                 vocab_to_embed_params = []
                 if hasattr(self.model, 'vocab_to_embed') and self.model.vocab_to_embed is not None:
                     vocab_to_embed_params = list(self.model.vocab_to_embed.parameters())
 
-                # Transformer 参数分类: 矩阵 vs 标量/向量
+                # Split transformer params into matrix vs. scalar/vector.
                 transformer_matrix_params = []
                 transformer_scalar_params = []
                 for name, param in self.model.transformer.named_parameters():
-                    if param.ndim >= 2:  # 矩阵参数 (weights)
+                    if param.ndim >= 2:
                         transformer_matrix_params.append(param)
-                    else:  # 标量/向量参数 (biases, layer norms, etc.)
+                    else:
                         transformer_scalar_params.append(param)
 
-                # 学习率倍数 (可通过命令行参数覆盖)
+                # Multipliers are overridable from the CLI.
                 embedding_lr_mult = getattr(self.hparams, 'embedding_lr_mult', 0.3)
                 vocab_to_embed_lr_mult = getattr(self.hparams, 'vocab_to_embed_lr_mult', 0.1)
                 scalar_lr_mult = getattr(self.hparams, 'scalar_lr_mult', 0.5)
 
                 optimizer_parameters = [
-                    # Alpha: 高学习率，无 weight decay
+                    # Alpha: high LR, no weight decay.
                     {'params': alpha_param, 'weight_decay': 0.0,
                      'lr': self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate},
-                    # Embedding: 中等学习率，无 weight decay
-                    # {'params': embedding_params, 'weight_decay': self.hparams.weight_decay,
+                    # Embedding: medium LR, no weight decay.
                     {'params': embedding_params, 'weight_decay': 0.0,
                      'lr': self.hparams.peak_learning_rate * embedding_lr_mult},
-                    # vocab_to_embed: 较低学习率
-                    # {'params': vocab_to_embed_params, 'weight_decay': self.hparams.weight_decay,
+                    # vocab_to_embed: conservative LR, no weight decay.
                     {'params': vocab_to_embed_params, 'weight_decay': 0.0,
                      'lr': self.hparams.peak_learning_rate * vocab_to_embed_lr_mult},
-                    # Transformer 矩阵: 主学习率
+                    # Transformer matrices: base LR.
                     {'params': transformer_matrix_params, 'weight_decay': self.hparams.weight_decay,
                      'lr': self.hparams.peak_learning_rate},
-                    # Transformer 标量: 较高学习率，无 weight decay
+                    # Transformer scalars: higher LR, no weight decay.
                     {'params': transformer_scalar_params, 'weight_decay': 0.0,
                      'lr': self.hparams.peak_learning_rate * scalar_lr_mult},
                 ]
 
-                # 过滤空参数组
+                # Drop empty groups.
                 optimizer_parameters = [p for p in optimizer_parameters if len(p['params']) > 0]
 
-                print(f"[Option 1] 分层学习率已启用:")
+                print(f"[Layered LR] enabled:")
                 print(f"  - Alpha LR: {self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate}")
                 print(f"  - Embedding LR: {self.hparams.peak_learning_rate * embedding_lr_mult}")
                 print(f"  - vocab_to_embed LR: {self.hparams.peak_learning_rate * vocab_to_embed_lr_mult}")
                 print(f"  - Transformer Matrix LR: {self.hparams.peak_learning_rate}")
                 print(f"  - Transformer Scalar LR: {self.hparams.peak_learning_rate * scalar_lr_mult}")
             else:
-                # 原始实现
+                # Default single-group path.
                 alpha_param = self.model.alpha
                 other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha'])]
                 assert len(other_params) > 1, "Could not gather model params correctly please investigate"
@@ -1434,19 +1463,24 @@ class ModelTrainer(LightningModule):
                 ]
 
             return self.get_optimizer_scheduler_dict(optimizer_parameters)
-            
+
         elif self.hparams.model_name == "baseline_transformer":
             all_params = [param for _, param in self.model.named_parameters()]
             optimizer_parameters = [
-                {'params': all_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate}  # Weight decay for other parameters
+                {'params': all_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate}
             ]
             return self.get_optimizer_scheduler_dict(optimizer_parameters)
-        
+
         else:
             raise NotImplementedError(f"havent implemented configure optimizers for model {self.hparams.model_name}")
 
-        
-    def configure_optimizers_vid(self):
+
+    def configure_optimizers_vid(self) -> Any:
+        """Build an optimizer for the legacy VID modality.
+
+        :return: Optimizer/scheduler dict.
+        :rtype: Any
+        """
         if self.hparams.model_name == "ebt":
             alpha_param = self.model.alpha
             encoder_params = list(self.model.image_encoder.parameters())
@@ -1473,158 +1507,53 @@ class ModelTrainer(LightningModule):
         else:
             raise NotImplementedError(f"havent implemented configure optimizers for model {self.hparams.model_name}")
         
-    def configure_optimizers_img(self):
+    def configure_optimizers_img(self) -> Any:
+        """Build an optimizer for the legacy IMG modality.
+
+        :return: Optimizer/scheduler dict.
+        :rtype: Any
+        """
         if self.hparams.model_name == "ebt":
             alpha_param = self.model.alpha
             other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha', 'image_encoder', 'text_encoder'])]
             assert len(other_params) > 1, "Could not gather model params correctly please investigate"
-            
+
             optimizer_parameters = [
                 {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},  # No weight decay for alpha
                 {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate} # Weight decay for other parameters
             ]
-            
-            # if self.hparams.image_task == "t2i": # do this bc other models wont have these 'sub' models
-            #     image_encoder_params = list(self.model.image_encoder.parameters())
-            #     optimizer_parameters.insert(1, {'params': image_encoder_params, 'weight_decay': 0, 'lr': 0})
-            #     text_encoder_params = list(self.model.text_encoder.parameters())
-            #     optimizer_parameters.insert(2, {'params': text_encoder_params, 'weight_decay': 0, 'lr': 0})
-            
-            return self.get_optimizer_scheduler_dict(optimizer_parameters)
-            
-        # elif self.hparams.model_name == "dit":
-        #     other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['image_encoder', 'text_encoder'])]
 
-        #     optimizer_parameters = [
-        #         {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate}  # Weight decay for other parameters
-        #     ]
-        #     if self.hparams.image_task == "t2i":
-        #         image_encoder_params = list(self.model.image_encoder.parameters())
-        #         optimizer_parameters.insert(0, {'params': image_encoder_params, 'weight_decay': 0, 'lr': 0})
-        #         text_encoder_params = list(self.model.text_encoder.parameters())
-        #         optimizer_parameters.insert(1, {'params': text_encoder_params, 'weight_decay': 0, 'lr': 0})
-            
-        #     return self.get_optimizer_scheduler_dict(optimizer_parameters)
-        
+            return self.get_optimizer_scheduler_dict(optimizer_parameters)
+
         else:
             raise NotImplementedError(f"havent implemented configure optimizers for model {self.hparams.model_name}")
 
-    # def create_full_ds(self):
-    #     if self.hparams.dataset_name == "coco_tiny":
-    #         self.full_ds = COCOTinyDataset(self.hparams, split = "train", transform = self.transform)
-    #     if self.hparams.dataset_name == "ucf101":
-    #         self.full_ds = UCF101Dataset(self.hparams, split = "train", transform = self.transform)
-    #     elif self.hparams.dataset_name == "vid_synthetic":
-    #         self.full_ds = VIDSyntheticDataset(self.hparams)
-    #     elif self.hparams.dataset_name == "pajama":
-    #         self.full_ds = RedPajamaDataset(self.hparams)
-    #     elif self.hparams.dataset_name == 'fineweb':
-    #         self.full_ds = FineWebDataset(self.hparams)
-    #     elif "bigbench" in self.hparams.dataset_name:
-    #         x = self.hparams.dataset_name
-    #         self.full_ds = BigBenchDataset(self.hparams, "train", x[x.find('_') + 1 :])
-    #     elif self.hparams.dataset_name == "planbench":
-    #         self.full_ds = PlanBenchDataset(self.hparams, split = "train")
-    #     elif self.hparams.dataset_name == "nlp_synthetic":
-    #         self.full_ds = NLPSyntheticDataset(self.hparams)
-    #     elif self.hparams.dataset_name == "aggregate": # aggregate VID dataset combining ssv2 and k400
-    #         self.full_ds = AggregateDataset(self.hparams, split = "train", transform = self.transform, normal_lookup=self.normal_lookup)
-    #     else:
-    #         raise NotImplementedError(f"haven't implemented dataset {self.hparams.dataset_name} full_ds yet")
+    def get_collate_fn(self) -> Optional[Any]:
+        """Return the dataset-specific collate function, if any.
 
-    # def setup(self, stage=None):
-    #     # NOTE when passing stage into datasets/dataloaders use string rep not the stage param from this func since is a PL enum
-    #     # Assign train/val datasets for use in dataloaders 
-    #     assert self.hparams.test_split_pct == 0, "Haven't implemented nonzero value for test_split_pct yet"
-
-    #     if stage == "fit":
-    #         # all of these conditions need to have manual split
-    #         if self.hparams.dataset_name in ["coco_tiny", "ucf101", "vid_synthetic", "pajama", "fineweb", "bigbench", "planbench", "nlp_synthetic"]:
-    #             self.create_full_ds()
-    #             train_samples = int(len(self.full_ds) * (1 - self.hparams.validation_split_pct))
-    #             valid_samples = len(self.full_ds) - train_samples
-    #             self.train_ds, self.val_ds = random_split(self.full_ds, [train_samples, valid_samples])
-    #         elif self.hparams.dataset_name == "aggregate":
-    #             self.create_full_ds()
-    #             self.train_ds, self.val_ds = self.full_ds.train_val_split(val_split_pct = self.hparams.validation_split_pct)
-    #         elif self.hparams.dataset_name == 'k400':
-    #             self.train_ds = Kinetics400Dataset(self.hparams, split = 'train', transform = self.transform)
-    #             self.val_ds = Kinetics400Dataset(self.hparams, split = 'val', transform = self.transform)
-    #         elif self.hparams.dataset_name in ('something' , 'smth'):
-    #             self.train_ds = SomethingDataset(self.hparams, split = 'train', transform = self.transform)
-    #             self.val_ds = SomethingDataset(self.hparams, split = 'val', transform = self.transform)
-    #         elif self.hparams.dataset_name in ('imagenet' , 'imagenet1k'):
-    #             self.train_ds = ImageNetDataset(self.hparams, split = 'train', transform = self.transform)
-    #             self.val_ds = ImageNetDataset(self.hparams, split = 'val', transform = self.transform)
-    #         elif self.hparams.dataset_name == 'coco_medium':
-    #             self.train_ds = COCOMediumDataset(self.hparams, split = "train", transform = self.transform)
-    #             self.val_ds = COCOMediumDataset(self.hparams, split = "validation", transform = self.transform)
-    #         elif self.hparams.dataset_name == "gsm8k":
-    #             self.train_ds = GSM8KDataset(self.hparams, split = "train")
-    #             self.val_ds = GSM8KDataset(self.hparams, split = "test") # no val just test https://huggingface.co/datasets/openai/gsm8k
-    #         elif self.hparams.dataset_name == "ai2arc":
-    #             self.train_ds = AI2ArcDataset(self.hparams, split = 'train')
-    #             self.val_ds = AI2ArcDataset(self.hparams, split = 'validation')
-    #         elif self.hparams.dataset_name == "squad":
-    #             self.train_ds = SQuADDataset(self.hparams, split = 'train')
-    #             self.val_ds = SQuADDataset(self.hparams, split = 'validation')
-    #         else:
-    #             raise NotImplementedError("Haven't implemented this dataset yet")
-    #         print(f"{self.hparams.dataset_name} length of train_dataset: {len(self.train_ds)} and val_dataset: {len(self.val_ds)}")
-            
-    #     # Assign test dataset for use in dataloader(s)
-    #     elif stage == "test":
-    #         if self.hparams.dataset_name == "ucf101":
-    #             self.test_ds = UCF101Dataset(self.hparams, split = "test", transform = self.transform)
-    #         elif self.hparams.dataset_name in ('kinetics400' , 'k400'):
-    #             self.test_ds = Kinetics400Dataset(self.hparams, split = "test", transform = self.transform)
-    #         elif self.hparams.dataset_name in ('something' , 'smth'):
-    #             self.test_ds = SomethingDataset(self.hparams, split = "test", transform = self.transform)
-    #         elif self.hparams.dataset_name in ('imagenet' , 'imagenet1k'):
-    #             self.test_ds = ImageNetDataset(self.hparams, split = "test", transform = self.transform)
-    #         elif self.hparams.dataset_name == 'aggregate':
-    #             self.test_ds = AggregateDataset(self.hparams, split = "test", transform = self.transform)
-    #         elif self.hparams.dataset_name == "coco_tiny":
-    #             self.test_ds = COCOTinyDataset(self.hparams, split = "validation", transform = self.transform) # use validation since there is no test split, splitted train into val
-    #         elif self.hparams.dataset_name == "coco_medium":
-    #             self.test_ds = COCOMediumDataset(self.hparams, split = "test", transform = self.transform)
-    #         elif self.hparams.dataset_name == "pajama": # for now am assuming test split == val split, so dont save train or full ds here, just to get val split
-    #             full_ds = RedPajamaDataset(self.hparams)
-    #             train_samples = int(len(full_ds) * (1 - self.hparams.validation_split_pct))
-    #             test_samples = len(full_ds) - train_samples
-    #             _, self.test_ds = random_split(full_ds, [train_samples, test_samples])
-    #         elif self.hparams.dataset_name == "fineweb":
-    #             raise NotImplementedError(f"haven't implemented fineweb dataset test split yet")
-    #         elif "bigbench" in self.hparams.dataset_name:
-    #             x = self.hparams.dataset_name
-    #             self.test_ds = BigBenchDataset(self.hparams, "validation", x[x.find('_') + 1 :]) #use val for testing as Bigbench only has train/val
-    #         elif self.hparams.dataset_name == "gsm8k":
-    #             self.test_ds = GSM8KDataset(self.hparams, split="test")
-    #         elif self.hparams.dataset_name == "lambada":
-    #             self.test_ds = LambadaDataset(self.hparams, split="test")
-    #         elif self.hparams.dataset_name == "squad":
-    #             self.test_ds = SQuADDataset(self.hparams, split="validation") # no test split use val
-    #         elif self.hparams.dataset_name == "planbench":
-    #             raise NotImplementedError(f"no planbench test split")
-    #         elif self.hparams.dataset_name == "ai2arc":
-    #             self.test_ds = AI2ArcDataset(self.hparams, split = "test")
-    #         else:
-    #             raise NotImplementedError("haven't implemented this dataset yet")
-    #         print(f"{self.hparams.dataset_name} length of test_ds: {len(self.test_ds)}")
-    #     else:
-    #         raise ValueError(f"Unknown stage: {stage}, please investigate")
-    
-    def get_collate_fn(self):
+        :return: Collator instance or ``None`` when padding is unnecessary.
+        :rtype: Optional[Any]
+        """
         collate_fn = None if not self.hparams.modality == "NLP" else NLP_HF_Collator(self.hparams) #NOTE this assumes all modalities except NLP DONT have collator, may not be true in the future
         if self.hparams.dataset_name == "nlp_synthetic": #NOTE this is a hack to get around the fact that synthetic dataset cant return real text and thus cant use collate_fn
             collate_fn = None
         return collate_fn
     
-    def  train_dataloader(self):
+    def  train_dataloader(self) -> Any:
+        """Build the training dataloader.
+
+        Routes to the NanoChat pretrain / NanoChat SFT / Sudoku SFT /
+        mixed-sudoku dataloaders depending on ``hparams.dataset_name``.
+        Applies a one-shot resume-state dict that is consumed on the first
+        call after checkpoint load.
+
+        :return: A dataloader producing ``(inputs, targets)`` batches.
+        :rtype: Any
+        """
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
 
-        # 从 checkpoint 恢复的 dataloader 位置（只用一次）
+        # Dataloader position restored from checkpoint (used at most once).
         resume_state = getattr(self, '_dataloader_resume_state', None)
         self._dataloader_resume_state = None
 
@@ -1654,22 +1583,28 @@ class ModelTrainer(LightningModule):
                 tokenizer=tokenizer,
                 batch_size=self.hparams.batch_size_per_device,
                 max_len=self.hparams.context_length,
-                max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches, # 显示的1个epoch对应设置的self.hparams.max_steps个训练步数
+                max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches, # one displayed epoch corresponds to ``self.hparams.max_steps`` training steps
                 split="train",
                 device=self.device,
                 resume_state_dict=resume_state,
             )
         return train_dataloader
 
-    def val_dataloader(self):
-        # IMPORTANT: NanoChat dataset split information
-        # The train/val split is HARDCODED in nanochat/dataloader.py line 37:
-        # - Training: parquet_paths[:-1] (all files except the last one)
-        # - Validation: parquet_paths[-1:] (only the last file)
-        # With 370 total shards, this gives 369 train + 1 val (0.27% validation)
-        # The --validation_split_pct parameter does NOT control this split!
+    def val_dataloader(self) -> Any:
+        """Build the validation dataloader.
 
-        # Use tokenizer_obj for dataloader
+        .. note::
+
+            The NanoChat train/val split is hardcoded in
+            ``nanochat/dataloader.py`` — training uses
+            ``parquet_paths[:-1]`` and validation uses the final shard
+            (``parquet_paths[-1:]``). With 370 shards this is roughly
+            369 train + 1 val (~0.27% validation). The
+            ``--validation_split_pct`` flag does not control this split.
+
+        :return: A dataloader producing validation batches.
+        :rtype: Any
+        """
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
 
         if getattr(self.hparams, 'dataset_name', 'nanochat') == 'nanochat_sft':
@@ -1704,7 +1639,16 @@ class ModelTrainer(LightningModule):
 
         return val_dataloader
 
-    def test_dataloader(self):
+    def test_dataloader(self) -> Any:
+        """Build the test dataloader.
+
+        Returns a map-style ``DataLoader`` for inference on GSM8K or the
+        NanoChat shard evaluation dataset; otherwise falls back to
+        :meth:`val_dataloader` (pretrain-mode default).
+
+        :return: Dataloader for the configured test/inference dataset.
+        :rtype: Any
+        """
         # For inference mode with specific datasets, use DataLoader with collate_fn
         if self.hparams.execution_mode == "inference" and self.hparams.dataset_name == "gsm8k":
             test_ds = GSM8KDataset(self.hparams, split="test")
@@ -1755,17 +1699,25 @@ class ModelTrainer(LightningModule):
         else:
             # Default: use val_dataloader for pretrain mode
             return self.val_dataloader()
-        
-    # def train_dataloader(self):
-    #     return DataLoader(self.train_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = not self.hparams.no_shuffle, prefetch_factor=self.hparams.prefetch_factor)
 
-    # def val_dataloader(self):
-    #     return DataLoader(self.val_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
+    def log_metrics(self, metrics_dict: Dict[str, Any], phase: str, log_torchmetrics: bool = True) -> None:
+        """Log metrics to W&B / Lightning with train vs. val semantics.
 
-    # def test_dataloader(self):
-    #     return DataLoader(self.test_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
+        Scalars from ``metrics_dict`` are logged; tensor values with more
+        than one element are summarized as per-step mean/std to avoid a CPU
+        sync. Train-phase entries are logged per step, validation entries
+        per epoch so ``ModelCheckpoint`` sees an epoch-level ``valid_loss``.
 
-    def log_metrics(self, metrics_dict, phase, log_torchmetrics = True):
+        :param metrics_dict: Mapping of metric name to value (scalar or
+            tensor).
+        :type metrics_dict: Dict[str, Any]
+        :param phase: ``"train"``, ``"valid"`` or ``"test"``.
+        :type phase: str
+        :param log_torchmetrics: When ``True`` and any torchmetrics are
+            registered, also log their phase-filtered values.
+        :type log_torchmetrics: bool
+        :raises ValueError: If a value has an unsupported type.
+        """
         # first log torchmetrics if there are any
         if log_torchmetrics and len(self.metrics) > 0:
             phase_dict = {key : value for key, value in self.torchmetrics_dict.items() if phase in key}
@@ -1776,25 +1728,6 @@ class ModelTrainer(LightningModule):
         keys = list(metrics_dict.keys()) # Iterate over a copy of the keys to avoid modification issues during iteration
         for key in keys:
             value = metrics_dict[key]
-            # if 'image' in key: # images
-            #     image = self.to_pil(value)
-            #     wandb_image = wandb.Image(image, mode="RGB")
-            #     self.logger.experiment.log({f'{phase}_{key}': wandb_image})
-
-            # elif 'video' in key: # videos
-            #     video_np = value.cpu().numpy()
-            #     assert video_np.ndim != 5, "video should not include batch dimension, either fix that or add support"
-            #     if video_np.shape[1] in [1, 3]:
-            #         pass  # Axes are already correct
-            #     elif video_np.shape[-1] in [1, 3]:
-            #         # If video_np is (frames, height, width, channels), transpose axes
-            #         video_np = video_np.transpose(0, 3, 1, 2)
-            #     else:
-            #         raise ValueError(f"Unexpected video shape: {video_np.shape}")
-            #     if video_np.dtype != np.uint8:
-            #         video_np = (video_np * 255).astype(np.uint8)
-            #     wandb_video = wandb.Video(video_np, fps=4, format="mp4")
-            #     self.logger.experiment.log({f'{phase}_{key}': wandb_video})
 
             if isinstance(value, torch.Tensor) and value.numel() > 1: # histogram
                 # Optimize: Log stats instead of Histogram to avoid CPU sync/copy
@@ -1812,27 +1745,29 @@ class ModelTrainer(LightningModule):
 
         if scalar_metrics:
             if phase == "train":
-                # 训练阶段：on_step=True, on_epoch=False
-                # 每个 train step 独立上报，不跨 step 累积。
+                # Train phase: on_step=True, on_epoch=False. Each train step
+                # reports independently without cross-step accumulation.
                 self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True,
                               on_step=True, on_epoch=False)
             else:
-                # 验证/测试阶段：on_step=False, on_epoch=True
-                # Lightning 保证每次 val_loop 是独立的 validation epoch，
-                # on_epoch=True 只在当次 val 的 batch 内累积均值，
-                # 不会跨多次 val_check_interval 累积（不存在"280次val被平均"的问题）。
-                # ModelCheckpoint 在 on_validation_end 查询 epoch-level 指标，
-                # 必须用 on_epoch=True 才能让 valid_loss 出现在 returned metrics 里。
+                # Validation/test: on_step=False, on_epoch=True. Lightning
+                # treats each val loop as an independent epoch, so
+                # on_epoch=True averages only within the current val loop's
+                # batches and does not carry over across val_check_interval
+                # cycles. ``ModelCheckpoint`` reads epoch-level metrics in
+                # ``on_validation_end``, so on_epoch=True is required to
+                # surface ``valid_loss``.
                 self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True,
                               on_step=False, on_epoch=True)
 
-        # === 增强的调试日志 (仅 train 阶段) ===
-        # lr/wd/Alpha 等只在训练步骤记录，避免在 validation 阶段触发
-        # "log on epoch level in distributed setting" 的 warning
+        # === Extra diagnostic logging (train phase only) ===
+        # lr/wd/alpha are logged only at training steps to avoid the
+        # "log on epoch level in distributed setting" warning during
+        # validation.
         if phase == "train" and len(self.trainer.optimizers) > 0:
             optimizer = self.trainer.optimizers[0]
 
-            # 记录所有参数组的学习率
+            # Log the learning rate / weight decay of every param group.
             for i, group in enumerate(optimizer.param_groups):
                 group_lr = group['lr']
                 group_wd = group.get('weight_decay', 0)
@@ -1841,26 +1776,26 @@ class ModelTrainer(LightningModule):
                 self.log(f"wd/param_group_{i}", group_wd, prog_bar=False,
                          on_step=True, on_epoch=False)
 
-            # 主学习率 (最后一个参数组，通常是 transformer 参数)
+            # Primary LR is the last param group (usually transformer params).
             current_lr = optimizer.param_groups[-1]['lr']
             self.log("Global_LR", current_lr, on_step=True, on_epoch=False)
 
-            # Alpha 参数的学习率 (第一个参数组)
+            # Alpha parameter LR is the first param group.
             if len(optimizer.param_groups) > 1:
                 alpha_lr = optimizer.param_groups[0]['lr']
                 self.log("Alpha_LR", alpha_lr, on_step=True, on_epoch=False)
 
-        # Alpha (MCMC step size) 值 (仅 train 阶段，避免 validation 阶段 warning)
+        # Alpha (MCMC step size) value — train only, to avoid validation warning.
         if phase == "train" and self.hparams.mcmc_step_size_learnable:
             self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach(),
                      on_step=True, on_epoch=False)
 
-        # Langevin dynamics noise (仅 train 阶段)
+        # Langevin dynamics noise — train only.
         if phase == "train" and self.hparams.langevin_dynamics_noise_learnable:
             self.log("Langevin_dynamics_noise", self.model.langevin_dynamics_noise_std.detach(),
                      on_step=True, on_epoch=False)
 
-        # 训练进度信息 (仅在训练阶段, 仅 rank 0 打印)
+        # Training progress information (train phase only, rank-0 printing only).
         if phase == "train" and hasattr(self, 'trainer') and self.trainer is not None:
             import time as _time
 
@@ -1870,7 +1805,7 @@ class ModelTrainer(LightningModule):
             self.log("step", float(current_step), prog_bar=True, on_step=True, on_epoch=False)
             self.log("progress_pct", progress_pct, prog_bar=False, on_step=True, on_epoch=False)
 
-            # GPU 内存使用 (如果可用)
+            # GPU memory usage (when available).
             if torch.cuda.is_available():
                 gpu_mem_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
                 gpu_mem_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
@@ -1879,26 +1814,26 @@ class ModelTrainer(LightningModule):
                 self.log("gpu_mem_reserved_gb", gpu_mem_reserved, prog_bar=False,
                          on_step=True, on_epoch=False)
 
-            # === 丰富训练日志 (仅 rank 0 打印, 避免 DDP 重复) ===
+            # === Rich training log (rank-0 only to avoid DDP duplication) ===
             if self.trainer.is_global_zero:
-                # --- 时间统计 ---
+                # --- Wall-clock statistics ---
                 dt_ms = (getattr(self, '_last_dt', None) or 0.0) * 1000.0
                 wall_elapsed = 0.0
                 if self._train_start_time is not None:
                     wall_elapsed = _time.time() - self._train_start_time
                 total_min = wall_elapsed / 60.0
 
-                # --- LR ratio (相对于 peak_lr) ---
+                # --- LR ratio relative to peak_lr ---
                 lrm = 1.0
                 if len(self.trainer.optimizers) > 0:
                     opt = self.trainer.optimizers[0]
-                    # 取最后一个参数组（通常是 transformer/muon 主参数组）的 lr
+                    # Take the last param group (usually the transformer/muon main group).
                     cur_lr = opt.param_groups[-1]['lr']
                     peak_lr = self.hparams.peak_learning_rate
                     lrm = cur_lr / peak_lr if peak_lr > 0 else 1.0
 
-                # --- tok/sec: tokens processed per second (全局) ---
-                # 每个 optimizer step 消耗 tokens = num_gpus × batch_per_device × context_length × grad_accum
+                # --- tok/sec: tokens processed per second (global) ---
+                # Tokens per optimizer step = num_gpus × batch_per_device × context_length × grad_accum
                 num_gpus = getattr(self.hparams, 'num_gpus', 1)
                 tokens_per_step = (num_gpus
                                    * self.hparams.batch_size_per_device
@@ -1907,14 +1842,14 @@ class ModelTrainer(LightningModule):
                 tok_per_sec = tokens_per_step / (dt_ms / 1000.0) if dt_ms > 0 else 0.0
 
                 # --- MFU (Model FLOP Utilization) ---
-                # 参考 PaLM / nanoGPT 计算方式:
-                # FLOPs per token ≈ 6 × num_params（前向 + 反向）
+                # Following PaLM / nanoGPT conventions:
+                # FLOPs per token ≈ 6 × num_params (forward + backward)
                 # MFU = actual_tok_per_sec × flops_per_token / peak_flops_per_sec
-                # H200 peak bfloat16 FLOPS ≈ 989 TFLOPS per GPU
+                # H200 peak bfloat16 FLOPS ≈ 989 TFLOPS per GPU.
                 try:
                     num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
                     flops_per_token = 6 * num_params  # forward + backward
-                    # Peak FLOPS: H200=989T, A100=312T; 这里保守用 312T/GPU (A100)
+                    # Peak FLOPS: H200=989T, A100=312T. Default to H200 here.
                     # peak_flops_per_gpu = 312e12
                     peak_flops_per_gpu = 989e12
                     gpu_peak_flops = num_gpus * peak_flops_per_gpu
@@ -1935,12 +1870,12 @@ class ModelTrainer(LightningModule):
                 else:
                     eta_str = ""
 
-                # --- 当前 loss ---
+                # --- Current loss ---
                 loss_val = metrics_dict.get('loss', 0.0)
                 if isinstance(loss_val, torch.Tensor):
                     loss_val = loss_val.item()
 
-                # --- 最新 valid 指标 ---
+                # --- Latest validation metrics ---
                 last_valid = getattr(self, '_last_valid_metrics', {})
                 valid_loss_val = last_valid.get('loss', None)
                 valid_bpb_val = last_valid.get('bpb', None)
@@ -1953,7 +1888,7 @@ class ModelTrainer(LightningModule):
                 if valid_ppl_val is not None:
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
 
-                # --- 打印 ---
+                # --- Print ---
                 print(
                     f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
                     f"loss: {loss_val:.6f}"

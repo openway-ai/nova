@@ -1,39 +1,61 @@
+"""Batch collators used by EBT training pipelines."""
+
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import torch
+
 from openebm.elm.tokenizer import AutoTokenizer
 
 @dataclass
 class DataCollatorWithPadding:
-    """
-    Minimal pure-PyTorch version of transformers.DataCollatorWithPadding.
+    """Minimal pure-PyTorch analogue of ``transformers.DataCollatorWithPadding``.
 
-    This collator pads variable-length tokenized samples into a batch tensor.
+    Pads variable-length tokenized samples into rectangular batch tensors.
 
-    Expected each feature (sample) to be a dict like:
-      {
-        "input_ids": List[int],
-        "attention_mask": Optional[List[int]],
-        "token_type_ids": Optional[List[int]],
-        "labels": Optional[Union[int, float, List[int]]],
-        ...
-      }
+    Each feature (sample) is a dict with, at minimum, an ``input_ids`` key
+    and optionally ``attention_mask``, ``token_type_ids``, and ``labels``
+    (scalar or sequence).
 
-    Notes:
-    - This is a minimal implementation. The real HF collator supports more dtypes,
-      numpy, tensors, and tokenizer.pad() behavior.
-    - We handle the most common training pipeline use-cases.
+    :ivar tokenizer: Tokenizer object providing ``pad_token_id`` and
+        ``padding_side``.
+    :vartype tokenizer: Any
+    :ivar padding: ``True`` / ``"longest"`` pads to the longest sample in the
+        batch; ``"max_length"`` pads to ``max_length``; ``False`` still
+        produces rectangular tensors via ``max(lengths)``.
+    :vartype padding: Union[bool, str]
+    :ivar max_length: Required when ``padding == "max_length"``.
+    :vartype max_length: Optional[int]
+    :ivar pad_to_multiple_of: When set, rounds the target length up to a
+        multiple of this value (useful for Tensor Core alignment).
+    :vartype pad_to_multiple_of: Optional[int]
+    :ivar return_tensors: Currently only ``"pt"`` is supported.
+    :vartype return_tensors: str
+    :ivar label_pad_token_id: Pad value used for sequence labels
+        (usually ``-100`` to match ``CrossEntropyLoss(ignore_index)``).
+    :vartype label_pad_token_id: int
     """
 
     tokenizer: Any
-    padding: Union[bool, str] = True  # True/"longest"/"max_length"/False
+    padding: Union[bool, str] = True
     max_length: Optional[int] = None
     pad_to_multiple_of: Optional[int] = None
     return_tensors: str = "pt"
-    label_pad_token_id: int = -100  # common ignore_index for CE loss
+    label_pad_token_id: int = -100
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """Pad and stack the provided features into a batch dict.
+
+        :param features: List of feature dicts.
+        :type features: List[Dict[str, Any]]
+        :return: Dict of stacked tensors (``input_ids``, optionally
+            ``attention_mask`` / ``token_type_ids`` / ``labels`` plus any
+            scalar metadata).
+        :rtype: Dict[str, torch.Tensor]
+        :raises ValueError: If ``features`` is empty, ``return_tensors`` is
+            not ``"pt"``, ``padding`` is invalid, or label types are mixed
+            across the batch.
+        """
         if self.return_tensors != "pt":
             raise ValueError("This minimal collator only supports return_tensors='pt'.")
 
@@ -182,75 +204,101 @@ class DataCollatorWithPadding:
 
 
 class NLP_HF_Collator:
-    def __init__(self, hparams):
+    """Lazy-initialized collator that plugs an HF-like tokenizer into training.
+
+    The tokenizer is resolved on first ``__call__`` so that the collator can
+    be pickled across worker processes without instantiating the tokenizer
+    on the main process.
+    """
+
+    def __init__(self, hparams: Any) -> None:
+        """Initialize the collator and capture the hparams object.
+
+        :param hparams: Training hparams (namespace/dict-like). Relevant
+            attributes include ``context_length``, ``mcmc_replay_buffer``,
+            ``pretokenize_dataset``, ``execution_mode``, ``tokenizer``,
+            ``tokenizer_path``, and ``tokenizer_obj``.
+        :type hparams: Any
+        """
         self.hparams = hparams
         self.max_length = hparams.context_length+1
-        self.tokenizer = None  # Will be initialized in __call__
+        self.tokenizer = None  # Lazily initialized in __call__.
         self.data_collator = None
 
-    def _get_tokenizer_wrapper(self, tokenizer_obj):
-        """
-        Wrap nanochat tokenizer to support HuggingFace-like interface.
+    def _get_tokenizer_wrapper(self, tokenizer_obj: Any) -> Any:
+        """Wrap a nanochat tokenizer with an HuggingFace-like interface.
+
+        :param tokenizer_obj: Tokenizer instance (either already wrapped,
+            a nanochat ``RustBPETokenizer``, or an HF tokenizer).
+        :type tokenizer_obj: Any
+        :return: A :class:`NanoChatTokenizerWrapper` when ``tokenizer_obj``
+            is a nanochat tokenizer, otherwise ``tokenizer_obj`` unchanged.
+        :rtype: Any
         """
         from openebm.elm.nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
 
-        # Check if it's already wrapped
         if isinstance(tokenizer_obj, NanoChatTokenizerWrapper):
             return tokenizer_obj
 
-        # Check if it's a nanochat RustBPETokenizer that needs wrapping
+        # ``RustBPETokenizer`` exposes an ``enc`` attribute; detect that case.
         if hasattr(tokenizer_obj, 'enc') and hasattr(tokenizer_obj.enc, 'encode'):
-            # It's a RustBPETokenizer, wrap it
             return NanoChatTokenizerWrapper(tokenizer_obj=tokenizer_obj)
 
-        # Otherwise, return as is (it's likely already HF tokenizer)
         return tokenizer_obj
 
-    def __call__(self, batch):
-        padding = "max_length" if self.hparams.mcmc_replay_buffer else True # for replay buffer need to pad to max since all elements in replay buffer need same seq dim
+    def __call__(self, batch: Any) -> Any:
+        """Tokenize / pad ``batch`` using the cached tokenizer.
+
+        :param batch: Raw batch from the dataset. Structure depends on
+            ``hparams.pretokenize_dataset`` and ``hparams.execution_mode``.
+        :type batch: Any
+        :return: A tensor dict for training or a ``(questions, answers)``
+            tuple when running in inference mode.
+        :rtype: Any
+        """
+        # When the replay buffer is active every sequence in the buffer must
+        # share the same padding length, so we force ``max_length`` padding.
+        padding = "max_length" if self.hparams.mcmc_replay_buffer else True
         if self.hparams.pretokenize_dataset:
             if self.tokenizer is None:
-                # CRITICAL FIX: Use tokenizer_obj (nanochat tokenizer) if available
-                # This fixes CUDA index out of bounds error when using wrong vocab_size
+                # CRITICAL: Prefer ``tokenizer_obj`` (nanochat tokenizer) when
+                # available; using ``tokenizer_path`` with a wrong vocab size
+                # triggers a CUDA "index out of bounds" error.
                 if hasattr(self.hparams, 'tokenizer_obj') and self.hparams.tokenizer_obj is not None:
                     self.tokenizer = self._get_tokenizer_wrapper(self.hparams.tokenizer_obj)
                 else:
-                    # Use tokenizer_path if available, otherwise fallback
                     tokenizer_path = self.hparams.tokenizer_path if hasattr(self.hparams, 'tokenizer_path') else self.hparams.tokenizer
                     self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, clean_up_tokenization_spaces=False)
-                # Safe assignment: ensure eos_token_id exists before using it
+                # Ensure ``pad_token_id`` is always defined.
                 if hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
                     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
                 elif hasattr(self.tokenizer, 'bos_token_id'):
                     self.tokenizer.pad_token_id = self.tokenizer.bos_token_id
                 else:
-                    self.tokenizer.pad_token_id = 0  # Fallback to 0 for GPT-NeoX style tokenizers
+                    self.tokenizer.pad_token_id = 0  # Fallback for GPT-NeoX-style tokenizers.
                 self.data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, return_tensors="pt", padding=padding, max_length=self.max_length)
             return self.data_collator(batch)
         else:
             if self.tokenizer is None:
-                # CRITICAL FIX: Use tokenizer_obj (nanochat tokenizer) if available
-                # This fixes CUDA index out of bounds error when using wrong vocab_size
+                # See comment above — prefer ``tokenizer_obj`` when provided.
                 if hasattr(self.hparams, 'tokenizer_obj') and self.hparams.tokenizer_obj is not None:
                     self.tokenizer = self._get_tokenizer_wrapper(self.hparams.tokenizer_obj)
                 else:
-                    # Use tokenizer_path if available, otherwise fallback
                     tokenizer_path = self.hparams.tokenizer_path if hasattr(self.hparams, 'tokenizer_path') else self.hparams.tokenizer
                     self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, clean_up_tokenization_spaces = False)
-                # Safe assignment: ensure eos_token_id exists before using it
                 if hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
                     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
                 elif hasattr(self.tokenizer, 'bos_token_id'):
                     self.tokenizer.pad_token_id = self.tokenizer.bos_token_id
                 else:
-                    self.tokenizer.pad_token_id = 0  # Fallback to 0 for GPT-NeoX style tokenizers
+                    self.tokenizer.pad_token_id = 0  # Fallback for GPT-NeoX-style tokenizers.
             if self.hparams.execution_mode == "inference":
                 questions, answers = zip(*batch)
                 return self.tokenizer(questions, return_tensors="pt", padding=True, truncation=True, max_length=self.max_length), self.tokenizer(answers, return_tensors="pt", padding=True, truncation=True, max_length=self.max_length)
 
             tokens = self.tokenizer(batch, return_tensors="pt", padding=padding, truncation=True, max_length=self.max_length)
             return tokens
-        
+
 
 # -----------------------------
 # Example usage
@@ -262,8 +310,8 @@ if __name__ == "__main__":
 
     collator = DataCollatorWithPadding(
         tokenizer=DummyTokenizer(),
-        padding=True,              # pad to longest in batch
-        pad_to_multiple_of=8,      # optional
+        padding=True,
+        pad_to_multiple_of=8,
         label_pad_token_id=-100,
     )
 

@@ -1,13 +1,16 @@
-"""
-EBT SFT Dataset - 将 NanoChat SFT 数据集适配为 EBT 训练格式
+"""EBT SFT dataset adapter built on top of NanoChat's ``TaskMixture``.
 
-使用 NanoChat 的 TaskMixture（SmolTalk, MMLU, GSM8K 等）作为 SFT 数据源，
-输出格式与 EBT pretrain dataloader 完全一致: (inputs, targets) 形状 (B, T)。
+The dataset loads the NanoChat SFT task mixture (SmolTalk, MMLU, GSM8K, etc.)
+and emits ``(inputs, targets)`` batches with exactly the same shape ``(B, T)``
+that the EBT pretraining data loader produces, so that both pipelines can
+share the same training loop.
 """
 
+import copy
 import os
 import sys
-import copy
+from typing import Any, Iterator, Optional, Tuple
+
 import torch
 from torch.utils.data import IterableDataset as _IterableDataset, DataLoader
 
@@ -15,18 +18,30 @@ from nanochat.common import get_dist_info
 from nanochat.tokenizer import get_tokenizer
 
 
-def _load_sft_datasets():
-    """加载 SFT 数据集混合 (支持 offline 模式)"""
+def _load_sft_datasets() -> Tuple[Any, Any]:
+    """Load the NanoChat SFT task mixture, with optional offline support.
+
+    Respects two environment variables:
+
+    - ``NANOCHAT_SFT_DATA_DIR``: when set, the NanoChat tasks transparently
+      read their data from that directory (offline mode).
+    - ``NANOCHAT_BASE_DIR``: base directory used to locate the optional
+      ``identity_conversations.jsonl`` file.
+
+    :return: Tuple ``(train_dataset, val_dataset)`` of NanoChat
+        ``TaskMixture`` instances.
+    :rtype: Tuple[Any, Any]
+    """
     from tasks.common import TaskMixture
     from tasks.gsm8k import GSM8K
     from tasks.mmlu import MMLU
     from tasks.smoltalk import SmolTalk
 
-    # Offline 模式支持：设置 NANOCHAT_SFT_DATA_DIR 环境变量
-    # nanochat tasks 会自动使用该路径下的离线数据集
+    # Offline mode: ``NANOCHAT_SFT_DATA_DIR`` lets the NanoChat tasks skip
+    # the network download and reuse a pre-staged dataset cache.
     sft_data_dir = os.environ.get("NANOCHAT_SFT_DATA_DIR", "")
     if sft_data_dir and os.path.exists(sft_data_dir):
-        print(f"[EBT SFT] 使用离线数据集: {sft_data_dir}")
+        print(f"[EBT SFT] Using offline dataset dir: {sft_data_dir}")
 
     base_dir = os.environ.get("NANOCHAT_BASE_DIR", "")
     identity_path = os.path.join(base_dir, "identity_conversations.jsonl")
@@ -65,20 +80,42 @@ def _load_sft_datasets():
 
 
 class SFTIterableDataset(_IterableDataset):
-    """将 NanoChat SFT TaskMixture 适配为 EBT IterableDataset"""
+    """Iterable dataset wrapping the NanoChat SFT ``TaskMixture`` for EBT.
+
+    Applies BOS-aligned best-fit packing (identical to ``chat_sft.py`` in
+    upstream NanoChat) and keeps exact-resume state across DDP ranks.
+    """
 
     STATE_VERSION = "sft_v1"
 
     def __init__(
         self,
-        tokenizer,
-        batch_size,
-        max_len,
-        split,
-        max_iter,
-        device="cuda",
-        resume_state_dict=None,
-    ):
+        tokenizer: Any,
+        batch_size: int,
+        max_len: int,
+        split: str,
+        max_iter: int,
+        device: str = "cuda",
+        resume_state_dict: Optional[dict] = None,
+    ) -> None:
+        """Initialize the dataset.
+
+        :param tokenizer: Tokenizer exposing ``get_bos_token_id`` and
+            ``render_conversation``.
+        :type tokenizer: Any
+        :param batch_size: Micro-batch size ``B``.
+        :type batch_size: int
+        :param max_len: Sequence length ``T``.
+        :type max_len: int
+        :param split: ``"train"`` or ``"val"``.
+        :type split: str
+        :param max_iter: Nominal iteration count.
+        :type max_iter: int
+        :param device: Target device.
+        :type device: str
+        :param resume_state_dict: Optional exact-resume state dict.
+        :type resume_state_dict: Optional[dict]
+        """
         super().__init__()
         self.tokenizer = tokenizer
         self.B = batch_size
@@ -103,12 +140,26 @@ class SFTIterableDataset(_IterableDataset):
 
         self.train_dataset, self.val_dataset = _load_sft_datasets()
 
-    def _can_restore(self, state):
+    def _can_restore(self, state: Any) -> bool:
+        """Return ``True`` when ``state`` looks like a compatible resume dict.
+
+        :param state: Candidate state dict.
+        :type state: Any
+        :return: Whether ``state`` can be restored with :meth:`_restore_state`.
+        :rtype: bool
+        """
         return isinstance(state, dict) and (
             state.get("state_version") == self.STATE_VERSION or "conv_buffer" in state
         )
 
-    def _initialize_fresh_state(self, ddp_rank, ddp_world_size):
+    def _initialize_fresh_state(self, ddp_rank: int, ddp_world_size: int) -> None:
+        """Initialize a fresh (non-resume) streaming state.
+
+        :param ddp_rank: Rank of the current process.
+        :type ddp_rank: int
+        :param ddp_world_size: DDP world size.
+        :type ddp_world_size: int
+        """
         self.ddp_rank = ddp_rank
         self.ddp_world_size = ddp_world_size
         self.row_capacity = self.T + 1
@@ -119,7 +170,17 @@ class SFTIterableDataset(_IterableDataset):
         self.epoch = 1
         self.it = 0
 
-    def _restore_state(self, state, ddp_rank, ddp_world_size):
+    def _restore_state(self, state: dict, ddp_rank: int, ddp_world_size: int) -> None:
+        """Restore streaming state from a resume dict.
+
+        :param state: Resume state dict previously returned by
+            :meth:`_build_state_dict`.
+        :type state: dict
+        :param ddp_rank: Rank of the current process.
+        :type ddp_rank: int
+        :param ddp_world_size: DDP world size.
+        :type ddp_world_size: int
+        """
         self.ddp_rank = ddp_rank
         self.ddp_world_size = ddp_world_size
         self.row_capacity = int(state.get("row_capacity", self.T + 1))
@@ -135,7 +196,15 @@ class SFTIterableDataset(_IterableDataset):
             f"it={self.it}, conv_buffer={len(self.conv_buffer)}"
         )
 
-    def _build_state_dict(self, copy_buffer):
+    def _build_state_dict(self, copy_buffer: bool) -> dict:
+        """Return a serializable snapshot of the streaming state.
+
+        :param copy_buffer: When ``True``, deep-copy the in-flight buffer;
+            otherwise share the reference (cheaper but not safe to persist).
+        :type copy_buffer: bool
+        :return: State dict with all fields required to resume exactly.
+        :rtype: dict
+        """
         return {
             "state_version": self.STATE_VERSION,
             "split": self.split,
@@ -150,8 +219,12 @@ class SFTIterableDataset(_IterableDataset):
             "conv_buffer": copy.deepcopy(self.conv_buffer) if copy_buffer else self.conv_buffer,
         }
 
-    def __iter__(self):
-        """BOS-aligned bestfit packing，对齐 chat_sft.py"""
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        """Yield ``(inputs, targets)`` batches with BOS-aligned best-fit packing.
+
+        :return: Iterator of ``(inputs, targets)`` tensors, each of shape ``(B, T)``.
+        :rtype: Iterator[Tuple[torch.Tensor, torch.Tensor]]
+        """
         ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
         dataset = self.train_dataset if self.split == "train" else self.val_dataset
         dataset_size = len(dataset)
@@ -169,7 +242,8 @@ class SFTIterableDataset(_IterableDataset):
         else:
             self._initialize_fresh_state(ddp_rank, ddp_world_size)
 
-        def refill_buffer():
+        def refill_buffer() -> None:
+            """Render more conversations until the sliding buffer is full."""
             while len(self.conv_buffer) < self.buffer_size:
                 conversation = dataset[self.cursor]
                 ids, _ = self.tokenizer.render_conversation(conversation)
@@ -234,16 +308,37 @@ class SFTIterableDataset(_IterableDataset):
             if self.split != "train" and self.it >= self.max_iter:
                 break
 
-    def get_dataloader_state(self):
+    def get_dataloader_state(self) -> Optional[dict]:
+        """Return the exact-resume state of the current stream.
+
+        :return: State dict suitable for later :meth:`load_state_dict`, or the
+            cached dict when iteration has not started yet.
+        :rtype: Optional[dict]
+        """
         if self.cursor is None:
             return self.last_state_dict
         return self._build_state_dict(copy_buffer=True)
 
-    def state_dict(self):
+    def state_dict(self) -> dict:
+        """Return the (possibly empty) state dict.
+
+        :return: State dict, or ``{}`` when no state is available.
+        :rtype: dict
+        """
         state = self.get_dataloader_state()
         return {} if state is None else state
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Load ``state_dict`` into the dataset.
+
+        When the dataset was constructed with an explicit ``resume_state_dict``
+        the local state takes priority — an incoming external state is logged
+        and otherwise ignored. This prevents Lightning from overwriting the
+        per-rank resume state during the initial setup phase.
+
+        :param state_dict: State dict to restore.
+        :type state_dict: dict
+        """
         if self._resume_state_locked and self._can_restore(self.resume_state_dict):
             current_state = self.resume_state_dict
             incoming_state = state_dict
@@ -257,24 +352,68 @@ class SFTIterableDataset(_IterableDataset):
         self.resume_state_dict = copy.deepcopy(state_dict)
         self._runtime_initialized = False
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the nominal iteration count.
+
+        :return: ``max_iter`` passed at construction time.
+        :rtype: int
+        """
         return self.max_iter
 
 
 class SFTDataLoader(DataLoader):
-    def state_dict(self):
+    """``DataLoader`` that forwards ``state_dict`` to the wrapped dataset."""
+
+    def state_dict(self) -> dict:
+        """Return the underlying dataset's state dict, or ``{}``.
+
+        :return: State dict, or ``{}`` when unavailable.
+        :rtype: dict
+        """
         dataset = getattr(self, "dataset", None)
         if dataset is None or not hasattr(dataset, "state_dict"):
             return {}
         return dataset.state_dict()
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Forward ``state_dict`` into the wrapped dataset.
+
+        :param state_dict: State dict to restore.
+        :type state_dict: dict
+        """
         dataset = getattr(self, "dataset", None)
         if dataset is not None and hasattr(dataset, "load_state_dict"):
             dataset.load_state_dict(state_dict)
 
 
-def generate_sft_dataloader(tokenizer, batch_size, max_len, max_iter, split, device, resume_state_dict=None):
+def generate_sft_dataloader(
+    tokenizer: Any,
+    batch_size: int,
+    max_len: int,
+    max_iter: int,
+    split: str,
+    device: str,
+    resume_state_dict: Optional[dict] = None,
+) -> SFTDataLoader:
+    """Build an :class:`SFTDataLoader` around an :class:`SFTIterableDataset`.
+
+    :param tokenizer: Tokenizer forwarded to the dataset.
+    :type tokenizer: Any
+    :param batch_size: Micro-batch size.
+    :type batch_size: int
+    :param max_len: Sequence length.
+    :type max_len: int
+    :param max_iter: Nominal iteration count.
+    :type max_iter: int
+    :param split: Dataset split.
+    :type split: str
+    :param device: Target device.
+    :type device: str
+    :param resume_state_dict: Optional exact-resume state.
+    :type resume_state_dict: Optional[dict]
+    :return: A ready-to-use :class:`SFTDataLoader`.
+    :rtype: SFTDataLoader
+    """
     dataset = SFTIterableDataset(
         tokenizer=tokenizer,
         batch_size=batch_size,

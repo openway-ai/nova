@@ -1,4 +1,10 @@
-# Human-crafted
+"""Entry point for training Energy-Based Transformer (EBT) and baseline models.
+
+This module parses command-line arguments, constructs the PyTorch Lightning
+:class:`Trainer` with the appropriate logger, checkpointing, and distributed
+strategy, and dispatches training, validation, or inference for the requested
+modality (NLP, VID, or IMG).
+"""
 # coding: utf-8
 import torch
 import os
@@ -6,24 +12,15 @@ from argparse import ArgumentParser
 
 import random
 
-# 允许加载旧 checkpoint 中的自定义类
+# Allow loading custom classes from legacy checkpoints.
 try:
     from nanochat.tokenizer import RustBPETokenizer
     torch.serialization.add_safe_globals([RustBPETokenizer])
 except:
     pass
 
-# 抑制 CUDA stream 不匹配警告（恢复训练时的已知问题）
+# Suppress CUDA stream mismatch warning (known issue when resuming training).
 torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
-
-# from nanolightning.torchlightning_trainer import Trainer
-# from nanolightning.iteratabletrainer import IterableTrainer
-# from nanolightning.torchlightning_trainer import ModelSummary
-# from nanolightning.torchlightning_function import DDPStrategy
-# from nanolightning.torchlightning_function import seed_everything
-# from nanolightning.torchlightning_function import WandbLogger
-# from nanolightning.torchlightning_function import ModelCheckpoint
-# from nanolightning.torchlightning_function import rank_zero_only
 
 try:
     from lightning.pytorch import Trainer, seed_everything
@@ -49,17 +46,13 @@ import json
 import shutil
 from openebm.elm import logger as text_logger
 
-# from torch.utils.tensorboard import SummaryWriter # need to implement, which involves maybe changing the forward function
-
-# from utils.dataloader_debugger import debug_dataloader
-# from utils import load_trained_pl_model
 from openebm.elm.utils import model_sizes, init_wandb_watch, call_style_gan_fvd
 from openebm.elm import logger
 from openebm.elm.trainer import ModelTrainer
 from openebm.elm.eval import nlp_eval_acc
 
-@rank_zero_only # to ensure only one wandb run is created, if didnt do that then each GPU would create its own wandb run
-def setup_wandb(args): 
+@rank_zero_only # ensure only one wandb run is created; otherwise each GPU would create its own
+def setup_wandb(args):
     import wandb
     if wandb.run is None:
         run = wandb.init(dir="logs/", name=f'{args.run_name}', entity=f'{args.wandb_entity}', project=f'{args.wandb_project}', mode = "offline" if args.wandb_offline else "online") # this is solely used to force wandb to start tracking stdout in logs
@@ -67,7 +60,17 @@ def setup_wandb(args):
         return run
     return None
 
-def main(args):
+def main(args) -> None:
+    """Run the full training/testing pipeline based on parsed CLI arguments.
+
+    Handles seeding, wandb/logger setup, device selection, optional SFT
+    checkpoint loading, dispatch to either training (with optional post-train
+    testing) or a standalone test run, and rank-0 post-processing of
+    inference outputs.
+
+    :param args: Parsed :mod:`argparse` namespace produced from the argument
+        parser defined in ``__main__``.
+    """
     # --disable_wandb is an alias for --no_wandb
     if args.disable_wandb:
         args.no_wandb = True
@@ -76,7 +79,7 @@ def main(args):
         seed_everything(random.randint(0,1000000), workers=True)
     else:
         seed_everything(33, workers=True) #33 is default
-        
+
     if args.debug_mode:
         args.no_wandb = True
         args.detect_anomaly = True
@@ -108,10 +111,6 @@ def main(args):
         print("SLURM_GPUS_PER_NODE:", os.environ.get("SLURM_GPUS_PER_NODE"))
         print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
 
-    # txt_logger is no longer supported [deprecated]
-    # txt_logger = text_logger.setup_custom_logger(log_filename = args.debug_log_filename, print_console = True) # this used to be set to args.print_logs but is default true now and print_logs is not used
-    # args.txt_logger = txt_logger
-
     if args.model_size != "": # set params based off of model size
         args.num_transformer_blocks = model_sizes[args.model_size]['num_transformer_blocks']
         args.multiheaded_attention_heads = model_sizes[args.model_size]['multiheaded_attention_heads']
@@ -123,37 +122,19 @@ def main(args):
 
     if args.override_transformer_blocks > 0:
         args.num_transformer_blocks = args.override_transformer_blocks
-    
+
     # hparam assertion sanity checks
-    # if args.modality == "VID":
-    #     if args.backbone_type == "dinov2":
-    #         assert args.embedding_dim == 0, "embedding dim defined implicitly by encoder dimensionality"
-    #         vit_backbone_embed_dim_map = {"small": 384, "base": 768, "large": 1024, "giant": 1536} # gotten from dinov2 repo
-    #         args.vit_backbone_dim = vit_backbone_embed_dim_map[args.vit_backbone_size]
-    #         args.embedding_dim = args.vit_backbone_dim
-    #     elif args.backbone_type == "vae":
-    #         assert args.embedding_dim != 0, "must define embedding dim for vae"
-    #     else:
-    #         raise NotImplementedError(f"Unspported backbone type: {args.backbone_type}")
     if args.modality == "NLP":
         assert args.embedding_dim != 0, "must define embedding dim for NLP models"
         if args.vocab_to_embed_uses_prob_dist:
             assert args.normalize_initial_condition, "if vocab_to_embed_uses_prob_dist is true must use normalize_initial_condition"
     elif args.modality == "VID":
-        # VID is old default, treat as NLP for backward compatibility
+        # VID is the old default; treat as NLP for backward compatibility.
         args.modality = "NLP"
         print(f"WARNING: modality=VID is deprecated, treating as NLP")
-    # elif args.modality == "IMG":
-    #     args.backbone_type = "vae" # always uses vae
-    #     assert args.embedding_dim != 0, "must define embedding dim for IMG models"
     else:
         raise ValueError(f"please add support for modality {args.modality}")
-    
-    # assert not(args.random_num_mcmc_steps == True and args.reconstruct_loss_only_final_step == True), "cannot have both random_num_mcmc_steps and reconstruct_loss_only_final_step set"
-    # if args.ramp_up_num_mcmc_steps_every_x_epochs != -1:
-    #     assert args.random_num_mcmc_steps, "random_num_mcmc_steps needs to be True"
-    #NOTE should uncomment if add above hparams back
-    
+
     args.num_nodes = int(os.getenv('SLURM_JOB_NUM_NODES', 1)) # may not exist if not using slurm so default to 1; multi node only supports slurm as of now
     print(f"SLURM_JOB_NUM_NODES: {args.num_nodes}")
     print("torch.cuda.device_count()", torch.cuda.device_count())
@@ -184,16 +165,13 @@ def main(args):
 
     model_trainer = ModelTrainer(args)
 
-    # SFT: 加载预训练权重但不恢复训练状态
+    # SFT: load pretrained weights but do not restore the training state.
     if args.finetuning_model_ckpt is not None and args.finetuning_model_ckpt != "":
-        print(f"[SFT] 加载预训练权重: {args.finetuning_model_ckpt}")
+        print(f"[SFT] Loading pretrained weights: {args.finetuning_model_ckpt}")
         ckpt = torch.load(args.finetuning_model_ckpt, map_location='cpu', weights_only=False)
         model_trainer.load_state_dict(ckpt['state_dict'], strict=False)
-        print(f"[SFT] 权重加载完成，训练从 step 0 开始")
+        print(f"[SFT] Weight load complete; training restarts from step 0")
 
-    # if args.debug_dataloader:
-    #     debug_dataloader(args, model_trainer)
-    #     return
     if args.log_model_archi:
         print(str(model_trainer.model))
         print(str(args))
@@ -202,20 +180,21 @@ def main(args):
         init_wandb_watch(wandb_logger, model_trainer, args.wandb_watch_log_freq, args.wandb_watch_level)
 
     if args.create_model_viz:
-        # BACKLOG use tensorboard for this if active eventually. disabled for now since makes some things challenging
+        # BACKLOG: migrate to tensorboard once reintroduced; disabled for now.
         return
     print(f'pytorch version: {torch.__version__}\n')
 
     if args.set_matmul_precision is not None: #default is highest
         torch.set_float32_matmul_precision(args.set_matmul_precision)
-    
+
     opt_name = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
     ckpt_dir = args.checkpoint_dir if args.checkpoint_dir else f"./logs/checkpoints/{args.run_name}"
     checkpoint_filename = f"s={{step}}-{args.model_size}-ctx{args.context_length}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
-    save_last = (args.save_periodic_steps <= 0)  # periodic 启用时不需要 last.ckpt，periodic 已覆盖 crash recovery
+    save_last = (args.save_periodic_steps <= 0)  # when periodic saving is enabled, last.ckpt is unnecessary because periodic already covers crash recovery
     checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=ckpt_dir, filename=checkpoint_filename, verbose=True, min_free_gb=50)
 
-    # 定期保存 checkpoint（不依赖 val_loss），防止 SFT 后期模型丢失
+    # Periodically save a checkpoint (independent of val_loss) so late-stage
+    # SFT models are not lost even if validation loss does not improve.
     periodic_checkpoint = None
     if args.save_periodic_steps > 0:
         periodic_checkpoint = DiskAwareCheckpoint(
@@ -248,8 +227,8 @@ def main(args):
             print(f"best model path that will be used during testing {checkpoint_callback.best_model_path}")
             print("$$$$$$$$$$  STARTED TESTING AFTER TRAINING  $$$$$$$$$$")
             raise NotImplementedError("need to test this with newer PL")
-            # test_trainer = L.Trainer(logger=wandb_logger,devices=1,num_nodes=1) NOTE tested this code does not work gets stuck, see thread, TODO test with newer PL
-            #warning reference - https://github.com/Lightning-AI/lightning/issues/12862
+            # Known to get stuck with older PL; reference:
+            # https://github.com/Lightning-AI/lightning/issues/12862
             best_model.eval()
             trainer.test(best_model)
         clear_cache()
@@ -261,11 +240,12 @@ def main(args):
         if os.path.exists(args.save_generation_logs_dir): # remove any existing logs
             shutil.rmtree(args.save_generation_logs_dir)
 
-        
+
         checkpoint = torch.load(args.only_test_model_ckpt, weights_only=False)
         pretrained_hparams = checkpoint['hyper_parameters']
 
-        default_args = vars(args).copy() # NOTE this is so can test older models trained with older code as well as use newer hparams (for inference) on pretrained models, may be finicky feel free to tweak
+        # Allow testing older checkpoints while overriding inference hparams from the current CLI.
+        default_args = vars(args).copy()
         for key, value in default_args.items():
             if key not in pretrained_hparams:
                 pretrained_hparams[key] = value
@@ -273,9 +253,6 @@ def main(args):
             if key.startswith("infer_"):
                 pretrained_hparams[key] = value
                 print(f"OVERRIDING PARAMETER IN PRETRAINED CHECKPOINT FOR INFERENCE: Using args set value for inference parameter '{key}': {value}")
-
-        # if args.modality == "VID":
-        #     pretrained_hparams["modality"] = "VID" # this is just to test old models with a refactor of CV -> VID
 
         model = ModelTrainer(pretrained_hparams)
         model.load_state_dict(checkpoint['state_dict'])
@@ -286,33 +263,39 @@ def main(args):
         model_trainer.model.eval()
         trainer.test(model_trainer)
 
-        # DDP: only rank 0 merges shard files and computes metrics
+        # DDP: only rank 0 merges shard files and computes metrics.
         if trainer.global_rank == 0:
-            # Merge per-rank JSONL shard files into a single results.jsonl
+            # Merge per-rank JSONL shard files into a single results.jsonl.
             from openebm.elm.logger import JsonlLogger
             JsonlLogger.merge_rank_files(args.save_generation_logs_dir, "results.jsonl")
 
             if args.modality == "NLP": # can have modality specific logic here for inference
                 if args.execution_mode == "inference":
-                    # Only compute EM/F1 for generation tasks (GSM8K, etc), not PPL tasks (nanochat)
+                    # Only compute EM/F1 for generation tasks (GSM8K, etc), not PPL tasks (nanochat).
                     if args.dataset_name in ["gsm8k", "arc", "humaneval", "mmlu", "smoltalk", "spellingbee"]:
                         em_score, f1_score = nlp_eval_acc(os.path.join(args.save_generation_logs_dir, "results.jsonl"))
                         if wandb_logger is not None:
                             wandb_logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
                     else:
                         print(f"Skipping EM/F1 evaluation for PPL-only dataset: {args.dataset_name}")
-            # elif args.modality == "VID":
-            #     if args.infer_generate_video:
-            #         print("calling style gan FVD code on generated video dataset, NOTE THIS CODE MAY NOT WORK AS EXPECTED or get stuck")
-            #         fvd, fid = call_style_gan_fvd(args)
-            #         trainer.logger.experiment.log({"test_fvd": fvd, "test_fid": fid})
-            # elif args.modality == "IMG":
-            #     pass # no post test code for denoising, for t2i could call FID code here if desired
             else:
                 raise NotImplementedError(f"no post test evaluation setup for this modality: {args.modality} yet")
 
-def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", periodic_checkpoint=None):
-    torch.autograd.set_detect_anomaly(args.detect_anomaly) #NOTE seems pl detect anomaly is not working so manually set it here
+def set_trainer(args, wandb_logger, checkpoint_callback, stage: str = "train", periodic_checkpoint=None) -> Trainer:
+    """Build a configured PyTorch Lightning :class:`Trainer` instance.
+
+    Picks the distributed strategy, clipping, profiler, and val/test limits
+    from ``args`` and wires the provided logger and checkpoint callbacks.
+
+    :param args: Parsed CLI namespace.
+    :param wandb_logger: Wandb logger instance or ``None``.
+    :param checkpoint_callback: Primary monitoring checkpoint callback.
+    :param stage: Stage label, ``"train"`` or ``"test"``.
+    :param periodic_checkpoint: Optional secondary callback that saves every
+        ``save_periodic_steps`` training steps.
+    :returns: Configured :class:`~lightning.pytorch.Trainer`.
+    """
+    torch.autograd.set_detect_anomaly(args.detect_anomaly) # PL's detect_anomaly flag is unreliable; set it manually here
 
     if args.find_unused_parameters or args.distributed_strategy == "ddp":
             args.distributed_strategy = DDPStrategy(
@@ -323,7 +306,6 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
     profiler = None if args.profiler == "" else args.profiler
     gradient_clip_val = args.gradient_clip_val if args.gradient_clip_val > 0 else None
     limit_val_batches = 0 if args.overfit_batches > 0 else args.limit_val_batches
-    # val_check_interval = args.val_check_interval if args.val_check_interval == 1.0 else args.val_check_interval * args.accumulate_grad_batches  #NOTE the reason we mult by args.accumulate_grad_batches is because of this bug https://github.com/Lightning-AI/pytorch-lightning/issues/12205
     limit_test_batches = args.limit_test_batches if args.limit_test_batches == 1 else args.limit_test_batches * args.accumulate_grad_batches
     trainer = Trainer(
         accelerator="auto",
@@ -334,7 +316,7 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
         logger=wandb_logger,
         enable_model_summary=args.log_model_archi,
         callbacks = [checkpoint_callback] + ([periodic_checkpoint] if periodic_checkpoint else []) + [ModelSummary(max_depth=-1)],
-        strategy = args.distributed_strategy, 
+        strategy = args.distributed_strategy,
         enable_checkpointing=True,
         fast_dev_run = args.fast_dev_run,
         num_sanity_val_steps = args.val_sanity,
@@ -346,45 +328,17 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
         overfit_batches=args.overfit_batches,
         profiler=profiler,
         val_check_interval=args.val_check_interval,
-        # check_val_every_n_epoch=args.check_val_every_n_epoch,
         deterministic=args.deterministic,
         log_every_n_steps=args.log_every_n_steps,
         accumulate_grad_batches=args.accumulate_grad_batches,
         inference_mode=False # set inference mode to false to get grad for models like ebt during testing
     )
 
-    # trainer = IterableTrainer(
-    #     accelerator="auto",
-    #     devices = args.gpus,
-    #     num_nodes=args.num_nodes,
-    #     precision=args.float_precision,
-    #     max_steps=args.max_steps,
-    #     logger=wandb_logger,
-    #     enable_model_summary=args.log_model_archi,
-    #     callbacks = [checkpoint_callback, ModelSummary(max_depth=-1)],
-    #     strategy = args.distributed_strategy, 
-    #     enable_checkpointing=True,
-    #     fast_dev_run = args.fast_dev_run,
-    #     num_sanity_val_steps = args.val_sanity,
-    #     limit_train_batches = args.limit_train_batches,
-    #     limit_val_batches = limit_val_batches,
-    #     limit_test_batches = limit_test_batches,
-    #     detect_anomaly=args.detect_anomaly,
-    #     gradient_clip_val=gradient_clip_val,
-    #     overfit_batches=args.overfit_batches,
-    #     profiler=profiler,
-    #     val_every_n_step=args.val_every_n_step,
-    #     val_after_n_step=args.val_after_n_step,
-    #     deterministic=args.deterministic,
-    #     log_every_n_steps=args.log_every_n_steps,
-    #     accumulate_grad_batches=args.accumulate_grad_batches,
-    #     inference_mode=False # set inference mode to false to get grad for models like ebt during testing
-    # )
-
     return trainer
-    
 
-def clear_cache():
+
+def clear_cache() -> None:
+    """Release cached CUDA memory via :func:`torch.cuda.empty_cache`."""
     torch.cuda.empty_cache()
     
 
@@ -494,7 +448,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
 
-    parser.add_argument("--use_ve", help="启用 Value Embedding (VE)，为交替层添加可学习的值嵌入", action="store_true", default=False)
+    parser.add_argument("--use_ve", help="Enable Value Embedding (VE): add learnable value embeddings on alternating layers", action="store_true", default=False)
 
     parser.add_argument("--use_mcmc_time_embed", action="store_true", default=False,
         help="Enable MCMC step time embedding (only for ebt_type=time_embed). When False, all steps share the same transition kernel, enabling arbitrary step count at inference.")
@@ -664,33 +618,34 @@ if __name__ == '__main__':
 
     parser.add_argument("--lars_exclude_bias_bn_wd", help="excludes bias and batch norm from Lars adaptation and weight decay", action="store_true", default=False)
 
-    # Muon + AdamW 混合优化器参数 (--optimizer muon_adamw 时生效)
-    parser.add_argument("--muon_lr", help="[Muon] 矩阵参数学习率 (Muon optimizer)", type=float, default=0.02)
-    parser.add_argument("--muon_momentum", help="[Muon] Nesterov 动量系数", type=float, default=0.95)
-    parser.add_argument("--muon_ns_steps", help="[Muon] Polar Express 迭代次数", type=int, default=5)
-    parser.add_argument("--muon_beta2", help="[Muon] 二阶矩 beta2 (variance reduction)", type=float, default=0.95)
-    # Muon 模式下 AdamW 参数的独立绝对 LR (不再从 peak_lr 派生)
-    # 参考 NanoChat gpt.py:setup_optimizer 和 base_train.py 的默认值
-    # 设为 -1 表示 fallback 到 peak_lr × mult 的旧行为
-    parser.add_argument("--adamw_embedding_lr", help="[Muon] embedding 绝对 LR (NanoChat 默认 0.3, 会自动 dmodel scaling)", type=float, default=-1)
-    parser.add_argument("--adamw_vocab_to_embed_lr", help="[Muon] vocab_to_embed 绝对 LR (EBT 特有, 建议保守 0.01)", type=float, default=-1)
-    parser.add_argument("--adamw_scalar_lr", help="[Muon] transformer scalar 绝对 LR (NanoChat 默认 0.04)", type=float, default=-1)
-    parser.add_argument("--adamw_dmodel_lr_scaling", help="[Muon] 是否对 AdamW LR 做 dmodel scaling: lr × (dim/768)^-0.5", action="store_true", default=False)
+    # Muon + AdamW hybrid optimizer parameters (active when --optimizer muon_adamw)
+    parser.add_argument("--muon_lr", help="[Muon] LR for matrix parameters (Muon optimizer)", type=float, default=0.02)
+    parser.add_argument("--muon_momentum", help="[Muon] Nesterov momentum coefficient", type=float, default=0.95)
+    parser.add_argument("--muon_ns_steps", help="[Muon] Polar Express iteration count", type=int, default=5)
+    parser.add_argument("--muon_beta2", help="[Muon] Second-moment beta2 (variance reduction)", type=float, default=0.95)
+    # In Muon mode, AdamW param groups use independent absolute LRs
+    # (no longer derived from peak_lr). Defaults follow NanoChat
+    # gpt.py::setup_optimizer and base_train.py.
+    # A value of -1 falls back to the legacy peak_lr × mult behaviour.
+    parser.add_argument("--adamw_embedding_lr", help="[Muon] embedding absolute LR (NanoChat default 0.3; auto dmodel scaling)", type=float, default=-1)
+    parser.add_argument("--adamw_vocab_to_embed_lr", help="[Muon] vocab_to_embed absolute LR (EBT-specific; 0.01 recommended)", type=float, default=-1)
+    parser.add_argument("--adamw_scalar_lr", help="[Muon] transformer scalar absolute LR (NanoChat default 0.04)", type=float, default=-1)
+    parser.add_argument("--adamw_dmodel_lr_scaling", help="[Muon] apply dmodel scaling to AdamW LR: lr × (dim/768)^-0.5", action="store_true", default=False)
 
-    # Option 1: 分层学习率参数
-    parser.add_argument("--layered_lr", help="[Option 1] 启用分层学习率，不同参数类型使用不同学习率", action="store_true", default=False)
-    parser.add_argument("--embedding_lr_mult", help="[Option 1] embedding 层学习率倍数 (相对于 peak_lr)", type=float, default=0.3)
-    parser.add_argument("--vocab_to_embed_lr_mult", help="[Option 1] vocab_to_embed 层学习率倍数", type=float, default=0.1)
-    parser.add_argument("--scalar_lr_mult", help="[Option 1] transformer 标量参数学习率倍数", type=float, default=0.5)
+    # Option 1: Layered learning rate parameters
+    parser.add_argument("--layered_lr", help="[Option 1] Enable layered LR: different parameter types use different LRs", action="store_true", default=False)
+    parser.add_argument("--embedding_lr_mult", help="[Option 1] embedding LR multiplier (relative to peak_lr)", type=float, default=0.3)
+    parser.add_argument("--vocab_to_embed_lr_mult", help="[Option 1] vocab_to_embed LR multiplier", type=float, default=0.1)
+    parser.add_argument("--scalar_lr_mult", help="[Option 1] transformer scalar LR multiplier", type=float, default=0.5)
 
-    # Option 2: 动态 Weight Decay 参数
-    parser.add_argument("--dynamic_wd", help="[Option 2] 启用动态 Weight Decay，线性衰减到 0", action="store_true", default=False)
+    # Option 2: Dynamic Weight Decay parameters
+    parser.add_argument("--dynamic_wd", help="[Option 2] Enable dynamic Weight Decay with linear decay to 0", action="store_true", default=False)
 
-    # Option 3: Linear Warmdown LR 调度参数
-    parser.add_argument("--linear_warmdown", help="[Option 3] 启用 NanoChat 风格的 Linear Warmdown LR 调度", action="store_true", default=False)
-    parser.add_argument("--warmup_ratio", help="[Option 3] warmup 占总步数的比例 (NanoChat 默认 0.0)", type=float, default=0.0)
-    parser.add_argument("--warmdown_ratio", help="[Option 3] warmdown 占总步数的比例 (NanoChat 默认 0.5)", type=float, default=0.5)
-    parser.add_argument("--final_lr_frac", help="[Option 3] 最终 LR 占 peak_lr 的比例 (NanoChat 默认 0.0)", type=float, default=0.0)
+    # Option 3: Linear Warmdown LR schedule parameters
+    parser.add_argument("--linear_warmdown", help="[Option 3] Enable NanoChat-style Linear Warmdown LR schedule", action="store_true", default=False)
+    parser.add_argument("--warmup_ratio", help="[Option 3] Warmup ratio of total steps (NanoChat default 0.0)", type=float, default=0.0)
+    parser.add_argument("--warmdown_ratio", help="[Option 3] Warmdown ratio of total steps (NanoChat default 0.5)", type=float, default=0.5)
+    parser.add_argument("--final_lr_frac", help="[Option 3] Final LR as a fraction of peak_lr (NanoChat default 0.0)", type=float, default=0.0)
 
     #DATASET AND DATALOADER #########################################################
 
@@ -844,7 +799,7 @@ if __name__ == '__main__':
     parser.add_argument("--resume_training_ckpt", help="checkpoint to resume training from, use absolute",type=str, default="")
 
     parser.add_argument("--resume_warmup_steps", type=int, default=0,
-        help="Resume 后的 warmup 步数，LR 从 0 线性升到 schedule 值。0=不启用")     
+        help="Post-resume warmup step count: LR ramps linearly from 0 to the scheduled value. 0 disables.")
 
     parser.add_argument("--checkpoint_monitor_string", help="string to use to monitor for saving checkpoint. supported by PL callback", type=str, default="valid_loss")
 
@@ -869,12 +824,12 @@ if __name__ == '__main__':
     # SPEED ##################################################################
 
     parser.add_argument("--compile_model", help="compiles the model using torch.compile", action="store_true", default=False)
-    parser.add_argument("--compile_mode", help="torch.compile 模式: full (编译整个模型), transformer_only (仅编译 transformer，推荐), disabled", type=str, default="transformer_only", choices=["full", "transformer_only", "disabled"])
-    parser.add_argument("--compile_backend", help="torch.compile 后端: inductor (默认), eager, aot_eager", type=str, default="inductor")
-    parser.add_argument("--compile_dynamic", help="允许动态形状 (可能降低加速效果)", action="store_true", default=False)
+    parser.add_argument("--compile_mode", help="torch.compile mode: full (compile the whole model), transformer_only (compile only the transformer, recommended), disabled", type=str, default="transformer_only", choices=["full", "transformer_only", "disabled"])
+    parser.add_argument("--compile_backend", help="torch.compile backend: inductor (default), eager, aot_eager", type=str, default="inductor")
+    parser.add_argument("--compile_dynamic", help="Allow dynamic shapes (may reduce speedup)", action="store_true", default=False)
 
-    parser.add_argument("--gradient_checkpointing", help="启用 gradient checkpointing 以节省显存 (用计算换显存)", action="store_true", default=False)
-    parser.add_argument("--use_sdpa_attention", help="使用 SDPA 注意力变体 (ar_ebt_time_embed_sdpa_math.py), 大幅减少 Path B 中间张量显存占用", action="store_true", default=False)
+    parser.add_argument("--gradient_checkpointing", help="Enable gradient checkpointing to save GPU memory (trades compute for memory)", action="store_true", default=False)
+    parser.add_argument("--use_sdpa_attention", help="Use the SDPA attention variant (ar_ebt_time_embed_sdpa_math.py); substantially reduces Path B activation memory", action="store_true", default=False)
 
     #SLURM#########################################################################
 

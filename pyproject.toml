@@ -1,9 +1,31 @@
 [project]
 name = "openebm"
 version = "0.1.0"
-description = "the minimal full-stack ChatGPT clone"
+description = "Energy-Based language Models for non-autoregressive generation and reasoning."
 readme = "README.md"
 requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "OpenEBM contributors" },
+]
+keywords = [
+    "energy-based-models",
+    "non-autoregressive",
+    "language-models",
+    "transformer",
+    "ebt",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "datasets>=4.0.0",
     "fastapi>=0.117.1",
@@ -26,9 +48,18 @@ dependencies = [
     "zstandard>=0.25.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/openway-ai/OpenEBM"
+Repository = "https://github.com/openway-ai/OpenEBM"
+Issues = "https://github.com/openway-ai/OpenEBM/issues"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    "mypy>=1.11.0",
+    "ruff>=0.6.0",
+    "sphinx>=7.0.0",
+    "sphinx-rtd-theme>=2.0.0",
 ]
 
 [tool.pytest.ini_options]
@@ -75,3 +106,68 @@ conflicts = [
 
 [tool.setuptools.packages.find]
 where = [".", "nanochat"]
+
+# ---------------------------------------------------------------------------
+# Linting / formatting / type-checking
+# ---------------------------------------------------------------------------
+# The configuration below is scoped to the `openebm/elm` sub-package; the
+# vendored `nanochat/` directory and other sub-packages are explicitly
+# excluded so that their style is never rewritten or type-checked by OpenEBM
+# tooling.
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+include = ["openebm/elm/**/*.py"]
+extend-exclude = [
+    "nanochat",
+    "openebm/common",
+    "openebm/dlm",
+    "openebm/elm/bkp",
+    "openebm/elm/sudoku_third_party",
+    "openebm/elm/runs",
+    "openebm/elm/lightning_logs",
+    "openebm/elm/logs",
+    "openebm/elm/tmp",
+    "openebm/elm/tmp_docs",
+    "lightning_logs",
+    "logs",
+    "tmp",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",  # line length handled by formatter
+    "E402",  # module-level imports-not-at-top are common in research notebooks
+    "F401",  # keep re-exports from __init__.py
+    "F403",  # wildcard imports are used by utils re-exports
+    "F405",  # wildcard import star symbols
+]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["openebm/elm"]
+exclude = [
+    "nanochat/",
+    "openebm/common/",
+    "openebm/dlm/",
+    "openebm/elm/bkp/",
+    "openebm/elm/sudoku_third_party/",
+    "openebm/elm/runs/",
+    "openebm/elm/lightning_logs/",
+    "openebm/elm/logs/",
+    "openebm/elm/tmp/",
+    "openebm/elm/tmp_docs/",
+    "lightning_logs/",
+    "logs/",
+    "tmp/",
+]
+ignore_missing_imports = true
+follow_imports = "silent"
+disallow_untyped_defs = false
+check_untyped_defs = false
+warn_unused_ignores = false
+warn_redundant_casts = true
+no_implicit_optional = false
+show_error_codes = true

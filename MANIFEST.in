@@ -1,0 +1,29 @@
+include README.md
+include LICENSE
+include CONTRIBUTING.md
+include pyproject.toml
+
+recursive-include openebm/elm *.py
+
+# Exclude vendored code and large runtime artefacts
+prune nanochat
+prune openebm/common
+prune openebm/dlm
+prune openebm/elm/bkp
+prune openebm/elm/sudoku_third_party
+prune openebm/elm/runs
+prune openebm/elm/lightning_logs
+prune openebm/elm/logs
+prune openebm/elm/tmp
+prune openebm/elm/tmp_docs
+prune openebm/elm/data/sudoku_cache
+prune openebm/elm/data/sudoku_cache_v2
+prune lightning_logs
+prune logs
+prune tmp
+
+global-exclude __pycache__
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.log
+global-exclude .DS_Store

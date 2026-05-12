@@ -1,30 +1,36 @@
-"""
-Sudoku 评估器 — 整盘准确率 (board accuracy) + 单格准确率 (cell accuracy)
+"""Sudoku SFT evaluator.
 
-用于评估模型在 Sudoku SFT 任务上的表现。
+Reports two metrics:
+
+- **board accuracy** — fraction of puzzles where every cell matches the
+  ground truth.
+- **cell accuracy** — fraction of individual cells that match the ground
+  truth, averaged across all puzzles.
 """
 
 import re
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 
-def parse_board_from_text(text):
-    """从模型生成文本中提取 9x9 数字矩阵。
+def parse_board_from_text(text: Optional[str]) -> Optional[List[List[int]]]:
+    """Extract a 9x9 integer grid from ``text`` if possible.
 
-    支持格式:
-      - 空格分隔的 9x9 网格 (每行 9 个数字)
-      - 连续 81 个数字
+    Two layouts are supported:
 
-    Returns:
-        9x9 list of ints, or None if parsing fails
+    - a 9-row grid where each row contains at least nine digits, or
+    - any text from which 81 consecutive digits can be extracted.
+
+    :param text: Model-generated text.
+    :type text: Optional[str]
+    :return: A 9x9 ``list[list[int]]``, or ``None`` when parsing fails.
+    :rtype: Optional[List[List[int]]]
     """
     if text is None:
         return None
 
-    # Try parsing as space-separated 9x9 grid
     lines = [line.strip() for line in text.strip().split("\n") if line.strip()]
     if len(lines) >= 9:
-        board = []
+        board: List[List[int]] = []
         for line in lines[:9]:
             digits = re.findall(r"\d", line)
             if len(digits) >= 9:
@@ -32,7 +38,6 @@ def parse_board_from_text(text):
         if len(board) == 9:
             return board
 
-    # Try parsing as 81 consecutive digits
     all_digits = re.findall(r"\d", text)
     if len(all_digits) >= 81:
         board = []
@@ -43,19 +48,26 @@ def parse_board_from_text(text):
     return None
 
 
-def evaluate_sudoku(predictions, references):
+def evaluate_sudoku(
+    predictions: Sequence[str],
+    references: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
     """Evaluate sudoku predictions against ground truth.
 
-    Args:
-        predictions: list of str — model-generated text for each puzzle
-        references: list of dict — each with "puzzle" and "solution" (9x9 int lists)
+    :param predictions: Model-generated text for each puzzle.
+    :type predictions: Sequence[str]
+    :param references: Reference dicts; each must contain at least a
+        ``solution`` key holding the 9x9 ground-truth grid.
+    :type references: Sequence[Dict[str, Any]]
+    :return: Dict with the following fields:
 
-    Returns:
-        dict with:
-          - board_accuracy: fraction of puzzles solved completely correctly
-          - cell_accuracy: fraction of individual cells correct (across all puzzles)
-          - n_samples: number of evaluated samples
-          - n_parsed: number of predictions successfully parsed as 9x9 boards
+        - ``board_accuracy``: fraction of puzzles solved completely correctly.
+        - ``cell_accuracy``: fraction of individual cells correct.
+        - ``n_samples``: number of evaluated samples.
+        - ``n_parsed``: number of predictions successfully parsed as 9x9 grids.
+    :rtype: Dict[str, Any]
+    :raises AssertionError: If ``predictions`` and ``references`` have
+        different lengths.
     """
     assert len(predictions) == len(references), (
         f"Mismatch: {len(predictions)} predictions vs {len(references)} references"
@@ -72,7 +84,7 @@ def evaluate_sudoku(predictions, references):
         pred_board = parse_board_from_text(pred_text)
 
         if pred_board is None:
-            # Failed to parse — count as all wrong
+            # Parsing failed; count the whole board as incorrect.
             total_cells += 81
             continue
 
@@ -97,28 +109,32 @@ def evaluate_sudoku(predictions, references):
     }
 
 
-def validate_sudoku_board(board):
-    """Check if a 9x9 board is a valid sudoku solution.
+def validate_sudoku_board(board: Optional[List[List[int]]]) -> bool:
+    """Check whether ``board`` is a valid sudoku solution.
 
-    Returns True if all rows, columns, and 3x3 boxes contain digits 1-9 exactly once.
+    A board is valid when every row, column, and 3x3 box contains the digits
+    1-9 exactly once.
+
+    :param board: Candidate 9x9 grid, or ``None``.
+    :type board: Optional[List[List[int]]]
+    :return: ``True`` if the board is a valid completed sudoku,
+        ``False`` otherwise.
+    :rtype: bool
     """
     if board is None or len(board) != 9:
         return False
 
     target = set(range(1, 10))
 
-    # Check rows
     for row in board:
         if len(row) != 9 or set(row) != target:
             return False
 
-    # Check columns
     for c in range(9):
         col = {board[r][c] for r in range(9)}
         if col != target:
             return False
 
-    # Check 3x3 boxes
     for box_r in range(3):
         for box_c in range(3):
             box = set()

@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""
-EBT Web 对话服务 - 通过网页端与训练好的 EBT 模型进行交互式对话
+"""FastAPI web service exposing an EBT checkpoint as a streaming chat endpoint.
 
-基于 chat_ebt.py 的 EBTChatEngine 核心引擎，封装为 FastAPI Web 服务。
-完整保留原有 /xx 命令功能，并在网页端提供流式对话体验。
+Reuses the :class:`EBTChatEngine` from ``chat_ebt.py`` (inlined here to avoid a
+circular import) and wraps it in a FastAPI application that serves a small HTML
+UI and Server-Sent-Events based streaming API, while preserving the same set of
+``/xx`` slash commands available in the terminal version.
 
-启动方法:
-    bash runs/chat_ebt_web.sh                           # 默认参数
-    bash runs/chat_ebt_web.sh --show-mcmc               # 展示 MCMC 步骤
-    bash runs/chat_ebt_web.sh --port 8080               # 指定端口
+Startup::
+
+    bash runs/chat_ebt_web.sh
+    bash runs/chat_ebt_web.sh --show-mcmc
+    bash runs/chat_ebt_web.sh --port 8080
 
 Endpoints:
-    GET  /              - Chat UI (内嵌 HTML)
-    POST /chat/completions - 流式对话 API (SSE)
-    POST /command       - 执行 /xx 命令
-    GET  /health        - 健康检查
-    GET  /status        - 当前引擎状态
+
+* ``GET  /``                   -- chat UI (inlined HTML)
+* ``POST /chat/completions``   -- streaming chat API (SSE)
+* ``POST /command``            -- execute a ``/xx`` slash command
+* ``GET  /health``             -- health probe
+* ``GET  /status``             -- current engine state
 """
 
 import argparse
@@ -31,7 +34,8 @@ from typing import Optional, List, Dict, Any, AsyncGenerator
 
 from openebm.elm.generate import call_model_forward_decode, _get_tokenizer, sample_top_p
 
-# 清除分布式训练环境变量
+# Clear any distributed training env vars so this single-process server does not
+# inherit a stale rendezvous config from the caller.
 for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT']:
     if var in os.environ:
         del os.environ[var]
@@ -40,42 +44,45 @@ os.environ['NANOCHAT_OFFLINE_MODE'] = '1'
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['NANOCHAT_BASE_DIR'] = "/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
 
-# ── 参数解析 ──
+# Argument parsing
 parser = argparse.ArgumentParser(description='EBT Web Chat Server')
-parser.add_argument('-c', '--checkpoint', type=str, required=True, help='Checkpoint 路径')
+parser.add_argument('-c', '--checkpoint', type=str, required=True, help='Checkpoint path')
 parser.add_argument('--tokenizer', type=str,
                     default="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer",
-                    help='Tokenizer 路径')
-parser.add_argument('-t', '--temperature', type=float, default=0.8, help='默认温度')
-parser.add_argument('--top-p', type=float, default=0.9, help='默认 Top-P')
-parser.add_argument('--max-tokens', type=int, default=512, help='默认最大 tokens')
-parser.add_argument('--show-mcmc', action='store_true', help='展示 MCMC 步骤过程')
-parser.add_argument('--verbose', action='store_true', help='详细模式')
-parser.add_argument('--show-energy', action='store_true', help='展示能量值变化')
-parser.add_argument('--show-distribution', action='store_true', help='展示概率分布变化')
+                    help='Tokenizer path')
+parser.add_argument('-t', '--temperature', type=float, default=0.8, help='Default temperature')
+parser.add_argument('--top-p', type=float, default=0.9, help='Default Top-P')
+parser.add_argument('--max-tokens', type=int, default=512, help='Default max tokens')
+parser.add_argument('--show-mcmc', action='store_true', help='Show MCMC step process')
+parser.add_argument('--verbose', action='store_true', help='Verbose mode')
+parser.add_argument('--show-energy', action='store_true', help='Show energy value changes')
+parser.add_argument('--show-distribution', action='store_true', help='Show probability distribution changes')
 parser.add_argument('--override-mcmc-steps', type=int, default=None)
 parser.add_argument('--override-noise-std', type=float, default=None)
 parser.add_argument('--override-alpha', type=float, default=None)
 parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'])
-parser.add_argument('--device', type=str, default='cuda', help='设备')
-parser.add_argument('--port', type=int, default=8000, help='服务端口')
-parser.add_argument('--host', type=str, default='0.0.0.0', help='绑定地址')
+parser.add_argument('--device', type=str, default='cuda', help='Device')
+parser.add_argument('--port', type=int, default=8000, help='Service port')
+parser.add_argument('--host', type=str, default='0.0.0.0', help='Bind address')
 args = parser.parse_args()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# EBTChatEngine - 直接复用 chat_ebt.py 的核心引擎（内联以避免循环 import）
-# ══════════════════════════════════════════════════════════════════════════════
+# EBTChatEngine -- directly mirrored from chat_ebt.py (inlined to avoid a circular import).
+
 
 class EBTChatEngine:
-    """EBT 对话引擎 (来自 chat_ebt.py)"""
+    """EBT chat engine used by the web server (mirrors ``chat_ebt.py``)."""
 
-    def __init__(self, checkpoint_path, tokenizer_path, device="cuda", dtype=torch.bfloat16,
-                 show_mcmc=False, verbose=False, show_energy=False, show_distribution=False,
-                 override_mcmc_steps=None, override_noise_std=None, override_alpha=None):
+    def __init__(self, checkpoint_path: str, tokenizer_path: str, device: str = "cuda",
+                 dtype: torch.dtype = torch.bfloat16,
+                 show_mcmc: bool = False, verbose: bool = False,
+                 show_energy: bool = False, show_distribution: bool = False,
+                 override_mcmc_steps: Optional[int] = None,
+                 override_noise_std: Optional[float] = None,
+                 override_alpha: Optional[float] = None) -> None:
         self.device = device
         self.dtype = dtype
         self.show_mcmc = show_mcmc
@@ -90,7 +97,7 @@ class EBTChatEngine:
         self.hparams = None
         self._load_model(checkpoint_path, tokenizer_path)
 
-    def _load_model(self, checkpoint_path, tokenizer_path):
+    def _load_model(self, checkpoint_path: str, tokenizer_path: str) -> None:
         print(f"[WebServer] Loading checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
@@ -137,17 +144,17 @@ class EBTChatEngine:
 
         try:
             self.model.load_state_dict(new_state_dict, strict=True)
-            print("  ✓ 权重加载成功 (strict=True)")
+            print("  ✓ Weights loaded successfully (strict=True)")
         except Exception as e:
-            print(f"  ⚠ strict 加载失败, 回退 strict=False: {e}")
+            print(f"  ⚠ strict loading failed, falling back to strict=False: {e}")
             self.model.load_state_dict(new_state_dict, strict=False)
 
         self.model = self.model.to(self.device)
         self.model.eval()
         self._apply_overrides()
-        print("✓ 模型加载完成")
+        print("✓ Model loaded")
 
-    def _apply_overrides(self):
+    def _apply_overrides(self) -> None:
         if self.override_mcmc_steps is not None:
             original_steps = getattr(self.hparams, 'mcmc_num_steps', 2)
             if self.override_mcmc_steps > original_steps:
@@ -178,6 +185,11 @@ class EBTChatEngine:
             self.model.alpha = torch.tensor(self.override_alpha, dtype=self.model.alpha.dtype, device=self.model.alpha.device)
 
     def get_model_info(self) -> dict:
+        """Return a plain-dict summary of model hyperparameters and engine flags.
+
+        :return: dictionary consumed by the ``/info`` and ``/status`` endpoints.
+        :rtype: dict
+        """
         embed_dim = getattr(self.hparams, 'embedding_dim', getattr(self.hparams, 'dim', 'N/A'))
         n_layers = getattr(self.hparams, 'num_layers', getattr(self.hparams, 'n_layers', 'N/A'))
         n_heads = getattr(self.hparams, 'num_heads', getattr(self.hparams, 'n_heads', 'N/A'))
@@ -198,7 +210,19 @@ class EBTChatEngine:
 
     def generate_stream(self, prompt: str, max_tokens: int = 512,
                         temperature: float = 0.8, top_p: float = 0.9):
-        """生成器: 逐 token yield, 用于流式输出"""
+        """Yield decoded tokens one at a time for single-turn streaming output.
+
+        :param prompt: user message to respond to.
+        :type prompt: str
+        :param max_tokens: maximum number of new tokens to sample.
+        :type max_tokens: int
+        :param temperature: sampling temperature; ``0`` enables greedy decoding.
+        :type temperature: float
+        :param top_p: nucleus-sampling cumulative probability threshold.
+        :type top_p: float
+        :return: a generator of decoded token strings.
+        :rtype: Any
+        """
         inner_tok = getattr(self.tokenizer, 'tokenizer', None)
         if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
             bos_id = inner_tok.get_bos_token_id()
@@ -278,7 +302,20 @@ class EBTChatEngine:
 
     def generate_stream_multi_turn(self, messages: list, max_tokens: int = 512,
                                    temperature: float = 0.8, top_p: float = 0.9):
-        """多轮对话的流式生成"""
+        """Yield decoded tokens for a multi-turn conversation.
+
+        :param messages: list of ``{"role": ..., "content": ...}`` dicts
+            following the OpenAI chat schema.
+        :type messages: list
+        :param max_tokens: maximum number of new tokens to sample.
+        :type max_tokens: int
+        :param temperature: sampling temperature; ``0`` enables greedy decoding.
+        :type temperature: float
+        :param top_p: nucleus-sampling cumulative probability threshold.
+        :type top_p: float
+        :return: a generator of decoded token strings.
+        :rtype: Any
+        """
         inner_tok = getattr(self.tokenizer, 'tokenizer', None)
 
         if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
@@ -300,7 +337,7 @@ class EBTChatEngine:
                     prompt_tokens_list.append(asst_end)
             prompt_tokens_list.append(asst_start)
         else:
-            # Fallback: 只用最后一条 user 消息
+            # Fallback: use only the last user message.
             last_user = ""
             for msg in messages:
                 if msg["role"] == "user":
@@ -311,7 +348,7 @@ class EBTChatEngine:
             if bos_id is not None and (not prompt_tokens_list or prompt_tokens_list[0] != bos_id):
                 prompt_tokens_list = [bos_id] + prompt_tokens_list
 
-        # ── 以下与 generate_stream 相同的生成逻辑 ──
+        # Remaining generation logic is identical to generate_stream.
         if hasattr(self.tokenizer, 'bos_token_id') and self.tokenizer.bos_token_id is not None:
             pad_id = self.tokenizer.bos_token_id
         elif hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
@@ -372,45 +409,54 @@ class EBTChatEngine:
                     yield token_text
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # FastAPI Web Server
-# ══════════════════════════════════════════════════════════════════════════════
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel
 
-# ── 运行时可调参数 (通过 /command API 修改) ──
+# Runtime-mutable parameters (updated via the /command API).
 runtime_config = {
     "temperature": args.temperature,
     "top_p": args.top_p,
     "max_tokens": args.max_tokens,
 }
 
-# ── 全局锁: EBT 模型同一时刻只能处理一个请求 ──
+# NOTE: the EBT model can only serve one request at a time, so a global lock
+# serialises incoming chat completions.
 generate_lock = asyncio.Lock()
 
 
 class ChatMessage(BaseModel):
+    """One message in a chat conversation (OpenAI-compatible schema)."""
+
     role: str
     content: str
 
 class ChatRequest(BaseModel):
+    """Request body for ``POST /chat/completions``."""
+
     messages: List[ChatMessage]
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
 
 class CommandRequest(BaseModel):
+    """Request body for ``POST /command``."""
+
     command: str
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """启动时加载模型"""
+    """FastAPI lifespan hook: load the EBT engine before serving requests.
+
+    :param app: the FastAPI application instance.
+    :type app: FastAPI
+    """
     print("=" * 70)
-    print("EBT Web Chat Server - 正在初始化...")
+    print("EBT Web Chat Server - initializing...")
     print("=" * 70)
 
     dtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
@@ -438,19 +484,31 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
 
-# ── GET / ── 内嵌 HTML UI ──
+# GET / -- inlined HTML UI.
 @app.get("/")
 async def root():
+    """Serve the embedded single-page chat UI.
+
+    :return: an HTML response containing the chat page.
+    :rtype: HTMLResponse
+    """
     return HTMLResponse(content=EBT_CHAT_HTML)
 
 
-# ── POST /chat/completions ── 流式对话 ──
+# POST /chat/completions -- streaming chat.
 @app.post("/chat/completions")
 async def chat_completions(request: ChatRequest):
-    if not request.messages:
-        raise HTTPException(status_code=400, detail="至少需要一条消息")
+    """Run a streaming chat completion via Server-Sent Events.
 
-    # 日志
+    :param request: parsed chat request body.
+    :type request: ChatRequest
+    :return: an SSE ``StreamingResponse`` yielding one token per event.
+    :rtype: StreamingResponse
+    :raises HTTPException: if ``messages`` is empty.
+    """
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="At least one message is required")
+
     logger.info("=" * 40)
     for msg in request.messages:
         logger.info(f"[{msg.role.upper()}]: {msg.content}")
@@ -460,7 +518,7 @@ async def chat_completions(request: ChatRequest):
     top_p = request.top_p if request.top_p is not None else runtime_config["top_p"]
     max_tok = request.max_tokens if request.max_tokens is not None else runtime_config["max_tokens"]
 
-    # Clamp
+    # Clamp to the ranges the terminal client enforces.
     temp = max(0.0, min(2.0, temp))
     top_p = max(0.0, min(1.0, top_p))
     max_tok = max(1, min(4096, max_tok))
@@ -473,10 +531,11 @@ async def chat_completions(request: ChatRequest):
     async def stream_sse():
         async with generate_lock:
             loop = asyncio.get_event_loop()
-            # 因为 EBT generate 是同步阻塞的 (GPU forward), 需要跑在线程池里
+            # The EBT generator is a synchronous GPU-bound iterator, so it has
+            # to run in a worker thread to avoid blocking the asyncio loop.
             gen = engine.generate_stream_multi_turn(messages_dicts, max_tokens=max_tok,
                                                      temperature=temp, top_p=top_p)
-            # 用 queue 桥接同步生成器 -> 异步 SSE
+            # Bridge sync generator to async SSE via a queue.
             q: asyncio.Queue = asyncio.Queue()
 
             def _run_gen():
@@ -500,7 +559,7 @@ async def chat_completions(request: ChatRequest):
                 response_tokens.append(item)
                 yield f"data: {json.dumps({'token': item}, ensure_ascii=False)}\n\n"
 
-            await fut  # 确保线程结束
+            await fut  # ensure the worker thread has exited
 
         full_response = "".join(response_tokens)
         logger.info(f"[ASSISTANT]: {full_response}")
@@ -510,9 +569,16 @@ async def chat_completions(request: ChatRequest):
     return StreamingResponse(stream_sse(), media_type="text/event-stream")
 
 
-# ── POST /command ── 处理 /xx 命令 ──
+# POST /command -- handle /xx slash commands.
 @app.post("/command")
 async def handle_command(req: CommandRequest):
+    """Dispatch a ``/xx`` slash command from the web UI.
+
+    :param req: parsed command request body.
+    :type req: CommandRequest
+    :return: a JSON-serialisable result dict.
+    :rtype: dict
+    """
     cmd = req.command.strip()
     parts = cmd.split()
     action = parts[0].lower() if parts else ""
@@ -520,105 +586,110 @@ async def handle_command(req: CommandRequest):
     engine: EBTChatEngine = app.state.engine
 
     if action in ['/quit', '/exit']:
-        return {"result": "quit 命令仅在终端模式下有效，网页端请直接关闭页面。"}
+        return {"result": "The quit command only works in terminal mode. Close the page to exit the web client."}
 
     if action == '/clear':
-        return {"result": "对话已清空。", "action": "clear"}
+        return {"result": "Conversation cleared.", "action": "clear"}
 
     if action == '/help':
         return {"result": (
-            "可用命令:\n"
-            "  /temp [值]        - 查看/设置温度 (0.0-2.0)\n"
-            "  /topp [值]        - 查看/设置 Top-P (0.0-1.0)\n"
-            "  /tokens [值]      - 查看/设置最大 tokens (1-4096)\n"
-            "  /mcmc             - 切换 MCMC 显示\n"
-            "  /verbose          - 切换详细模式\n"
-            "  /energy           - 切换能量显示\n"
-            "  /status           - 显示当前设置\n"
-            "  /info             - 显示模型信息\n"
-            "  /clear            - 清空对话历史\n"
-            "  /help             - 显示此帮助"
+            "Available commands:\n"
+            "  /temp [value]     - Show/set temperature (0.0-2.0)\n"
+            "  /topp [value]     - Show/set Top-P (0.0-1.0)\n"
+            "  /tokens [value]   - Show/set max tokens (1-4096)\n"
+            "  /mcmc             - Toggle MCMC display\n"
+            "  /verbose          - Toggle verbose mode\n"
+            "  /energy           - Toggle energy display\n"
+            "  /status           - Show current settings\n"
+            "  /info             - Show model info\n"
+            "  /clear            - Clear the conversation history\n"
+            "  /help             - Show this help"
         )}
 
     if action == '/temp' or action == '/temperature':
         if arg is None:
-            return {"result": f"当前温度: {runtime_config['temperature']}"}
+            return {"result": f"Current temperature: {runtime_config['temperature']}"}
         try:
             val = float(arg)
             if 0.0 <= val <= 2.0:
                 runtime_config['temperature'] = val
-                return {"result": f"✓ 温度已设置为: {val}"}
-            return {"result": "✗ 温度必须在 0.0-2.0 之间", "error": True}
+                return {"result": f"✓ Temperature set to: {val}"}
+            return {"result": "✗ Temperature must be between 0.0-2.0", "error": True}
         except ValueError:
-            return {"result": "✗ 无效的温度值", "error": True}
+            return {"result": "✗ Invalid temperature value", "error": True}
 
     if action == '/topp':
         if arg is None:
-            return {"result": f"当前 Top-P: {runtime_config['top_p']}"}
+            return {"result": f"Current Top-P: {runtime_config['top_p']}"}
         try:
             val = float(arg)
             if 0.0 <= val <= 1.0:
                 runtime_config['top_p'] = val
-                return {"result": f"✓ Top-P 已设置为: {val}"}
-            return {"result": "✗ Top-P 必须在 0.0-1.0 之间", "error": True}
+                return {"result": f"✓ Top-P set to: {val}"}
+            return {"result": "✗ Top-P must be between 0.0-1.0", "error": True}
         except ValueError:
-            return {"result": "✗ 无效的 Top-P 值", "error": True}
+            return {"result": "✗ Invalid Top-P value", "error": True}
 
     if action == '/tokens':
         if arg is None:
-            return {"result": f"当前最大 Tokens: {runtime_config['max_tokens']}"}
+            return {"result": f"Current Max Tokens: {runtime_config['max_tokens']}"}
         try:
             val = int(arg)
             if 1 <= val <= 4096:
                 runtime_config['max_tokens'] = val
-                return {"result": f"✓ 最大 Tokens 已设置为: {val}"}
-            return {"result": "✗ 最大 Tokens 必须在 1-4096 之间", "error": True}
+                return {"result": f"✓ Max Tokens set to: {val}"}
+            return {"result": "✗ Max Tokens must be between 1-4096", "error": True}
         except ValueError:
-            return {"result": "✗ 无效的 Tokens 值", "error": True}
+            return {"result": "✗ Invalid Tokens value", "error": True}
 
     if action == '/mcmc':
         engine.show_mcmc = not engine.show_mcmc
-        return {"result": f"✓ MCMC 显示已{'开启' if engine.show_mcmc else '关闭'}"}
+        return {"result": f"✓ MCMC display {'enabled' if engine.show_mcmc else 'disabled'}"}
 
     if action == '/verbose':
         engine.verbose = not engine.verbose
-        return {"result": f"✓ 详细模式已{'开启' if engine.verbose else '关闭'}"}
+        return {"result": f"✓ Verbose mode {'enabled' if engine.verbose else 'disabled'}"}
 
     if action == '/energy':
         engine.show_energy = not engine.show_energy
-        return {"result": f"✓ 能量显示已{'开启' if engine.show_energy else '关闭'}"}
+        return {"result": f"✓ Energy display {'enabled' if engine.show_energy else 'disabled'}"}
 
     if action == '/status':
         info = engine.get_model_info()
         return {"result": (
-            f"当前设置:\n"
-            f"  温度: {runtime_config['temperature']}\n"
+            f"Current settings:\n"
+            f"  Temperature: {runtime_config['temperature']}\n"
             f"  Top-P: {runtime_config['top_p']}\n"
-            f"  最大 Tokens: {runtime_config['max_tokens']}\n"
-            f"  显示 MCMC: {'是' if info['show_mcmc'] else '否'}\n"
-            f"  详细模式: {'是' if info['verbose'] else '否'}\n"
-            f"  显示能量: {'是' if info['show_energy'] else '否'}"
+            f"  Max Tokens: {runtime_config['max_tokens']}\n"
+            f"  Show MCMC: {'yes' if info['show_mcmc'] else 'no'}\n"
+            f"  Verbose mode: {'yes' if info['verbose'] else 'no'}\n"
+            f"  Show energy: {'yes' if info['show_energy'] else 'no'}"
         )}
 
     if action == '/info':
         info = engine.get_model_info()
         return {"result": (
-            f"模型配置:\n"
-            f"  嵌入维度: {info['embedding_dim']}\n"
-            f"  层数: {info['num_layers']}\n"
-            f"  注意力头数: {info['num_heads']}\n"
-            f"  MCMC 步数: {info['mcmc_steps']}\n"
-            f"  MCMC 步长 (alpha): {info['alpha']}\n"
-            f"  Langevin 噪声: {info['noise_std']}\n"
-            f"  上下文长度: {info['context_length']}"
+            f"Model configuration:\n"
+            f"  Embedding dim: {info['embedding_dim']}\n"
+            f"  Layer count: {info['num_layers']}\n"
+            f"  Attention head count: {info['num_heads']}\n"
+            f"  MCMC steps: {info['mcmc_steps']}\n"
+            f"  MCMC step size (alpha): {info['alpha']}\n"
+            f"  Langevin noise: {info['noise_std']}\n"
+            f"  Context length: {info['context_length']}"
         )}
 
-    return {"result": f"未知命令: {action}。输入 /help 查看所有命令。", "error": True}
+    return {"result": f"Unknown command: {action}. Type /help to list all commands.", "error": True}
 
 
-# ── GET /health ──
+# GET /health
 @app.get("/health")
 async def health():
+    """Report whether the engine has finished loading.
+
+    :return: dictionary with status flags.
+    :rtype: dict
+    """
     engine = getattr(app.state, 'engine', None)
     return {
         "status": "ok",
@@ -627,21 +698,24 @@ async def health():
     }
 
 
-# ── GET /status ──
+# GET /status
 @app.get("/status")
 async def status():
+    """Return the engine's model info merged with runtime configuration.
+
+    :return: combined info dict.
+    :rtype: dict
+    """
     engine: EBTChatEngine = app.state.engine
     info = engine.get_model_info()
     info.update(runtime_config)
     return info
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 内嵌 HTML UI
-# ══════════════════════════════════════════════════════════════════════════════
+# Inlined HTML UI
 
 EBT_CHAT_HTML = r"""<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
@@ -743,7 +817,7 @@ EBT_CHAT_HTML = r"""<!DOCTYPE html>
 
     <div class="input-container">
         <div class="input-wrapper">
-            <textarea id="chatInput" class="chat-input" placeholder="输入消息或 /help 查看命令..." rows="1" onkeydown="handleKeyDown(event)"></textarea>
+            <textarea id="chatInput" class="chat-input" placeholder="Type a message or /help to view commands..." rows="1" onkeydown="handleKeyDown(event)"></textarea>
             <button id="sendButton" class="send-btn" onclick="sendMessage()" disabled>
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
             </button>
@@ -787,11 +861,11 @@ function addMessage(role, content, messageIndex) {
     c.className = 'message-content';
     c.textContent = content;
     if (role === 'user' && messageIndex !== undefined) {
-        c.title = '点击编辑并从此处重新开始';
+        c.title = 'Click to edit and restart from here';
         c.addEventListener('click', () => { if (!isGenerating) editMessage(messageIndex); });
     }
     if (role === 'assistant' && messageIndex !== undefined) {
-        c.title = '点击重新生成此回复';
+        c.title = 'Click to regenerate this reply';
         c.addEventListener('click', () => { if (!isGenerating) regenerateMessage(messageIndex); });
     }
     div.appendChild(c);
@@ -847,7 +921,7 @@ async function generateAssistantResponse() {
         }
         const aidx = messages.length;
         messages.push({role:'assistant', content: full});
-        el.title = '点击重新生成此回复';
+        el.title = 'Click to regenerate this reply';
         el.addEventListener('click', () => { if (!isGenerating) regenerateMessage(aidx); });
     } catch(err) {
         el.innerHTML = '<div class="error-message">Error: ' + err.message + '</div>';
@@ -888,16 +962,14 @@ chatInput.focus();
 fetch(API_URL + '/health').then(r=>r.json()).then(d=>{
     console.log('EBT Engine status:', d);
 }).catch(err=>{
-    chatWrapper.innerHTML = '<div class="error-message">EBT 引擎未就绪，请等待模型加载完成后刷新页面。</div>';
+    chatWrapper.innerHTML = '<div class="error-message">EBT engine not ready, please refresh after the model finishes loading.</div>';
 });
 </script>
 </body>
 </html>"""
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 入口
-# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
 
 if __name__ == "__main__":
     import uvicorn

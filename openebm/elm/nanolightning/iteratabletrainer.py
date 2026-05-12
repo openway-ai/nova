@@ -1,17 +1,23 @@
 """
-IterableTrainer: A standalone trainer for PyTorch IterableDataset.
+Standalone trainer for PyTorch ``IterableDataset``.
 
-Does not inherit from Trainer. Designed exclusively for infinite streaming
-datasets (e.g., nanochat's tokenizing data loader wrapped in IterableDataset).
+This module provides :class:`IterableTrainer`, a self-contained trainer that
+does not inherit from PyTorch Lightning's ``Trainer``. It is designed for
+infinite streaming datasets (for example, nanochat's tokenizing data loader
+wrapped in an :class:`torch.utils.data.IterableDataset`).
 
-Design principles:
-  - Training time is governed entirely by optimizer steps, not epochs.
-  - Termination:  global_step >= max_steps
-  - Validation:   global_step % val_every_n_step == 0  (step-based)
-  - IterableDataset handles DDP data sharding internally; no DistributedSampler
-    is applied to any dataloader.
-  - global_step counts optimizer steps (incremented after gradient accumulation).
-  - current_epoch is always 0; the epoch concept is not used.
+Design principles
+-----------------
+:Time unit: Training progress is governed entirely by optimizer steps;
+    epochs are not used.
+:Termination: Training stops when ``global_step >= max_steps``.
+:Validation: Triggered on a step-based schedule,
+    ``global_step % val_every_n_step == 0``.
+:DDP sharding: ``IterableDataset`` handles DDP data sharding internally; no
+    ``DistributedSampler`` is applied to any dataloader.
+:Step counter: ``global_step`` counts optimizer steps, incremented only after
+    gradient accumulation completes.
+:Epoch counter: ``current_epoch`` is always ``0``; the epoch concept is unused.
 """
 
 import os
@@ -31,19 +37,21 @@ from openebm.elm.nanolightning.torchlightning_trainer import ModelSummary
 
 class IterableTrainer:
     """
-    Standalone step-based trainer for IterableDataset.
+    Step-based trainer for :class:`torch.utils.data.IterableDataset` workloads.
 
-    Supports:
-      - Single-GPU and multi-GPU (DDP via torchrun) training
-      - Mixed-precision training (32-true, 16-mixed, bf16-mixed)
-      - Gradient accumulation and gradient clipping
-      - Step-based validation and checkpoint saving
-      - Checkpoint save/load and training resumption
-      - fast_dev_run and other debug modes
-      - LightningModule lifecycle hooks
-      - WandbLogger and ModelCheckpoint callback integration
+    Provides a minimal trainer tailored to infinite streaming datasets, with
+    a feature set that is a superset of the arguments accepted by
+    ``train.py``'s ``set_trainer()``.
 
-    Constructor args are a superset of those accepted by train.py's set_trainer().
+    :Supports:
+        * Single-GPU and multi-GPU (DDP via ``torchrun``) training.
+        * Mixed-precision training (``32-true``, ``16-mixed``, ``bf16-mixed``).
+        * Gradient accumulation and gradient clipping.
+        * Step-based validation and checkpoint saving.
+        * Checkpoint save/load and training resumption.
+        * ``fast_dev_run`` and other debug modes.
+        * LightningModule lifecycle hooks.
+        * ``WandbLogger`` and ``ModelCheckpoint`` callback integration.
     """
 
     def __init__(
@@ -60,7 +68,7 @@ class IterableTrainer:
         enable_checkpointing: bool = True,
         fast_dev_run: bool = False,
         num_sanity_val_steps: int = 0,
-        limit_train_batches: Union[int, float] = 1.0,  # accepted but not used in training loop
+        limit_train_batches: Union[int, float] = 1.0,  # accepted for API parity; unused in the training loop
         limit_val_batches: Union[int, float] = 1.0,
         limit_test_batches: Union[int, float] = 1.0,
         detect_anomaly: bool = False,
@@ -68,13 +76,13 @@ class IterableTrainer:
         overfit_batches: Union[int, float] = 0,
         profiler: Optional[str] = None,
         val_every_n_step: Union[int] = 15000,
-        val_after_n_step: int = 0,  
+        val_after_n_step: int = 0,
         deterministic: bool = False,
         log_every_n_steps: int = 50,
         accumulate_grad_batches: int = 1,
         inference_mode: bool = True,
-    ):
-        # ---- Store configuration ----
+    ) -> None:
+        # Store configuration
         self.accelerator = accelerator
         self._devices_arg = devices
         self.num_nodes = num_nodes
@@ -101,7 +109,7 @@ class IterableTrainer:
         self.accumulate_grad_batches = accumulate_grad_batches
         self.inference_mode = inference_mode
 
-        # ---- Runtime state ----
+        # Runtime state
         self.global_step: int = 0
         self.current_epoch: int = 0  # always 0; epoch tracking is not used
         self.global_rank: int = 0
@@ -109,37 +117,37 @@ class IterableTrainer:
         self.world_size: int = 1
         self.optimizers: List[torch.optim.Optimizer] = []
         self._schedulers: List[Dict[str, Any]] = []
-        self._model = None       # unwrapped LightningModule
-        self._ddp_model = None   # DDP-wrapped model (or same as _model)
-        self._device = None
-        self._should_stop = False
+        self._model: Any = None       # unwrapped LightningModule
+        self._ddp_model: Any = None   # DDP-wrapped model (or same as _model)
+        self._device: Optional[torch.device] = None
+        self._should_stop: bool = False
 
-        # ---- DDP configuration from strategy ----
-        self._find_unused_parameters = False
+        # DDP configuration derived from the strategy argument
+        self._find_unused_parameters: bool = False
         if isinstance(self.strategy, DDPStrategy):
             self._find_unused_parameters = self.strategy.find_unused_parameters
 
-        # ---- Precision / autocast setup ----
-        self._autocast_dtype = None
-        self._use_grad_scaler = False
+        # Precision / autocast setup
+        self._autocast_dtype: Optional[torch.dtype] = None
+        self._use_grad_scaler: bool = False
         if precision in ("16-mixed", "16"):
             self._autocast_dtype = torch.float16
             self._use_grad_scaler = True
         elif precision in ("bf16-mixed", "bf16"):
             self._autocast_dtype = torch.bfloat16
-            self._use_grad_scaler = False  # bf16 does not need loss scaling
+            self._use_grad_scaler = False  # bf16 does not require loss scaling
 
-        # ---- Determinism ----
+        # Determinism
         if deterministic:
             torch.use_deterministic_algorithms(True, warn_only=True)
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
-        # ---- Anomaly detection ----
+        # Anomaly detection
         if detect_anomaly:
             torch.autograd.set_detect_anomaly(True)
 
-        # ---- fast_dev_run: 1 train step + 1 val batch, then stop ----
+        # fast_dev_run: run a single train step plus one val batch, then stop
         if self.fast_dev_run:
             self.max_steps = 1
             self.limit_val_batches = 1
@@ -152,11 +160,13 @@ class IterableTrainer:
 
     def _setup_distributed(self) -> None:
         """
-        Detect and initialize distributed training environment.
+        Detect and initialize the distributed training environment.
 
-        If launched via torchrun, RANK / LOCAL_RANK / WORLD_SIZE are already
-        set in the environment. Initializes the NCCL process group and sets
-        rank / device information accordingly.
+        When launched via ``torchrun``, the environment variables ``RANK``,
+        ``LOCAL_RANK`` and ``WORLD_SIZE`` are already set. This method
+        initializes the NCCL process group and updates the rank/device
+        attributes accordingly. Otherwise it falls back to single-process
+        mode on CUDA (if available) or CPU.
         """
         if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
             self.global_rank = int(os.environ["RANK"])
@@ -180,41 +190,55 @@ class IterableTrainer:
 
     @property
     def is_global_zero(self) -> bool:
-        """True if this is the rank-0 process (or single-GPU)."""
+        """
+        :returns: ``True`` on the rank-0 process (or when running single-GPU).
+        :rtype: bool
+        """
         return self.global_rank == 0
 
-    def _print_rank0(self, *args, **kwargs) -> None:
-        """Print only on the master process."""
+    def _print_rank0(self, *args: Any, **kwargs: Any) -> None:
+        """Print a message only on the master (rank-0) process."""
         if self.is_global_zero:
             print(*args, **kwargs, flush=True)
 
-    def _get_batch_size(self):
-        """Get per-device batch size."""
+    def _get_batch_size(self) -> int:
+        """
+        :returns: Per-device batch size, taken from the model's hparams
+            (falls back to ``32`` if not set).
+        :rtype: int
+        """
         return getattr(self._model.hparams, 'batch_size_per_device', 32)
 
-    def _print_training_sample(self, batch, model) -> None:
-        """Print a training sample for inspection."""
+    def _print_training_sample(self, batch: Any, model: Any) -> None:
+        """
+        Print a decoded training sample for inspection.
+
+        Silently returns if the model has no ``tokenizer`` attribute or the
+        batch structure is unexpected.
+
+        :param batch: Training batch, expected to be a tuple/list whose first
+            two elements are input and target tensors.
+        :param model: LightningModule; expected to expose a ``tokenizer`` attr.
+        """
         try:
-            # Get tokenizer if available
             tokenizer = getattr(model, 'tokenizer', None)
             if tokenizer is None:
                 return
 
-            # Extract first sample from batch
+            # Extract the first sample from the batch
             if isinstance(batch, (list, tuple)) and len(batch) >= 2:
                 inputs = batch[0]  # [1, B, T] or [B, T]
                 targets = batch[1]
 
-                # Handle the [1, B, T] case by squeezing first dim
+                # Squeeze the outer dimension for the [1, B, T] layout
                 if inputs.dim() == 3 and inputs.size(0) == 1:
                     inputs = inputs.squeeze(0)
                     targets = targets.squeeze(0)
 
-                # Get first sample
-                sample_input = inputs[0].cpu().tolist()[:50]  # First 50 tokens
+                # Take the first sample, truncated to 50 tokens
+                sample_input = inputs[0].cpu().tolist()[:50]
                 sample_target = targets[0].cpu().tolist()[:50]
 
-                # Decode tokens
                 input_text = tokenizer.decode(sample_input)
                 target_text = tokenizer.decode(sample_target)
 
@@ -228,8 +252,12 @@ class IterableTrainer:
     # Precision context manager
     # ====================================================================
 
-    def _autocast_ctx(self):
-        """Return an autocast context for mixed-precision, or a no-op context."""
+    def _autocast_ctx(self) -> Any:
+        """
+        :returns: An autocast context manager for mixed-precision training,
+            or a :class:`contextlib.nullcontext` when autocast is disabled.
+        :rtype: Any
+        """
         if self._autocast_dtype is not None:
             return torch.amp.autocast(device_type="cuda", dtype=self._autocast_dtype)
         return nullcontext()
@@ -239,7 +267,14 @@ class IterableTrainer:
     # ====================================================================
 
     def _move_batch_to_device(self, batch: Any) -> Any:
-        """Recursively move tensors in a batch to the training device."""
+        """
+        Recursively move tensors in a batch to the training device.
+
+        :param batch: Arbitrarily nested tensor/dict/list/tuple structure.
+        :returns: A batch of the same shape with all tensors placed on
+            ``self._device``; non-tensor leaves are passed through unchanged.
+        :rtype: Any
+        """
         if isinstance(batch, torch.Tensor):
             return batch.to(self._device, non_blocking=True)
         elif isinstance(batch, dict):
@@ -253,10 +288,17 @@ class IterableTrainer:
         """
         Compute the effective number of batches for validation or test.
 
-        If the dataset implements __len__, applies the limit as a fraction
-        (float <= 1.0) or absolute count (int). If the dataset has no __len__
-        (bare IterableDataset without __len__), treats float as unlimited
-        (sys.maxsize) and int as an absolute count.
+        Behaviour:
+            * If the dataset implements ``__len__``, apply ``limit`` as either
+              a fraction (``float <= 1.0``) or an absolute count (``int``).
+            * If the dataset has no ``__len__`` (bare ``IterableDataset``),
+              treat a float as unlimited (``sys.maxsize``) and an int as an
+              absolute count.
+
+        :param dataloader: DataLoader whose length is inspected when possible.
+        :param limit: Either a fraction in ``(0, 1]`` or an absolute batch count.
+        :returns: The number of batches to process.
+        :rtype: int
         """
         try:
             total = len(dataloader)
@@ -274,19 +316,26 @@ class IterableTrainer:
     # Optimizer / scheduler configuration
     # ====================================================================
 
-    def _configure_optimizers(self, model) -> None:
+    def _configure_optimizers(self, model: Any) -> None:
         """
-        Call model.configure_optimizers() and parse the result.
+        Call ``model.configure_optimizers()`` and parse the returned config.
 
-        Supports the dict format used by this repository:
+        The dict layout used throughout this repository is::
+
             {
                 'optimizer': optimizer,
                 'lr_scheduler': {
                     'scheduler': scheduler,
                     'interval': 'step',
-                    'frequency': 1
-                }
+                    'frequency': 1,
+                },
             }
+
+        Plain optimizer objects, ``(optimizers, schedulers)`` tuples, and
+        lists of optimizers are also accepted.
+
+        :param model: LightningModule exposing ``configure_optimizers``.
+        :raises ValueError: If the return type is not recognized.
         """
         opt_config = model.configure_optimizers()
 
@@ -321,7 +370,12 @@ class IterableTrainer:
             )
 
     def _step_schedulers(self, interval: str) -> None:
-        """Step all LR schedulers that match the given interval ('step' or 'epoch')."""
+        """
+        Step every LR scheduler whose configured interval matches ``interval``.
+
+        :param interval: Either ``"step"`` (called after each optimizer step)
+            or ``"epoch"`` (called at epoch boundaries).
+        """
         for sched_cfg in self._schedulers:
             if sched_cfg.get("interval", "epoch") == interval:
                 freq = sched_cfg.get("frequency", 1)
@@ -334,13 +388,16 @@ class IterableTrainer:
     # Checkpoint helpers
     # ====================================================================
 
-    def _resume_from_checkpoint(self, model, ckpt_path: str) -> None:
+    def _resume_from_checkpoint(self, model: Any, ckpt_path: str) -> None:
         """
         Resume training from a saved checkpoint.
 
-        Restores model weights, optimizer states, scheduler states, and
-        global_step. current_epoch is not restored because epoch tracking
-        is not used.
+        Restores model weights, optimizer states, scheduler states, and the
+        ``global_step`` counter. ``current_epoch`` is intentionally not
+        restored because epoch tracking is unused.
+
+        :param model: LightningModule whose weights should be restored.
+        :param ckpt_path: Path to a ``torch.save``-generated checkpoint file.
         """
         self._print_rank0(f"Resuming training from checkpoint: {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location=self._device, weights_only=False)
@@ -367,11 +424,15 @@ class IterableTrainer:
 
         self._print_rank0(f"Resumed at global_step={self.global_step}")
 
-    def _try_checkpoint(self, model, val_metrics: Dict[str, Any]) -> None:
+    def _try_checkpoint(self, model: Any, val_metrics: Dict[str, Any]) -> None:
         """
-        Invoke all ModelCheckpoint callbacks with the current validation metrics.
+        Invoke every :class:`ModelCheckpoint` callback with the latest metrics.
 
-        Only runs on rank 0 to avoid duplicate checkpoint writes in DDP.
+        Runs only on rank 0 to avoid duplicate checkpoint writes under DDP.
+
+        :param model: LightningModule being trained.
+        :param val_metrics: Dict of scalar metrics produced by the most recent
+            validation pass; passed through to the callback for monitoring.
         """
         if not self.enable_checkpointing:
             return
@@ -396,17 +457,26 @@ class IterableTrainer:
     # Validation loop
     # ====================================================================
 
-    def _run_validation(self, model, val_dataloader: DataLoader) -> Dict[str, Any]:
+    def _run_validation(self, model: Any, val_dataloader: DataLoader) -> Dict[str, Any]:
         """
-        Run the full validation loop for IterableDataset.
+        Run the validation loop for an :class:`IterableDataset` dataloader.
 
-        Uses iter()/next() instead of a for-loop. If the iterator is
-        exhausted before num_val_batches is reached, it is re-created
-        so that validation always processes exactly num_val_batches batches.
+        Uses ``iter()``/``next()`` rather than a for-loop. If the iterator is
+        exhausted before ``num_val_batches`` is reached, it is re-created so
+        that validation processes exactly ``num_val_batches`` batches.
 
-        EBT models require gradients during validation (MCMC optimization), so
-        this method does NOT wrap in no_grad or inference_mode; the model manages
-        its own gradient context via torch.set_grad_enabled internally.
+        .. note::
+
+           EBT models require gradients during validation (MCMC optimization),
+           so this method does NOT wrap the loop in ``no_grad`` or
+           ``inference_mode``. The model manages its own gradient context via
+           ``torch.set_grad_enabled`` internally.
+
+        :param model: LightningModule being evaluated.
+        :param val_dataloader: Validation dataloader (typically wrapping an
+            :class:`torch.utils.data.IterableDataset`).
+        :returns: Dict mapping metric name to the mean value over the run.
+        :rtype: Dict[str, Any]
         """
         model.eval()
         model.on_validation_epoch_start()
@@ -474,14 +544,17 @@ class IterableTrainer:
     # Test loop
     # ====================================================================
 
-    def test(self, model, datamodule=None) -> None:
+    def test(self, model: Any, datamodule: Any = None) -> None:
         """
-        Run the test loop for IterableDataset.
+        Run the test loop for an :class:`IterableDataset` dataloader.
 
-        Uses iter()/next() with a manual tqdm progress bar to avoid
-        calling len() on the DataLoader. When inference_mode=False
-        (required for EBT's MCMC gradient computation), no gradient
-        restriction is applied.
+        Uses ``iter()``/``next()`` with a manual :mod:`tqdm` progress bar so
+        that ``len()`` is never called on the dataloader. When
+        ``inference_mode=False`` (required for EBT's MCMC gradient
+        computation), no gradient restriction is applied.
+
+        :param model: LightningModule to evaluate.
+        :param datamodule: Accepted for API parity; currently unused.
         """
         self._setup_distributed()
 
@@ -536,24 +609,29 @@ class IterableTrainer:
     # Training entry point
     # ====================================================================
 
-    def fit(self, model, datamodule=None, ckpt_path: Optional[str] = None) -> None:
+    def fit(self, model: Any, datamodule: Any = None, ckpt_path: Optional[str] = None) -> None:
         """
         Run the full step-based training loop.
 
-        Lifecycle:
-          1. Setup distributed environment.
-          2. Move model to device; wrap in DDP if needed.
-          3. Configure optimizers and schedulers.
-          4. Optionally resume from checkpoint.
-          5. Optionally run sanity validation.
-          6. Main loop: fetch -> forward -> backward -> optimizer step.
-             Validation is triggered every val_every_n_step optimizer steps.
-             Training stops when global_step >= max_steps.
-          7. Final validation and checkpoint after the loop ends.
+        :Lifecycle:
+            1. Setup the distributed environment.
+            2. Move the model to the target device; wrap in DDP if needed.
+            3. Configure optimizers and schedulers.
+            4. Optionally resume from a checkpoint.
+            5. Optionally run sanity validation.
+            6. Main loop: fetch -> forward -> backward -> optimizer step.
+               Validation fires every ``val_every_n_step`` optimizer steps.
+               Training stops when ``global_step >= max_steps``.
+            7. Run a final validation and checkpoint after the loop ends.
 
-        The training dataloader wraps an infinite IterableDataset. StopIteration
-        from the iterator is treated as an emergency exit (it should never happen
-        under normal usage with nanochat's streaming generator).
+        The training dataloader wraps an infinite ``IterableDataset``. A
+        :class:`StopIteration` raised by the iterator is treated as an
+        emergency exit; under normal usage with nanochat's streaming
+        generator it should never happen.
+
+        :param model: LightningModule to train.
+        :param datamodule: Accepted for API parity; currently unused.
+        :param ckpt_path: Optional checkpoint path to resume from.
         """
         self._setup_distributed()
 
@@ -633,7 +711,6 @@ class IterableTrainer:
             opt.zero_grad()
 
         train_iter = iter(train_dl)
-        # train_step = 0
 
         while not self._should_stop:
 
@@ -657,7 +734,6 @@ class IterableTrainer:
 
             with self._autocast_ctx():
                 loss = model.training_step(batch, batch_idx)
-                # print(f"IterableTrainer: Step = {train_step}, Loss = {loss}")
 
             if loss is None:
                 batch_idx += 1
@@ -702,7 +778,7 @@ class IterableTrainer:
                 for opt in self.optimizers:
                     opt.zero_grad()
 
-                self.global_step += 1 # global_step += 1 should before _step_schedulers
+                self.global_step += 1  # must increment before _step_schedulers
                 self._step_schedulers("step")
                 accum_count = 0
                 did_step = True
@@ -732,7 +808,6 @@ class IterableTrainer:
             model.on_train_batch_end(loss, batch, batch_idx)
             model.clear_logged_metrics()
             batch_idx += 1
-            # train_step += 1
 
             # ----------------------------------------------------------
             # Step-based validation

@@ -1,15 +1,17 @@
-"""
-Sudoku 数据下载与预处理脚本
+"""Sudoku dataset downloader and preprocessor.
 
-数据源:
-  - SATNet 训练集: https://powei.tw/sudoku.zip (one-hot .pt)
-  - RRN 测试集: https://www.dropbox.com/s/rp3hbjs91xiqdgc/sudoku-hard.zip?dl=1 (CSV 81位数字串)
+Data sources:
 
-输出: 缓存为 .pt 文件，每个包含 list of dict:
-  {"puzzle": [[int]*9]*9, "solution": [[int]*9]*9, "source": str}
+- SATNet training set: ``https://powei.tw/sudoku.zip`` (one-hot ``.pt``).
+- RRN test set: ``https://www.dropbox.com/s/rp3hbjs91xiqdgc/sudoku-hard.zip?dl=1``
+  (CSV with 81-digit strings).
 
-用法:
-  python prepare_sudoku_data.py [--data_dir PATH]
+Output: a cache of ``.pt`` files, each storing a list of dicts with the layout
+``{"puzzle": [[int]*9]*9, "solution": [[int]*9]*9, "source": str}``.
+
+Usage::
+
+    python prepare_sudoku_data.py [--data_dir PATH]
 """
 
 import argparse
@@ -19,6 +21,7 @@ import sys
 import tempfile
 import urllib.request
 import zipfile
+from typing import Any, Dict, List
 
 import torch
 
@@ -29,8 +32,18 @@ SATNET_URL = "https://powei.tw/sudoku.zip"
 RRN_URL = "https://www.dropbox.com/s/rp3hbjs91xiqdgc/sudoku-hard.zip?dl=1"
 
 
-def download_and_extract(url, dest_dir, desc=""):
-    """Download a zip file and extract to dest_dir. Returns extraction path."""
+def download_and_extract(url: str, dest_dir: str, desc: str = "") -> str:
+    """Download ``url`` as a zip and extract it into ``dest_dir``.
+
+    :param url: URL of the zip archive.
+    :type url: str
+    :param dest_dir: Destination directory for the zip and its extracted files.
+    :type dest_dir: str
+    :param desc: Optional label used in log messages.
+    :type desc: str
+    :return: The extraction directory (same as ``dest_dir``).
+    :rtype: str
+    """
     os.makedirs(dest_dir, exist_ok=True)
     zip_path = os.path.join(dest_dir, os.path.basename(url).split("?")[0])
     if not os.path.exists(zip_path):
@@ -49,14 +62,20 @@ def download_and_extract(url, dest_dir, desc=""):
 
 # ── SATNet ──────────────────────────────────────────────────────────────────
 
-def load_satnet(data_dir):
-    """
-    Load SATNet sudoku data.
+def load_satnet(data_dir: str) -> List[Dict[str, Any]]:
+    """Load the SATNet sudoku dataset from disk.
 
-    features.pt: shape [N, 9, 9, 9] one-hot (given cells have a hot digit, empty cells are all-zero)
-    labels.pt:   shape [N, 9, 9, 9] one-hot (complete solution, all cells filled)
+    The source files ``features.pt`` and ``labels.pt`` contain one-hot tensors
+    of shape ``[N, 9, 9, 9]``. For ``features``, given cells have a hot digit
+    and empty cells are all-zero; ``labels`` always has a hot digit (complete
+    solution).
 
-    Returns list of dicts with puzzle/solution as 9x9 int lists (1-9, 0=empty).
+    :param data_dir: Directory containing the extracted ``sudoku/`` folder.
+    :type data_dir: str
+    :return: List of puzzle/solution dicts with 9x9 int lists (``1``-``9``,
+        ``0`` encodes an empty cell in the puzzle).
+    :rtype: List[Dict[str, Any]]
+    :raises FileNotFoundError: When ``features.pt`` is missing.
     """
     features_path = os.path.join(data_dir, "sudoku", "features.pt")
     labels_path = os.path.join(data_dir, "sudoku", "labels.pt")
@@ -68,20 +87,18 @@ def load_satnet(data_dir):
         )
 
     print(f"[SATNet] Loading features from {features_path}")
-    features = torch.load(features_path, weights_only=True)  # [N, 9, 9, 9]
+    features = torch.load(features_path, weights_only=True)
     print(f"[SATNet] Loading labels from {labels_path}")
-    labels = torch.load(labels_path, weights_only=True)  # [N, 9, 9, 9]
+    labels = torch.load(labels_path, weights_only=True)
 
     print(f"[SATNet] features shape: {features.shape}, labels shape: {labels.shape}")
 
-    # Convert one-hot to digit values
-    # features: given cells have one-hot encoding, empty cells are all-zero
-    # Use argmax+1 for solution; for puzzle, check if any digit is given
-    solution_digits = labels.argmax(dim=3) + 1  # [N, 9, 9], values 1-9
+    # Convert one-hot tensors back to digit values (1-9).
+    solution_digits = labels.argmax(dim=3) + 1
 
-    # For puzzle: cells with all-zero one-hot → 0 (empty), otherwise argmax+1
-    has_value = features.sum(dim=3) > 0  # [N, 9, 9] bool
-    puzzle_digits = (features.argmax(dim=3) + 1) * has_value.long()  # 0 for empty
+    # For puzzles: cells with all-zero one-hot become 0 (empty).
+    has_value = features.sum(dim=3) > 0
+    puzzle_digits = (features.argmax(dim=3) + 1) * has_value.long()
 
     samples = []
     N = features.shape[0]
@@ -98,11 +115,17 @@ def load_satnet(data_dir):
 
 # ── RRN ─────────────────────────────────────────────────────────────────────
 
-def parse_rrn_csv(csv_path):
-    """
-    Parse RRN CSV file. Each row: (question, answer) as 81-char digit strings.
-    question: 0 = empty cell, 1-9 = given digit
-    answer: 1-9 for all cells
+def parse_rrn_csv(csv_path: str) -> List[Dict[str, Any]]:
+    """Parse an RRN CSV file into puzzle/solution dicts.
+
+    Each CSV row is ``(question, answer)`` where both are 81-character digit
+    strings; ``0`` in ``question`` marks an empty cell and ``answer`` is the
+    complete solution.
+
+    :param csv_path: Path to the CSV file.
+    :type csv_path: str
+    :return: List of puzzle/solution dicts (see :func:`load_satnet`).
+    :rtype: List[Dict[str, Any]]
     """
     samples = []
     with open(csv_path) as f:
@@ -127,8 +150,15 @@ def parse_rrn_csv(csv_path):
     return samples
 
 
-def load_rrn(data_dir):
-    """Load RRN test set from extracted CSV files."""
+def load_rrn(data_dir: str) -> List[Dict[str, Any]]:
+    """Load the RRN test set from the extracted CSV file.
+
+    :param data_dir: Directory containing the extracted ``sudoku-hard/`` folder.
+    :type data_dir: str
+    :return: List of puzzle/solution dicts.
+    :rtype: List[Dict[str, Any]]
+    :raises FileNotFoundError: When ``test.csv`` is missing.
+    """
     test_csv = os.path.join(data_dir, "sudoku-hard", "test.csv")
     if not os.path.exists(test_csv):
         raise FileNotFoundError(
@@ -143,11 +173,18 @@ def load_rrn(data_dir):
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
-def prepare_sudoku_data(data_dir):
-    """Download, preprocess, and cache all sudoku data."""
+def prepare_sudoku_data(data_dir: str) -> None:
+    """Download, preprocess, and cache all sudoku datasets.
+
+    Produces ``satnet_train.pt`` / ``satnet_val.pt`` / ``rrn_test.pt`` in
+    ``data_dir``. The SATNet dataset is split 90/10 into train/val slices.
+
+    :param data_dir: Directory used for both raw downloads and processed
+        cache files.
+    :type data_dir: str
+    """
     os.makedirs(data_dir, exist_ok=True)
 
-    # Check if already cached
     satnet_train_path = os.path.join(data_dir, "satnet_train.pt")
     satnet_val_path = os.path.join(data_dir, "satnet_val.pt")
     rrn_test_path = os.path.join(data_dir, "rrn_test.pt")
@@ -159,7 +196,8 @@ def prepare_sudoku_data(data_dir):
         print(f"  rrn_test.pt:     {os.path.getsize(rrn_test_path)} bytes")
         return
 
-    # Use a temp directory for raw downloads, cache dir for processed output
+    # Raw downloads and extracts live in a sibling ``_raw`` folder so that the
+    # top-level cache directory only holds the processed ``.pt`` files.
     raw_dir = os.path.join(data_dir, "_raw")
     os.makedirs(raw_dir, exist_ok=True)
 
@@ -170,7 +208,6 @@ def prepare_sudoku_data(data_dir):
     download_and_extract(SATNET_URL, raw_dir, desc="SATNet")
     satnet_samples = load_satnet(raw_dir)
 
-    # Split 90/10 for train/val
     n_total = len(satnet_samples)
     n_train = int(n_total * 0.9)
     satnet_train = satnet_samples[:n_train]
@@ -192,7 +229,6 @@ def prepare_sudoku_data(data_dir):
     torch.save(rrn_test, rrn_test_path)
     print(f"[RRN] Saved {rrn_test_path}")
 
-    # Summary
     print("\n" + "=" * 60)
     print("  Summary")
     print("=" * 60)
@@ -201,7 +237,6 @@ def prepare_sudoku_data(data_dir):
     print(f"  rrn_test.pt:     {len(rrn_test)} samples")
     print(f"  Cache dir:       {data_dir}")
 
-    # Verify a sample
     sample = satnet_train[0]
     print(f"\n  Sample puzzle (first row):    {sample['puzzle'][0]}")
     print(f"  Sample solution (first row):  {sample['solution'][0]}")
