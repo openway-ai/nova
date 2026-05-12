@@ -328,7 +328,8 @@ class EBT_NLP(LightningModule):
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=torch.bfloat16, device=self.device) * self.hparams.gaussian_random_noise_scaling
+            mcmc_dtype = torch.bfloat16 if getattr(self.hparams, 'float_precision', '') == "bf16-true" else torch.float32
+            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=mcmc_dtype, device=self.device) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
             predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device)
         else:
