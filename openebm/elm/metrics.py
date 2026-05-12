@@ -178,4 +178,4 @@ def calculate_bpb_score(
     total_bytes_val = total_bytes.item()
     bpb = total_nats_val / (math.log(2) * total_bytes_val) if total_bytes_val > 0 else float('inf')
 
-    return bpb
+    return bpb, total_nats_val, total_bytes_val

@@ -3,6 +3,10 @@
 Subclasses :class:`nanochat.gpt.GPT` with EBT-specific additions such as
 MCMC-step time embeddings and a scalar energy head.
 """
+import os, sys
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from nanochat.gpt import GPT, GPTConfig
 

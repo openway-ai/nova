@@ -8,48 +8,46 @@ modality (NLP, VID, or IMG).
 # coding: utf-8
 import torch
 import os
+import random
+import shutil
+import sys
 from argparse import ArgumentParser
 
-import random
+import torch
+import wandb
 
 # Allow loading custom classes from legacy checkpoints.
 try:
     from nanochat.tokenizer import RustBPETokenizer
     torch.serialization.add_safe_globals([RustBPETokenizer])
-except:
+except Exception:
     pass
 
 # Suppress CUDA stream mismatch warning (known issue when resuming training).
-torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+if hasattr(torch.autograd.graph, 'set_warn_on_accumulate_grad_stream_mismatch'):
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 try:
     from lightning.pytorch import Trainer, seed_everything
+    from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary
+    from lightning.pytorch.loggers import WandbLogger
     from lightning.pytorch.strategies import DDPStrategy
     from lightning.pytorch.utilities.rank_zero import rank_zero_only
-    from lightning.pytorch.loggers import WandbLogger
-    from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary
 except ImportError:
     from pytorch_lightning import Trainer, seed_everything
+    from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
+    from pytorch_lightning.loggers import WandbLogger
     from pytorch_lightning.strategies import DDPStrategy
     from pytorch_lightning.utilities.rank_zero import rank_zero_only
-    from pytorch_lightning.loggers import WandbLogger
-    from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
 
-from openebm.elm.disk_aware_checkpoint import DiskAwareCheckpoint
-
-import sys
-import wandb
-import ast
-import math
-from tqdm import tqdm
-import json
-import shutil
 from openebm.elm import logger as text_logger
 
 from openebm.elm.utils import model_sizes, init_wandb_watch, call_style_gan_fvd
 from openebm.elm import logger
 from openebm.elm.trainer import ModelTrainer
 from openebm.elm.eval import nlp_eval_acc
+from openebm.elm.trainer import ModelTrainer
+from openebm.elm.utils import init_wandb_watch, model_sizes
 
 @rank_zero_only # ensure only one wandb run is created; otherwise each GPU would create its own
 def setup_wandb(args):
@@ -147,8 +145,9 @@ def main(args) -> None:
         num_gpus = int(args.gpus)
     print("devices/args.gpus: ", args.gpus)
 
-    args.total_num_workers = args.num_workers * num_gpus
-    print("num_nodes", args.num_nodes, "total num_workers across all GPUs", args.total_num_workers, "num workers per GPU", args.num_workers, "num_GPUs", num_gpus)
+    # NOTE: num_workers is NOT configurable — nanochat DataLoader hardcodes num_workers=0
+    # because the generator holds GPU state (pre-allocated CUDA buffers) that cannot be
+    # pickled into worker processes. See dataset.py generate_dataloader() for details.
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     assert (device == torch.device('cuda') and num_gpus > 0), "using cpu instead of cuda. if you would like to proceed please remove this line and change code below to not use GPUs, otherwise check packages to ensure torch/others have cuda support"
@@ -421,7 +420,11 @@ if __name__ == '__main__':
     parser.add_argument("--mcmc_step_size", help="is size of optimization step, or alpha in the paper, kinda like LR, can be learned param", type=float, default=60.0)
     
     parser.add_argument("--mcmc_step_size_learnable", help="makes mcmc_step_size a learnable param", action="store_true", default = False)
-    
+
+    parser.add_argument("--mcmc_step_size_per_step",
+        help="learn a separate mcmc_step_size (alpha) for each MCMC step index",
+        action="store_true", default=False)
+
     parser.add_argument("--mcmc_step_size_lr_multiplier", help="learning rate multiplier for mcmc step size, so to get lr of mcmc step size take lr multiply by this value", type=float, default=5000.0)
 
     parser.add_argument("--randomize_mcmc_step_size_scale", help="randomize the value of mcmc_step_size by a factor specified, i.e. if is 2 will mult by 2 and div by 2 and thats the range to sample from uniformly", type=float, default=1)
@@ -649,9 +652,11 @@ if __name__ == '__main__':
 
     #DATASET AND DATALOADER #########################################################
 
-    parser.add_argument("--num_workers", help="num_workers per GPU. idea to do per GPU gotten from https://discuss.pytorch.org/t/guidelines-for-assigning-num-workers-to-dataloader/813/", type=int, default=4)
-
-    parser.add_argument("--prefetch_factor", help="prefetch factor for dataloader", type=int, default=None)
+    # NOTE: --num_workers and --prefetch_factor have been removed.
+    # The nanochat DataLoader hardcodes num_workers=0 because its generator holds
+    # GPU state (pre-allocated CUDA buffers) that cannot be pickled into worker
+    # processes. pin_memory=False because data is already on GPU.
+    # See dataset.py generate_dataloader() for details.
     
     parser.add_argument("--dataset_name", help="dataset name", default="ucf101")
     

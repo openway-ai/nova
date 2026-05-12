@@ -26,7 +26,7 @@ dependencies = [
     "zstandard>=0.25.0",
     "torchmetrics==1.8.2",
     "ipdb==0.13.13",
-    "pytorch-lightning==2.4.0",
+    "pytorch-lightning==2.6.1",
 ]
 
 [dependency-groups]
