@@ -1,29 +1,38 @@
+"""Text generation and perplexity utilities for EBT / baseline transformers.
+
+Most of the decoding code is adapted from
+``https://github.com/meta-llama/llama/blob/main/llama/generation.py#L129``.
+
+.. note::
+
+    The energy-landscape plotting code currently works for fixed-step EBT
+    variants; per-landscape plotting for time-embed EBT variants is still
+    pending.
+"""
+
+import io
+from typing import Any, Dict, List, Optional, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
+
 from openebm.elm.tokenizer import AutoTokenizer
-import matplotlib.pyplot as plt
-import io
-# import base64
-# from PIL import Image
-import numpy as np
-# NOTE THIS WORKS FOR PLOTTING LANDSCAPE JUST DOESNT DO PER LANDSCAPE FOR TIME EMBED MODELS
-# most of this code is from https://github.com/meta-llama/llama/blob/main/llama/generation.py#L129
 
-def sample_top_p(probs, p):
-    """
-    Perform top-p (nucleus) sampling on a probability distribution.
 
-    Args:
-        probs (torch.Tensor): Probability distribution tensor.
-        p (float): Probability threshold for top-p sampling.
+def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
+    """Top-p (nucleus) sampling over a probability distribution.
 
-    Returns:
-        torch.Tensor: Sampled token indices.
+    Selects the smallest set of tokens whose cumulative probability mass
+    exceeds ``p``, then renormalizes over that set and samples.
 
-    Note:
-        Top-p sampling selects the smallest set of tokens whose cumulative probability mass
-        exceeds the threshold p. The distribution is renormalized based on the selected tokens.
-
+    :param probs: Probability distribution.
+    :type probs: torch.Tensor
+    :param p: Nucleus threshold in ``[0, 1]``.
+    :type p: float
+    :return: Sampled token indices.
+    :rtype: torch.Tensor
     """
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
@@ -34,39 +43,90 @@ def sample_top_p(probs, p):
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
 
-def call_model_forward_decode(hparams, model, input_tokens, start_pos, bsz):
-    #TODO eventually add back kv caching, for now start_pos is not supported  in baseline transformer and EBT so start_pos can only be 0
+
+def call_model_forward_decode(hparams: Any, model: Any, input_tokens: torch.Tensor, start_pos: int, bsz: int) -> torch.Tensor:
+    """Run a forward pass appropriate for decoding.
+
+    KV caching is not yet supported, so ``start_pos`` is forced to ``0``
+    inside the call.
+
+    :param hparams: Training/inference hparams (needs ``model_name`` and,
+        when ``ebt``, ``infer_ebt_advanced``).
+    :type hparams: Any
+    :param model: Model to call.
+    :type model: Any
+    :param input_tokens: Input token ids.
+    :type input_tokens: torch.Tensor
+    :param start_pos: KV-cache start position (currently unused).
+    :type start_pos: int
+    :param bsz: Batch size.
+    :type bsz: int
+    :return: Logits at the final position.
+    :rtype: torch.Tensor
+    """
     if hparams.model_name == "ebt":
         if hparams.infer_ebt_advanced:
             ebt_outputs = model.ebt_advanced_inference(input_tokens, start_pos = 0, learning = False)
-            logits = ebt_outputs[0] # dont return a list just return the final predicted logits
+            logits = ebt_outputs[0]
         else:
             ebt_outputs = model.forward(input_tokens, start_pos = 0, learning = False, return_raw_logits = True)
-            logits = ebt_outputs[0][-1] # uses 0, -1 since ebt returns tuple of lists of (logits, energy predictions) for each mcmc step; dont want learning mode since needs grad
+            # EBT returns (logits_list, energy_list) per MCMC step; take the
+            # last step's logits. ``learning=False`` avoids gradient tracking.
+            logits = ebt_outputs[0][-1]
         energies = ebt_outputs[1]
-        energies = [energy_tensor.reshape(bsz, -1).mean(dim=1) for energy_tensor in energies] # will be num_mcmc_step * energy landscapes len list, with bsz elements each
+        # energies[step] has shape (bsz, ...); mean over the trailing dims.
+        energies = [energy_tensor.reshape(bsz, -1).mean(dim=1) for energy_tensor in energies]
     else:
         logits = model.forward(input_tokens, start_pos = 0, learning = False, return_raw_logits = True)
     return logits
 
-def call_model_forward_ppl(hparams, model, input_tokens, start_pos, bsz):
-    #TODO same issues with start pos as above
+
+def call_model_forward_ppl(hparams: Any, model: Any, input_tokens: torch.Tensor, start_pos: int, bsz: int) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
+    """Run a forward pass appropriate for perplexity scoring.
+
+    Same KV-cache caveat as :func:`call_model_forward_decode`.
+
+    :param hparams: See :func:`call_model_forward_decode`.
+    :type hparams: Any
+    :param model: Model to call.
+    :type model: Any
+    :param input_tokens: Input token ids.
+    :type input_tokens: torch.Tensor
+    :param start_pos: KV-cache start position (currently unused).
+    :type start_pos: int
+    :param bsz: Batch size.
+    :type bsz: int
+    :return: ``(logits, energies)`` — ``energies`` is ``None`` for non-EBT
+        models.
+    :rtype: Tuple[torch.Tensor, Optional[List[torch.Tensor]]]
+    """
     if hparams.model_name == "ebt":
         if hparams.infer_ebt_advanced:
             ebt_outputs = model.ebt_advanced_inference(input_tokens, start_pos = 0, learning = False)
-            logits = ebt_outputs[0] # dont return a list just return the final predicted logits
+            logits = ebt_outputs[0]
         else:
             ebt_outputs = model.forward(input_tokens, start_pos = 0, learning = False, return_raw_logits = True)
-            logits = ebt_outputs[0][-1] # uses 0, -1 since ebt returns tuple of lists of (logits, energy predictions) for each mcmc step; dont want learning mode since needs grad
+            # Same indexing convention as ``call_model_forward_decode``.
+            logits = ebt_outputs[0][-1]
         energies = ebt_outputs[1]
-        energies = [energy_tensor.reshape(bsz, -1).mean(dim=1) for energy_tensor in energies] # will be num_mcmc_step * energy landscapes len list, with bsz elements each
+        energies = [energy_tensor.reshape(bsz, -1).mean(dim=1) for energy_tensor in energies]
     else:
         logits = model.forward(input_tokens, start_pos = 0, learning = False, return_raw_logits = True)
         energies = None
     return logits, energies
 
-def _get_tokenizer(hparams):
-    """Get or create cached tokenizer. Avoids re-wrapping NanoChatTokenizerWrapper per batch."""
+
+def _get_tokenizer(hparams: Any) -> Any:
+    """Return a cached tokenizer, creating and wrapping it on first use.
+
+    Avoids re-wrapping a :class:`NanoChatTokenizerWrapper` on every batch.
+
+    :param hparams: Hparams object; the tokenizer is cached on it as
+        ``_cached_gen_tokenizer``.
+    :type hparams: Any
+    :return: A HuggingFace-like tokenizer.
+    :rtype: Any
+    """
     if hasattr(hparams, '_cached_gen_tokenizer'):
         return hparams._cached_gen_tokenizer
 
@@ -90,10 +150,26 @@ def _get_tokenizer(hparams):
     return tokenizer
 
 
-def generate_text(model, batch, hparams):
+def generate_text(model: Any, batch: Tuple[Any, Any], hparams: Any) -> List[Dict[str, Any]]:
+    """Generate text for ``(questions, answers)`` and return decoded outputs.
+
+    :param model: Model to decode from (must expose ``transformer.params``).
+    :type model: Any
+    :param batch: ``(questions, answers)`` pair as emitted by the eval
+        dataloader. Both halves may be dict-like or raw tensors.
+    :type batch: Tuple[Any, Any]
+    :param hparams: Inference hparams (``infer_max_gen_len``, ``infer_temp``,
+        ``infer_topp``, ``infer_logprobs``, ``infer_echo``,
+        ``context_length``).
+    :type hparams: Any
+    :return: One dict per sample with keys ``generation``, ``target``,
+        ``prompt`` and optionally ``tokens`` / ``logprobs``.
+    :rtype: List[Dict[str, Any]]
+    """
     tokenizer = _get_tokenizer(hparams)
 
-    # Safe access to eos_token_id with fallback to bos_token_id (for compatibility)
+    # Tokenizers can expose eos / pad / bos in any combination; fall back
+    # through them so this works across HF and NanoChat tokenizers.
     if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
         tokenizer_pad_token_id = tokenizer.eos_token_id
     elif hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None:
@@ -101,25 +177,23 @@ def generate_text(model, batch, hparams):
     elif hasattr(tokenizer, 'bos_token_id'):
         tokenizer_pad_token_id = tokenizer.bos_token_id
     else:
-        tokenizer_pad_token_id = 0  # Fallback to 0 (common for BOS/EOS/PAD in GPT-NeoX)
-        
+        tokenizer_pad_token_id = 0
+
     questions, answers = batch
 
-    # Handle both dict/dict-like format (from DataCollator) and tensor format
-    # Normalize to ensure we can access via ['input_ids']
+    # Normalize the batch: accept either dict-like inputs (from a
+    # DataCollator) or raw tensors. After this block both ``questions`` and
+    # ``answers`` are dicts with ``input_ids`` (and ``attention_mask`` for
+    # questions).
     if not isinstance(questions, dict) and not hasattr(questions, '__getitem__'):
-        # questions is a raw tensor, wrap it
         ids = questions if isinstance(questions, torch.Tensor) else torch.tensor(questions, dtype=torch.long)
         attn_mask = (ids != tokenizer_pad_token_id).long()
-        # Create dict-like wrapper
         questions = {'input_ids': ids, 'attention_mask': attn_mask}
 
     if not isinstance(answers, dict) and not hasattr(answers, '__getitem__'):
-        # answers is a raw tensor, wrap it
         ans_ids = answers if isinstance(answers, torch.Tensor) else torch.tensor(answers, dtype=torch.long)
         answers = {'input_ids': ans_ids}
 
-    # Now we can safely access via dict keys
     ids = questions['input_ids']
     attn_mask = questions["attention_mask"]
     max_gen_len = hparams.infer_max_gen_len
@@ -127,22 +201,20 @@ def generate_text(model, batch, hparams):
     top_p = hparams.infer_topp
     logprobs = hparams.infer_logprobs
     echo = hparams.infer_echo
-    # ppl = model.forward_loss_wrapper(questions, phase="test")['perplexity'].item() # just in case want to debug model PPL
 
-    prompt_tokens = [] #NOTE this was to fix a bug where this generation code was not working for bs > 1 due to pad_token_id being same as eos_token_id and min_prompt_len being wrong
+    # Use the attention mask to find the true prompt length per row. This
+    # avoids a subtle bug with bs > 1 when pad_token_id == eos_token_id and
+    # min_prompt_len would otherwise be miscomputed.
+    prompt_tokens = []
     for row_ids, row_mask in zip(ids, attn_mask):
-        seq_len = row_mask.sum().item()         # number of *real* tokens
+        seq_len = row_mask.sum().item()
         prompt_tokens.append(row_ids[:seq_len].tolist())
-    
+
     params = model.transformer.params
     bsz = len(prompt_tokens)
 
     min_prompt_len = min(len(t) for t in prompt_tokens)
     max_prompt_len = max(len(t) for t in prompt_tokens)
-    # if max_prompt_len > hparams.context_length:
-    #     over_length_prompt = max(prompt_tokens, key=len)
-    #     print(f"Prompt exceeding max length ({max_prompt_len} > {hparams.context_length}):")
-    #     print(tokenizer.decode(over_length_prompt))
     assert max_prompt_len <= hparams.context_length
     total_len = min(hparams.context_length, max_gen_len + max_prompt_len)
     pad_id = tokenizer_pad_token_id
@@ -164,16 +236,16 @@ def generate_text(model, batch, hparams):
                 ignore_index=pad_id,
             )
         for cur_pos in range(min_prompt_len, total_len):
-            input_tokens = tokens[:, :cur_pos] # NOTE removed prev_pos since are not using start_pos in model forward for now, TODO eventually add back
+            input_tokens = tokens[:, :cur_pos]
             logits = call_model_forward_decode(hparams, model, input_tokens, prev_pos, bsz)
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
             else:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
-            
+
             next_token = next_token.reshape(-1)
-            # only replace token if prompt has already been generated
+            # Only replace the token when the prompt has already been consumed.
             next_token = torch.where(
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
@@ -185,7 +257,7 @@ def generate_text(model, batch, hparams):
                     reduction="none",
                     ignore_index=pad_id,
                 )
-            # Get EOS token ID safely (use the same logic as above)
+            # Same fallback sequence as tokenizer_pad_token_id above.
             eos_token_id = getattr(tokenizer, 'eos_token_id', getattr(tokenizer, 'bos_token_id', 0))
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
                 next_token == eos_token_id
@@ -198,13 +270,11 @@ def generate_text(model, batch, hparams):
         token_logprobs = token_logprobs.tolist()
     out_tokens, out_logprobs = [], []
     for i, toks in enumerate(tokens.tolist()):
-        # cut to max gen len
         start = 0 if echo else len(prompt_tokens[i])
         toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
         probs = None
         if logprobs:
             probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
-        # cut to eos tok if any
         eos_token_id = getattr(tokenizer, 'eos_token_id', getattr(tokenizer, 'bos_token_id', 0))
         if eos_token_id in toks:
             eos_idx = toks.index(eos_token_id)
@@ -233,21 +303,40 @@ def generate_text(model, batch, hparams):
     ]
 
 
-def get_ppl(model, batch, hparams): # is very similar to model forward_loss_wrapper, just doesnt work on list for logits and calls advanced inference. mainly to avoid using inference_mode which generates tokens one at a time, this is for getting PPL over the entire sequence
+def get_ppl(model: Any, batch: Dict[str, torch.Tensor], hparams: Any) -> Dict[str, Any]:
+    """Compute perplexity and optionally plot energy-landscape diagnostics.
+
+    Similar to ``model.forward_loss_wrapper`` but skips the list-of-logits
+    path and avoids token-by-token ``inference_mode`` for sequence-level PPL.
+
+    :param model: Model to score with.
+    :type model: Any
+    :param batch: Dict with ``input_ids`` of shape ``[B, 1, S]``.
+    :type batch: Dict[str, torch.Tensor]
+    :param hparams: Hparams (``model_name``, ``infer_plot_energy_landscape``).
+    :type hparams: Any
+    :return: Dict with ``loss``, ``perplexity`` and, for EBT models,
+        per-MCMC-step mean energies.
+    :rtype: Dict[str, Any]
+    :raises AssertionError: If ``infer_plot_energy_landscape`` is set for
+        non-EBT models.
+    """
     batch_size = batch['input_ids'].shape[0]
-    with torch.no_grad(): # by default no grad, although ebt will enable grad
+    # EBT models may enable grad internally even inside this ``no_grad`` block.
+    with torch.no_grad():
         input_ids = batch['input_ids'].squeeze(dim=1)[:, :-1]
         if hparams.model_name == "ebt":
             logits, energies = call_model_forward_ppl(hparams, model, input_ids, 0, batch_size)
         else:
             logits, _ = call_model_forward_ppl(hparams, model, input_ids, 0, batch_size)
 
-    next_token_indices = batch['input_ids'].squeeze(dim=1)[:, 1:].reshape(-1) # BS * S; reshape since targets are supposed to be 1D
+    # Targets must be 1-D for cross entropy.
+    next_token_indices = batch['input_ids'].squeeze(dim=1)[:, 1:].reshape(-1)
 
-    # Get pad token id safely - nanochat doesn't have pad token, so use -100 (standard ignore index)
+    # NanoChat has no pad token; fall back to -100 (standard ignore index).
     pad_token_id = model.tokenizer_pad_token_id
     if pad_token_id is None:
-        pad_token_id = -100  # Standard ignore index that won't match any actual token
+        pad_token_id = -100
 
     cce_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), next_token_indices, ignore_index=pad_token_id)
     perplexity = torch.exp(cce_loss).detach()
@@ -264,9 +353,7 @@ def get_ppl(model, batch, hparams): # is very similar to model forward_loss_wrap
             avg_step_energy = torch.mean(step_tensor, dim=0)
             energy_tensors.append(avg_step_energy)
 
-        # Convert energy tensors to scalars for logging
         for step_idx, energy in enumerate(energy_tensors):
-            # Take mean if energy is not a scalar
             if energy.numel() > 1:
                 energy_scalar = energy.mean().item()
             else:
@@ -275,126 +362,100 @@ def get_ppl(model, batch, hparams): # is very similar to model forward_loss_wrap
 
     if hparams.infer_plot_energy_landscape:
         assert hparams.model_name == "ebt", "Energy landscape plotting only works with EBT models"
-        
+
         _, energies_list, predicted_tokens_list = model.ebt_advanced_inference(input_ids, start_pos=0, learning=False)
-        
-        # Create separate plots for different MCMC steps
+
         image_tensors = {}
-        
-        # Select steps to plot (first, middle, and last step)
+
+        # Plot all MCMC steps (first, intermediate, last).
         num_steps = len(predicted_tokens_list)
         steps_to_plot = list(range(num_steps))
-        
+
         for step_idx in steps_to_plot:
             token_losses = []
             step_energies = []
-            
-            # Get target tokens (actual next tokens in sequence)
+
             target_tokens = batch['input_ids'].squeeze(dim=1)[:, 1:]
-            
+
             for batch_idx in range(batch_size):
                 for pos_idx in range(input_ids.shape[1]):
-                    # Skip padded positions
                     if pos_idx >= target_tokens.shape[1] or target_tokens[batch_idx, pos_idx] == model.tokenizer_pad_token_id:
                         continue
-                    
+
                     target_token = target_tokens[batch_idx, pos_idx]
-                    
-                    # Get predicted token distribution at this position for this step
+
                     token_logit = predicted_tokens_list[step_idx][batch_idx, pos_idx]
-                    
-                    # Calculate cross entropy loss for this prediction vs ground truth
+
                     token_loss = F.cross_entropy(
-                        token_logit.unsqueeze(0), 
+                        token_logit.unsqueeze(0),
                         target_token.unsqueeze(0),
                         reduction='none'
                     ).item()
-                    
-                    # Get energy value for this position at this step
+
                     token_energy = energies_list[step_idx][batch_idx, pos_idx].item()
-                    
+
                     token_losses.append(token_loss)
                     step_energies.append(token_energy)
-            
-            # Create the scatter plot for this step
+
             plt.figure(figsize=(10, 6))
             plt.scatter(step_energies, token_losses, alpha=0.5)
             plt.xlabel('Predicted Energy')
             plt.ylabel('Ground Truth Cross-Entropy Loss')
             plt.title(f'Energy Landscape vs Ground Truth Loss (MCMC Step {step_idx})')
-            
-            # Add trend line if there are enough points
+
             if len(step_energies) > 5:
                 z = np.polyfit(step_energies, token_losses, 1)
                 p = np.poly1d(z)
                 plt.plot(sorted(step_energies), p(sorted(step_energies)), "r--", alpha=0.8)
-                
-                # Add correlation coefficient
+
                 from scipy.stats import pearsonr
                 corr, _ = pearsonr(step_energies, token_losses)
                 plt.annotate(f"Correlation: {corr:.3f}", xy=(0.05, 0.95), xycoords='axes fraction')
-            
-            # Save plot to buffer and convert to tensor
+
             buf = io.BytesIO()
             plt.savefig(buf, format='png')
             buf.seek(0)
             plt.close()
-            
-            # # Convert to PIL Image and then to tensor
-            # pil_img = Image.open(buf).convert('RGB')
-            # # Convert PIL image to tensor (channels, height, width) with values in [0, 1]
-            # img_tensor = torch.FloatTensor(np.array(pil_img)).permute(2, 0, 1) / 255.0
-            
-            # image_tensors[f"image_energy_landscape_step_{step_idx}"] = img_tensor
-        
-        # Also create a combined plot showing the evolution
+
+        # Combined plot showing the evolution across MCMC steps.
         plt.figure(figsize=(10, 6))
         colors = ['blue', 'green', 'red', 'purple', 'orange', 'cyan']
-        
+
         for i, step_idx in enumerate(steps_to_plot):
             token_losses = []
             step_energies = []
-            
+
             for batch_idx in range(batch_size):
                 for pos_idx in range(input_ids.shape[1]):
                     if pos_idx >= target_tokens.shape[1] or target_tokens[batch_idx, pos_idx] == model.tokenizer_pad_token_id:
                         continue
-                    
+
                     target_token = target_tokens[batch_idx, pos_idx]
                     token_logit = predicted_tokens_list[step_idx][batch_idx, pos_idx]
-                    
+
                     token_loss = F.cross_entropy(
-                        token_logit.unsqueeze(0), 
+                        token_logit.unsqueeze(0),
                         target_token.unsqueeze(0),
                         reduction='none'
                     ).item()
-                    
+
                     token_energy = energies_list[step_idx][batch_idx, pos_idx].item()
-                    
+
                     token_losses.append(token_loss)
                     step_energies.append(token_energy)
-            
+
             color_idx = i % len(colors)
-            plt.scatter(step_energies, token_losses, alpha=0.5, color=colors[color_idx], 
+            plt.scatter(step_energies, token_losses, alpha=0.5, color=colors[color_idx],
                         label=f'Step {step_idx}')
-        
+
         plt.xlabel('Predicted Energy')
         plt.ylabel('Ground Truth Cross-Entropy Loss')
         plt.title('Energy Landscape Evolution During MCMC Steps')
         plt.legend()
-        
+
         buf = io.BytesIO()
         plt.savefig(buf, format='png')
         buf.seek(0)
         plt.close()
-        
-        # pil_img = Image.open(buf).convert('RGB')
-        # img_tensor = torch.FloatTensor(np.array(pil_img)).permute(2, 0, 1) / 255.0
-        
-        # image_tensors["image_energy_landscape_combined"] = img_tensor
-        
-        # # Add all images to outputs
-        # for key, tensor in image_tensors.items():
-        #     outputs[key] = tensor
 
     return outputs

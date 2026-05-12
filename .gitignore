@@ -6,6 +6,10 @@ eval_bundle/
 *.DS_Store
 
 **/docs/
+**/sudoku_cache/
+**/sudoku_cache_v2/
+
+
 
 # Secrets
 .env
@@ -50,6 +54,8 @@ tmp_*/
 *.png
 *.jpg
 *.jpeg
+*.jsonl
+
 
 # Externel code
 nanochat/nanochat/external/

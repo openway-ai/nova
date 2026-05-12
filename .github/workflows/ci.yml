@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev-openebm-clean]
+    paths:
+      - "openebm/elm/**"
+      - "pyproject.toml"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "openebm/elm/**"
+      - "pyproject.toml"
+      - ".github/workflows/ci.yml"
+
+# CI is intentionally scoped to the `openebm/elm` sub-package. The vendored
+# `nanochat/` directory is excluded from lint / type-check runs.
+
+jobs:
+  lint:
+    name: Ruff lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install Ruff
+        run: pip install "ruff>=0.6.0"
+      - name: Lint openebm/elm only
+        run: ruff check openebm/elm
+
+  typecheck:
+    name: Mypy type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install Mypy and required type stubs
+        run: pip install "mypy>=1.11.0"
+      - name: Run mypy on openebm/elm (non-blocking)
+        run: mypy openebm/elm || true
+
+  test:
+    name: Pytest (collect + fast only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install pytest
+        run: pip install "pytest>=8.0.0"
+      - name: Collect tests (without running slow ones)
+        run: |
+          if [ -d "openebm/elm/tests" ]; then
+            pytest openebm/elm/tests -m "not slow" --collect-only -q
+          else
+            echo "No tests directory yet — skipping."
+          fi

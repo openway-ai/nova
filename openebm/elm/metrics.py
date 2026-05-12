@@ -1,17 +1,42 @@
-import torch
-import torchmetrics
-import nltk
-import string
-from typing import List
-import torch.distributed as dist
-import ipdb
+"""Evaluation metrics used across EBT training and QA-style eval scripts."""
+
+from typing import Any, List
+
 import math
+import string
+
+import nltk
+import torch
+import torch.distributed as dist
+import torchmetrics
+import ipdb
 
 custom_nltk_path = "/mnt/shared-storage-user/lixueyan/datasets/nltk_data"
 if custom_nltk_path not in nltk.data.path:
     nltk.data.path.insert(0, custom_nltk_path)
 
-def get_torchmetrics(metric, metrics_average_type, num_classes, metrics_task):
+def get_torchmetrics(
+    metric: str,
+    metrics_average_type: str,
+    num_classes: int,
+    metrics_task: str,
+) -> Any:
+    """Return the ``torchmetrics`` instance that matches ``metric``.
+
+    :param metric: Metric name substring (must contain ``accuracy``,
+        ``f1_score``, ``precision`` or ``recall``).
+    :type metric: str
+    :param metrics_average_type: Averaging strategy forwarded to torchmetrics.
+    :type metrics_average_type: str
+    :param num_classes: Number of classes for the metric.
+    :type num_classes: int
+    :param metrics_task: Task kind forwarded to torchmetrics
+        (``"binary"`` / ``"multiclass"`` / ``"multilabel"``).
+    :type metrics_task: str
+    :return: Configured torchmetrics metric instance.
+    :rtype: Any
+    :raises ValueError: When ``metric`` does not match any supported name.
+    """
     if 'accuracy' in metric:
         return torchmetrics.Accuracy(average=metrics_average_type, num_classes=num_classes, task=metrics_task)
     elif 'f1_score' in metric:
@@ -25,12 +50,20 @@ def get_torchmetrics(metric, metrics_average_type, num_classes, metrics_task):
 
 
 def calculate_em(predictions: List[str], references: List[str]) -> float:
-    '''
-    Method for calculating the Exact Match (EM) score for Question Answering / Text Generation tasks
-    '''
+    """Exact-match score for QA / text-generation tasks.
+
+    :param predictions: Model predictions.
+    :type predictions: List[str]
+    :param references: Ground-truth answers.
+    :type references: List[str]
+    :return: Fraction of predictions that exactly match the reference after
+        :func:`normalize_text` normalization.
+    :rtype: float
+    :raises AssertionError: If the inputs are empty or of different lengths.
+    """
     assert len(predictions) > 0, "Predictions list cannot be empty"
     assert len(predictions) == len(references), "Predictions and references must have same length"
-    
+
     total = len(predictions)
     correct = sum(
         normalize_text(pred) == normalize_text(ref)
@@ -40,12 +73,19 @@ def calculate_em(predictions: List[str], references: List[str]) -> float:
 
 
 def calculate_f1_score(predictions: List[str], references: List[str]) -> float:
-    '''
-    Method for calculating the F1 score for Question Answering / Text Generation tasks
-    '''
+    """Token-level F1 score for QA / text-generation tasks.
+
+    :param predictions: Model predictions.
+    :type predictions: List[str]
+    :param references: Ground-truth answers.
+    :type references: List[str]
+    :return: Average token-level F1 across the provided pairs.
+    :rtype: float
+    :raises AssertionError: If the inputs are empty or of different lengths.
+    """
     assert len(predictions) > 0, "Predictions list cannot be empty"
     assert len(predictions) == len(references), "Predictions and references must have same length"
-    
+
     total_f1 = 0
     for pred, ref in zip(predictions, references):
         pred_tokens = nltk.word_tokenize(normalize_text(pred))
@@ -65,7 +105,7 @@ def calculate_f1_score(predictions: List[str], references: List[str]) -> float:
 
         precision = matches / len(pred_tokens) if pred_tokens else 0
         recall = matches / len(ref_tokens) if ref_tokens else 0
-        
+
         f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
         total_f1 += f1
 
@@ -73,6 +113,13 @@ def calculate_f1_score(predictions: List[str], references: List[str]) -> float:
 
 
 def normalize_text(text: str) -> str:
+    """Lowercase the text, strip punctuation, and collapse whitespace.
+
+    :param text: Input text.
+    :type text: str
+    :return: Normalized text suitable for EM/F1 comparison.
+    :rtype: str
+    """
     text = text.lower()
     text = ''.join(ch for ch in text if ch not in set(string.punctuation))
     text = ' '.join(text.split())
@@ -80,26 +127,32 @@ def normalize_text(text: str) -> str:
 
 
 @torch.no_grad()
-def calculate_bpb_score(next_token_indices, per_token_loss, token_bytes):
+def calculate_bpb_score(
+    next_token_indices: torch.Tensor,
+    per_token_loss: torch.Tensor,
+    token_bytes: torch.Tensor,
+) -> float:
+    """Compute bits-per-byte (BPB), a vocab-size-agnostic evaluation metric.
+
+    Mirrors :func:`forward_loss_wrapper`: normalizes the per-token
+    cross-entropy (in nats) by the byte length of each target token, following
+    ``nanochat/loss_eval.py::evaluate_bpb``.
+
+    :param next_token_indices: Flat tensor of target token ids
+        (shape ``(B*S,)``). Negative entries are treated as ``ignore_index``.
+    :type next_token_indices: torch.Tensor
+    :param per_token_loss: Per-token cross-entropy in nats (shape ``(B*S,)``).
+    :type per_token_loss: torch.Tensor
+    :param token_bytes: 1-D ``LongTensor`` of shape ``(vocab_size,)`` with the
+        UTF-8 byte length of each token id. Entries equal to ``0`` mark
+        special tokens that are excluded from the metric.
+    :type token_bytes: torch.Tensor
+    :return: Bits-per-byte score aggregated across ranks when DDP is active,
+        or ``float('inf')`` if there are no valid bytes in the batch.
+    :rtype: float
     """
-      Compute bits-per-byte (BPB) loss, a vocab-size agnostic evaluation metric.
-      Mirrors forward_loss_wrapper's structure. Normalizes cross-entropy (nats) by
-      the byte length of each target token, following nanochat/loss_eval.py:evaluate_bpb().
-
-      Args:
-          next_token_indices: 1D LongTensor of target token indices (BS,)
-          per_token_loss: 1D tensor of per-token losses (reduction='none') or
-                          scalar mean loss (reduction='mean', backward compatible but less accurate)
-          token_bytes: 1D LongTensor of shape (vocab_size,), byte count per token id;
-                       0 marks special tokens (e.g. <|bos|>) excluded from the metric.
-
-      Returns:
-          (bpb, total_nats, total_bytes) tuple where:
-          - bpb: bits per byte (float)
-          - total_nats: sum of per-token losses for valid positions (float)
-          - total_bytes: sum of byte counts for valid positions (int)
-      """
-    # Map target tokens → byte lengths; explicitly handle ignore_index (y < 0) from finetune masking
+    # Map target tokens to byte lengths; explicitly handle ``ignore_index``
+    # (entries with ``y < 0`` introduced by fine-tune masking).
 
     if (next_token_indices.int() < 0).any():
         valid = next_token_indices >= 0
@@ -110,13 +163,13 @@ def calculate_bpb_score(next_token_indices, per_token_loss, token_bytes):
             torch.zeros_like(next_token_indices, dtype=token_bytes.dtype),
         )
     else:
-        num_bytes = token_bytes[next_token_indices]  # [B*S]
+        num_bytes = token_bytes[next_token_indices]
 
-    # Only count positions where token has bytes > 0 (excludes special tokens)
+    # Only count positions whose byte length is positive (excludes specials).
     total_nats = (per_token_loss * (num_bytes > 0)).sum()
     total_bytes = num_bytes.sum().to(torch.int64)
 
-    # DDP aggregation across ranks
+    # DDP aggregation across ranks.
     if dist.is_initialized():
         dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)

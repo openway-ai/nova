@@ -1,4 +1,10 @@
-#NOTE most code gotten from llama2 codebase -- credit:https://github.com/meta-llama/llama
+"""Default autoregressive Energy-Based Transformer (EBT) model components.
+
+Contains the Llama2-style building blocks (RMSNorm, rotary embeddings,
+attention, feed-forward, transformer block) together with the
+energy-based head that scores predicted-token embeddings.
+"""
+# NOTE: most code adapted from the llama2 codebase. Credit: https://github.com/meta-llama/llama
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -15,95 +21,93 @@ except ImportError:
     build_layer_ve = None
 
 class RMSNorm(torch.nn.Module):
+    """Root-mean-square layer normalization.
+
+    :ivar eps: Small constant added to the denominator for numerical stability.
+    :vartype eps: float
+    :ivar weight: Learnable per-feature scale parameter.
+    :vartype weight: torch.nn.Parameter
+    """
+
     def __init__(self, dim: int, eps: float = 1e-6):
-        """
-        Initialize the RMSNorm normalization layer.
+        """Initialize the RMSNorm normalization layer.
 
-        Args:
-            dim (int): The dimension of the input tensor.
-            eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
-
-        Attributes:
-            eps (float): A small value added to the denominator for numerical stability.
-            weight (nn.Parameter): Learnable scaling parameter.
-
+        :param dim: Feature dimension to normalize over (last axis).
+        :type dim: int
+        :param eps: Small value added to the denominator for numerical stability.
+        :type eps: float
         """
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x):
-        """
-        Apply the RMSNorm normalization to the input tensor.
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the RMS normalization formula to the input tensor.
 
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The normalized tensor.
-
+        :param x: Input tensor whose last dimension is normalized.
+        :type x: torch.Tensor
+        :return: RMS-normalized tensor with the same shape as ``x``.
+        :rtype: torch.Tensor
         """
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
-        """
-        Forward pass through the RMSNorm layer.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the RMSNorm layer.
 
-        Args:
-            x (torch.Tensor): The input tensor.
+        Computes the normalization in float32 for numerical stability and
+        casts the result back to the input dtype before multiplying by the
+        learnable scale.
 
-        Returns:
-            torch.Tensor: The output tensor after applying RMSNorm.
-
+        :param x: Input tensor of shape ``(..., dim)``.
+        :type x: torch.Tensor
+        :return: Scaled, RMS-normalized tensor with the same shape and dtype
+            as ``x``.
+        :rtype: torch.Tensor
         """
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    """Precompute the rotary-embedding complex frequency tensor.
 
-    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-    and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
+    Computes the complex exponentials used by rotary position embeddings for
+    positions ``[0, end)`` and head dimension ``dim``. The frequencies are
+    scaled by ``theta`` in the standard RoPE formulation. The returned tensor
+    holds ``complex64`` values.
 
-    Args:
-        dim (int): Dimension of the frequency tensor.
-        end (int): End index for precomputing frequencies.
-        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
-
-    Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.
-
-    
-        
-
+    :param dim: Per-head feature dimension.
+    :type dim: int
+    :param end: Exclusive upper bound on the position index.
+    :type end: int
+    :param theta: Base for the geometric frequency progression.
+    :type theta: float
+    :return: Complex frequency tensor of shape ``(end, dim // 2)``.
+    :rtype: torch.Tensor
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    # NOTE: complex64 representation of the rotation angles.
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    """
-    Reshape frequency tensor for broadcasting it with another tensor.
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Reshape the frequency tensor so it broadcasts against ``x``.
 
-    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
-    for the purpose of broadcasting the frequency tensor during element-wise operations.
+    Inserts singleton dimensions so that the sequence axis (``dim 1``) and
+    the head-dim axis (``dim -1``) of ``freqs_cis`` align with ``x``.
 
-    Args:
-        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
-        x (torch.Tensor): Target tensor for broadcasting compatibility.
-
-    Returns:
-        torch.Tensor: Reshaped frequency tensor.
-
-    Raises:
-        AssertionError: If the frequency tensor doesn't match the expected shape.
-        AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
+    :param freqs_cis: Precomputed complex frequency tensor of shape
+        ``(x.shape[1], x.shape[-1])``.
+    :type freqs_cis: torch.Tensor
+    :param x: Target tensor whose shape dictates the broadcast layout.
+    :type x: torch.Tensor
+    :return: View of ``freqs_cis`` reshaped for broadcasting against ``x``.
+    :rtype: torch.Tensor
+    :raises AssertionError: If ``x.ndim`` or ``freqs_cis.shape`` are not
+        compatible with the expected layout.
     """
     ndim = x.ndim
     assert 0 <= 1 < ndim
@@ -117,24 +121,21 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply rotary embeddings to input tensors using the given frequency tensor.
+    """Apply rotary position embeddings to the query and key tensors.
 
-    This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
-    frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
-    is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
-    returned as real tensors.
+    Interprets the last dimension of ``xq`` and ``xk`` as complex pairs,
+    multiplies by ``freqs_cis``, and converts back to real tensors with the
+    original dtype.
 
-    Args:
-        xq (torch.Tensor): Query tensor to apply rotary embeddings.
-        xk (torch.Tensor): Key tensor to apply rotary embeddings.
-        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-
-        
-
+    :param xq: Query tensor of shape ``(B, S, H, D)`` where ``D`` is even.
+    :type xq: torch.Tensor
+    :param xk: Key tensor of shape ``(B, S, H, D)`` where ``D`` is even.
+    :type xk: torch.Tensor
+    :param freqs_cis: Precomputed complex frequency tensor.
+    :type freqs_cis: torch.Tensor
+    :return: Tuple ``(xq_out, xk_out)`` of rotated query and key tensors,
+        each with the same shape and dtype as the inputs.
+    :rtype: Tuple[torch.Tensor, torch.Tensor]
     """
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
@@ -145,7 +146,19 @@ def apply_rotary_emb(
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    """Repeat key/value heads along the head dimension.
+
+    Equivalent to ``torch.repeat_interleave(x, dim=2, repeats=n_rep)`` but
+    implemented via ``expand`` + ``reshape`` to avoid materializing the
+    intermediate copy when possible.
+
+    :param x: Tensor of shape ``(B, S, n_kv_heads, head_dim)``.
+    :type x: torch.Tensor
+    :param n_rep: Number of times to repeat each KV head.
+    :type n_rep: int
+    :return: Tensor of shape ``(B, S, n_kv_heads * n_rep, head_dim)``.
+    :rtype: torch.Tensor
+    """
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -157,31 +170,25 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    """Multi-head attention module."""
+    """Multi-head attention module with EBT-specific prediction branch.
+
+    Implements causal self-attention for the ``original`` token stream and a
+    parallel attention path for the ``predicted`` tokens, whose self-scores
+    are spliced on the super-diagonal of the attention matrix.
+    """
+
     def __init__(self, layer_id: int, args: EBTModelArgs):
-        """
-        Initialize the Attention module.
+        """Initialize the Attention module.
 
-        Args:
-            args (EBTModelArgs): Model configuration parameters.
-
-        Attributes:
-            n_kv_heads (int): Number of key and value heads.
-            n_local_heads (int): Number of local query heads.
-            n_local_kv_heads (int): Number of local key and value heads.
-            n_rep (int): Number of repetitions for local heads.
-            head_dim (int): Dimension size of each attention head.
-            wq (ColumnParallelLinear): Linear transformation for queries.
-            wk (ColumnParallelLinear): Linear transformation for keys.
-            wv (ColumnParallelLinear): Linear transformation for values.
-            wo (RowParallelLinear): Linear transformation for output.
-            cache_k (torch.Tensor): Cached keys for attention.
-            cache_v (torch.Tensor): Cached values for attention.
-
+        :param layer_id: Identifier of this layer within the stack; used for
+            deciding whether value embeddings (VE) should be enabled.
+        :type layer_id: int
+        :param args: Model configuration parameters.
+        :type args: EBTModelArgs
         """
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        model_parallel_size = 1 #NOTE this is hardcoded since we are using DDP
+        model_parallel_size = 1  # NOTE: hardcoded to 1 since we use DDP rather than tensor parallelism.
         self.n_local_heads = args.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
@@ -193,64 +200,19 @@ class Attention(nn.Module):
             nn.init.zeros_(self.ve_gate.weight)
         else:
             self.ve_gate = None
-        
+
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         init_whole_model_weights(self.wq, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
-        
-        
+
+
         self.wk = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         init_whole_model_weights(self.wk, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
-        
+
         self.wv = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         init_whole_model_weights(self.wv, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
-        
+
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
         init_whole_model_weights(self.wo, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
-        # self.wq = ColumnParallelLinear(
-        #     args.dim,
-        #     args.n_heads * self.head_dim,
-        #     bias=False,
-        #     gather_output=False,
-        #     init_method=lambda x: x,
-        # )
-        # self.wk = ColumnParallelLinear(
-        #     args.dim,
-        #     self.n_kv_heads * self.head_dim,
-        #     bias=False,
-        #     gather_output=False,
-        #     init_method=lambda x: x,
-        # )
-        # self.wv = ColumnParallelLinear(
-        #     args.dim,
-        #     self.n_kv_heads * self.head_dim,
-        #     bias=False,
-        #     gather_output=False,
-        #     init_method=lambda x: x,
-        # )
-        # self.wo = RowParallelLinear(
-        #     args.n_heads * self.head_dim,
-        #     args.dim,
-        #     bias=False,
-        #     input_is_parallel=True,
-        #     init_method=lambda x: x,
-        # )
-
-        # self.cache_k = torch.zeros(
-        #     (
-        #         args.max_batch_size,
-        #         args.max_seq_len,
-        #         self.n_local_kv_heads,
-        #         self.head_dim,
-        #     )
-        # )
-        # self.cache_v = torch.zeros(
-        #     (
-        #         args.max_batch_size,
-        #         args.max_seq_len,
-        #         self.n_local_kv_heads,
-        #         self.head_dim,
-        #     )
-        # )
 
     def forward(
         self,
@@ -259,24 +221,35 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
         ve: Optional[torch.Tensor] = None,
-    ):
+    ) -> torch.Tensor:
+        """Forward pass of the EBT attention module.
+
+        The input ``x`` concatenates the original token embeddings and the
+        predicted token embeddings along the sequence dimension. The module
+        produces attended outputs for both halves and concatenates them on
+        return.
+
+        :param x: Input tensor of shape ``(B, 2*(S-1), D)``.
+        :type x: torch.Tensor
+        :param start_pos: Starting position (currently unused, retained for
+            API compatibility with the KV-cache variant).
+        :type start_pos: int
+        :param freqs_cis: Precomputed rotary frequency tensor.
+        :type freqs_cis: torch.Tensor
+        :param mask: Optional additive attention mask (``-inf`` for masked
+            positions).
+        :type mask: Optional[torch.Tensor]
+        :param ve: Optional value-embedding tensor of shape
+            ``(B, 2*(S-1), n_local_kv_heads * head_dim)`` mixed into ``xv``
+            through a learned gate.
+        :type ve: Optional[torch.Tensor]
+        :return: Output tensor of shape ``(B, 2*(S-1), D)``.
+        :rtype: torch.Tensor
         """
-        Forward pass of the attention module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            start_pos (int): Starting position for caching.
-            freqs_cis (torch.Tensor): Precomputed frequency tensor.
-            mask (torch.Tensor, optional): Attention mask tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after attention.
-
-        """
-        # NOTE the usage of S-1/S/S+1 is messed up and confusing here, I recommend checking the paper
-        bsz, full_seqlen, _ = x.shape # full_seqlen includes real embeds and pred embeds
-        original_seqlen = full_seqlen//2 # length of original sequence without next pred
-        context_length = original_seqlen + 1 # actual context length of model
+        # NOTE: the usage of S-1/S/S+1 below is confusing; see the paper for details.
+        bsz, full_seqlen, _ = x.shape  # full_seqlen includes real embeds and pred embeds
+        original_seqlen = full_seqlen//2  # length of original sequence without next pred
+        context_length = original_seqlen + 1  # actual context length of model
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
         xq = xq.view(bsz, full_seqlen, self.n_local_heads, self.head_dim)
@@ -286,107 +259,102 @@ class Attention(nn.Module):
             ve = ve.view(bsz, full_seqlen, self.n_local_kv_heads, self.head_dim)
             gate = 3 * torch.sigmoid(self.ve_gate(x[:, :, :self.ve_gate_channels]))
             xv = xv + gate.unsqueeze(-1) * ve
-        
-        # _o is for original attention stuff
-        xq_o = xq[:, :original_seqlen, :, :] #B, S-1, N, H (N and H are num head and head dim respectively)
+
+        # _o suffix: tensors for the original sequence.
+        xq_o = xq[:, :original_seqlen, :, :]  # B, S-1, N, H (N=num heads, H=head dim)
         xk_o = xk[:, :original_seqlen, :, :]
         xv_o = xv[:, :original_seqlen, :, :]
-        
-        # _p is for predicted attention stuff
-        xq_p = xq[:, original_seqlen:, :, :] #B, S-1, N, H (N and H are num head and head dim respectively)
+
+        # _p suffix: tensors for the predicted (next-token) sequence.
+        xq_p = xq[:, original_seqlen:, :, :]  # B, S-1, N, H
         xk_p = xk[:, original_seqlen:, :, :]
         xv_p = xv[:, original_seqlen:, :, :]
-        
-        
+
+
         xq_o, xk_o = apply_rotary_emb(xq_o, xk_o, freqs_cis=freqs_cis[:original_seqlen])
-        
-        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[1:context_length]) # use 1 since are the next preds and thus need to condition on a frame
-        # I tested this compared to prepending row on S dimension and the tensors were the same
 
-        # self.cache_k = self.cache_k.to(xq)
-        # self.cache_v = self.cache_v.to(xq)
+        # NOTE: use freqs_cis[1:context_length] for predictions because each next pred must
+        # condition on a shifted frame.
+        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=freqs_cis[1:context_length])
+        # NOTE: verified to be equivalent to prepending a row along the S dimension.
 
-        # self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        # self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
-        # keys = self.cache_k[:bsz, : start_pos + seqlen]
-        # values = self.cache_v[:bsz, : start_pos + seqlen]
-
-        # # repeat k/v heads if n_kv_heads < n_heads # this does nothing since self.n_rep = 1
-        # keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        # values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        
-        #original attn calc is more normal############################################
+        # Original (causal) attention branch.
 
         # seqlen here is S-1 which = original_seqlen
         xq_o = xq_o.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys_o = xk_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        values_o = xv_o.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim) # B, N, S-1, S-1
+        keys_o = xk_o.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        values_o = xv_o.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        scores_o = torch.matmul(xq_o, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)  # B, N, S-1, S-1
         if mask is not None:
-            #this mask needs to be seqlen, seqlen, was S, S
-            o_mask = mask[:-1, :-1] #set to S-1, S-1 like 0 -inf -inf; 0 0 -inf, etc   
+            # Mask needs to be (seqlen, seqlen); the incoming full mask is (S, S) so we slice to (S-1, S-1).
+            o_mask = mask[:-1, :-1]  # (S-1, S-1) causal mask: row 0 = [0, -inf, ...], row 1 = [0, 0, -inf, ...].
             scores_o = scores_o + o_mask  # (bs, n_local_heads, seqlen, seqlen)
         scores_o = F.softmax(scores_o.float(), dim=-1).type_as(xq_o)
         output_o = torch.matmul(scores_o, values_o)  # (bs, n_local_heads, seqlen, head_dim)
-        output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1) # has B, S-1, D after
-        
-        #pred sequence attn calc is for energy-based transformer ########################################################################################
-        
+        output_o = output_o.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1)  # B, S-1, D
+
+        # Predicted-sequence attention branch (EBT specific).
+
         # seqlen here is S-1 which = original_seqlen
         xq_p = xq_p.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys_p = xk_p.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        
-        values_p = xv_p.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        scores_p = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim) # B, N, S-1, S-1; this uses xq_p and keys_o since for every next pred calcs similarity to all prev words
-        temp_append = torch.zeros((scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1), dtype=scores_p.dtype, device=scores_p.device) # B, N, S-1, 1; is used since context_length = original_length +1, superdiag needs this
-        scores_p = torch.cat((scores_p, temp_append), dim = -1)# is B, N, S-1, S; represents for each next pred (S-1 row) attending to all previous words (S-1) and then itself +1
-        
-        insertion_superdiagonal = (xq_p * keys_p).sum(dim = 3) / math.sqrt(self.head_dim)
-        insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype) # for if using non 32 precision
-        # bs, n, s-1 ; this calcs attn score of next preds with themselves, is like grabbing diag of matmul
-        
-        superdiag_rows = torch.arange(scores_p.shape[2]) #[0, ..., S-2] (len 15)
-        superdiag_cols = torch.arange(1, scores_p.shape[3]) # [1, ..., S-1] (len 15)
-        # use [3] last line since is [2]+1 and scores_p is wider than is tall as has B, N, S-1, S
-        
-        # first remove superdiagonal values so doesnt use attention to future tokens--prevents leakage of probability mass
-        zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device) # for zeroing out superdiag since dont want to include in matmul, do this in differentiable way
+        keys_p = xk_p.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+
+        values_p = xv_p.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        # xq_p vs keys_o: each next-pred attends to all previous original tokens.
+        scores_p = torch.matmul(xq_p, keys_o.transpose(2, 3)) / math.sqrt(self.head_dim)  # B, N, S-1, S-1
+        # context_length = original_length + 1, so the super-diagonal needs an extra column.
+        temp_append = torch.zeros((scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1), dtype=scores_p.dtype, device=scores_p.device)  # B, N, S-1, 1
+        scores_p = torch.cat((scores_p, temp_append), dim=-1)  # B, N, S-1, S: each next pred attends to all previous words (S-1) plus itself (+1).
+
+        insertion_superdiagonal = (xq_p * keys_p).sum(dim=3) / math.sqrt(self.head_dim)
+        insertion_superdiagonal = insertion_superdiagonal.to(scores_p.dtype)  # NOTE: cast needed when running in non-fp32 precision.
+        # (bs, n, s-1); self-attention score of each next pred, i.e. the diagonal of the matmul.
+
+        superdiag_rows = torch.arange(scores_p.shape[2])  # [0, ..., S-2] (length S-1)
+        superdiag_cols = torch.arange(1, scores_p.shape[3])  # [1, ..., S-1] (length S-1)
+        # Indexing uses shape[3] = shape[2] + 1 since scores_p has shape B, N, S-1, S (wider than tall).
+
+        # First, zero the super-diagonal so we do not leak attention probability mass onto future tokens.
+        zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device)  # NOTE: built this way to keep the operation differentiable.
         diagonal_removal_mask = torch.ones_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
         diagonal_removal_mask[:, :, superdiag_rows, superdiag_cols] = zero_superdiag
-        scores_p = scores_p * diagonal_removal_mask        
-        
-        # then set diagonal to next pred self attention scores in differentiable way
+        scores_p = scores_p * diagonal_removal_mask
+
+        # Then insert the next-pred self-attention scores onto the super-diagonal in a differentiable way.
         diagonal_addition_mask = torch.zeros_like(scores_p, dtype=scores_p.dtype, device=scores_p.device)
         diagonal_addition_mask[:, :, superdiag_rows, superdiag_cols] = insertion_superdiagonal
-        scores_p = scores_p + diagonal_addition_mask         
-        
+        scores_p = scores_p + diagonal_addition_mask
+
         if mask is not None:
-            p_mask = mask[1:, :]  #S-1, S like 0 0 -inf -inf; 0 0 0, -inf, etc  
+            p_mask = mask[1:, :]  # (S-1, S) pred mask: row 0 = [0, 0, -inf, ...], row 1 = [0, 0, 0, -inf, ...].
             scores_p = scores_p + p_mask
         scores_p = F.softmax(scores_p.float(), dim=-1).type_as(xq_p)
-        
-        #Q: why do I need to extract superdiagonal why cant i just do matmul after? A: its bc would need same subsequence in value matrix but dont have it, have original subsequence and then seperately all next preds
-        scores_p_superdiagonal = scores_p.diagonal(offset=1, dim1=2, dim2=3).clone() # is B, N, S-1; basically how much each token on this superdiag should attent to itself; clone since dont want mask to change this
-        
-        scores_p = scores_p * diagonal_removal_mask # keeps scores_p as is except for superdiagonal which is next preds attention to selves, cant multiply these naively by values_p or values_o
-        
-        scores_p = scores_p[:, :, :, :-1] # B, N, S-1, S-1 now; next preds/scores_p_superdiagonal was why needed extra col earlier (temp_append)
-        output_p = torch.matmul(scores_p, values_o) # B, N, S-1, H; is how next preds attend to all original previous tokens;
-        
-        #next_pred_self_attention is to get self attention based on extracted superdiagonal and the values matrix (for predictions)
-        next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim = -1) # B, N, S-1, H this is for weighted sum of each next pred to its final embed rep.
-        
-        output_p = output_p + next_pred_self_attention # B, N, S-1, H adding this is adding the aspect of each next pred embedding attending to itself
-        output_p = output_p.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1) # after this is B, S-1, D
-        
-        #return linear projection of concatted outputs ########################################################################################
-        
-        output = torch.cat((output_o, output_p), dim = 1) # B, 2(S-1), D
+
+        # NOTE: we extract the super-diagonal rather than doing a single matmul because the predicted
+        # tokens live in a separate value matrix (values_p), not inside values_o.
+        scores_p_superdiagonal = scores_p.diagonal(offset=1, dim1=2, dim2=3).clone()  # B, N, S-1; cloned so later mutation of scores_p does not affect it.
+
+        # Re-apply the removal mask so scores_p carries only the original-token contributions.
+        scores_p = scores_p * diagonal_removal_mask
+
+        scores_p = scores_p[:, :, :, :-1]  # B, N, S-1, S-1; temp_append is no longer needed after the super-diagonal was split off.
+        output_p = torch.matmul(scores_p, values_o)  # B, N, S-1, H: each next pred attending to all previous original tokens.
+
+        # Add the contribution of each next-pred embedding attending to itself via the extracted super-diagonal.
+        next_pred_self_attention = values_p * scores_p_superdiagonal.unsqueeze(dim=-1)  # B, N, S-1, H
+
+        output_p = output_p + next_pred_self_attention  # B, N, S-1, H
+        output_p = output_p.transpose(1, 2).contiguous().view(bsz, original_seqlen, -1)  # B, S-1, D
+
+        # Concatenate both branches and project back to the model dimension.
+
+        output = torch.cat((output_o, output_p), dim=1)  # B, 2(S-1), D
         return self.wo(output)
 
 
 class FeedForward(nn.Module):
+    """SwiGLU feed-forward block used inside each transformer layer."""
+
     def __init__(
         self,
         dim: int,
@@ -394,72 +362,55 @@ class FeedForward(nn.Module):
         weight_initialization: str,
         weight_initialization_gain: float
     ):
-        """
-        Initialize the FeedForward module.
+        """Initialize the FeedForward module.
 
-        Args:
-            dim (int): Input dimension.
-            hidden_dim (int): Hidden dimension of the feedforward layer.
-            multiple_of (int): Value to ensure hidden dimension is a multiple of this value.
-            ffn_dim_multiplier (float, optional): Custom multiplier for hidden dimension. Defaults to None.
-
-        Attributes:
-            w1 (ColumnParallelLinear): Linear transformation for the first layer.
-            w2 (RowParallelLinear): Linear transformation for the second layer.
-            w3 (ColumnParallelLinear): Linear transformation for the third layer.
-
+        :param dim: Input and output feature dimension.
+        :type dim: int
+        :param ffn_dim_multiplier: Multiplier applied to ``dim`` to obtain
+            the hidden dimension. If ``None`` the hidden dimension equals
+            ``dim``.
+        :type ffn_dim_multiplier: Optional[float]
+        :param weight_initialization: Name of the weight-initialization
+            scheme passed to :func:`init_whole_model_weights`.
+        :type weight_initialization: str
+        :param weight_initialization_gain: Gain factor for the
+            initialization scheme.
+        :type weight_initialization_gain: float
         """
         super().__init__()
-        # hidden_dim = int(2 * hidden_dim / 3)
-        # # custom dim factor multiplier
-        # if ffn_dim_multiplier is not None:
-        #     hidden_dim = int(ffn_dim_multiplier * hidden_dim)
-        # hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-        
+
         hidden_dim = dim if ffn_dim_multiplier is None else int(dim*ffn_dim_multiplier)
 
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         init_whole_model_weights(self.w1, weight_initialization, weight_initialization_gain=weight_initialization_gain)
-        
+
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         init_whole_model_weights(self.w2, weight_initialization, weight_initialization_gain=weight_initialization_gain)
-        
+
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
         init_whole_model_weights(self.w3, weight_initialization, weight_initialization_gain=weight_initialization_gain)
-        
-        # self.w1 = ColumnParallelLinear(
-        #     dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        # )
-        # self.w2 = RowParallelLinear(
-        #     hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
-        # )
-        # self.w3 = ColumnParallelLinear(
-        #     dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        # )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the SwiGLU feed-forward transformation.
+
+        :param x: Input tensor of shape ``(..., dim)``.
+        :type x: torch.Tensor
+        :return: Output tensor of shape ``(..., dim)``.
+        :rtype: torch.Tensor
+        """
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class TransformerBlock(nn.Module):
+    """One transformer layer: RMSNorm -> attention -> RMSNorm -> feed-forward, with residuals."""
+
     def __init__(self, layer_id: int, args: EBTModelArgs):
-        """
-        Initialize a TransformerBlock.
+        """Initialize a TransformerBlock.
 
-        Args:
-            layer_id (int): Identifier for the layer.
-            args (EBTModelArgs): Model configuration parameters.
-
-        Attributes:
-            n_heads (int): Number of attention heads.
-            dim (int): Dimension size of the model.
-            head_dim (int): Dimension size of each attention head.
-            attention (Attention): Attention module.
-            feed_forward (FeedForward): FeedForward module.
-            layer_id (int): Identifier for the layer.
-            attention_norm (RMSNorm): Layer normalization for attention output.
-            ffn_norm (RMSNorm): Layer normalization for feedforward output.
-
+        :param layer_id: Zero-based index of this layer within the stack.
+        :type layer_id: int
+        :param args: Model configuration parameters.
+        :type args: EBTModelArgs
         """
         super().__init__()
         self.n_heads = args.n_heads
@@ -483,21 +434,24 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
         ve: Optional[torch.Tensor] = None,
-    ):
+    ) -> torch.Tensor:
+        """Run one transformer block on the concatenated (original + predicted) sequence.
+
+        :param x: Input tensor of shape ``(B, 2*(S-1), D)``.
+        :type x: torch.Tensor
+        :param start_pos: Starting position for attention caching.
+        :type start_pos: int
+        :param freqs_cis: Precomputed rotary frequency tensor.
+        :type freqs_cis: torch.Tensor
+        :param mask: Optional additive attention mask.
+        :type mask: Optional[torch.Tensor]
+        :param ve: Optional value-embedding tensor forwarded to the attention
+            module.
+        :type ve: Optional[torch.Tensor]
+        :return: Output tensor of shape ``(B, 2*(S-1), D)``.
+        :rtype: torch.Tensor
         """
-        Perform a forward pass through the TransformerBlock.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            start_pos (int): Starting position for attention caching.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-            mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
-
-        Returns:
-            torch.Tensor: Output tensor after applying attention and feedforward layers.
-
-        """
-        # x has shape B, 2*(S-1), D?
+        # x has shape B, 2*(S-1), D
         h = x + self.attention(
             self.attention_norm(x), start_pos, freqs_cis, mask, ve
         )
@@ -506,21 +460,17 @@ class TransformerBlock(nn.Module):
 
 
 class EBTDefault(nn.Module):
+    """Default autoregressive Energy-Based Transformer.
+
+    Stacks :class:`TransformerBlock` layers on top of input embeddings and
+    produces a scalar energy per predicted token via a final linear head.
+    """
+
     def __init__(self, params: EBTModelArgs):
-        """
-        Initialize a Transformer model.
+        """Initialize the EBT model.
 
-        Args:
-            params (EBTModelArgs): Model configuration parameters.
-
-        Attributes:
-            params (EBTModelArgs): Model configuration parameters.
-            n_layers (int): Number of layers in the model.
-            layers (torch.nn.ModuleList): List of Transformer blocks.
-            norm (RMSNorm): Layer normalization for the model output.
-            output (ColumnParallelLinear): Linear layer for final output.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-
+        :param params: Model configuration parameters.
+        :type params: EBTModelArgs
         """
         super().__init__()
         self.params = params
@@ -558,26 +508,38 @@ class EBTDefault(nn.Module):
         mcmc_step=None,
         real_token_ids: Optional[torch.Tensor] = None,
         predicted_tokens: Optional[torch.Tensor] = None,
-    ):  # NOTE mcmc_step not used here
+    ) -> torch.Tensor:
+        """Forward pass through the EBT model.
+
+        :param embeddings: Concatenated embeddings of shape
+            ``(B, 2*(S-1), D)`` containing both real and predicted-token
+            embeddings.
+        :type embeddings: torch.Tensor
+        :param start_pos: Starting position for attention caching.
+        :type start_pos: int
+        :param mcmc_step: MCMC step index. Accepted for API compatibility but
+            not used in this implementation.
+        :type mcmc_step: Optional[int]
+        :param real_token_ids: Optional token IDs for the real sequence,
+            consumed by value-embedding layers when ``use_ve`` is enabled.
+        :type real_token_ids: Optional[torch.Tensor]
+        :param predicted_tokens: Optional token IDs for the predicted
+            sequence, consumed by value-embedding layers when ``use_ve`` is
+            enabled.
+        :type predicted_tokens: Optional[torch.Tensor]
+        :return: Energy tensor of shape ``(B, S-1, 1)`` scoring the
+            predicted-token half of the sequence.
+        :rtype: torch.Tensor
         """
-        Perform a forward pass through the Transformer model.
-
-        Args:
-            embeds (torch.Tensor): Embeddings (instead of tokens since is for vision).
-            start_pos (int): Starting position for attention caching.
-
-        Returns:
-            torch.Tensor: Output energies after applying the Transformer model.
-
-        """
+        # NOTE: mcmc_step is unused in this variant; kept for signature compatibility.
         _bsz, seqlen = embeddings.shape[:2]
-        seqlen = (seqlen+2) // 2 # do this since passed in seqlen is 2(S-1) so add 2 div 2 = S
+        seqlen = (seqlen+2) // 2  # incoming seqlen is 2*(S-1); (2*(S-1) + 2) // 2 = S
         self.freqs_cis = self.freqs_cis.to(embeddings.device)
 
-        # 动态扩展 freqs_cis 如果需要的长度超过预计算的长度
+        # Dynamically extend freqs_cis if the required length exceeds the precomputed one.
         required_length = start_pos + seqlen
         if required_length > self.freqs_cis.shape[0]:
-            # 重新计算更长的 freqs_cis
+            # Recompute a longer freqs_cis tensor.
             new_freqs_cis = precompute_freqs_cis(
                 self.params.dim // self.params.n_heads,
                 required_length
@@ -594,18 +556,18 @@ class EBTDefault(nn.Module):
 
             mask = torch.triu(mask, diagonal=1)
 
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            # NOTE: when performing key-value caching, attention is computed only for the new sequence.
+            # The resulting score matrix is (seqlen, cache_len + seqlen); only entries (i, j) with
+            # j > cache_len + i are masked since row i corresponds to token cache_len + i.
             mask = torch.hstack([
                 torch.zeros((seqlen, start_pos), device=embeddings.device),
                 mask
             ]).type_as(embeddings)
-            # causal mask is like this by default 0, -inf, -inf
-            #                         0, 0,    -inf
-            #                         0, 0,    0
-                
+            # Default causal mask layout:
+            #   0,    -inf, -inf
+            #   0,    0,    -inf
+            #   0,    0,    0
+
 
             for i, layer in enumerate(self.layers):
                 ve = None

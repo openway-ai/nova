@@ -16,23 +16,45 @@ except ImportError:
 
 
 class BackwardRMSNormFunction(torch.autograd.Function):
-    """
-    Forward: identity
-    Backward: apply RMSNorm on grad_output, with its own weight parameter.
+    """Identity in forward; RMSNorm applied to gradients in backward.
+
+    The weight is learnable and enters only via the backward pass.
     """
 
     @staticmethod
-    def forward(ctx, input_, weight, eps, use_fp32_norm):
-        # Save for backward
+    def forward(ctx: "torch.autograd.function.FunctionCtx", input_: torch.Tensor, weight: torch.Tensor, eps: float, use_fp32_norm: bool) -> torch.Tensor:
+        """Identity forward that stashes ``weight``/``eps``/``use_fp32_norm`` for backward.
+
+        :param ctx: Autograd context used to cache tensors for backward.
+        :type ctx: torch.autograd.function.FunctionCtx
+        :param input_: Input tensor; returned unchanged.
+        :type input_: torch.Tensor
+        :param weight: Learnable scale used only in backward.
+        :type weight: torch.Tensor
+        :param eps: Numerical-stability constant.
+        :type eps: float
+        :param use_fp32_norm: If ``True``, the backward RMS is computed in FP32
+            then cast back; if ``False`` it stays in the input dtype.
+        :type use_fp32_norm: bool
+        :return: ``input_`` unchanged.
+        :rtype: torch.Tensor
+        """
         ctx.save_for_backward(weight)
         ctx.eps = eps
         ctx.use_fp32_norm = use_fp32_norm
         return input_  # Identity forward
 
     @staticmethod
-    def backward(ctx, grad_output):
-        """
-        grad_output -> RMSNorm(grad_output) using 'weight'.
+    def backward(ctx: "torch.autograd.function.FunctionCtx", grad_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, None, None]:
+        """Apply RMSNorm to ``grad_output`` using the stashed ``weight``.
+
+        :param ctx: Autograd context populated in :meth:`forward`.
+        :type ctx: torch.autograd.function.FunctionCtx
+        :param grad_output: Gradient tensor flowing back from the next op.
+        :type grad_output: torch.Tensor
+        :return: ``(grad_input, grad_weight, None, None)`` — one ``None`` per
+            non-tensor forward argument.
+        :rtype: Tuple[torch.Tensor, torch.Tensor, None, None]
         """
         # print("grad_output", grad_output)
         (weight,) = ctx.saved_tensors
@@ -58,11 +80,18 @@ class BackwardRMSNormFunction(torch.autograd.Function):
 
 
 class BackwardRMSNorm(nn.Module):
-    """
-    nn.Module that applies identity in forward, RMSNorm in backward,
-    with its own learnable weight.
-    """
-    def __init__(self, dim: int, eps: float = 1e-6, use_fp32_norm: bool = True):
+    """Identity in forward, RMSNorm in backward, with a learnable weight."""
+
+    def __init__(self, dim: int, eps: float = 1e-6, use_fp32_norm: bool = True) -> None:
+        """Initialize the backward-only RMSNorm.
+
+        :param dim: Size of the last dimension being normalized.
+        :type dim: int
+        :param eps: Numerical-stability constant.
+        :type eps: float
+        :param use_fp32_norm: Route the backward RMS through FP32 when ``True``.
+        :type use_fp32_norm: bool
+        """
         super().__init__()
         self.weight = nn.Parameter(torch.full((dim,), 0.01))
         # self.weight = nn.Parameter(torch.ones(dim))
@@ -70,23 +99,56 @@ class BackwardRMSNorm(nn.Module):
         self.eps = eps
         self.use_fp32_norm = use_fp32_norm
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return ``x`` unchanged; normalization is only applied in backward.
+
+        :param x: Input tensor.
+        :type x: torch.Tensor
+        :return: The same tensor ``x``.
+        :rtype: torch.Tensor
+        """
         return BackwardRMSNormFunction.apply(x, self.weight, self.eps, self.use_fp32_norm)
     
 class BackwardLayerNormFunction(torch.autograd.Function):
+    """Identity in forward; LayerNorm applied to gradients in backward."""
+
     @staticmethod
-    def forward(ctx, input_, gamma, beta, eps):
-        # Save for backward
+    def forward(ctx: "torch.autograd.function.FunctionCtx", input_: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, eps: float) -> torch.Tensor:
+        """Identity forward that stashes ``gamma``/``beta``/``eps`` for backward.
+
+        :param ctx: Autograd context used to cache tensors for backward.
+        :type ctx: torch.autograd.function.FunctionCtx
+        :param input_: Input tensor; returned unchanged.
+        :type input_: torch.Tensor
+        :param gamma: Learnable scale used only in backward.
+        :type gamma: torch.Tensor
+        :param beta: Learnable shift used only in backward.
+        :type beta: torch.Tensor
+        :param eps: Numerical-stability constant.
+        :type eps: float
+        :return: ``input_`` unchanged.
+        :rtype: torch.Tensor
+        """
         ctx.save_for_backward(gamma, beta)
         ctx.eps = eps
         # Identity forward pass
         return input_
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx: "torch.autograd.function.FunctionCtx", grad_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        """Apply LayerNorm to ``grad_output`` using the stashed ``gamma``/``beta``.
+
+        :param ctx: Autograd context populated in :meth:`forward`.
+        :type ctx: torch.autograd.function.FunctionCtx
+        :param grad_output: Gradient tensor flowing back from the next op.
+        :type grad_output: torch.Tensor
+        :return: ``(grad_input, grad_gamma, grad_beta, None)`` — one ``None``
+            for the non-tensor ``eps`` forward argument.
+        :rtype: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]
+        """
         gamma, beta = ctx.saved_tensors
         eps = ctx.eps
-        
+
         # Compute mean and variance of grad_output over the last dimension
         mu = grad_output.mean(dim=-1, keepdim=True)
         var = grad_output.var(dim=-1, keepdim=True, unbiased=False)
@@ -94,18 +156,18 @@ class BackwardLayerNormFunction(torch.autograd.Function):
 
         # "LayerNorm" of the incoming gradient
         normed_grad = (grad_output - mu) / std
-        
+
         # Output gradient for the input
         #    out_grad = gamma * normed_grad + beta
         grad_input = gamma * normed_grad + beta
-        
+
         # For the chain rule:
         # partial(out_grad) / partial(gamma) = normed_grad
         # partial(out_grad) / partial(beta)  = 1
         # Then multiply each by grad_output for the chain rule, i.e. (grad_output_from_next * partial).
         # But in this scenario, the "local" gradient transform is the final. By convention (matching the RMSNorm example),
-        # we multiply normed_grad by grad_output to find derivative wrt gamma, etc. 
-        # However, the code snippet below just sums across the relevant dims, 
+        # we multiply normed_grad by grad_output to find derivative wrt gamma, etc.
+        # However, the code snippet below just sums across the relevant dims,
         # assuming grad_output is the final gradient from the next operation.
 
         sum_dims = list(range(grad_output.dim() - 1))
@@ -116,28 +178,56 @@ class BackwardLayerNormFunction(torch.autograd.Function):
 
 
 class BackwardLayerNorm(nn.Module):
+    """Identity in forward, LayerNorm in backward, with learnable gamma and beta.
+
+    Normalizes over the last dimension.
     """
-    Identity on the forward pass, LayerNorm on the backward pass,
-    with learnable gamma and beta. Normalizes over the last dimension.
-    """
-    def __init__(self, dim: int, eps: float = 1e-5):
+
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+        """Initialize the backward-only LayerNorm.
+
+        :param dim: Size of the last dimension being normalized.
+        :type dim: int
+        :param eps: Numerical-stability constant.
+        :type eps: float
+        """
         super().__init__()
         # self.gamma = nn.Parameter(torch.ones(dim))
         self.gamma = nn.Parameter(torch.full((dim,), 0.01))
         self.beta = nn.Parameter(torch.zeros(dim))
         self.eps = eps
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return ``x`` unchanged; normalization is only applied in backward.
+
+        :param x: Input tensor.
+        :type x: torch.Tensor
+        :return: The same tensor ``x``.
+        :rtype: torch.Tensor
+        """
         return BackwardLayerNormFunction.apply(x, self.gamma, self.beta, self.eps)
 
 
-class EBMBackwardsRMSNorm(nn.Module): # NOTE none of this worked well, could make loss lower initially (i.e. equal to -log(len(vocab))) but then it diverged or converged slower
+class EBMBackwardsRMSNorm(nn.Module):
+    """Forward RMSNorm followed by backward-only RMSNorm (identity forward).
+
+    .. note::
+
+        None of these variants worked better than plain RMSNorm. They could
+        drive the initial loss close to ``-log(len(vocab))`` but then the
+        run diverged or converged slower.
     """
-    Applies:
-      1) A standard (forward) RMSNorm.
-      2) A backward-only RMSNorm (identity forward) with its own parameter.
-    """
-    def __init__(self, dim: int, eps: float = 1e-6, use_fp32_norm: bool = True):
+
+    def __init__(self, dim: int, eps: float = 1e-6, use_fp32_norm: bool = True) -> None:
+        """Initialize the combined forward/backward RMSNorm.
+
+        :param dim: Size of the last dimension being normalized.
+        :type dim: int
+        :param eps: Numerical-stability constant.
+        :type eps: float
+        :param use_fp32_norm: Whether the inner RMSNorms use the FP32 path.
+        :type use_fp32_norm: bool
+        """
         super().__init__()
         # Forward RMSNorm has its own weight_fwd
         self.forward_rms = RMSNorm(dim, eps, use_fp32_norm=use_fp32_norm)
@@ -145,71 +235,92 @@ class EBMBackwardsRMSNorm(nn.Module): # NOTE none of this worked well, could mak
         self.backward_rms = BackwardRMSNorm(dim, eps, use_fp32_norm=use_fp32_norm)
         # self.backward_ln = BackwardLayerNorm(dim, eps)
 
-    def forward(self, x: torch.Tensor):
-        """
-        1) Apply standard RMSNorm in forward.
-        2) Then apply backward-only RMSNorm (which is identity in forward).
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply forward RMSNorm then the backward-only RMSNorm (identity fwd).
+
+        :param x: Input tensor.
+        :type x: torch.Tensor
+        :return: Tensor after forward RMSNorm (backward-only pass is identity
+            on the forward path).
+        :rtype: torch.Tensor
         """
         x = self.forward_rms(x)
         x = self.backward_rms(x)
         # x = self.backward_ln(x)
         return x
 
+
 class DyT(nn.Module):
-    def __init__(self, num_features, alpha_init_value=0.5, bias_learnable = True):
+    """Dynamic Tanh (DyT) activation-norm hybrid.
+
+    See https://jiachenzhu.github.io/DyT/ for the reference implementation.
+    """
+
+    def __init__(self, num_features: int, alpha_init_value: float = 0.5, bias_learnable: bool = True) -> None:
+        """Initialize the DyT layer.
+
+        :param num_features: Feature dimension ``D``.
+        :type num_features: int
+        :param alpha_init_value: Initial value for the scalar ``alpha``.
+        :type alpha_init_value: float
+        :param bias_learnable: If ``False``, ``bias`` is frozen at zero.
+        :type bias_learnable: bool
+        """
         super().__init__()
         self.alpha = nn.Parameter(torch.ones(1) * alpha_init_value)
         self.weight = nn.Parameter(torch.ones(num_features))
         self.bias = nn.Parameter(torch.zeros(num_features), requires_grad=bias_learnable)
-    
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply ``tanh(alpha * x) * weight + bias``.
+
+        :param x: Input tensor with trailing dim of size ``num_features``.
+        :type x: torch.Tensor
+        :return: Output tensor of the same shape.
+        :rtype: torch.Tensor
+        """
         x = torch.tanh(self.alpha * x)
         return x * self.weight + self.bias
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, use_fp32_norm: bool = True):
-        """
-        Initialize the RMSNorm normalization layer.
+    """Root-mean-square layer normalization."""
 
-        Args:
-            dim (int): The dimension of the input tensor.
-            eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
-            use_fp32_norm (bool): If True, compute normalization in FP32 then cast back.
-                Should be False for bf16-true to avoid FP32 graph nodes.
+    def __init__(self, dim: int, eps: float = 1e-6, use_fp32_norm: bool = True) -> None:
+        """Initialize the RMSNorm normalization layer.
 
-        Attributes:
-            eps (float): A small value added to the denominator for numerical stability.
-            weight (nn.Parameter): Learnable scaling parameter.
-
+        :param dim: Dimension of the input tensor.
+        :type dim: int
+        :param eps: Small value added to the denominator for numerical
+            stability.
+        :type eps: float
+        :param use_fp32_norm: If ``True``, compute normalization in FP32 then
+            cast back. Should be ``False`` for ``bf16-true`` to avoid FP32
+            graph nodes.
+        :type use_fp32_norm: bool
         """
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
         self.use_fp32_norm = use_fp32_norm
 
-    def _norm(self, x):
-        """
-        Apply the RMSNorm normalization to the input tensor.
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RMS normalization to ``x`` over the last dimension.
 
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The normalized tensor.
-
+        :param x: Input tensor.
+        :type x: torch.Tensor
+        :return: Normalized tensor with the same shape as ``x``.
+        :rtype: torch.Tensor
         """
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
-        """
-        Forward pass through the RMSNorm layer.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the RMSNorm layer.
 
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The output tensor after applying RMSNorm.
-
+        :param x: Input tensor.
+        :type x: torch.Tensor
+        :return: Tensor with the same shape as ``x`` after applying RMSNorm
+            and the learnable scale.
+        :rtype: torch.Tensor
         """
         if self.use_fp32_norm:
             output = self._norm(x.float()).type_as(x)
@@ -218,21 +329,21 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    """
-    Precompute the cosine and sine frequency tensors for rotary embeddings.
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Precompute the cosine and sine frequency tensors for rotary embeddings.
 
-    Returns a tuple of (cos, sin) tensors with shape (end, dim//2), stored as
+    Returns ``(cos, sin)`` tensors of shape ``(end, dim // 2)``, stored as
     float32 but applied via real-valued arithmetic to avoid dtype casting in
     the forward/backward graph.
 
-    Args:
-        dim (int): Head dimension.
-        end (int): Maximum sequence length.
-        theta (float, optional): RoPE base. Defaults to 10000.0.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: (cos, sin) each of shape (end, dim//2).
+    :param dim: Head dimension.
+    :type dim: int
+    :param end: Maximum sequence length.
+    :type end: int
+    :param theta: RoPE base.
+    :type theta: float
+    :return: ``(cos, sin)`` each of shape ``(end, dim // 2)``.
+    :rtype: Tuple[torch.Tensor, torch.Tensor]
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)
@@ -245,21 +356,21 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: Tuple[torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply rotary embeddings using real-valued cos/sin arithmetic.
+    """Apply rotary embeddings using real-valued cos/sin arithmetic.
 
     Avoids any dtype casting so the computation stays in the model's native
-    dtype (e.g. bfloat16) throughout, which is important for keeping the
-    MCMC autograd graph in low precision.
+    dtype (for example bfloat16), which is important for keeping the MCMC
+    autograd graph in low precision.
 
-    Args:
-        xq (torch.Tensor): Query tensor, shape (..., seq, n_heads, head_dim).
-        xk (torch.Tensor): Key tensor, shape (..., seq, n_kv_heads, head_dim).
-        freqs_cis (Tuple[torch.Tensor, torch.Tensor]): (cos, sin) each of
-            shape (seq, head_dim//2), precomputed by precompute_freqs_cis.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Rotated xq and xk in original dtype.
+    :param xq: Query tensor of shape ``(..., seq, n_heads, head_dim)``.
+    :type xq: torch.Tensor
+    :param xk: Key tensor of shape ``(..., seq, n_kv_heads, head_dim)``.
+    :type xk: torch.Tensor
+    :param freqs_cis: ``(cos, sin)`` each of shape ``(seq, head_dim // 2)``,
+        precomputed by :func:`precompute_freqs_cis`.
+    :type freqs_cis: Tuple[torch.Tensor, torch.Tensor]
+    :return: Rotated ``xq`` and ``xk`` in their original dtype.
+    :rtype: Tuple[torch.Tensor, torch.Tensor]
     """
     cos, sin = freqs_cis  # (seq, head_dim//2)
     # cast cos/sin to match input dtype (e.g. bfloat16) to avoid float32 intermediates
@@ -287,7 +398,18 @@ def apply_rotary_emb(
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    """Repeat key/value heads ``n_rep`` times along the head dimension.
+
+    Equivalent to ``torch.repeat_interleave(x, dim=2, repeats=n_rep)``.
+
+    :param x: Tensor of shape ``(bs, slen, n_kv_heads, head_dim)``.
+    :type x: torch.Tensor
+    :param n_rep: Number of repetitions along the KV-head dimension.
+    :type n_rep: int
+    :return: Expanded tensor of shape
+        ``(bs, slen, n_kv_heads * n_rep, head_dim)``.
+    :rtype: torch.Tensor
+    """
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -299,27 +421,20 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    """Multi-head attention module."""
-    def __init__(self, layer_id: int, args: EBTModelArgs):
-        """
-        Initialize the Attention module.
+    """Multi-head attention module with a dual original/predicted path.
 
-        Args:
-            args (EBTModelArgs): Model configuration parameters.
+    Implements the two-stream attention used by the time-embed EBT variant:
+    one stream over the original tokens and a second stream over the
+    predicted tokens that additionally attends to the original sequence.
+    """
 
-        Attributes:
-            n_kv_heads (int): Number of key and value heads.
-            n_local_heads (int): Number of local query heads.
-            n_local_kv_heads (int): Number of local key and value heads.
-            n_rep (int): Number of repetitions for local heads.
-            head_dim (int): Dimension size of each attention head.
-            wq (ColumnParallelLinear): Linear transformation for queries.
-            wk (ColumnParallelLinear): Linear transformation for keys.
-            wv (ColumnParallelLinear): Linear transformation for values.
-            wo (RowParallelLinear): Linear transformation for output.
-            cache_k (torch.Tensor): Cached keys for attention.
-            cache_v (torch.Tensor): Cached values for attention.
+    def __init__(self, layer_id: int, args: EBTModelArgs) -> None:
+        """Initialize the Attention module.
 
+        :param layer_id: Layer index (used for VE routing).
+        :type layer_id: int
+        :param args: Model configuration.
+        :type args: EBTModelArgs
         """
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
@@ -402,23 +517,37 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         mask: Optional[torch.Tensor],
         ve: Optional[torch.Tensor] = None,
-    ):
+    ) -> torch.Tensor:
+        """Forward pass of the attention module.
+
+        .. note::
+
+            The ``S-1`` / ``S`` / ``S+1`` bookkeeping around predicted and
+            original tokens is non-obvious; consult the EBT paper for
+            definitions.
+
+        :param x: Input tensor of shape ``(B, 2*(S-1) [+1], D)``; the
+            condition prefix, original tokens, and predicted tokens are all
+            concatenated along the sequence dim.
+        :type x: torch.Tensor
+        :param start_pos: Starting position for caching (reserved; KV cache
+            is currently disabled in this module).
+        :type start_pos: int
+        :param freqs_cis: ``(cos, sin)`` tuple from
+            :func:`precompute_freqs_cis` sliced to the current sequence
+            range.
+        :type freqs_cis: Tuple[torch.Tensor, torch.Tensor]
+        :param mask: Optional attention mask of shape ``(seqlen, seqlen)``.
+        :type mask: Optional[torch.Tensor]
+        :param ve: Optional value-embedding tensor routed via :mod:`ve`;
+            ``None`` when VE is disabled.
+        :type ve: Optional[torch.Tensor]
+        :return: Output tensor of shape ``(B, 2*(S-1) [+1], D)``.
+        :rtype: torch.Tensor
         """
-        Forward pass of the attention module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            start_pos (int): Starting position for caching.
-            freqs_cis (torch.Tensor): Precomputed frequency tensor.
-            mask (torch.Tensor, optional): Attention mask tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after attention.
-
-        # """
         # NOTE the usage of S-1/S/S+1 is messed up and confusing here, I recommend checking the paper
         bsz, full_seqlen, _ = x.shape # full_seqlen includes real embeds and pred embeds
         original_seqlen = (full_seqlen + 1)//2 # this is just the condition plus all original tokens, +1 is bc of condition
@@ -569,28 +698,30 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
+    """Gated feed-forward network used inside each Transformer block."""
+
     def __init__(
         self,
         dim: int,
         ffn_dim_multiplier: Optional[float],
         weight_initialization: str,
         ebt_act_func: str = "silu",
-        weight_initialization_gain: float = 1.0
-    ):
-        """
-        Initialize the FeedForward module.
+        weight_initialization_gain: float = 1.0,
+    ) -> None:
+        """Initialize the FeedForward module.
 
-        Args:
-            dim (int): Input dimension.
-            hidden_dim (int): Hidden dimension of the feedforward layer.
-            multiple_of (int): Value to ensure hidden dimension is a multiple of this value.
-            ffn_dim_multiplier (float, optional): Custom multiplier for hidden dimension. Defaults to None.
-
-        Attributes:
-            w1 (ColumnParallelLinear): Linear transformation for the first layer.
-            w2 (RowParallelLinear): Linear transformation for the second layer.
-            w3 (ColumnParallelLinear): Linear transformation for the third layer.
-
+        :param dim: Input/output feature dimension.
+        :type dim: int
+        :param ffn_dim_multiplier: Hidden-dim multiplier; when ``None`` the
+            hidden dim equals ``dim``.
+        :type ffn_dim_multiplier: Optional[float]
+        :param weight_initialization: Name of the weight initializer.
+        :type weight_initialization: str
+        :param ebt_act_func: Activation function name; one of ``"silu"``,
+            ``"relu"``, ``"gelu"``, ``"elu"``.
+        :type ebt_act_func: str
+        :param weight_initialization_gain: Gain forwarded to the initializer.
+        :type weight_initialization_gain: float
         """
         super().__init__()
         # hidden_dim = int(2 * hidden_dim / 3)
@@ -598,7 +729,7 @@ class FeedForward(nn.Module):
         # if ffn_dim_multiplier is not None:
         #     hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         # hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-        
+
         hidden_dim = dim if ffn_dim_multiplier is None else int(dim*ffn_dim_multiplier)
 
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
@@ -627,29 +758,30 @@ class FeedForward(nn.Module):
         #     dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         # )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the gated feed-forward: ``w2(act(w1(x)) * w3(x))``.
+
+        :param x: Input tensor of shape ``(..., dim)``.
+        :type x: torch.Tensor
+        :return: Output tensor of shape ``(..., dim)``.
+        :rtype: torch.Tensor
+        """
         return self.w2(self.act_func(self.w1(x)) * self.w3(x))
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: EBTModelArgs):
-        """
-        Initialize a TransformerBlock.
+    """A single EBT transformer block: Attention + FeedForward with norms."""
 
-        Args:
-            layer_id (int): Identifier for the layer.
-            args (EBTModelArgs): Model configuration parameters.
+    def __init__(self, layer_id: int, args: EBTModelArgs) -> None:
+        """Initialize a TransformerBlock.
 
-        Attributes:
-            n_heads (int): Number of attention heads.
-            dim (int): Dimension size of the model.
-            head_dim (int): Dimension size of each attention head.
-            attention (Attention): Attention module.
-            feed_forward (FeedForward): FeedForward module.
-            layer_id (int): Identifier for the layer.
-            attention_norm (RMSNorm): Layer normalization for attention output.
-            ffn_norm (RMSNorm): Layer normalization for feedforward output.
-
+        :param layer_id: Identifier for the layer (forwarded to
+            :class:`Attention`).
+        :type layer_id: int
+        :param args: Model configuration.
+        :type args: EBTModelArgs
+        :raises ValueError: If ``args.ebt_norm`` is not one of ``"rms"``,
+            ``"layer"``, ``"none"``, ``"dyt"``, ``"ebm_backwards_norm"``.
         """
         super().__init__()
         self.n_heads = args.n_heads
@@ -687,22 +819,25 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
+        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         mask: Optional[torch.Tensor],
         ve: Optional[torch.Tensor] = None,
-    ):
-        """
-        Perform a forward pass through the TransformerBlock.
+    ) -> torch.Tensor:
+        """Perform a forward pass through the TransformerBlock.
 
-        Args:
-            x (torch.Tensor): Input tensor.
-            start_pos (int): Starting position for attention caching.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-            mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
-
-        Returns:
-            torch.Tensor: Output tensor after applying attention and feedforward layers.
-
+        :param x: Input tensor of shape ``(B, 2*(S-1) [+1], D)``.
+        :type x: torch.Tensor
+        :param start_pos: Starting position for attention caching.
+        :type start_pos: int
+        :param freqs_cis: ``(cos, sin)`` frequency tuple forwarded to
+            :class:`Attention`.
+        :type freqs_cis: Tuple[torch.Tensor, torch.Tensor]
+        :param mask: Optional attention mask.
+        :type mask: Optional[torch.Tensor]
+        :param ve: Optional value embeddings forwarded to :class:`Attention`.
+        :type ve: Optional[torch.Tensor]
+        :return: Output tensor of the same shape as ``x``.
+        :rtype: torch.Tensor
         """
         # x has shape B, 2*(S-1), D?
         h = x + self.attention(
@@ -713,23 +848,32 @@ class TransformerBlock(nn.Module):
 
 
 class EBTTimeConcat(nn.Module):
-    def __init__(self, params: EBTModelArgs, max_mcmc_steps, gradient_checkpointing=False, use_mcmc_time_embed=False):
-        """
-        Initialize a Transformer model.
+    """Energy-Based Transformer with time-embedding MCMC concatenation."""
 
-        Args:
-            params (EBTModelArgs): Model configuration parameters.
-            use_mcmc_time_embed (bool): If True, use per-step time embeddings (original behavior).
-                If False, all MCMC steps share the same transition kernel, enabling arbitrary inference steps.
+    def __init__(
+        self,
+        params: EBTModelArgs,
+        max_mcmc_steps: int,
+        gradient_checkpointing: bool = False,
+        use_mcmc_time_embed: bool = False,
+    ) -> None:
+        """Initialize the EBT transformer.
 
-        Attributes:
-            params (EBTModelArgs): Model configuration parameters.
-            n_layers (int): Number of layers in the model.
-            layers (torch.nn.ModuleList): List of Transformer blocks.
-            norm (RMSNorm): Layer normalization for the model output.
-            output (ColumnParallelLinear): Linear layer for final output.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-
+        :param params: Model configuration.
+        :type params: EBTModelArgs
+        :param max_mcmc_steps: Maximum MCMC step count used to size the time
+            embedding table.
+        :type max_mcmc_steps: int
+        :param gradient_checkpointing: Enable gradient checkpointing when
+            ``True``.
+        :type gradient_checkpointing: bool
+        :param use_mcmc_time_embed: When ``True``, use per-step time
+            embeddings (original behavior). When ``False``, all MCMC steps
+            share the same transition kernel, enabling arbitrary inference
+            step counts.
+        :type use_mcmc_time_embed: bool
+        :raises ValueError: If ``params.ebt_norm`` is not one of the
+            supported norm names.
         """
         super().__init__()
         self.params = params
@@ -783,21 +927,30 @@ class EBTTimeConcat(nn.Module):
         self,
         embeddings: torch.Tensor,
         start_pos: int,
-        mcmc_step=0,
+        mcmc_step: int = 0,
         real_token_ids: Optional[torch.Tensor] = None,
         predicted_tokens: Optional[torch.Tensor] = None,
-    ):
-        """
-        Perform a forward pass through the Transformer model.
+    ) -> torch.Tensor:
+        """Perform a forward pass through the EBT transformer.
 
-        Args:
-            embeds (torch.Tensor): Embeddings (instead of tokens since is for vision).
-            start_pos (int): Starting position for attention caching.
-            mcmc_step (int): Current MCMC step index, used for time embeddings.
-
-        Returns:
-            torch.Tensor: Output energies after applying the Transformer model.
-
+        :param embeddings: Token embeddings of shape
+            ``(B, 2*(S-1), D)`` (plus one extra time-embedding row when
+            ``use_mcmc_time_embed`` is enabled).
+        :type embeddings: torch.Tensor
+        :param start_pos: Starting position for attention caching.
+        :type start_pos: int
+        :param mcmc_step: Current MCMC step index used to index the time
+            embedding table.
+        :type mcmc_step: int
+        :param real_token_ids: Optional tensor of real-token ids used by
+            Value Embeddings.
+        :type real_token_ids: Optional[torch.Tensor]
+        :param predicted_tokens: Optional tensor of predicted token ids used
+            by Value Embeddings.
+        :type predicted_tokens: Optional[torch.Tensor]
+        :return: Per-position energies for the predicted half of the
+            sequence, shape ``(B, S-1, 1)``.
+        :rtype: torch.Tensor
         """
         _bsz = embeddings.shape[0]
 

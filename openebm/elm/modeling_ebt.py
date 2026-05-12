@@ -1,10 +1,20 @@
+"""Energy-Based Transformer (EBT) language model.
+
+This module defines :class:`EBT_NLP`, a LightningModule-based language model
+that refines predicted token distributions through MCMC-style iterative
+energy minimization. At each step the model takes the gradient of a scalar
+energy with respect to the predicted logits and updates them, optionally
+with Langevin-style noise and gradient clamping. The module also exposes a
+contrastive energy loss and a multi-sample advanced inference loop with
+energy-based best-sample selection.
+"""
+
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 from openebm.elm.nanolightning.torchlightning_module import LightningModule
-# import torch.optim as optim
-# from torchmetrics import Accuracy
-# from transformers import AutoTokenizer
 
 import math
 import random
@@ -17,19 +27,38 @@ from openebm.elm.metrics import calculate_bpb_score
 import ipdb
 
 class EBT_NLP(LightningModule):
-    def __init__(self, hparams):
+    """Energy-Based Transformer for next-token prediction.
+
+    The model predicts a distribution over the vocabulary for each position
+    by iteratively minimizing a scalar energy produced by an internal
+    transformer. MCMC-style updates alternate between computing the
+    gradient of the energy with respect to the current predicted logits and
+    taking a step in the descent direction, optionally with Langevin noise.
+
+    :param hparams: hyperparameters container, either a ``dict`` loaded from
+        a checkpoint or an object whose attributes are copied via ``vars``.
+    :type hparams: Any
+    """
+
+    def __init__(self, hparams: Any) -> None:
+        """Initialize embeddings, transformer, replay buffer, and MCMC state.
+
+        :param hparams: hyperparameters, as dict (from ckpt) or namespace.
+        :type hparams: Any
+        """
         super().__init__()
-        if isinstance(hparams, dict):#passed in from model ckpt
+        if isinstance(hparams, dict):
             self.hparams.update(hparams)
         else:
             self.hparams.update(vars(hparams))
-        
-        # tokenizer = AutoTokenizer.from_pretrained(self.hparams.tokenizer, clean_up_tokenization_spaces = False)
-        # Use tokenizer_obj if available (set by ModelTrainer), otherwise use tokenizer directly
-        self.tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
-        self.tokenizer_pad_token_id = None # Nanochat doesn't have <|pad|> or <|eos|> # self.tokenizer.eos_token_id
 
-        self.vocab_size = self.tokenizer.get_vocab_size() # len(self.tokenizer) # self.vocab_size = self.tokenizer.vocab_size caused errors since is smaller than len(self.tokenizer), is 50254 for neox-20b, len tokenizer is 50277 so decided to use that
+        # NOTE: prefer tokenizer_obj when set by ModelTrainer, otherwise fall back to raw tokenizer
+        self.tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
+        self.tokenizer_pad_token_id = None # NOTE: Nanochat tokenizer has no explicit <|pad|>/<|eos|> id
+
+        # NOTE: use tokenizer.get_vocab_size() rather than vocab_size attr; the attr underreports
+        # (e.g. neox-20b: 50254 vs len(tokenizer) 50277) so we consistently use the full size.
+        self.vocab_size = self.tokenizer.get_vocab_size()
         self.hparams.vocab_size = self.vocab_size
         
         if self.hparams.mcmc_step_size_learnable and getattr(self.hparams, 'mcmc_step_size_per_step', False):
@@ -44,11 +73,11 @@ class EBT_NLP(LightningModule):
 
         self.embeddings = nn.Embedding(self.vocab_size, self.hparams.embedding_dim)
         init_whole_model_weights(self.embeddings, self.hparams.weight_initialization_method, weight_initialization_gain=self.hparams.weight_initialization_gain)
-        
+
         self.log_softmax = nn.LogSoftmax(dim = -1)
         self.softmax = nn.Softmax(dim = -1)
-        
-        if not self.hparams.vocab_to_embed_uses_prob_dist: # if are not using the prob dist * embed as vocab to embed
+
+        if not self.hparams.vocab_to_embed_uses_prob_dist:
             if 'learnable_process_memory' in self.hparams and self.hparams.learnable_process_memory and self.hparams.process_memory_type != None:
                 self.vocab_to_embed = Memory_Gating_MLP(self.vocab_size, self.hparams.embedding_dim, self.hparams.process_memory_type, self.hparams.process_memory_linear_layer)
             elif 'learnable_process_memory' in self.hparams and self.hparams.learnable_process_memory:
@@ -57,11 +86,12 @@ class EBT_NLP(LightningModule):
             elif self.hparams.num_modality_processing_mlp_layers != 1:
                 self.vocab_to_embed = MLP(self.vocab_size, self.hparams.embedding_dim, self.hparams.embedding_dim, dropout_rate=0, layer_norm=True, num_hidden_layers = self.hparams.num_modality_processing_mlp_layers - 2)
             else:
-                self.vocab_to_embed = nn.Linear(self.vocab_size, self.hparams.embedding_dim, bias = False, device = self.device) #NOTE this is ebt special, since we want to input a prob dist and pred this prob dist but the transformer needs an embedding as input
+                # NOTE: EBT-specific: we feed a prob dist through a linear projection instead of an embedding lookup
+                self.vocab_to_embed = nn.Linear(self.vocab_size, self.hparams.embedding_dim, bias = False, device = self.device)
             init_whole_model_weights(self.vocab_to_embed, self.hparams.weight_initialization_method, weight_initialization_gain=self.hparams.weight_initialization_gain)
 
         self.transformer = setup_ebt(self.hparams)
-        
+
         self.finished_warming_up = False
 
         self.mcmc_replay_buffer = 'mcmc_replay_buffer' in self.hparams and self.hparams.mcmc_replay_buffer and self.hparams.execution_mode != "inference"

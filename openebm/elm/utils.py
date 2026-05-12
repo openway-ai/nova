@@ -1,32 +1,50 @@
+"""Utility helpers for Energy-Based Transformer (EBT) models.
+
+This module provides shared building blocks used across the OpenEBM/ELM
+training stack, including:
+
+* :class:`EBTModelArgs` — dataclass holding EBT model hyperparameters.
+* Model size presets (``model_sizes``) and nanochat depth-based auto-scaling.
+* Small reusable modules (:class:`ResidualBlock`, :class:`MLP`,
+  :class:`Memory_Augmented_MLP`, :class:`Memory_Gating_MLP`).
+* Factory helpers (:func:`setup_ebt`, :func:`setup_transformer`).
+* Numerical / training utilities: weight initialisation, denormalisation,
+  hinged MSE loss, tokenizer-based subsequence search, WandB watch setup,
+  StyleGAN-V FVD/FID invocation, and DiT-style sinusoidal position embeddings.
+"""
+
 import torch
 from torch import nn
 import numpy as np
 import traceback
 import math
-from typing import Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from dataclasses import dataclass
-
-# from torch.nn import functional as F
-# import pytorch_lightning as L
-# import torch.optim as optim
-# from torchmetrics import Accuracy
-# from torchvision.transforms import functional as TF
-# import torchvision.models as models
-# from diffusers import AutoencoderKL
-# import random
-# from functools import partial
-# from PIL import Image
-# import torchvision
-# from torchvision.transforms import ToPILImage
-# from datetime import datetime
-# import torch.distributed as dist
-# import os
-# from torchvision.utils import make_grid, save_image
-# import json
 
 
 @dataclass
 class EBTModelArgs:
+    """Hyperparameters for an Energy-Based Transformer backbone.
+
+    :ivar dim: Transformer hidden size.
+    :ivar n_layers: Number of transformer blocks.
+    :ivar n_heads: Number of attention heads.
+    :ivar n_kv_heads: Optional number of key/value heads for GQA.
+    :ivar vocab_size: Vocabulary size of the token embedding table.
+    :ivar use_ve: Whether to use the value-embedding variant.
+    :ivar ffn_dim_multiplier: Optional multiplier for the feed-forward hidden dim.
+    :ivar norm_eps: Epsilon for normalisation layers.
+    :ivar dyt_alpha_init: Initial alpha for dynamic tanh (DyT) normalisation.
+    :ivar max_batch_size: Maximum batch size used for pre-allocated buffers.
+    :ivar max_seq_len: Maximum sequence length supported by positional buffers.
+    :ivar weight_initialization: Weight initialisation method (``"xavier"`` or ``"he"``).
+    :ivar adaln_zero_init: Whether AdaLN layers should be zero-initialised.
+    :ivar ebt_norm: Normalisation type to use inside EBT blocks.
+    :ivar ebt_act_func: Activation function inside EBT blocks.
+    :ivar weight_initialization_gain: Multiplicative gain applied after init.
+    :ivar use_mcmc_time_embed: Whether to append an MCMC step time embedding token.
+    """
+
     dim: int = 768
     n_layers: int = 12
     n_heads: int = 12
@@ -47,69 +65,80 @@ class EBTModelArgs:
     use_sdpa_attention: bool = False
     float_precision: str = "32-true"
 
-# nanochat depth-based auto-scaling
-# base_dim = depth * aspect_ratio # aspect_ratio = 64
-# head_dim = 128
-# embedding_dim = ((base_dim + head_dim - 1) // head_dim) * head_dim
-# num_heads = model_dim // head_dim
+# nanochat depth-based auto-scaling:
+#   base_dim       = depth * aspect_ratio     (aspect_ratio = 64)
+#   head_dim       = 128
+#   embedding_dim  = round_up(base_dim, head_dim)
+#   num_heads      = embedding_dim // head_dim
 
 NANOCHAT_HEAD_DIM = 128
 
-def nanochat_depth_scaling(depth, aspect_ratio=64):
+def nanochat_depth_scaling(depth: int, aspect_ratio: int = 64) -> Dict[str, int]:
+    """Compute nanochat-style model dimensions from a target depth.
+
+    :param depth: Number of transformer blocks.
+    :param aspect_ratio: Ratio between the base dimension and depth.
+    :returns: Dict with ``num_transformer_blocks``, ``embedding_dim`` and
+        ``multiheaded_attention_heads`` ready to splice into a hparams dict.
+    """
     base_dim = depth * aspect_ratio
     head_dim = NANOCHAT_HEAD_DIM
     embedding_dim = ((base_dim + head_dim - 1) // head_dim) * head_dim
     num_heads = embedding_dim // head_dim
     return {
         "num_transformer_blocks": depth,
-        "embedding_dim": embedding_dim, 
+        "embedding_dim": embedding_dim,
         "multiheaded_attention_heads": num_heads,
     }
 
 
-model_sizes = { # small -> xl same as mamba https://arxiv.org/pdf/2312.00752; all others estimated empirically. LRs based off mamba where applicable
+# Preset model sizes. ``small`` through ``xl`` mirror the Mamba reference
+# configurations (https://arxiv.org/pdf/2312.00752); the smaller variants and
+# ``d26`` are estimated empirically. Recommended LRs are kept inline for
+# convenience when scaling up runs.
+model_sizes = {
 
-    "4xs": { # LR 0.0024 recommended
+    "4xs": {  # LR 0.0024 recommended
         "num_transformer_blocks": 2,
         "multiheaded_attention_heads": 2,
         "embedding_dim": 128,
     },
-    "3xs": { # LR 0.0018
+    "3xs": {  # LR 0.0018
         "num_transformer_blocks": 4,
         "multiheaded_attention_heads": 4,
         "embedding_dim": 256,
     },
-    "xxs": { # LR 0.0012
+    "xxs": {  # LR 0.0012
         "num_transformer_blocks": 6,
         "multiheaded_attention_heads": 6,
         "embedding_dim": 384,
     },
-    "2xs": { # LR 0.0012
+    "2xs": {  # LR 0.0012
         "num_transformer_blocks": 6,
         "multiheaded_attention_heads": 6,
         "embedding_dim": 384,
     },
-    "xs": { # LR 0.0009
+    "xs": {  # LR 0.0009
         "num_transformer_blocks": 12,
         "multiheaded_attention_heads": 6,
         "embedding_dim": 384,
     },
-    "small": { # LR 0.0006
+    "small": {  # LR 0.0006
         "num_transformer_blocks": 12,
         "multiheaded_attention_heads": 12,
         "embedding_dim": 768,
     },
-    "medium": { # 0.0003
+    "medium": {  # LR 0.0003
         "num_transformer_blocks": 24,
         "multiheaded_attention_heads": 16,
         "embedding_dim": 1024,
     },
-    "large": { # 0.00025
+    "large": {  # LR 0.00025
         "num_transformer_blocks": 24,
         "multiheaded_attention_heads": 16,
         "embedding_dim": 1536,
     },
-    "xl": { # 0.0002
+    "xl": {  # LR 0.0002
         "num_transformer_blocks": 24,
         "multiheaded_attention_heads": 32,
         "embedding_dim": 2048,
@@ -122,22 +151,34 @@ model_sizes = { # small -> xl same as mamba https://arxiv.org/pdf/2312.00752; al
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, hidden_size, dropout_rate):
+    """Linear -> ReLU -> Dropout residual block preserving the feature dim."""
+
+    def __init__(self, hidden_size: int, dropout_rate: float):
         super(ResidualBlock, self).__init__()
         self.linear = nn.Linear(hidden_size, hidden_size, bias=False)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout_rate)
-        
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.linear(x)
         out = self.relu(out)
         out = self.dropout(out)
-        return x + out  # Add the residual connection
+        return x + out  # residual connection
 
 class MLP(nn.Module):
-    def __init__(self, input_size, hidden_size, final_size, dropout_rate, layer_norm, num_hidden_layers=1):
+    """Configurable feed-forward MLP with optional residual connections.
+
+    :param input_size: Input feature dimension.
+    :param hidden_size: Hidden feature dimension.
+    :param final_size: Output feature dimension.
+    :param dropout_rate: Dropout probability applied between layers.
+    :param layer_norm: Whether to apply LayerNorm after the first linear.
+    :param num_hidden_layers: Total number of hidden layer slots (>=1).
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, final_size: int, dropout_rate: float, layer_norm: bool, num_hidden_layers: int = 1):
         super(MLP, self).__init__()
-        self.add_residual_connections = True  # Residual connections are always on by default
+        self.add_residual_connections = True  # always on by default
         self.layers = nn.ModuleList()
 
         # Initial layer
@@ -165,15 +206,22 @@ class MLP(nn.Module):
         else:
             self.layers.append(nn.Linear(hidden_size, final_size, bias=False))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
             x = layer(x)
         return x
-    
+
 class Memory_Augmented_MLP(nn.Module):
-    def __init__(self, input_modality_size, memory_size, input_modality_hidden_size, final_size, dropout_rate, layer_norm, num_hidden_layers=1):
+    """MLP that fuses an input embedding with a learned memory vector.
+
+    The input is first projected to ``input_modality_hidden_size`` and then
+    concatenated with a single learned memory embedding before going through
+    the fusion MLP stack.
+    """
+
+    def __init__(self, input_modality_size: int, memory_size: int, input_modality_hidden_size: int, final_size: int, dropout_rate: float, layer_norm: bool, num_hidden_layers: int = 1):
         super(Memory_Augmented_MLP, self).__init__()
-        self.add_residual_connections = True  # Residual connections are always on by default
+        self.add_residual_connections = True  # always on by default
         self.input_layers = nn.ModuleList()
         self.memory_size = memory_size
 
@@ -208,22 +256,32 @@ class Memory_Augmented_MLP(nn.Module):
         else:
             self.fusion_layers.append(nn.Linear(self.fusion_hidden_size, final_size, bias=False))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length = x.shape[0], x.shape[1]
         for layer in self.input_layers:
             x = layer(x)
-        
+
         memory_embedding = self.memory.weight[0]
         memory_embedding = memory_embedding.unsqueeze(0).unsqueeze(0).expand(batch_size, sequence_length, self.memory_size)
-        fused_x = torch.cat((x, memory_embedding), dim=-1) # B, S, H + M (where H is hidden size M is memory size)
-        
+        fused_x = torch.cat((x, memory_embedding), dim=-1)  # (B, S, H + M) where H is hidden size, M is memory size
+
         for layer in self.fusion_layers:
             fused_x = layer(fused_x)
-        
+
         return fused_x
-    
+
 class Memory_Gating_MLP(nn.Module):
-    def __init__(self, input_modality_size, embedding_dim, process_memory_type = "add", process_memory_linear_layer = False):
+    """Combine a vocabulary embedding with a learned memory vector.
+
+    :param input_modality_size: Input vocabulary / feature dimension.
+    :param embedding_dim: Target embedding dimension.
+    :param process_memory_type: How to mix memory and input embeddings —
+        ``"add"``, ``"gate"``, or ``"residual_gate"``.
+    :param process_memory_linear_layer: If True, apply a linear transform to
+        the memory embedding before mixing.
+    """
+
+    def __init__(self, input_modality_size: int, embedding_dim: int, process_memory_type: str = "add", process_memory_linear_layer: bool = False):
         super(Memory_Gating_MLP, self).__init__()
         self.vocab_to_embed = nn.Linear(input_modality_size, embedding_dim, bias = False)
         self.memory = nn.Embedding(1, embedding_dim)
@@ -232,13 +290,13 @@ class Memory_Gating_MLP(nn.Module):
             self.memory_linear_layer = nn.Linear(embedding_dim, embedding_dim, bias = False)
         self.process_memory_type = process_memory_type
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         vocab_embeds = self.vocab_to_embed(x)
         memory_embedding = self.memory.weight[0]
         memory_embedding = memory_embedding.unsqueeze(0).unsqueeze(0).expand_as(vocab_embeds)
         if self.process_memory_linear_layer:
             memory_embedding = self.memory_linear_layer(memory_embedding)
-        
+
         if self.process_memory_type == "add":
             final_embeddings = vocab_embeds + memory_embedding
         elif self.process_memory_type == "gate":
@@ -251,32 +309,36 @@ class Memory_Gating_MLP(nn.Module):
         return final_embeddings
 
 
-def calc_out_of_bounds_loss(energy): # gives loss for < 0 or > 1
+def calc_out_of_bounds_loss(energy: torch.Tensor) -> torch.Tensor:
+    """Penalise energies that fall outside the ``[0, 1]`` interval.
+
+    :param energy: Tensor of predicted energies.
+    :returns: Scalar mean absolute deviation from the ``[0, 1]`` range.
+    """
     lower_bound_loss = torch.abs(energy)
     upper_bound_loss = torch.abs(energy - 1)
-    loss = torch.where(energy < 0, lower_bound_loss, 
+    loss = torch.where(energy < 0, lower_bound_loss,
                     torch.where(energy > 1, upper_bound_loss, torch.zeros_like(energy)))
     loss = torch.mean(loss)
-    
+
     return loss
 
-# def log_pred_futures(futures, device, dataset_name, i, denormalize):
-#     denormalized_futures = denormalize(futures.clone(), dataset_name, device = device)
+def denormalize(tensor: torch.Tensor, dataset_name: str, device: Any, custom_normalization: bool, vae_normalization: bool = False) -> torch.Tensor:
+    """Reverse dataset-specific and default ImageNet-style normalisation.
 
-#     to_pil = ToPILImage()
-#     for b in range(denormalized_futures.shape[0]):  # Loop over the batch size
-#         if b % 16 == 0:
-#             for s in range(denormalized_futures.shape[1]):  # Loop over the sequence length
-#                 frame_to_save = to_pil(denormalized_futures[b, s].cpu())  # Extract a frame (C x W x H)
-                
-#                 # Save the image
-#                 current_time = datetime.now().strftime("%H_%M_%S")
-#                 frame_to_save.save(f"./logs/debug/mcmc_futures/{current_time}_batch_{b}_seq_{s}_dev_{device}_iter_{i}.png")
-
-def denormalize(tensor, dataset_name, device, custom_normalization, vae_normalization=False):
+    :param tensor: Tensor shaped ``(B, T, C, H, W)`` to denormalise.
+    :param dataset_name: Dataset key used to select per-dataset statistics.
+    :param device: Torch device on which the mean/std tensors are placed.
+    :param custom_normalization: If True, reverse the dataset-specific
+        normalisation stored in ``normal_lookup`` first.
+    :param vae_normalization: If True, use ``[0.5, 0.5, 0.5]`` mean/std
+        (SD-VAE convention) instead of the ImageNet defaults for the final
+        stage.
+    :returns: Denormalised tensor on the same device.
+    """
     tensor = tensor.clone().detach()
 
-    # Define default normalization values
+    # Default ImageNet mean/std
     default_mean = [0.485, 0.456, 0.406]
     default_std = [0.229, 0.224, 0.225]
     default_mean = torch.tensor(default_mean, device=device).view(1, 1, 3, 1, 1)
@@ -293,54 +355,58 @@ def denormalize(tensor, dataset_name, device, custom_normalization, vae_normaliz
         }
         dataset_std, dataset_mean = normal_lookup.get(dataset_name, ([1, 1, 1], [0, 0, 0]))
 
-        # Convert means and stds to tensors and reshape for broadcast compatibility
+        # Convert to tensors and reshape for broadcast compatibility
         dataset_mean = torch.tensor(dataset_mean, device=device).view(1, 1, 3, 1, 1)
         dataset_std = torch.tensor(dataset_std, device=device).view(1, 1, 3, 1, 1)
-        
 
-        # Perform denormalization
+
         # First reverse the dataset-specific normalization
         tensor = tensor * dataset_std + dataset_mean
-    
+
     # Then reverse the default normalization
     if vae_normalization:
-        default_mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 1, 3, 1, 1) 
+        default_mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 1, 3, 1, 1)
         default_std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 1, 3, 1, 1)
         tensor = tensor * default_std + default_mean
         return tensor
     else:
         return tensor * default_std + default_mean
 
-def scale_clamp(tensor, min_value, max_value):
+def scale_clamp(tensor: torch.Tensor, min_value: float, max_value: float) -> torch.Tensor:
+    """Scale ``tensor`` so out-of-range values map back onto ``[min, max]``.
+
+    Unlike :func:`torch.clamp`, this preserves the relative magnitude of
+    values outside the interval by dividing by the per-element overshoot ratio.
+    """
     scale_factor = torch.ones_like(tensor)
     scale_factor = torch.where(tensor > max_value, tensor / max_value, scale_factor)
     scale_factor = torch.where(tensor < min_value, tensor / min_value, scale_factor)
-    
+
     scaled_tensor = tensor / scale_factor
     return scaled_tensor
 
-# def load_trained_pl_model(ckpt_path, new_hparams, for_inference = False):
-#     from base_model_trainer import ModelTrainer
-#     checkpoint = torch.load(ckpt_path, weights_only=False)
-#     model = ModelTrainer(new_hparams)
-#     model.load_state_dict(checkpoint['state_dict'])
-#     if for_inference:
-#         model.cuda().eval()
-#         model.model.eval()
-#     return model.model
-
-def print_model_layers_and_status(model):
+def print_model_layers_and_status(model: nn.Module) -> None:
+    """Print every submodule's name, type and current training mode."""
     for name, module in model.named_modules():
         print(f'Layer: {name}, Type: {type(module).__name__}, Training Mode: {module.training}')
 
-def init_whole_model_weights(model, weight_initialization_method, nonlinearity='linear', weight_initialization_gain=1.0):
-    def init_weights(m):
+def init_whole_model_weights(model: nn.Module, weight_initialization_method: str, nonlinearity: str = 'linear', weight_initialization_gain: float = 1.0) -> None:
+    """Apply a chosen weight initialisation to every ``nn.Linear`` in ``model``.
+
+    :param model: Module whose linear layers will be (re-)initialised in place.
+    :param weight_initialization_method: Either ``"he"`` (Kaiming normal) or
+        ``"xavier"`` (Xavier normal).
+    :param nonlinearity: Only used for ``"he"``; one of
+        ``['linear', 'relu', 'leaky_relu', 'selu', 'tanh']``.
+    :param weight_initialization_gain: Multiplicative gain applied after init.
+    """
+    def init_weights(m: nn.Module) -> None:
         if isinstance(m, nn.Linear):
             if weight_initialization_method == "he":
                 valid_nonlinearities = ['linear', 'relu', 'leaky_relu', 'selu', 'tanh']
                 if nonlinearity not in valid_nonlinearities:
                     raise ValueError(f"Unsupported nonlinearity: {nonlinearity}. Must be one of {valid_nonlinearities}")
-                
+
                 nn.init.kaiming_normal_(m.weight, nonlinearity=nonlinearity)
                 if weight_initialization_gain != 1.0:
                     m.weight.data *= weight_initialization_gain
@@ -354,7 +420,7 @@ def init_whole_model_weights(model, weight_initialization_method, nonlinearity='
                     nn.init.constant_(m.bias, 0.)
             else:
                 raise ValueError(f"Unknown weight init method: {weight_initialization_method}")
-    
+
     model.apply(init_weights)
 
 
@@ -392,63 +458,84 @@ def init_whole_model_weights(model, weight_initialization_method, nonlinearity='
 #                 return image_encoder.encode(batch).latent_dist.mean.mul_(0.18215) # constant following SDXL VAE https://github.com/CompVis/stable-diffusion
 
     
-def hinged_mse_loss(predictions, targets, margin=0.1):
-    """
-    Compute the Hinged MSE loss between predictions and targets.
+def hinged_mse_loss(predictions: torch.Tensor, targets: torch.Tensor, margin: float = 0.1) -> torch.Tensor:
+    """Compute a hinged MSE loss: errors within ``margin`` are ignored.
+
     :param predictions: Predicted values.
     :param targets: Ground truth values.
-    :param margin: The threshold below which errors are ignored.
-    :return: Hinged MSE loss.
+    :param margin: Threshold below which errors contribute zero loss.
+    :returns: Scalar loss tensor.
     """
     errors = torch.abs(predictions - targets)
     hinged_errors = torch.where(errors > margin, errors, torch.zeros_like(errors))
     loss = torch.mean(hinged_errors ** 2)
     return loss
 
-def find_subsequences(input_tensor, sub_seq):
+def find_subsequences(input_tensor: torch.Tensor, sub_seq: List[int]) -> torch.Tensor:
+    """Locate the first occurrence of ``sub_seq`` in each row of ``input_tensor``.
+
+    :param input_tensor: Tensor of shape ``(batch, seq_len)``.
+    :param sub_seq: Sequence of token ids to search for.
+    :returns: LongTensor of shape ``(batch,)`` giving the start index of the
+        first match in each row.
+    :raises ValueError: If ``sub_seq`` is missing from any row.
+    """
     sub_seq_len = len(sub_seq)
     batch_size, seq_len = input_tensor.shape
     sub_seq_tensor = torch.tensor(sub_seq, device=input_tensor.device)
     sub_seq_tensor = sub_seq_tensor.view(1, -1)
     windows = input_tensor.unfold(1, sub_seq_len, 1)
     matches = (windows == sub_seq_tensor).all(dim=2).long()
-    
+
     if not matches.any(dim=1).all():
         raise ValueError("Sub-sequence not found in one or more sequences.")
-    
+
     start_positions = matches.argmax(dim=1)
     return start_positions
 
-def mask_q_tokens(input_tensor, tokenizer):
-    '''
-    input_tensor = [batch size, seq len]
-    '''
+def mask_q_tokens(input_tensor: torch.Tensor, tokenizer: Any) -> torch.Tensor:
+    """Mask the question tokens (before ``[[Answer]]:``) with the pad token.
+
+    :param input_tensor: Tensor of shape ``(batch_size, seq_len)``.
+    :param tokenizer: Tokenizer exposing ``encode`` and ``pad_token_id``.
+    :returns: Same-shaped tensor with question-side tokens replaced by pad.
+    """
     batch_size = input_tensor.shape[0]
     seq_length = input_tensor.shape[1]
     answer_tag = tokenizer.encode("[[Answer]]:", add_special_tokens=True)
-    
+
     answer_start_pos = find_subsequences(input_tensor, answer_tag)
     answer_start_pos += len(answer_tag)
     mask = torch.arange(seq_length, device=input_tensor.device).expand(batch_size, seq_length)
     mask = mask < answer_start_pos.unsqueeze(1)
     input_tensor = torch.where(mask, tokenizer.pad_token_id, input_tensor)
-    
+
     return input_tensor
 
-def analyse_tokens(input_tensor, tokenizer):
-    '''for debugging only'''
+def analyse_tokens(input_tensor: torch.Tensor, tokenizer: Any) -> None:
+    """Print token ids and decoded text for each row of ``input_tensor``.
+
+    Intended for debugging only.
+    """
     decode = tokenizer.batch_decode(input_tensor, skip_special_tokens=True)
     for i in range(input_tensor.shape[0]):
         print(input_tensor[i].tolist())
         print(decode[i])
         print('-'*60)
 
-def setup_ebt(hparams): # specifically for EBT not for baseline transformer
-    # to prevent circular import
+def setup_ebt(hparams: Any) -> nn.Module:
+    """Instantiate an EBT backbone from a hyperparameter namespace.
 
-    max_seq_len = hparams.context_length+1 # for next pred in context
+    Only used for EBT variants (not the baseline transformer). The specific
+    class is selected from ``hparams.ebt_type`` (``"default"``, ``"time_embed"``
+    or AdaLN variants).
+    """
+    # Imports are local to avoid circular imports at module load time.
+
+    max_seq_len = hparams.context_length + 1  # +1 for next-token prediction in-context
     use_mcmc_time_embed = getattr(hparams, 'use_mcmc_time_embed', False)
-    max_seq_len = max_seq_len + 1 if (hparams.ebt_type == "time_embed" and use_mcmc_time_embed) else max_seq_len # need +1 only when time embed is actually used
+    # +1 more only when an MCMC time-embed token is actually appended
+    max_seq_len = max_seq_len + 1 if (hparams.ebt_type == "time_embed" and use_mcmc_time_embed) else max_seq_len
 
     adaln_zero_init = True if hparams.ebt_type == "adaln_zero" else False
     missing_attrs = [name for name in ("use_ve", "vocab_size") if not hasattr(hparams, name)]
@@ -462,41 +549,51 @@ def setup_ebt(hparams): # specifically for EBT not for baseline transformer
     if hparams.ebt_type == "default": # causal decoder trans for ebm https://arxiv.org/abs/2406.08862
         from openebm.elm.ar_ebt_default import EBTDefault
         ebt = EBTDefault(params=transformer_args)
-    elif hparams.ebt_type == "time_embed": # time embed
+    elif hparams.ebt_type == "time_embed":  # MCMC-step time embedding variant
         if getattr(hparams, 'use_sdpa_attention', False):
             from openebm.elm.ar_ebt_time_embed_sdpa_math import EBTTimeConcat
         else:
             from openebm.elm.ar_ebt_time_embed import EBTTimeConcat
         gradient_checkpointing = getattr(hparams, 'gradient_checkpointing', False)
         ebt = EBTTimeConcat(params=transformer_args, max_mcmc_steps=hparams.mcmc_num_steps, gradient_checkpointing=gradient_checkpointing, use_mcmc_time_embed=use_mcmc_time_embed)
-    else: # adaln or adaln_zero
+    else:  # AdaLN / AdaLN-zero variants
         from openebm.elm.ar_ebt_adaln import EBTAdaLN
         ebt = EBTAdaLN(params=transformer_args, max_mcmc_steps = hparams.mcmc_num_steps)
 
     return ebt
 
-def setup_transformer(hparams): # specifically for baseline transformer
+def setup_transformer(hparams: Any) -> nn.Module:
+    """Instantiate the baseline (non-EBT) transformer from ``hparams``."""
     from openebm.elm.ar_transformer import Transformer, TransformerModelArgs
     transformer_args = TransformerModelArgs(dim = hparams.embedding_dim, n_layers = hparams.num_transformer_blocks, n_heads = hparams.multiheaded_attention_heads, max_batch_size = hparams.batch_size_per_device, max_seq_len=hparams.context_length, weight_initialization = hparams.weight_initialization_method, ffn_dim_multiplier=hparams.ffn_dim_multiplier, weight_initialization_gain=hparams.weight_initialization_gain)
     transformer = Transformer(params=transformer_args)
     return transformer
 
-def has_layer_norm(model):
+def has_layer_norm(model: nn.Module) -> bool:
+    """Return True iff ``model`` contains at least one :class:`nn.LayerNorm`."""
     return any(isinstance(module, nn.LayerNorm) for _, module in model.named_modules())
 
-def init_wandb_watch(wandb_logger, model_trainer, wandb_watch_log_freq, wandb_watch_level="parameters"):
-    """
-    wandb_watch_level controls what is logged:
-      - "parameters": only log parameter histograms (low overhead)
-      - "gradients": only log gradient histograms
-      - "all": log parameters + gradients (high overhead, debug only)
+def init_wandb_watch(wandb_logger: Any, model_trainer: Any, wandb_watch_log_freq: int, wandb_watch_level: str = "parameters") -> None:
+    """Attach ``wandb.watch`` to a model, routing LayerNorm safely.
+
+    :param wandb_logger: WandB logger exposing a ``watch`` method.
+    :param model_trainer: Lightning-style trainer holding the model at ``.model``.
+    :param wandb_watch_log_freq: Log frequency forwarded to WandB.
+    :param wandb_watch_level: What to log — ``"parameters"`` (low overhead),
+        ``"gradients"`` (gradient histograms only), or ``"all"`` (parameters
+        plus gradients; debug only, high overhead).
+
+    When the model contains :class:`nn.LayerNorm` submodules, LayerNorms are
+    split into a separate watched container forced to ``"parameters"`` mode.
+    This works around a WandB bug where gradient logging raises
+    ``AttributeError: 'NoneType' object has no attribute 'data'`` on LN modules.
     """
     log_mode = wandb_watch_level  # "parameters", "gradients", or "all"
 
     if not has_layer_norm(model_trainer.model):
         wandb_logger.watch(model_trainer.model, log=log_mode, log_freq=wandb_watch_log_freq)
 
-    else: # all of complex below code is to get around the issue where wandb watch with layer norm has 'AttributeError: 'NoneType' object has no attribute 'data'' when logging gradients...
+    else:  # Split LayerNorms into their own container to avoid the WandB gradient-logging bug
         non_layernorm_container = nn.Module()
         layernorm_container = nn.Module()
 
@@ -504,9 +601,9 @@ def init_wandb_watch(wandb_logger, model_trainer, wandb_watch_log_freq, wandb_wa
         ln_modules = {}
 
         for name, module in model_trainer.model.named_modules():
-            if name == "": # skips top level model
+            if name == "":  # skip top-level model
                 continue
-            safe_name = name.replace(".", "_") # model cant contain '.' in name
+            safe_name = name.replace(".", "_")  # module names cannot contain '.'
 
             if isinstance(module, nn.LayerNorm):
                 ln_modules[safe_name] = module
@@ -524,7 +621,7 @@ def init_wandb_watch(wandb_logger, model_trainer, wandb_watch_log_freq, wandb_wa
             layernorm_container.add_module(name, module)
 
         wandb_logger.watch(non_layernorm_container, log=log_mode, log_freq=wandb_watch_log_freq)
-        # LayerNorm always uses "parameters" only to avoid gradient logging bug
+        # LayerNorm always uses "parameters" only to avoid the gradient-logging bug
         ln_log_mode = "parameters" if log_mode in ("gradients", "all") else log_mode
         wandb_logger.watch(layernorm_container, log=ln_log_mode, log_freq=wandb_watch_log_freq)
 

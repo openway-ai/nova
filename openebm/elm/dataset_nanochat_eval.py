@@ -1,48 +1,67 @@
-"""
-Enhanced NanoChat evaluation dataset with dual-mode support:
-1. PPL mode: Full sequence for perplexity calculation
-2. Generation mode: Split sequence (first half as prompt, second half as ground truth)
-"""
-import os, sys
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+"""NanoChat evaluation dataset with dual-mode support.
 
+Supports two evaluation modes on the same cached parquet shards:
 
+- **PPL mode** — full sequence used for perplexity calculation.
+- **Generation mode** — sequence split into a prompt prefix and a ground-truth
+  continuation, for conditional generation benchmarks.
+"""
+
+import os
+import sys
+from typing import Any, Dict, List, Optional, Sequence
+
+import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
-import pyarrow.parquet as pq
-import os
+
 
 class NanoChatShardEvalDataset(Dataset):
-    """
-    Dataset for evaluating NanoChat on specific parquet shards.
+    """Evaluate a NanoChat-tokenized model on selected parquet shards.
 
     Supports two evaluation modes:
-    1. PPL mode: Use full sequence for perplexity calculation
-    2. Generation mode: Split sequence (first half prompt, second half ground truth)
 
-    Args:
-        tokenizer: Tokenizer object
-        context_length: Maximum sequence length (e.g., 256)
-        shard_indices: List of shard indices to evaluate (e.g., [0, 15] for first and last)
-        max_samples_per_shard: Maximum number of samples to take from each shard
-        data_dir: Directory containing parquet files
-        enable_generation: If True, also prepare data for text generation evaluation
-        generation_split_ratio: Ratio to split sequence (default 0.5 = half for prompt, half for GT)
+    - PPL mode: full sequence used for perplexity calculation.
+    - Generation mode: sequence split into a prompt (first half) and a target
+      (second half) used for conditional generation scoring.
     """
 
     def __init__(
         self,
-        tokenizer,
-        context_length=256,
-        shard_indices=[0, 15],
-        max_samples_per_shard=50,
-        data_dir="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/base_data",
-        enable_generation=True,
-        generation_split_ratio=0.5,
-        min_generation_length=64  # Minimum length for generation samples
-    ):
+        tokenizer: Any,
+        context_length: int = 256,
+        shard_indices: Sequence[int] = [0, 15],
+        max_samples_per_shard: int = 50,
+        data_dir: str = "/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/base_data",
+        enable_generation: bool = True,
+        generation_split_ratio: float = 0.5,
+        min_generation_length: int = 64,
+    ) -> None:
+        """Initialize the dataset.
+
+        :param tokenizer: Tokenizer exposing ``encode`` and, optionally,
+            ``decode`` / ``get_bos_token_id``.
+        :type tokenizer: Any
+        :param context_length: Maximum sequence length used for PPL.
+        :type context_length: int
+        :param shard_indices: Indices of the parquet shards to load
+            (e.g. ``[0, 15]`` for the first and last).
+        :type shard_indices: Sequence[int]
+        :param max_samples_per_shard: Maximum samples drawn from each shard.
+        :type max_samples_per_shard: int
+        :param data_dir: Directory containing the ``shard_{idx:05d}.parquet``
+            files.
+        :type data_dir: str
+        :param enable_generation: When ``True``, also emit a prompt/target
+            split suitable for generation evaluation.
+        :type enable_generation: bool
+        :param generation_split_ratio: Fraction of tokens assigned to the
+            prompt (``0.5`` = half/half).
+        :type generation_split_ratio: float
+        :param min_generation_length: Minimum token count required to keep a
+            sample for generation evaluation.
+        :type min_generation_length: int
+        """
         self.tokenizer = tokenizer
         self.context_length = context_length
         self.shard_indices = shard_indices
@@ -52,20 +71,21 @@ class NanoChatShardEvalDataset(Dataset):
         self.generation_split_ratio = generation_split_ratio
         self.min_generation_length = min_generation_length
 
-        # Get BOS token
         if hasattr(tokenizer, 'get_bos_token_id'):
             self.bos_token = tokenizer.get_bos_token_id()
         elif hasattr(tokenizer, 'bos_token_id'):
             self.bos_token = tokenizer.bos_token_id
         else:
-            self.bos_token = 1  # Default
+            self.bos_token = 1
 
-        # Load samples from specified shards
         self.samples = []
         self._load_samples()
 
-    def _load_samples(self):
-        """Load samples from specified shards."""
+    def _load_samples(self) -> None:
+        """Load tokenized samples from each configured shard.
+
+        Populates :attr:`samples` in place and prints a short progress trace.
+        """
         for shard_idx in self.shard_indices:
             shard_file = os.path.join(self.data_dir, f"shard_{shard_idx:05d}.parquet")
 
@@ -88,19 +108,17 @@ class NanoChatShardEvalDataset(Dataset):
                     if samples_from_shard >= self.max_samples_per_shard:
                         break
 
-                    # Tokenize the document
                     if hasattr(self.tokenizer, 'encode'):
-                        # NanoChat tokenizer
                         if hasattr(self.tokenizer, 'enc'):
-                            # RustBPETokenizer
+                            # NanoChat RustBPETokenizer path.
                             tokens = self.tokenizer.encode([text], prepend=self.bos_token, num_threads=1)[0]
                         else:
-                            # HuggingFace tokenizer
+                            # HuggingFace-style tokenizer path.
                             tokens = self.tokenizer.encode(text, add_special_tokens=True)
                     else:
                         raise ValueError("Tokenizer must have encode method")
 
-                    # For generation mode, we need longer sequences
+                    # Generation mode needs longer samples than PPL mode.
                     min_length = self.min_generation_length if self.enable_generation else self.context_length // 2
 
                     if len(tokens) >= min_length:
@@ -115,51 +133,49 @@ class NanoChatShardEvalDataset(Dataset):
 
         print(f"Total samples loaded: {len(self.samples)}")
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of samples loaded across all shards.
+
+        :return: Sample count.
+        :rtype: int
+        """
         return len(self.samples)
 
-    def __getitem__(self, idx):
-        """
-        Returns a sample with both PPL and generation data.
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Return the sample at ``idx``.
 
-        Returns:
-            dict with keys:
-                - 'input_ids': Full sequence for PPL calculation [B, S]
-                - 'text': Original text (truncated for logging)
-                - 'shard_idx': Which shard this came from
-                - 'num_tokens': Total number of tokens
+        The returned dict always contains PPL fields. When
+        ``enable_generation`` is set and the sample is long enough, the dict
+        also contains generation fields.
 
-                If enable_generation=True, also includes:
-                - 'prompt_ids': First half of sequence for generation
-                - 'target_ids': Second half of sequence (ground truth)
-                - 'prompt_text': Decoded prompt text
-                - 'target_text': Decoded target text
+        :param idx: Sample index.
+        :type idx: int
+        :return: Dict with keys ``input_ids`` (full sequence tensor),
+            ``text``, ``shard_idx``, ``num_tokens``, and optionally
+            ``prompt_ids``, ``target_ids``, ``prompt_text``, ``target_text``.
+        :rtype: Dict[str, Any]
         """
         sample = self.samples[idx]
         tokens = sample['tokens']
 
-        # Truncate to context_length if needed
         if len(tokens) > self.context_length:
             tokens = tokens[:self.context_length]
 
-        # Convert to tensor for PPL evaluation
         input_ids = torch.tensor(tokens, dtype=torch.long)
 
         result = {
             'input_ids': input_ids,
-            'text': sample['text'][:500],  # Truncate text for logging
+            'text': sample['text'][:500],
             'shard_idx': sample['shard_idx'],
             'num_tokens': len(tokens)
         }
 
-        # Add generation data if enabled
         if self.enable_generation and len(tokens) >= self.min_generation_length:
-            # Split tokens: first half as prompt, second half as target
             split_point = int(len(tokens) * self.generation_split_ratio)
 
-            # Ensure we have at least some tokens in both parts
-            split_point = max(split_point, 10)  # At least 10 tokens for prompt
-            split_point = min(split_point, len(tokens) - 10)  # At least 10 tokens for target
+            # Enforce at least 10 tokens on each side of the split.
+            split_point = max(split_point, 10)
+            split_point = min(split_point, len(tokens) - 10)
 
             prompt_tokens = tokens[:split_point]
             target_tokens = tokens[split_point:]
@@ -167,17 +183,15 @@ class NanoChatShardEvalDataset(Dataset):
             result['prompt_ids'] = torch.tensor(prompt_tokens, dtype=torch.long)
             result['target_ids'] = torch.tensor(target_tokens, dtype=torch.long)
 
-            # Decode for human-readable logging
             if hasattr(self.tokenizer, 'decode'):
                 try:
                     result['prompt_text'] = self.tokenizer.decode(prompt_tokens, skip_special_tokens=True)
                     result['target_text'] = self.tokenizer.decode(target_tokens, skip_special_tokens=True)
                 except:
-                    # Fallback if decode fails
+                    # Decode failures fall back to a raw character-level split.
                     result['prompt_text'] = sample['text'][:len(sample['text'])//2]
                     result['target_text'] = sample['text'][len(sample['text'])//2:]
             else:
-                # Use raw text split as fallback
                 text_split = int(len(sample['text']) * self.generation_split_ratio)
                 result['prompt_text'] = sample['text'][:text_split]
                 result['target_text'] = sample['text'][text_split:]
@@ -185,29 +199,20 @@ class NanoChatShardEvalDataset(Dataset):
         return result
 
 
-def collate_fn_nanochat_eval(batch):
-    """
-    Collate function for NanoChat evaluation with dual-mode support.
+def collate_fn_nanochat_eval(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collate :class:`NanoChatShardEvalDataset` samples into a batch dict.
 
-    Returns:
-        dict with:
-            - 'input_ids': Padded full sequences for PPL [B, 1, S]
-            - 'attention_mask': Attention mask [B, S]
-            - 'texts': List of original texts
-            - 'shard_indices': List of shard indices
-            - 'num_tokens': List of token counts
-
-            If generation enabled:
-            - 'prompt_ids': Padded prompts [B, S_prompt]
-            - 'target_ids': Padded targets [B, S_target]
-            - 'prompt_attention_mask': Attention mask for prompts
-            - 'prompt_texts': List of prompt texts
-            - 'target_texts': List of target texts
+    :param batch: List of sample dicts produced by :meth:`NanoChatShardEvalDataset.__getitem__`.
+    :type batch: List[Dict[str, Any]]
+    :return: Dict with PPL fields ``input_ids`` (shape ``[B, 1, S]``),
+        ``attention_mask``, ``texts``, ``shard_indices``, ``num_tokens``.
+        When generation data is present in the batch, also includes
+        ``prompt_ids``, ``prompt_attention_mask``, ``prompt_texts``,
+        ``target_texts`` and ``target_ids``.
+    :rtype: Dict[str, Any]
     """
-    # Find max length in this batch for PPL
     max_len = max(item['input_ids'].shape[0] for item in batch)
 
-    # Pad sequences for PPL evaluation
     input_ids_list = []
     attention_mask_list = []
 
@@ -215,13 +220,11 @@ def collate_fn_nanochat_eval(batch):
         seq_len = item['input_ids'].shape[0]
         padding_len = max_len - seq_len
 
-        # Pad with 0 (or use a specific pad token if needed)
         padded_input_ids = torch.cat([
             item['input_ids'],
             torch.zeros(padding_len, dtype=torch.long)
         ])
 
-        # Create attention mask (1 for real tokens, 0 for padding)
         attention_mask = torch.cat([
             torch.ones(seq_len, dtype=torch.long),
             torch.zeros(padding_len, dtype=torch.long)
@@ -230,11 +233,10 @@ def collate_fn_nanochat_eval(batch):
         input_ids_list.append(padded_input_ids)
         attention_mask_list.append(attention_mask)
 
-    # Stack into batch
     input_ids = torch.stack(input_ids_list)
     attention_mask = torch.stack(attention_mask_list)
 
-    # Add channel dimension for compatibility: [B, S] -> [B, 1, S]
+    # Add a channel dimension for compatibility with downstream code: [B, S] -> [B, 1, S].
     input_ids = input_ids.unsqueeze(1)
 
     result = {
@@ -245,9 +247,7 @@ def collate_fn_nanochat_eval(batch):
         'num_tokens': [item['num_tokens'] for item in batch]
     }
 
-    # Add generation data if available
     if 'prompt_ids' in batch[0]:
-        # Pad prompts
         max_prompt_len = max(item['prompt_ids'].shape[0] for item in batch)
         prompt_ids_list = []
         prompt_attention_mask_list = []
@@ -274,7 +274,7 @@ def collate_fn_nanochat_eval(batch):
         result['prompt_texts'] = [item['prompt_text'] for item in batch]
         result['target_texts'] = [item['target_text'] for item in batch]
 
-        # Also include target_ids for reference (no need to pad, just for logging)
+        # Targets are kept as a list (no padding required for logging/scoring).
         result['target_ids'] = [item['target_ids'] for item in batch]
 
     return result
