@@ -172,23 +172,24 @@ class SFTIterableDataset(_IterableDataset):
         def refill_buffer():
             while len(self.conv_buffer) < self.buffer_size:
                 conversation = dataset[self.cursor]
-                ids, _ = self.tokenizer.render_conversation(conversation)
+                ids, mask = self.tokenizer.render_conversation(conversation)
                 self.cursor += ddp_world_size
                 if self.cursor >= dataset_size:
                     self.cursor = self.cursor % dataset_size
                     self.epoch += 1
                 if len(ids) <= self.row_capacity:
-                    self.conv_buffer.append(ids)
+                    self.conv_buffer.append((ids, mask))
 
         while True:
             if self.split == "train" and self.it >= self.max_iter:
                 break
 
             rows = []
-            row_lengths = []
+            row_masks = []
 
             for _ in range(self.B):
                 row = []
+                row_mask = []
                 padded = False
                 while len(row) < self.row_capacity:
                     while len(self.conv_buffer) < self.buffer_size:
@@ -197,35 +198,34 @@ class SFTIterableDataset(_IterableDataset):
 
                     best_idx = -1
                     best_len = 0
-                    for i, conv in enumerate(self.conv_buffer):
-                        conv_len = len(conv)
+                    for i, (conv_ids, conv_mask) in enumerate(self.conv_buffer):
+                        conv_len = len(conv_ids)
                         if conv_len <= remaining and conv_len > best_len:
                             best_idx = i
                             best_len = conv_len
 
                     if best_idx >= 0:
-                        conv = self.conv_buffer.pop(best_idx)
-                        row.extend(conv)
+                        conv_ids, conv_mask = self.conv_buffer.pop(best_idx)
+                        row.extend(conv_ids)
+                        row_mask.extend(conv_mask)
                         self.consumed += ddp_world_size
                     else:
-                        content_len = len(row)
                         remaining = self.row_capacity - len(row)
                         row.extend([bos_token] * remaining)
+                        row_mask.extend([0] * remaining)
                         padded = True
                         break
 
-                if padded:
-                    row_lengths.append(content_len)
-                else:
-                    row_lengths.append(self.row_capacity)
                 rows.append(row[:self.row_capacity])
+                row_masks.append(row_mask[:self.row_capacity])
 
             batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
+            mask_tensor = torch.tensor(row_masks, dtype=torch.bool, pin_memory=use_cuda)
             inputs = batch_tensor[:, :-1].to(device=self.device, dtype=torch.int64, non_blocking=use_cuda)
             targets = batch_tensor[:, 1:].to(device=self.device, dtype=torch.int64, non_blocking=use_cuda)
-            for i, content_len in enumerate(row_lengths):
-                if content_len < self.row_capacity:
-                    targets[i, content_len - 1 :] = -1
+            target_mask = mask_tensor[:, 1:].to(device=self.device, dtype=torch.bool, non_blocking=use_cuda)
+            # Use nanochat's supervision mask directly: only assistant tokens should contribute to loss.
+            targets = targets.masked_fill(~target_mask, -1)
 
             self.it += 1
             self.last_state_dict = self._build_state_dict(copy_buffer=False)

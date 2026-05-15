@@ -246,7 +246,7 @@ class EBT_NLP(LightningModule):
             # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
             # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
 
-        if self.hparams.execution_mode == "finetune": # Only tokens after "[[Answer]]: " will be calculated in finetune
+        if self.hparams.execution_mode == "finetune" and self.hparams.dataset_name != "nanochat_sft": # nanochat_sft masking is handled in the dataloader
             next_token_indices = mask_q_tokens(next_token_indices, self.tokenizer)
         next_token_indices = next_token_indices.reshape(-1) # BS * S; reshape since targets are supposed to be 1D
 
