@@ -338,8 +338,18 @@ def _merge_shards(out_dir: Path, split: str, world_size: int, keep_shards: bool)
     return rows
 
 
-def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_shards: bool):
-    """rank-0 only. Merge shards, write summary/timing/status."""
+def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_shards: bool,
+                      max_error_dumps: int = 0):
+    """rank-0 only. Merge shards, write summary/timing/status.
+
+    v3 additions:
+      - by_givens bucket rollup written under `summary[split]['by_givens']`
+        and as a CSV section.
+      - tail-print of the summary table to stdout (i.e. eval.log via _Tee) so
+        the log is self-contained.
+      - optional dump of the first `max_error_dumps` `fully_solved=False` rows
+        per split under `results/errors/<split>/idx_<i>.json`.
+    """
     if layout['mode'] != 'structured':
         return
     out_dir = layout['out_dir']
@@ -356,8 +366,12 @@ def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_
     overall_filled_correct = 0
     overall_valid_sudoku = 0
 
+    # v3: collect error dumps + per-split rows for by_givens rollup.
+    rows_by_split = {}
+
     for split in splits:
         rows = _merge_shards(out_dir, split, world_size, keep_shards)
+        rows_by_split[split] = rows
         n = len(rows)
         c = sum(int(o.get('correct', 0)) for o in rows)
         t = sum(int(o.get('total', 0)) for o in rows)
@@ -392,6 +406,80 @@ def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_
             'avg_tokens_per_sample': (tokens / n) if n else 0.0,
             'avg_s_per_sample': (elapsed / n) if n else 0.0,
         }
+
+        # v3: by-givens bucket rollup. We bucket on the original puzzle's given count
+        # (`given_total` recorded per sample). Reports cell_acc + solved_pct + n per
+        # bucket so we can see the difficulty gradient (P5 in the v3 plan).
+        by_givens = {}
+        for o in rows:
+            g = int(o.get('given_total', -1))
+            if g <= 0:
+                continue
+            slot = by_givens.setdefault(g, {
+                'n': 0, 'cell_correct': 0, 'cell_total': 0,
+                'parsed': 0, 'fully_solved': 0,
+                'given_correct': 0, 'given_total': 0,
+                'filled_correct': 0, 'filled_total': 0,
+            })
+            slot['n'] += 1
+            slot['cell_correct'] += int(o.get('correct', 0))
+            slot['cell_total'] += int(o.get('total', 0))
+            slot['parsed'] += int(bool(o.get('parsed')))
+            slot['fully_solved'] += int(bool(o.get('fully_solved')))
+            slot['given_correct'] += int(o.get('given_correct', 0))
+            slot['given_total'] += int(o.get('given_total', 0))
+            slot['filled_correct'] += int(o.get('filled_correct', 0))
+            slot['filled_total'] += int(o.get('filled_total', 0))
+        # Densify with rates.
+        for g, slot in by_givens.items():
+            n_g = slot['n']
+            t_g = slot['cell_total']
+            slot['cell_acc'] = (slot['cell_correct'] / t_g) if t_g else 0.0
+            slot['fully_solved_pct'] = (slot['fully_solved'] / n_g) if n_g else 0.0
+            slot['parsed_pct'] = (slot['parsed'] / n_g) if n_g else 0.0
+            slot['given_cell_acc'] = (
+                slot['given_correct'] / slot['given_total']
+            ) if slot['given_total'] else 0.0
+            slot['filled_cell_acc'] = (
+                slot['filled_correct'] / slot['filled_total']
+            ) if slot['filled_total'] else 0.0
+        summary[split]['by_givens'] = {str(k): v for k, v in sorted(by_givens.items())}
+
+        # v3: by-format rollup so we can diagnose grid-vs-flat regression after the fact.
+        by_format = {}
+        for o in rows:
+            pf = o.get('puzzle_format') or 'unknown'
+            slot = by_format.setdefault(pf, {'n': 0, 'cell_correct': 0,
+                                              'cell_total': 0, 'fully_solved': 0})
+            slot['n'] += 1
+            slot['cell_correct'] += int(o.get('correct', 0))
+            slot['cell_total'] += int(o.get('total', 0))
+            slot['fully_solved'] += int(bool(o.get('fully_solved')))
+        for pf, slot in by_format.items():
+            slot['cell_acc'] = (slot['cell_correct'] / slot['cell_total']) \
+                if slot['cell_total'] else 0.0
+            slot['fully_solved_pct'] = (slot['fully_solved'] / slot['n']) \
+                if slot['n'] else 0.0
+        if by_format:
+            summary[split]['by_format'] = by_format
+
+        # v3: error dumps (first N unsolved rows per split) for case-study debugging.
+        if max_error_dumps > 0:
+            err_dir = out_dir / 'results' / 'errors' / split
+            err_dir.mkdir(parents=True, exist_ok=True)
+            dumped = 0
+            for o in rows:
+                if dumped >= max_error_dumps:
+                    break
+                if o.get('fully_solved'):
+                    continue
+                idx = o.get('idx', dumped)
+                try:
+                    with open(err_dir / f'idx_{idx}.json', 'w') as f:
+                        json.dump(o, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+                dumped += 1
         overall_correct += c
         overall_total += t
         overall_parsed += parsed
@@ -451,6 +539,56 @@ def _finalize_outputs(layout: dict, splits, world_size: int, timing: dict, keep_
     with open(out_dir / 'results' / 'timing.json', 'w') as f:
         json.dump(timing, f, indent=2, sort_keys=True)
 
+    # v3: by-givens CSV section per split — writes a separate CSV so the v2 summary.csv
+    # stays byte-clean for any existing parsers.
+    bg_csv_path = out_dir / 'results' / 'by_givens.csv'
+    try:
+        with open(bg_csv_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['split', 'givens', 'n', 'cell_acc', 'fully_solved_pct',
+                        'parsed_pct', 'given_cell_acc', 'filled_cell_acc'])
+            for split in splits:
+                bg = summary.get(split, {}).get('by_givens', {})
+                for g in sorted(bg.keys(), key=lambda x: int(x)):
+                    s = bg[g]
+                    w.writerow([
+                        split, g, s.get('n', 0),
+                        f"{s.get('cell_acc', 0.0):.6f}",
+                        f"{s.get('fully_solved_pct', 0.0):.6f}",
+                        f"{s.get('parsed_pct', 0.0):.6f}",
+                        f"{s.get('given_cell_acc', 0.0):.6f}",
+                        f"{s.get('filled_cell_acc', 0.0):.6f}",
+                    ])
+    except Exception as e:
+        print(f"[eval_sudoku_samples] WARN: failed to write by_givens.csv: {e}")
+
+    # v3: tail-print summary tables to stdout (which is _Tee'd to eval.log) so the log
+    # is self-contained for offline review.
+    try:
+        print()
+        print("================ FINAL SUMMARY (v3) ================")
+        for split in list(splits) + ['overall']:
+            s = summary.get(split, {})
+            print(f"  {split:>8}: n={s.get('n', 0)}  "
+                  f"cell_acc={100 * s.get('cell_acc', 0.0):.2f}%  "
+                  f"solved={100 * s.get('fully_solved_pct', 0.0):.2f}%  "
+                  f"parsed={100 * s.get('parsed_pct', 0.0):.2f}%  "
+                  f"given={100 * s.get('given_cell_acc', 0.0):.2f}%  "
+                  f"filled={100 * s.get('filled_cell_acc', 0.0):.2f}%")
+        print()
+        print("================ BY GIVENS ================")
+        print(f"  {'split':>8} {'g':>4} {'n':>5} {'cell_acc':>10} {'solved%':>9}")
+        for split in splits:
+            bg = summary.get(split, {}).get('by_givens', {})
+            for g in sorted(bg.keys(), key=lambda x: int(x)):
+                s = bg[g]
+                print(f"  {split:>8} {g:>4} {s.get('n', 0):>5} "
+                      f"{100 * s.get('cell_acc', 0.0):>9.2f}% "
+                      f"{100 * s.get('fully_solved_pct', 0.0):>8.2f}%")
+        print("=========================================")
+    except Exception as e:
+        print(f"[eval_sudoku_samples] WARN: tail-print summary failed: {e}")
+
 
 def _write_status(layout: dict, exit_code: int, error: str | None,
                   started_at: str, finished_at: str):
@@ -477,10 +615,25 @@ def _format_board(values):
 
 
 def parse_board(text):
-    nums = [int(x) for x in text.split() if x.isdigit() and len(x) == 1]
-    if len(nums) < 81:
+    """v3: lenient parser that handles both `grid` (space-separated) and `flat`
+    (spaceless 81-digit) outputs, and tolerates preambles like
+    "The solution is:\\n...".
+
+    Strategy:
+      1. Whitespace-split, keep single-digit ints. If we got ≥81 take the last 81.
+      2. Otherwise scan all single-digit chars in the string and take the last 81
+         (the "last" choice handles preambles before the actual solution).
+    Returns a list of 81 ints, or None on failure.
+    """
+    if not text:
         return None
-    return nums[:81]
+    nums = [int(x) for x in text.split() if x.isdigit() and len(x) == 1]
+    if len(nums) >= 81:
+        return nums[-81:]
+    nums = [int(c) for c in text if c.isdigit()]
+    if len(nums) >= 81:
+        return nums[-81:]
+    return None
 
 
 def evaluate_sample(engine, sample, max_tokens: int = 256,
@@ -543,9 +696,36 @@ def evaluate_sample(engine, sample, max_tokens: int = 256,
         'prompt_style': style,
         'prompt_template_idx': tpl_idx,
         'prompt_used': prompt,
+        # v3: format axis. Eval renders the prompt-side puzzle in `grid` format only,
+        # but we still tag the field so `by_format` rollup works once eval is extended
+        # to flat. The model-side response_format is best-effort: "flat" if the parsed
+        # response had no whitespace among the digit run, else "grid".
+        'puzzle_format': 'grid',
+        'solution_format': _infer_response_format(response, pred),
         'elapsed_s': elapsed_s,
         'tokens_generated': tokens_generated,
     }
+
+
+def _infer_response_format(response: Optional[str], pred: Optional[List[int]]) -> str:
+    if response is None or pred is None:
+        return 'unknown'
+    # If the response contains a contiguous 81-digit run with no internal whitespace,
+    # call it `flat`. Otherwise `grid`.
+    digit_runs = []
+    cur = []
+    for ch in response:
+        if ch.isdigit():
+            cur.append(ch)
+        else:
+            if cur:
+                digit_runs.append(len(cur))
+                cur = []
+    if cur:
+        digit_runs.append(len(cur))
+    if any(r >= 81 for r in digit_runs):
+        return 'flat'
+    return 'grid'
 
 
 SPLIT_FILES = [
@@ -553,6 +733,51 @@ SPLIT_FILES = [
     ('val',   'rrn_val.pt'),
     ('test',  'satnet_test.pt'),
 ]
+
+
+def _install_sigint_safe_finalize(args, layout, world_size):
+    """v3: rank-0 SIGINT/SIGTERM handler. Calls _finalize_outputs against whatever
+    shard data already exists, so an interrupted long run still emits summary.json
+    + by_givens.csv from the partial JSONL.
+
+    Re-raises the default behavior after finalize so the process still exits.
+    """
+    import signal
+
+    if layout is None or layout.get('mode') != 'structured':
+        return
+
+    finalized = {'done': False}
+
+    def _handler(signum, frame):
+        if finalized['done']:
+            return
+        finalized['done'] = True
+        try:
+            usable = list(getattr(args, 'splits', None) or [])
+            present = [s for s in usable
+                       if (layout['out_dir'] / 'results' / 'per_split' / s).exists()
+                       or (layout['out_dir'] / 'results' / f'{s}.jsonl').exists()]
+            print(f"\n[eval_sudoku_samples] caught signal {signum}; "
+                  f"finalizing partial outputs for splits={present}")
+            _finalize_outputs(layout, present, world_size, {}, True,
+                              max_error_dumps=getattr(args, 'max_error_dumps', 0))
+            _write_status(layout, 130, f'signal {signum}',
+                          datetime.now().isoformat(), datetime.now().isoformat())
+        except Exception as e:
+            print(f"[eval_sudoku_samples] sigint finalize error: {e}")
+        # Re-raise default behavior on SIGINT so the user gets normal Ctrl-C semantics.
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        except Exception:
+            sys.exit(130)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except Exception:
+            pass
 
 
 def load_splits(data_dir):
@@ -741,6 +966,7 @@ def _run_eval(args, rank: int, world_size: int):
                 'fully_solved': False, 'is_valid_sudoku': False,
                 'prompt_style': args.prompt_style, 'prompt_template_idx': -1,
                 'prompt_used': '',
+                'puzzle_format': 'grid', 'solution_format': 'unknown',
                 'elapsed_s': 0.0, 'tokens_generated': 0,
             }
             if rank == 0:
@@ -760,6 +986,10 @@ def _run_eval(args, rank: int, world_size: int):
                 'prompt_style': res['prompt_style'],
                 'prompt_template_idx': res['prompt_template_idx'],
                 'prompt_used': res['prompt_used'],
+                # v3: format axis (puzzle_format = how the prompt rendered the puzzle;
+                # solution_format = best-effort inference from the model's response).
+                'puzzle_format': res.get('puzzle_format', 'grid'),
+                'solution_format': res.get('solution_format', 'unknown'),
                 'elapsed_s': round(res['elapsed_s'], 4),
                 'tokens_generated': res['tokens_generated'],
                 'response': res['response'], 'pred': res['pred'],
@@ -922,6 +1152,10 @@ def _run_distributed_worker(args):
             _init_output_tree(layout, list(args.splits or []))
             _write_config(args, layout)
     _setup_logging_if_needed(args, is_main=(rank == 0), rank=rank)
+    # v3: install SIGINT-safe finalize on rank 0 so a partial run still flushes
+    # summary.json + by_givens.csv from existing per-rank shards on Ctrl-C.
+    if rank == 0:
+        _install_sigint_safe_finalize(args, getattr(args, '_layout', None), world_size)
     started_at = datetime.now().isoformat()
     err_txt = None
     exit_code = 0
@@ -945,7 +1179,8 @@ def _run_distributed_worker(args):
                                if (layout['out_dir'] / 'results' / 'per_split' / s).exists()
                                or (layout['out_dir'] / 'results' / f'{s}.jsonl').exists()]
                     _finalize_outputs(layout, present, world_size,
-                                      timing, getattr(args, 'keep_shards', False))
+                                      timing, getattr(args, 'keep_shards', False),
+                                      max_error_dumps=getattr(args, 'max_error_dumps', 0))
                     _write_status(layout, exit_code, err_txt,
                                   started_at, datetime.now().isoformat())
         except Exception as e:
@@ -1014,6 +1249,10 @@ def _build_parser():
     parser.add_argument('--single_gpu', action='store_true', help='Disable auto multi-GPU.')
     parser.add_argument('--master_port', type=int, default=0,
                         help='Master port for mp.spawn (0=auto).')
+    # v3: error dump cap. 0 = off; >0 dumps the first N unsolved samples per split
+    # under results/errors/<split>/idx_<i>.json (rank-0 only, finalized post-merge).
+    parser.add_argument('--max_error_dumps', type=int, default=0,
+                        help='Per-split cap on unsolved-sample JSON dumps (0=disabled).')
     return parser
 
 
@@ -1060,6 +1299,8 @@ def main():
 
     # Scenario C: single GPU / CPU.
     _setup_logging_if_needed(args, is_main=True, rank=0)
+    # v3: SIGINT-safe finalize for single-process path too.
+    _install_sigint_safe_finalize(args, layout, 1)
     started_at = datetime.now().isoformat()
     err_txt = None
     exit_code = 0
@@ -1076,7 +1317,8 @@ def main():
             present = [s for s in usable
                        if (layout['out_dir'] / 'results' / 'per_split' / s).exists()
                        or (layout['out_dir'] / 'results' / f'{s}.jsonl').exists()]
-            _finalize_outputs(layout, present, 1, timing, args.keep_shards)
+            _finalize_outputs(layout, present, 1, timing, args.keep_shards,
+                              max_error_dumps=getattr(args, 'max_error_dumps', 0))
             _write_status(layout, exit_code, err_txt,
                           started_at, datetime.now().isoformat())
     if exit_code != 0:

@@ -208,6 +208,15 @@ class EBT_NLP(LightningModule):
 
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
         no_randomness = False if phase == "train" else True
+        # v3: optional 3rd batch element = per-token loss weights (B, T) aligned with targets.
+        # Used by the sudoku v2 dataset for blank-position loss weighting (P1). When None
+        # (or a normal 2-tuple batch), behavior matches v2 byte-for-byte.
+        token_loss_weights = None
+        if isinstance(x, (list, tuple)) and len(x) >= 3:
+            tw = x[2]
+            if isinstance(tw, torch.Tensor):
+                # squeeze to match input/target shape
+                token_loss_weights = tw.squeeze(dim=0) if tw.dim() == 3 else tw
         if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
             # all_tokens = x['input_ids'].squeeze(dim=1)
             all_tokens = x[0].squeeze(dim=0)
@@ -227,6 +236,16 @@ class EBT_NLP(LightningModule):
             next_token_indices = mask_q_tokens(next_token_indices, self.tokenizer)
         next_token_indices = next_token_indices.reshape(-1) # BS * S; reshape since targets are supposed to be 1D
 
+        # v3: flatten weights to (BS*S,) to match next_token_indices.
+        flat_weights = None
+        if token_loss_weights is not None:
+            flat_weights = token_loss_weights.reshape(-1).to(
+                device=next_token_indices.device,
+                dtype=predicted_distributions[0].dtype,
+            )
+            # Zero-out positions corresponding to ignored targets so they don't bias the mean.
+            flat_weights = flat_weights * (next_token_indices != -1).to(flat_weights.dtype)
+
         reconstruction_loss = 0
         total_mcmc_steps = len(predicted_energies) # in general this equals self.hparams.mcmc_num_steps, isnt in case of rand number
         for mcmc_step, (predicted_distribution, predicted_energy) in enumerate(zip(predicted_distributions, predicted_energies)):
@@ -236,10 +255,29 @@ class EBT_NLP(LightningModule):
                 else:
                     label_smoothing = ((total_mcmc_steps - 1) - mcmc_step) / (total_mcmc_steps - 1) * self.hparams.soften_target_prob_dist
                 predicted_distribution = predicted_distribution.reshape(-1, self.vocab_size)
-                cce_loss = F.cross_entropy(predicted_distribution, next_token_indices, label_smoothing=label_smoothing, ignore_index=-1)
+                if flat_weights is not None:
+                    # v3: weighted CE on flat positions. We compute per-token CE then take a
+                    # weight-normalized mean. ignore_index=-1 is preserved by zeroed weights.
+                    per_token = F.cross_entropy(
+                        predicted_distribution, next_token_indices,
+                        label_smoothing=label_smoothing, ignore_index=-1,
+                        reduction='none',
+                    )
+                    w_sum = flat_weights.sum().clamp_min(1.0)
+                    cce_loss = (per_token * flat_weights).sum() / w_sum
+                else:
+                    cce_loss = F.cross_entropy(predicted_distribution, next_token_indices, label_smoothing=label_smoothing, ignore_index=-1)
             else:
                 predicted_distribution = self.log_softmax(predicted_distribution).reshape(-1, self.vocab_size)
-                cce_loss = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1)
+                if flat_weights is not None:
+                    per_token = F.nll_loss(
+                        predicted_distribution, next_token_indices,
+                        ignore_index=-1, reduction='none',
+                    )
+                    w_sum = flat_weights.sum().clamp_min(1.0)
+                    cce_loss = (per_token * flat_weights).sum() / w_sum
+                else:
+                    cce_loss = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1)
             
             if self.hparams.truncate_mcmc:
                 if mcmc_step == (total_mcmc_steps - 1):

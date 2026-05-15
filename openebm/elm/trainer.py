@@ -95,6 +95,183 @@ import ipdb
 
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
+
+# ── v3 utilities for Sudoku adaptive-ratio + difficulty schedule ──────────────
+
+# Three-phase schedule (P3 + P4) used in the v3 spec:
+#   step <  600                        → 0.6   (warmup)
+#   600 ≤ step < 2400                  → 0.85  (focus)
+#   step ≥ 2400                        → 0.7   (consolidation)
+# The retention guard then clips this around `valid_loss_sft` drift on each val tick.
+_V3_RATIO_PHASES = [
+    {'lo': 0,    'hi': 600,   'ratio': 0.6},
+    {'lo': 600,  'hi': 2400,  'ratio': 0.85},
+    {'lo': 2400, 'hi': 10**9, 'ratio': 0.7},
+]
+# Difficulty bucket weights aligned with SudokuSFTV2IterableDataset.DIFFICULTY_BUCKETS
+# (hard 17-22, medium 23-28, easy 29-34). P5 in the v3 spec.
+_V3_DIFFICULTY_PHASES = [
+    {'lo': 0,    'hi': 600,   'weights': [0.33, 0.33, 0.34]},   # warmup uniform
+    {'lo': 600,  'hi': 2400,  'weights': [0.55, 0.30, 0.15]},   # focus on hard tail
+    {'lo': 2400, 'hi': 10**9, 'weights': [0.40, 0.35, 0.25]},   # consolidation
+]
+# Retention guard (P4): SFT-loss target used to keep core SFT capability from drifting.
+# v2 baseline `valid_loss_sft` was 1.121 across the 0.4/0.6/0.8 sweep; we accept up to
+# +0.03 over baseline before cutting `sudoku_ratio` by 0.05 (floor 0.50).
+_V3_SFT_BASELINE = 1.121
+_V3_SFT_TOLERANCE = 0.03
+_V3_RATIO_FLOOR = 0.50
+_V3_RATIO_CEIL = 0.85
+_V3_RATIO_STEP = 0.05
+
+
+def _v3_three_phase_value(step, phases, default):
+    for p in phases:
+        if p['lo'] <= step < p['hi']:
+            return p['ratio'] if 'ratio' in p else p['weights']
+    return default
+
+
+def _v3_initial_bucket_weights(schedule_name):
+    """Return the warmup-phase bucket weights for the given schedule, or None for `fixed`.
+
+    `fixed`        → None (legacy uniform sampling over the whole pool).
+    `three_phase`  → returns the warmup-phase weights; AdaptiveRatioCallback later
+                     rotates buckets per phase.
+    Anything else  → None (treated as `fixed`).
+    """
+    if schedule_name == 'three_phase':
+        return list(_V3_DIFFICULTY_PHASES[0]['weights'])
+    return None
+
+
+class AdaptiveRatioCallback:
+    """Lightning callback wiring v3 sudoku schedules + retention guard (P3 + P4 + P5).
+
+    Three responsibilities:
+      1. Mutates `train_dataloader.dataset.sudoku_ratio` per `_V3_RATIO_PHASES`
+         on every training-batch start.
+      2. Mutates `train_dataloader.dataset.sudoku_ds.bucket_weights` per
+         `_V3_DIFFICULTY_PHASES` so RRN-train resampling tracks the schedule.
+      3. After each validation epoch, reads `valid_loss_sft` (already all-reduced)
+         and adjusts `sudoku_ratio` ± _V3_RATIO_STEP within [floor, ceil] based on
+         the SFT drift — primary core-preservation mechanism in v3 since KD is
+         deferred.
+
+    Determinism: each rank runs the same callback against the same `global_step`,
+    so DDP ranks stay in sync without explicit broadcast. The retention guard
+    keys off the rank-0-reduced `_last_valid_metrics['valid_loss_sft']`.
+    """
+
+    def __init__(
+        self,
+        ratio_schedule='three_phase_with_guard',
+        difficulty_schedule='three_phase',
+    ):
+        try:
+            from lightning.pytorch.callbacks import Callback as _LCB
+        except ImportError:
+            from pytorch_lightning.callbacks import Callback as _LCB
+        # Subclass at construction time so we don't import Callback at module load
+        # (the Lightning version is already established by the trainer module).
+        AdaptiveRatioCallback._mixin_callback(self, _LCB)
+        self.ratio_schedule = ratio_schedule
+        self.difficulty_schedule = difficulty_schedule
+        self._last_logged_step = -1
+
+    @staticmethod
+    def _mixin_callback(instance, callback_cls):
+        # Ensure isinstance(instance, Callback) is true so Lightning accepts it.
+        instance.__class__ = type(
+            'AdaptiveRatioCallback', (AdaptiveRatioCallback, callback_cls), {},
+        )
+
+    # ── helpers ────────────────────────────────────────────────────────
+
+    def _get_mixed_dataset(self, trainer):
+        train_dl = getattr(trainer, 'train_dataloader', None)
+        if train_dl is None:
+            return None
+        ds = getattr(train_dl, 'dataset', None)
+        # Only act on SudokuMixedIterableDataset (guard against other datasets).
+        if ds is None or not hasattr(ds, 'sudoku_ratio') or not hasattr(ds, 'sudoku_ds'):
+            return None
+        return ds
+
+    def _phase_ratio(self, step):
+        return _v3_three_phase_value(step, _V3_RATIO_PHASES, default=0.6)
+
+    def _phase_bucket_weights(self, step):
+        return list(_v3_three_phase_value(step, _V3_DIFFICULTY_PHASES, default=[1, 1, 1]))
+
+    # ── Lightning hooks ────────────────────────────────────────────────
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):  # type: ignore[override]
+        ds = self._get_mixed_dataset(trainer)
+        if ds is None:
+            return
+        step = int(trainer.global_step)
+        # 1. base ratio from the three-phase schedule
+        if self.ratio_schedule in ('three_phase', 'three_phase_with_guard'):
+            base = self._phase_ratio(step)
+            # Don't overwrite a guard-adjusted ratio mid-phase: only sync the *floor*
+            # of the schedule. We apply phase-on-transition edges; guard nudges live
+            # in on_validation_epoch_end.
+            current = float(ds.sudoku_ratio)
+            phase_lo = max(_V3_RATIO_FLOOR, base - 0.10)
+            phase_hi = min(_V3_RATIO_CEIL, base + 0.05)
+            if not (phase_lo <= current <= phase_hi):
+                ds.sudoku_ratio = float(base)
+        elif self.ratio_schedule == 'fixed':
+            pass  # leave alone
+        # 2. difficulty bucket weights
+        if self.difficulty_schedule == 'three_phase':
+            sudoku_ds = getattr(ds, 'sudoku_ds', None)
+            if sudoku_ds is not None and hasattr(sudoku_ds, 'bucket_weights'):
+                sudoku_ds.bucket_weights = self._phase_bucket_weights(step)
+        # 3. periodic log so the run.log shows the active schedule
+        if step != self._last_logged_step and (step % 100 == 0):
+            try:
+                pl_module.log_metrics(
+                    {
+                        'sudoku_ratio_active': float(ds.sudoku_ratio),
+                    },
+                    'train',
+                )
+            except Exception:
+                pass
+            self._last_logged_step = step
+
+    def on_validation_epoch_end(self, trainer, pl_module):  # type: ignore[override]
+        if self.ratio_schedule != 'three_phase_with_guard':
+            return
+        ds = self._get_mixed_dataset(trainer)
+        if ds is None:
+            return
+        last_metrics = getattr(pl_module, '_last_valid_metrics', None)
+        if not last_metrics:
+            return
+        sft_loss = last_metrics.get('valid_loss_sft')
+        if sft_loss is None:
+            return
+        delta = float(sft_loss) - _V3_SFT_BASELINE
+        before = float(ds.sudoku_ratio)
+        if delta > _V3_SFT_TOLERANCE:
+            new_r = max(_V3_RATIO_FLOOR, before - _V3_RATIO_STEP)
+        elif delta < 0.0:
+            new_r = min(_V3_RATIO_CEIL, before + _V3_RATIO_STEP)
+        else:
+            new_r = before
+        if abs(new_r - before) > 1e-6:
+            ds.sudoku_ratio = float(new_r)
+            try:
+                pl_module.log_metrics({'sudoku_ratio_guard_adjusted': float(new_r)}, 'valid')
+            except Exception:
+                pass
+            print(f"[AdaptiveRatioCallback] valid_loss_sft={sft_loss:.4f} "
+                  f"(Δ={delta:+.4f}) → sudoku_ratio {before:.2f} → {new_r:.2f}")
+
+
 class ModelTrainer(LightningModule):
     def __init__(self, hparams, trained_model = None):
         super().__init__()
@@ -604,24 +781,43 @@ class ModelTrainer(LightningModule):
         for src in sources:
             all_keys.update(buf.get(src, {}).keys())
         mixed = {}
+        # v3: also compute a fixed 0.5/0.5 balanced version so cross-ratio runs are
+        # comparable. The ratio-weighted `mixed[k]` is intentionally biased toward the
+        # heavier source — use it for ratio-aware monitoring and `balanced[k]` for
+        # cross-run comparisons (e.g. ckpt selection).
+        balanced_weights = {'sudoku': 0.5, 'sft': 0.5}
+        balanced = {}
         for k in all_keys:
             total = 0.0
             wsum = 0.0
+            btotal = 0.0
+            bwsum = 0.0
             for src in sources:
                 slot = buf.get(src, {}).get(k)
                 if slot is None or slot['count'].item() == 0:
                     continue
                 mean = (slot['sum'] / slot['count']).item()
                 w = weights.get(src, 0.0)
+                bw = balanced_weights.get(src, 0.0)
                 total += w * mean
                 wsum += w
+                btotal += bw * mean
+                bwsum += bw
             if wsum > 0:
                 mixed[k] = total / wsum  # 归一化以防某侧缺失
+            if bwsum > 0:
+                balanced[k + '_balanced'] = btotal / bwsum
         if mixed:
             self.log_metrics(mixed, "valid")
             if not hasattr(self, '_last_valid_metrics'):
                 self._last_valid_metrics = {}
             for k, v in mixed.items():
+                self._last_valid_metrics[k] = v
+        if balanced:
+            self.log_metrics(balanced, "valid")
+            if not hasattr(self, '_last_valid_metrics'):
+                self._last_valid_metrics = {}
+            for k, v in balanced.items():
                 self._last_valid_metrics[k] = v
 
     def on_test_epoch_start(self):
@@ -1714,6 +1910,12 @@ class ModelTrainer(LightningModule):
             )
         elif getattr(self.hparams, 'dataset_name', 'nanochat') == 'sudoku_mixed':
             from openebm.elm.data.sudoku_mixed_dataset import generate_sudoku_mixed_dataloader
+            # v3: derive bucket weights from --sudoku_difficulty_schedule (if any). The
+            # AdaptiveRatioCallback will mutate dataset.sudoku_ds.bucket_weights per
+            # phase so only the warmup-phase initial value is set here.
+            blank_weight = float(getattr(self.hparams, 'sudoku_blank_loss_weight', 1.0))
+            difficulty_sched = getattr(self.hparams, 'sudoku_difficulty_schedule', 'fixed')
+            initial_bucket_weights = _v3_initial_bucket_weights(difficulty_sched)
             train_dataloader = generate_sudoku_mixed_dataloader(
                 tokenizer=tokenizer,
                 batch_size=self.hparams.batch_size_per_device,
@@ -1723,6 +1925,8 @@ class ModelTrainer(LightningModule):
                 device=self.device,
                 resume_state_dict=resume_state,
                 sudoku_ratio=getattr(self.hparams, 'sudoku_ratio', 0.6),
+                blank_loss_weight=blank_weight,
+                difficulty_bucket_weights=initial_bucket_weights,
             )
         else:
             train_dataloader = generate_dataloader(

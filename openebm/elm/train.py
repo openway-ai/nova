@@ -325,6 +325,26 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
     limit_val_batches = 0 if args.overfit_batches > 0 else args.limit_val_batches
     # val_check_interval = args.val_check_interval if args.val_check_interval == 1.0 else args.val_check_interval * args.accumulate_grad_batches  #NOTE the reason we mult by args.accumulate_grad_batches is because of this bug https://github.com/Lightning-AI/pytorch-lightning/issues/12205
     limit_test_batches = args.limit_test_batches if args.limit_test_batches == 1 else args.limit_test_batches * args.accumulate_grad_batches
+
+    # v3: optional adaptive sudoku ratio + difficulty-bucket schedule callback. Only
+    # constructed when training on sudoku_mixed AND a non-fixed schedule is requested,
+    # so non-sudoku runs retain their previous Trainer construction byte-for-byte.
+    extra_callbacks = []
+    if (
+        getattr(args, 'dataset_name', '') == 'sudoku_mixed'
+        and (
+            getattr(args, 'sudoku_ratio_schedule', 'fixed') != 'fixed'
+            or getattr(args, 'sudoku_difficulty_schedule', 'fixed') != 'fixed'
+        )
+    ):
+        from openebm.elm.trainer import AdaptiveRatioCallback
+        extra_callbacks.append(
+            AdaptiveRatioCallback(
+                ratio_schedule=getattr(args, 'sudoku_ratio_schedule', 'fixed'),
+                difficulty_schedule=getattr(args, 'sudoku_difficulty_schedule', 'fixed'),
+            )
+        )
+
     trainer = Trainer(
         accelerator="auto",
         devices = args.gpus,
@@ -333,7 +353,7 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
         max_steps=args.max_steps,
         logger=wandb_logger,
         enable_model_summary=args.log_model_archi,
-        callbacks = [checkpoint_callback] + ([periodic_checkpoint] if periodic_checkpoint else []) + [ModelSummary(max_depth=-1)],
+        callbacks = [checkpoint_callback] + ([periodic_checkpoint] if periodic_checkpoint else []) + extra_callbacks + [ModelSummary(max_depth=-1)],
         strategy = args.distributed_strategy, 
         enable_checkpointing=True,
         fast_dev_run = args.fast_dev_run,
@@ -701,6 +721,42 @@ if __name__ == '__main__':
     parser.add_argument("--dataset_name", help="dataset name", default="ucf101")
 
     parser.add_argument("--sudoku_ratio", help="Mixing ratio for sudoku_mixed dataset: P(sample from Sudoku v2) per step. The remainder samples from nanochat SFT.", type=float, default=0.6)
+
+    # ── v3 sudoku training extensions (no-CoT scope) ────────────────────────────
+    parser.add_argument(
+        "--sudoku_ratio_schedule",
+        help=(
+            "v3 P3+P4: how `sudoku_ratio` evolves during training. "
+            "`fixed` keeps the value passed to --sudoku_ratio constant (v2 behavior). "
+            "`three_phase` uses warmup 0.6 / focus 0.85 / consolidate 0.7. "
+            "`three_phase_with_guard` adds a retention guard that pulls the ratio back "
+            "if `valid_loss_sft` drifts > 0.03 above the v2 baseline (1.121)."
+        ),
+        type=str,
+        choices=["fixed", "three_phase", "three_phase_with_guard"],
+        default="fixed",
+    )
+    parser.add_argument(
+        "--sudoku_blank_loss_weight",
+        help=(
+            "v3 P1: blank-position loss weighting K. Targets corresponding to blank "
+            "cells in the input puzzle get CE × K; givens & non-cell tokens get × 1. "
+            "K=1.0 (default) disables the weighting."
+        ),
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--sudoku_difficulty_schedule",
+        help=(
+            "v3 P5: difficulty-aware sampling over RRN-train. `fixed` = uniform "
+            "(legacy v2). `three_phase` upweights the 17-22 hint bucket to 0.55 in "
+            "the focus phase, then relaxes to 0.40 in consolidation."
+        ),
+        type=str,
+        choices=["fixed", "three_phase"],
+        default="fixed",
+    )
     
     parser.add_argument("--dataset_dir", help="dataset base directory", default="")
 
