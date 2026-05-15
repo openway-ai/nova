@@ -9,11 +9,12 @@ from typing import Optional, Tuple
 
 from openebm.elm.utils import init_whole_model_weights, EBTModelArgs
 try:
-    from openebm.elm.ve import build_layer_ve, build_value_embeds, has_ve
+    from openebm.elm.ve import build_layer_ve, build_value_embeds, has_ve, init_value_embeds
 except ImportError:
     has_ve = None
     build_value_embeds = None
     build_layer_ve = None
+    init_value_embeds = None
 
 
 class RMSNorm(torch.nn.Module):
@@ -191,7 +192,7 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
-        self.use_ve = args.use_ve and has_ve is not None and has_ve(layer_id, args.n_layers)
+        self.use_ve = args.use_ve and has_ve is not None and has_ve(layer_id, args.n_layers, args.use_sparse_ve)
         if self.use_ve:
             self.ve_gate_channels = 12
             self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_local_kv_heads, bias=False)
@@ -558,10 +559,8 @@ class EBTAdaLN(nn.Module):
         if self.use_ve:
             n_kv_heads = params.n_heads if params.n_kv_heads is None else params.n_kv_heads
             self.kv_dim = n_kv_heads * (params.dim // params.n_heads)
-            self.value_embeds = build_value_embeds(params.n_layers, params.vocab_size, self.kv_dim)
-            ve_init_bound = math.sqrt(3.0) * (params.dim ** -0.5)
-            for ve in self.value_embeds.values():
-                nn.init.uniform_(ve.weight, -ve_init_bound, ve_init_bound)
+            self.value_embeds = build_value_embeds(params.n_layers, params.vocab_size, self.kv_dim, params.use_low_rank_ve, params.ve_rank, params.use_sparse_ve)
+            init_value_embeds(self.value_embeds, params.dim)
         else:
             self.value_embeds = None
             self.kv_dim = None

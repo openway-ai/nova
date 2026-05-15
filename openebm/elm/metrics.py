@@ -1,14 +1,20 @@
 import torch
 import torchmetrics
-import nltk
+try:
+    import nltk
+except ImportError:
+    nltk = None
 import string
 from typing import List
 import torch.distributed as dist
-import ipdb
+try:
+    import ipdb
+except ImportError:
+    ipdb = None
 import math
 
 custom_nltk_path = "/mnt/shared-storage-user/lixueyan/datasets/nltk_data"
-if custom_nltk_path not in nltk.data.path:
+if nltk is not None and custom_nltk_path not in nltk.data.path:
     nltk.data.path.insert(0, custom_nltk_path)
 
 def get_torchmetrics(metric, metrics_average_type, num_classes, metrics_task):
@@ -41,6 +47,8 @@ def calculate_em(predictions: List[str], references: List[str]) -> float:
 
 def calculate_f1_score(predictions: List[str], references: List[str]) -> float:
     '''
+    if nltk is None:
+        raise ImportError("calculate_f1_score requires nltk")
     Method for calculating the F1 score for Question Answering / Text Generation tasks
     '''
     assert len(predictions) > 0, "Predictions list cannot be empty"

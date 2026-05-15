@@ -14,7 +14,8 @@ except:
     pass
 
 # 抑制 CUDA stream 不匹配警告（恢复训练时的已知问题）
-torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+if hasattr(torch.autograd.graph, "set_warn_on_accumulate_grad_stream_mismatch"):
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 # from nanolightning.torchlightning_trainer import Trainer
 # from nanolightning.iteratabletrainer import IterableTrainer
@@ -81,6 +82,14 @@ def main(args):
         args.no_wandb = True
         args.detect_anomaly = True
         args.limit_train_batches = 1
+
+    if args.use_low_rank_ve:
+        if not args.use_ve:
+            raise ValueError("--use_low_rank_ve requires --use_ve")
+        if args.ve_rank <= 0:
+            raise ValueError("--ve_rank must be positive")
+    if args.use_sparse_ve and not args.use_ve:
+        raise ValueError("--use_sparse_ve requires --use_ve")
 
     os.makedirs("./logs", exist_ok=True)
 
@@ -236,7 +245,12 @@ def main(args):
         print("$$$$$$$$$$  STARTED TRAINING  $$$$$$$$$$")
         trainer = set_trainer(args, wandb_logger, checkpoint_callback, periodic_checkpoint=periodic_checkpoint)
         resume_training_ckpt = None if args.resume_training_ckpt == "" else args.resume_training_ckpt
-        trainer.fit(model_trainer, ckpt_path=resume_training_ckpt, weights_only=False)
+        try:
+            trainer.fit(model_trainer, ckpt_path=resume_training_ckpt, weights_only=False)
+        except TypeError as exc:
+            if "weights_only" not in str(exc):
+                raise
+            trainer.fit(model_trainer, ckpt_path=resume_training_ckpt)
         
         if args.run_testing_after_training:
             args.only_test_model_ckpt = checkpoint_callback.best_model_path
@@ -495,6 +509,9 @@ if __name__ == '__main__':
     parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
 
     parser.add_argument("--use_ve", help="启用 Value Embedding (VE)，为交替层添加可学习的值嵌入", action="store_true", default=False)
+    parser.add_argument("--use_sparse_ve", help="稀疏启用 VE：前 1/3 层不启用，中间 1/3 每 4 层启用一次，后 1/3 每隔一层启用一次", action="store_true", default=False)
+    parser.add_argument("--use_low_rank_ve", help="启用低秩 Value Embedding 表: Embedding(vocab_size, ve_rank) + Linear(ve_rank, kv_dim)", action="store_true", default=False)
+    parser.add_argument("--ve_rank", help="低秩 VE 的中间维度，仅在 --use_low_rank_ve 时生效", type=int, default=256)
 
     parser.add_argument("--use_mcmc_time_embed", action="store_true", default=False,
         help="Enable MCMC step time embedding (only for ebt_type=time_embed). When False, all steps share the same transition kernel, enabling arbitrary step count at inference.")
