@@ -10,6 +10,14 @@ Mixed Sudoku + nanochat SFT Dataset
   - 让模型学到 "对话结束应输出 <|assistant_end|>" 的通用模式
 
 输出格式与 SFTIterableDataset 完全一致: (inputs, targets) shape (B, T)。
+
+v3:
+  - `sudoku_ratio` is a public mutable attribute. AdaptiveRatioCallback may rewrite
+    it on the fly (the iterable dataset path uses num_workers=0, so attribute mutation
+    is visible to the next __iter__ tick without IPC).
+  - `last_batch_source` records the source of the most recently yielded batch
+    ('sudoku' or 'sft') so the trainer can route per-source-only logic
+    (blank-position weighted CE on sudoku batches; SFT-loss-driven retention guard).
 """
 
 import copy
@@ -45,6 +53,8 @@ class SudokuMixedIterableDataset(_IterableDataset):
         resume_state_dict=None,
         sudoku_ratio=DEFAULT_SUDOKU_RATIO,
         seed=None,
+        blank_loss_weight=1.0,
+        difficulty_bucket_weights=None,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -54,6 +64,7 @@ class SudokuMixedIterableDataset(_IterableDataset):
         self.max_iter = max_iter
         self.device = device
         self.data_dir = data_dir or DEFAULT_SUDOKU_V2_DIR
+        # v3: public mutable; AdaptiveRatioCallback may rewrite this between batches.
         self.sudoku_ratio = sudoku_ratio
         self.resume_state_dict = resume_state_dict
         self._resume_state_locked = isinstance(resume_state_dict, dict) and (
@@ -64,6 +75,8 @@ class SudokuMixedIterableDataset(_IterableDataset):
         self._runtime_initialized = False
         self._seed = seed
         self.it = 0
+        # v3: source of the most-recently yielded batch ('sudoku' | 'sft').
+        self.last_batch_source = None
 
         # 预估两侧 iterator 的 max_iter 上界。因为按概率采样，每侧实际用量 ≈ max_iter * ratio。
         # 给 1.5 倍缓冲避免 StopIteration（底层 iterator 对 train split 是循环的）
@@ -88,6 +101,8 @@ class SudokuMixedIterableDataset(_IterableDataset):
             resume_state_dict=inner_sudoku_state,
             augment=True,
             seed=seed,
+            blank_loss_weight=blank_loss_weight,
+            difficulty_bucket_weights=difficulty_bucket_weights,
         )
         self.sft_ds = SFTIterableDataset(
             tokenizer=tokenizer,
@@ -150,21 +165,31 @@ class SudokuMixedIterableDataset(_IterableDataset):
             if self.split == "train" and self.it >= self.max_iter:
                 break
 
-            # 选择来源；若某侧耗尽则切到另一侧
-            pick_sudoku = mix_rng.random() < self.sudoku_ratio
+            # v3: re-read mutable sudoku_ratio every step so AdaptiveRatioCallback
+            # mutations take effect on the next batch.
+            current_ratio = float(self.sudoku_ratio)
+            pick_sudoku = mix_rng.random() < current_ratio
             try:
                 if pick_sudoku:
                     batch = next(sudoku_iter)
+                    chosen = 'sudoku'
                 else:
                     batch = next(sft_iter)
+                    chosen = 'sft'
             except StopIteration:
                 # 回退到另一侧，尽量不中断训练
                 try:
-                    batch = next(sft_iter) if pick_sudoku else next(sudoku_iter)
+                    if pick_sudoku:
+                        batch = next(sft_iter)
+                        chosen = 'sft'
+                    else:
+                        batch = next(sudoku_iter)
+                        chosen = 'sudoku'
                 except StopIteration:
                     break
 
             self.it += 1
+            self.last_batch_source = chosen
             self.last_state_dict = self._build_state_dict()
             yield batch
 
@@ -193,8 +218,15 @@ class SudokuMixedDataLoader(DataLoader):
 def generate_sudoku_mixed_dataloader(
     tokenizer, batch_size, max_len, max_iter, split, device,
     data_dir=None, resume_state_dict=None, sudoku_ratio=DEFAULT_SUDOKU_RATIO, seed=None,
+    blank_loss_weight=1.0, difficulty_bucket_weights=None,
 ):
-    """Factory function for mixed Sudoku v2 + nanochat SFT dataloader."""
+    """Factory function for mixed Sudoku v2 + nanochat SFT dataloader.
+
+    v3 extras (forwarded to the inner Sudoku v2 dataset):
+      - blank_loss_weight: K for blank-position loss weighting (1.0 = off).
+      - difficulty_bucket_weights: per-bucket sampling weights aligned with
+        SudokuSFTV2IterableDataset.DIFFICULTY_BUCKETS.
+    """
     dataset = SudokuMixedIterableDataset(
         tokenizer=tokenizer,
         batch_size=batch_size,
@@ -206,6 +238,8 @@ def generate_sudoku_mixed_dataloader(
         resume_state_dict=resume_state_dict,
         sudoku_ratio=sudoku_ratio,
         seed=seed,
+        blank_loss_weight=blank_loss_weight,
+        difficulty_bucket_weights=difficulty_bucket_weights,
     )
     dataloader = SudokuMixedDataLoader(
         dataset,
