@@ -249,6 +249,27 @@ class EBT_NLP(LightningModule):
         if self.hparams.execution_mode == "finetune" and self.hparams.dataset_name != "nanochat_sft": # nanochat_sft masking is handled in the dataloader
             next_token_indices = mask_q_tokens(next_token_indices, self.tokenizer)
         next_token_indices = next_token_indices.reshape(-1) # BS * S; reshape since targets are supposed to be 1D
+        supervised_tokens = (next_token_indices != -1).sum()
+
+        # Some packed SFT rows can end up with no supervised targets at all after masking.
+        # F.cross_entropy / F.nll_loss over an all-ignore target tensor returns NaN.
+        # Treat these batches as "skip for optimization / validation loss aggregation"
+        # instead of poisoning valid_loss and checkpoint selection.
+        if supervised_tokens.item() == 0:
+            zero = predicted_distributions[-1].new_zeros(())
+            return {
+                'loss': zero,
+                'initial_loss': zero,
+                'final_step_loss': zero,
+                'contrastive_loss': zero,
+                'initial_final_pred_energies_gap': zero,
+                'perplexity': zero,
+                'bpb': 0.0,
+                'bpb_nats': 0.0,
+                'bpb_bytes': 0,
+                'supervised_tokens': 0,
+                'empty_supervision_batch': 1,
+            }
 
         reconstruction_loss = 0
         total_mcmc_steps = len(predicted_energies) # in general this equals self.hparams.mcmc_num_steps, isnt in case of rand number
@@ -320,6 +341,8 @@ class EBT_NLP(LightningModule):
             'bpb': bpb_loss,
             'bpb_nats': bpb_nats,    # accumulated nats for epoch-level BPB
             'bpb_bytes': bpb_bytes,  # accumulated bytes for epoch-level BPB
+            'supervised_tokens': supervised_tokens.detach(),
+            'empty_supervision_batch': 0,
         }
         return log_dict
     

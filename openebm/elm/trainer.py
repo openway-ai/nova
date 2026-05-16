@@ -569,6 +569,8 @@ class ModelTrainer(LightningModule):
         """Reset BPB accumulators at the start of each validation epoch."""
         self._val_bpb_nats = 0.0
         self._val_bpb_bytes = 0
+        self._val_supervised_tokens = 0
+        self._val_empty_supervision_batches = 0
 
     def validation_step(self, batch, batch_idx):
         # Move token_bytes to the same device as the model if needed
@@ -588,6 +590,14 @@ class ModelTrainer(LightningModule):
             bpb_bytes = bpb_bytes.item()
         self._val_bpb_nats += bpb_nats
         self._val_bpb_bytes += bpb_bytes
+        supervised_tokens = eval_step_dict.get('supervised_tokens', 0)
+        empty_supervision_batch = eval_step_dict.get('empty_supervision_batch', 0)
+        if isinstance(supervised_tokens, torch.Tensor):
+            supervised_tokens = supervised_tokens.item()
+        if isinstance(empty_supervision_batch, torch.Tensor):
+            empty_supervision_batch = empty_supervision_batch.item()
+        self._val_supervised_tokens += supervised_tokens
+        self._val_empty_supervision_batches += empty_supervision_batch
 
         # 缓存最新 valid 指标，供 train 进度条显示
         if not hasattr(self, '_last_valid_metrics'):
@@ -612,11 +622,17 @@ class ModelTrainer(LightningModule):
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
         self._last_valid_metrics['bpb'] = epoch_bpb
+        self._last_valid_metrics['supervised_tokens'] = self._val_supervised_tokens
+        self._last_valid_metrics['empty_supervision_batch'] = self._val_empty_supervision_batches
 
         # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
         if self.logger is not None:
             try:
-                self.logger.experiment.log({'valid_bpb': epoch_bpb}, step=self.global_step)
+                self.logger.experiment.log({
+                    'valid_bpb': epoch_bpb,
+                    'valid_supervised_tokens': self._val_supervised_tokens,
+                    'valid_empty_supervision_batch': self._val_empty_supervision_batches,
+                }, step=self.global_step)
             except Exception:
                 pass
 
@@ -1834,6 +1850,8 @@ class ModelTrainer(LightningModule):
             if key in ('bpb_nats', 'bpb_bytes'):
                 continue
             if key == 'bpb' and phase != 'train':
+                continue
+            if key in ('supervised_tokens', 'empty_supervision_batch') and phase != 'train':
                 continue
 
             value = metrics_dict[key]
