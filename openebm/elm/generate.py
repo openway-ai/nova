@@ -25,14 +25,32 @@ def sample_top_p(probs, p):
         exceeds the threshold p. The distribution is renormalized based on the selected tokens.
 
     """
+    # Upcast to fp32 for numerical stability — bf16 cumsum/div/multinomial is
+    # the crash source observed in RL rollouts (device-side multinomial assert).
+    probs = probs.float()
+    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     mask = probs_sum - probs_sort > p
-    probs_sort[mask] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    probs_sort = probs_sort.masked_fill(mask, 0.0)
+
+    probs_sort_sum = probs_sort.sum(dim=-1, keepdim=True)
+    # Rows where the entire distribution collapsed to 0 → fallback to argmax
+    # of the (post-nan_to_num) original distribution to avoid multinomial NaN.
+    bad = (probs_sort_sum <= 1e-9).squeeze(-1)
+    probs_sort = probs_sort / probs_sort_sum.clamp_min(1e-9)
+
     next_token = torch.multinomial(probs_sort, num_samples=1)
+    if bad.any():
+        argmax_idx = probs.argmax(dim=-1, keepdim=True)
+        # next_token here indexes into the sorted distribution; for bad rows we
+        # bypass the gather-from-sort logic by storing a sentinel index 0 and
+        # overwriting after the gather. Simpler: gather first, then overwrite.
     next_token = torch.gather(probs_idx, -1, next_token)
-    return next_token
+    if bad.any():
+        next_token = torch.where(bad.unsqueeze(-1), argmax_idx, next_token)
+    return next_token.long()
 
 def call_model_forward_decode(hparams, model, input_tokens, start_pos, bsz):
     #TODO eventually add back kv caching, for now start_pos is not supported  in baseline transformer and EBT so start_pos can only be 0

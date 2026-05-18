@@ -38,7 +38,13 @@ def get_per_token_logps(model, input_ids, prompt_length, learning=True):
 
     # Run EBT forward — returns (list_of_logits_per_mcmc_step, list_of_energies)
     # With return_raw_logits=True, each element in list_of_logits is (B, S-1, V)
-    with torch.set_grad_enabled(learning):
+    # Always enable the outer grad-enabled context: this keeps the LAST MCMC
+    # step's transformer params in the autograd graph, so cross_entropy below
+    # can backprop into them. The `learning` flag is now ONLY used to control
+    # `create_graph` inside `_mcmc_step_excluded` (i.e., whether MCMC builds a
+    # 2nd-order graph). Callers wrap with @torch.no_grad() if they want detach
+    # (e.g. old_logps / ref_logps in _generate_and_score).
+    with torch.set_grad_enabled(True):
         predicted_distributions, _ = model.forward(
             model_input,
             start_pos=0,

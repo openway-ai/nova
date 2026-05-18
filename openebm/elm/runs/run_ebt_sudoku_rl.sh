@@ -50,16 +50,16 @@ NUM_GENERATIONS=8             # completions per prompt
 MAX_COMPLETION_LENGTH=224     # 9x9 sudoku needs ~200-400 tokens
 MAX_PROMPT_LENGTH=192
 TEMPERATURE=0.9
-TOP_P=0.95
+TOP_P=0.9                     # narrowed from 0.95 to reduce long-tail sampling noise
 GENERATION_BATCH_SIZE=8       # sub-batch for generation (VRAM management)
 
 NUM_ITERATIONS=1              # GRPO inner loop (μ in paper)
 EPSILON=0.2                   # PPO clip range
 BETA=0.0                      # KL penalty coefficient (0 disables ref_model)
-LEARNING_RATE=1e-6            # RL learning rate (much lower than SFT due to 2nd-order MCMC grads)
+LEARNING_RATE=1e-6            # RL learning rate (much lower than SFT due to MCMC grads)
 WEIGHT_DECAY=0.01
-GRADIENT_CLIP_VAL=1.0
-MAX_GRAD_PER_PARAM=0.1        # Per-parameter gradient clipping (prevents alpha/transformer divergence)
+GRADIENT_CLIP_VAL=0.5         # tightened from 1.0 for RL stability
+MAX_GRAD_PER_PARAM=0.05       # tightened from 0.1 (alpha frozen in Branch-A anyway)
 WARMUP_STEPS=20
 
 MAX_STEPS=1000

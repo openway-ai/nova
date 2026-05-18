@@ -84,12 +84,24 @@ class EBMGRPOConfig:
     """Path to the SFT-trained checkpoint to initialize from."""
 
     # ── EBT-specific ──────────────────────────────────────────────────────────
-    use_learning_mode_for_logprobs: bool = True
-    """Must be True for `current_logps` so gradients flow through the MCMC chain.
-    If False, `torch.set_grad_enabled(False)` detaches the policy log-probs, making
-    `loss.requires_grad=False` — DDP then hangs on all-reduce waiting for grad hooks
-    that never fire. Only `old_per_token_logps` / `ref_per_token_logps` should use
-    learning=False (they must be detached as PPO denominator / KL reference)."""
+    use_learning_mode_for_logprobs: bool = False
+    """MCMC gradient mode for current_logps.
+
+    False (Branch-A, default, d1-isomorphic): current_logps uses learning=False
+      → MCMC chain has NO 2nd-order graph; alpha is frozen; only the last MCMC
+      step's transformer params are differentiable. Numerator and denominator
+      of the PPO ratio come from the same estimator → exp(new-old) well-defined.
+
+    True (Branch-B): current_logps uses learning=True → create_graph=True in
+      `_mcmc_step_excluded`; alpha receives gradient through the full MCMC
+      chain. Numerically fragile under bf16; use only if Branch-A doesn't learn.
+
+    Earlier comments claimed learning=False causes DDP hangs — that was only
+    true when logprobs.py wrapped the forward in `set_grad_enabled(learning)`.
+    After fixing logprobs.py to always wrap with `set_grad_enabled(True)`
+    (Step 1.1), the last MCMC step's transformer params stay in the graph and
+    cross_entropy → current_logps still has requires_grad=True, so all-reduce
+    hooks fire correctly."""
 
     # ── Data ──────────────────────────────────────────────────────────────────
     data_dir: str = ""

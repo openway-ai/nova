@@ -43,19 +43,20 @@ def generate_completions(
     num_prompts, prompt_len = prompt_ids.shape
     device = prompt_ids.device
 
-    # Determine pad token
-    if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
-        pad_id = tokenizer.eos_token_id
-    elif hasattr(tokenizer, 'bos_token_id'):
+    # Determine pad token: prefer bos (nanochat convention), then eos, then 0.
+    # In nanochat, bos == eos token id, but using bos for pad is the documented
+    # path (see chat_ebt.py:300-309).
+    if hasattr(tokenizer, 'bos_token_id') and tokenizer.bos_token_id is not None:
         pad_id = tokenizer.bos_token_id
+    elif hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
+        pad_id = tokenizer.eos_token_id
     else:
         pad_id = 0
 
-    # Determine stop tokens
+    # Determine stop tokens — only semantic stoppers, NOT bos/eos.
+    # In nanochat bos == eos == pad, so adding eos_token_id here would stop
+    # generation on the very first token. See chat_ebt.py:335-343.
     stop_token_ids = set()
-    if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
-        stop_token_ids.add(tokenizer.eos_token_id)
-    # nanochat special tokens
     for special in ['<|user_start|>', '<|assistant_end|>']:
         try:
             tid = tokenizer.encode(special)
@@ -93,8 +94,12 @@ def generate_completions(
             )
             tokens[:, :prompt_len] = batch_prompts
 
-            # Track which positions are real (not pad) in the prompt
-            input_text_mask = tokens != pad_id
+            # Track which positions are real (not pad) in the prompt.
+            # Use a POSITION mask, NOT a token-value mask: in nanochat bos==pad,
+            # so a legitimate bos token inside the prompt would otherwise be
+            # misclassified as "pad" and overwritten by generation.
+            input_text_mask = torch.zeros(bsz, total_len, dtype=torch.bool, device=device)
+            input_text_mask[:, :prompt_len] = True
             eos_reached = torch.zeros(bsz, dtype=torch.bool, device=device)
 
             # Autoregressive generation
@@ -128,12 +133,14 @@ def generate_completions(
             # Extract completions
             completions = tokens[:, prompt_len:total_len]
 
-            # Build masks (1 for real tokens, 0 after EOS)
+            # Build masks (1 for real tokens, 0 after a semantic stop token).
+            # Do NOT zero on tok == pad_id: in nanochat bos==pad, and the model
+            # may legitimately emit bos tokens mid-completion.
             comp_masks = torch.ones_like(completions, dtype=torch.long)
             for i in range(bsz):
                 for pos in range(completions.shape[1]):
                     tok = completions[i, pos].item()
-                    if tok in stop_token_ids or tok == pad_id:
+                    if tok in stop_token_ids:
                         comp_masks[i, pos:] = 0
                         break
 
