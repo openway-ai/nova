@@ -1,32 +1,32 @@
 """
-EBT SFT Dataset - 将 NanoChat SFT 数据集适配为 EBT 训练格式
+EBT SFT dataset adapter for NanoChat task mixtures.
 
-使用 NanoChat 的 TaskMixture（SmolTalk, MMLU, GSM8K 等）作为 SFT 数据源，
-输出格式与 EBT pretrain dataloader 完全一致: (inputs, targets) 形状 (B, T)。
+This keeps the packed `(inputs, targets)` interface expected by the EBT trainer
+while using NanoChat conversation tasks as the data source.
 """
 
-import os
-import sys
 import copy
+import os
+from functools import lru_cache
+
 import torch
-from torch.utils.data import IterableDataset as _IterableDataset, DataLoader
+from torch.utils.data import DataLoader
+from torch.utils.data import IterableDataset as _IterableDataset
 
 from nanochat.common import get_dist_info
-from nanochat.tokenizer import get_tokenizer
 
 
-def _load_sft_datasets():
-    """加载 SFT 数据集混合 (支持 offline 模式)"""
+def _log_sft_dataset_root():
+    sft_data_dir = os.environ.get("NANOCHAT_SFT_DATA_DIR", "")
+    if sft_data_dir and os.path.exists(sft_data_dir):
+        print(f"[EBT SFT] Using offline dataset root: {sft_data_dir}")
+
+
+def _build_train_dataset():
     from tasks.common import TaskMixture
     from tasks.gsm8k import GSM8K
     from tasks.mmlu import MMLU
     from tasks.smoltalk import SmolTalk
-
-    # Offline 模式支持：设置 NANOCHAT_SFT_DATA_DIR 环境变量
-    # nanochat tasks 会自动使用该路径下的离线数据集
-    sft_data_dir = os.environ.get("NANOCHAT_SFT_DATA_DIR", "")
-    if sft_data_dir and os.path.exists(sft_data_dir):
-        print(f"[EBT SFT] 使用离线数据集: {sft_data_dir}")
 
     base_dir = os.environ.get("NANOCHAT_BASE_DIR", "")
     identity_path = os.path.join(base_dir, "identity_conversations.jsonl")
@@ -40,6 +40,7 @@ def _load_sft_datasets():
 
     try:
         from tasks.customjson import CustomJSON
+
         if os.path.exists(identity_path):
             train_tasks.append(CustomJSON(filepath=identity_path))
             train_tasks.append(CustomJSON(filepath=identity_path))
@@ -48,24 +49,49 @@ def _load_sft_datasets():
 
     try:
         from tasks.spellingbee import SimpleSpelling, SpellingBee
+
         train_tasks.append(SimpleSpelling(size=200000, split="train"))
         train_tasks.append(SpellingBee(size=80000, split="train"))
     except Exception:
         pass
 
-    train_dataset = TaskMixture(train_tasks)
+    return TaskMixture(train_tasks)
 
-    val_dataset = TaskMixture([
-        SmolTalk(split="test"),
-        MMLU(subset="all", split="test", stop=5200),
-        GSM8K(subset="main", split="test", stop=420),
-    ])
 
-    return train_dataset, val_dataset
+def _build_val_dataset():
+    from tasks.common import TaskMixture
+    from tasks.gsm8k import GSM8K
+    from tasks.mmlu import MMLU
+    from tasks.smoltalk import SmolTalk
+
+    return TaskMixture(
+        [
+            SmolTalk(split="test"),
+            MMLU(subset="all", split="test", stop=5200),
+            GSM8K(subset="main", split="test", stop=420),
+        ]
+    )
+
+
+@lru_cache(maxsize=2)
+def _load_sft_dataset(split):
+    """Load only the requested SFT split."""
+    _log_sft_dataset_root()
+    if split == "train":
+        return _build_train_dataset()
+    if split in ("val", "test"):
+        return _build_val_dataset()
+    raise ValueError(f"Unsupported SFT split: {split}")
+
+
+@lru_cache(maxsize=1)
+def _load_sft_datasets():
+    """Backward-compatible helper for callers expecting both splits."""
+    return _load_sft_dataset("train"), _load_sft_dataset("val")
 
 
 class SFTIterableDataset(_IterableDataset):
-    """将 NanoChat SFT TaskMixture 适配为 EBT IterableDataset"""
+    """Adapt NanoChat SFT task mixtures to the EBT iterable dataloader API."""
 
     STATE_VERSION = "sft_v1"
 
@@ -101,7 +127,9 @@ class SFTIterableDataset(_IterableDataset):
         self.ddp_rank = None
         self.ddp_world_size = None
 
-        self.train_dataset, self.val_dataset = _load_sft_datasets()
+        # Load only the split that is actually iterated. This avoids building
+        # both train and val task mixtures during trainer startup / sanity val.
+        self.dataset = None
 
     def _can_restore(self, state):
         return isinstance(state, dict) and (
@@ -151,9 +179,11 @@ class SFTIterableDataset(_IterableDataset):
         }
 
     def __iter__(self):
-        """BOS-aligned bestfit packing，对齐 chat_sft.py"""
+        """BOS-aligned best-fit packing, matching NanoChat chat formatting."""
         ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-        dataset = self.train_dataset if self.split == "train" else self.val_dataset
+        if self.dataset is None:
+            self.dataset = _load_sft_dataset(self.split)
+        dataset = self.dataset
         dataset_size = len(dataset)
         assert dataset_size > 0
 
@@ -190,7 +220,6 @@ class SFTIterableDataset(_IterableDataset):
             for _ in range(self.B):
                 row = []
                 row_mask = []
-                padded = False
                 while len(row) < self.row_capacity:
                     while len(self.conv_buffer) < self.buffer_size:
                         refill_buffer()
@@ -213,18 +242,25 @@ class SFTIterableDataset(_IterableDataset):
                         remaining = self.row_capacity - len(row)
                         row.extend([bos_token] * remaining)
                         row_mask.extend([0] * remaining)
-                        padded = True
                         break
 
-                rows.append(row[:self.row_capacity])
-                row_masks.append(row_mask[:self.row_capacity])
+                rows.append(row[: self.row_capacity])
+                row_masks.append(row_mask[: self.row_capacity])
 
             batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
             mask_tensor = torch.tensor(row_masks, dtype=torch.bool, pin_memory=use_cuda)
-            inputs = batch_tensor[:, :-1].to(device=self.device, dtype=torch.int64, non_blocking=use_cuda)
-            targets = batch_tensor[:, 1:].to(device=self.device, dtype=torch.int64, non_blocking=use_cuda)
-            target_mask = mask_tensor[:, 1:].to(device=self.device, dtype=torch.bool, non_blocking=use_cuda)
-            # Use nanochat's supervision mask directly: only assistant tokens should contribute to loss.
+            inputs = batch_tensor[:, :-1].to(
+                device=self.device, dtype=torch.int64, non_blocking=use_cuda
+            )
+            targets = batch_tensor[:, 1:].to(
+                device=self.device, dtype=torch.int64, non_blocking=use_cuda
+            )
+            target_mask = mask_tensor[:, 1:].to(
+                device=self.device, dtype=torch.bool, non_blocking=use_cuda
+            )
+
+            # Use NanoChat's supervision mask directly: only assistant tokens
+            # should contribute to the loss.
             targets = targets.masked_fill(~target_mask, -1)
 
             self.it += 1
@@ -274,7 +310,9 @@ class SFTDataLoader(DataLoader):
             dataset.load_state_dict(state_dict)
 
 
-def generate_sft_dataloader(tokenizer, batch_size, max_len, max_iter, split, device, resume_state_dict=None):
+def generate_sft_dataloader(
+    tokenizer, batch_size, max_len, max_iter, split, device, resume_state_dict=None
+):
     dataset = SFTIterableDataset(
         tokenizer=tokenizer,
         batch_size=batch_size,
