@@ -45,13 +45,27 @@ class EBMGRPOTrainer(LightningModule):
         # Policy model (trainable)
         self.model = model
 
+        # Branch-A: with current_logps using learning=False, alpha receives no
+        # gradient (it participates only in earlier MCMC steps whose graph is
+        # detached via create_graph=False). Freeze it explicitly so optimizer
+        # doesn't waste compute, and so DDP doesn't flag it as unused.
+        # Branch-B (use_learning_mode_for_logprobs=True) keeps alpha trainable.
+        if not config.use_learning_mode_for_logprobs:
+            if hasattr(self.model, 'alpha') and isinstance(self.model.alpha, torch.nn.Parameter):
+                self.model.alpha.requires_grad_(False)
+
         # Reference model (frozen) — for KL penalty
         if config.beta > 0.0:
             if ref_model is not None:
                 self.ref_model = ref_model
             else:
-                # Deep copy and freeze
-                self.ref_model = copy.deepcopy(model)
+                # Don't use copy.deepcopy on EBT — it has nn.Parameter alpha,
+                # buffers, and may have compiled-state artifacts that don't
+                # round-trip cleanly. Reconstruct from hparams and load state
+                # dict instead.
+                from openebm.elm.modeling_ebt import EBT_NLP
+                self.ref_model = EBT_NLP(model.hparams)
+                self.ref_model.load_state_dict(model.state_dict())
             for param in self.ref_model.parameters():
                 param.requires_grad = False
             self.ref_model.eval()
@@ -120,6 +134,7 @@ class EBMGRPOTrainer(LightningModule):
             self.log(f"train/reward_{key}", val)
 
         # ── Stability diagnostics ────────────────────────────────────────────
+        self.log("stability/degenerate_group_rate", gen_data.get("degenerate_rate", 0.0))
         self._log_stability_metrics()
 
         return total_loss
@@ -214,13 +229,31 @@ class EBMGRPOTrainer(LightningModule):
                 self.ref_model, full_ids, prompt_len, learning=False
             )
             ref_per_token_logps = ref_per_token_logps[:, :comp_len] * completion_masks.float()
+            # Defensive detach (we're already inside @torch.no_grad() in
+            # _generate_and_score, but after Step 1.1 logprobs.py forces
+            # set_grad_enabled(True) inside, which under the outer no_grad is
+            # still safe — make it explicit anyway).
+            ref_per_token_logps = ref_per_token_logps.detach()
 
         # ── 5. Compute advantages (group-relative) ───────────────────────────
         # Reshape rewards: (num_prompts, num_generations)
         grouped_rewards = rewards.view(num_prompts, self.config.num_generations)
         group_mean = grouped_rewards.mean(dim=1, keepdim=True)
-        group_std = grouped_rewards.std(dim=1, keepdim=True).clamp(min=1e-8)
-        advantages = ((grouped_rewards - group_mean) / group_std).view(-1)
+        group_std_raw = grouped_rewards.std(dim=1, keepdim=True)
+        # Detect degenerate groups (all completions identical → std≈0). In the
+        # sudoku task early-stage rollouts almost always degenerate because all
+        # completions fail to parse → reward=0 for all → std=0.
+        degenerate = (group_std_raw.squeeze(-1) < 1e-6)  # (num_prompts,)
+        # Use a saner lower bound than 1e-8 to prevent advantage explosion.
+        group_std_safe = group_std_raw.clamp(min=1e-4)
+        advantages = ((grouped_rewards - group_mean) / group_std_safe).view(-1)
+        # Zero-out degenerate groups (no learning signal anyway).
+        deg_mask = degenerate.repeat_interleave(self.config.num_generations)
+        advantages = torch.where(deg_mask, torch.zeros_like(advantages), advantages)
+        # Absolute clip on advantage magnitude: with reward in [0, 3] a legit
+        # advantage shouldn't exceed ±3; 5 leaves headroom.
+        advantages = advantages.clamp(-5.0, 5.0)
+        degenerate_rate = degenerate.float().mean().item()
 
         # ── Metrics ──────────────────────────────────────────────────────────
         avg_comp_len = completion_masks.sum(dim=1).float().mean().item()
@@ -239,6 +272,7 @@ class EBMGRPOTrainer(LightningModule):
             "reward_std": rewards.std().item(),
             "avg_completion_length": avg_comp_len,
             "reward_components": reward_components,
+            "degenerate_rate": degenerate_rate,
         }
 
     def _compute_grpo_loss(self, gen_data, iteration):
@@ -252,15 +286,51 @@ class EBMGRPOTrainer(LightningModule):
 
         comp_len = completion_masks.shape[1]
 
-        # Current log-probs MUST have gradients through MCMC chain.
-        # If learning=False, torch.set_grad_enabled(False) detaches everything → loss.requires_grad=False
-        # → DDP hangs forever on all-reduce waiting for grad hooks that never fire.
+        # Defensive: if rollout produced no signal or NaN logps, return a no-op
+        # loss that still requires grad (to keep DDP all-reduce alive). This is
+        # the last line of defense after Step 0.1-0.3; it replaces a crash with
+        # an observable skipped-step metric.
+        bad = (
+            (not torch.isfinite(old_logps).all())
+            or (not torch.isfinite(advantages).all())
+            or (completion_masks.sum().item() < 1.0)
+        )
+        if bad:
+            # Tiny loss attached to a real parameter so DDP grad hooks still
+            # fire. We pick any trainable param; alpha may be frozen in
+            # Branch-A, so iterate to find one that requires grad.
+            placeholder_param = None
+            for p in self.model.parameters():
+                if p.requires_grad:
+                    placeholder_param = p
+                    break
+            if placeholder_param is None:
+                placeholder = torch.zeros((), device=self.device, requires_grad=True)
+            else:
+                placeholder = (placeholder_param * 0.0).sum()
+            self.log("stability/skipped_step", 1.0)
+            return placeholder, {"policy_loss": 0.0, "kl": 0.0, "clip_ratio": 0.0}
+        else:
+            self.log("stability/skipped_step", 0.0)
+
+        # Current log-probs.
+        # Branch-A (d1-isomorphic, default): both old and current logps use
+        # learning=False — MCMC chain is a black-box sampler with no 2nd-order
+        # graph. Numerator and denominator come from the same estimator, so the
+        # PPO ratio exp(new-old) is well-defined even on the first step.
+        # DDP all-reduce stays alive because the outer set_grad_enabled(True)
+        # in logprobs.py keeps the last MCMC step's transformer params in the
+        # graph, so cross_entropy → current_logps still has requires_grad=True.
+        # Branch-B path (when use_learning_mode_for_logprobs=True) keeps
+        # learning=True for current to retain the 2nd-order graph (alpha grad).
+        learning_for_current = bool(self.config.use_learning_mode_for_logprobs)
         current_logps = get_per_token_logps(
             self.model,
             full_ids,
             prompt_len,
-            learning=True,
+            learning=learning_for_current,
         )
+        assert current_logps.requires_grad, "current_logps must require grad for DDP"
         current_logps = current_logps[:, :comp_len] * completion_masks
 
         # PPO ratio
@@ -275,14 +345,14 @@ class EBMGRPOTrainer(LightningModule):
         # KL penalty
         kl_value = 0.0
         if ref_logps is not None and self.config.beta > 0.0:
-            # Approximate KL: exp(ref - cur) - (ref - cur) - 1
-            per_token_kl = (
-                torch.exp(ref_logps - current_logps)
-                - (ref_logps - current_logps)
-                - 1.0
-            )
+            # Approximate KL: exp(ref - cur) - (ref - cur) - 1.
+            # Clamp the difference to prevent exp blowup when cur - ref is huge.
+            kl_diff = (ref_logps - current_logps).clamp(-10.0, 10.0)
+            per_token_kl = torch.exp(kl_diff) - kl_diff - 1.0
+            # Mask padding positions so they don't contribute to KL.
+            per_token_kl = per_token_kl * completion_masks
             per_token_loss = per_token_loss + self.config.beta * per_token_kl
-            kl_value = (per_token_kl * completion_masks).sum() / completion_masks.sum()
+            kl_value = per_token_kl.sum() / completion_masks.sum().clamp(min=1.0)
             kl_value = kl_value.item()
 
         # Aggregate loss (mean over valid tokens)

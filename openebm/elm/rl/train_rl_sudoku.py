@@ -67,10 +67,17 @@ def parse_args():
     # Training
     parser.add_argument("--num_gpus", type=int, default=-1)
     parser.add_argument("--float_precision", type=str, default="bf16-mixed")
-    parser.add_argument("--use_learning_mode", action="store_true", default=False,
-                        help="Use learning=True for log-prob computation (gradients through MCMC)")
-    parser.add_argument("--no_learning_mode", action="store_true", default=True,
-                        help="Disable learning mode for log-probs (faster, less signal)")
+    parser.add_argument(
+        "--logp_mcmc_grad",
+        type=str,
+        default="none",
+        choices=["none", "full"],
+        help="MCMC gradient mode for current_logps. "
+             "'none' (default, Branch-A): no 2nd-order graph; alpha frozen; "
+             "old/current logps use same estimator → ratio well-defined. "
+             "'full' (Branch-B): create_graph=True in MCMC; alpha trainable; "
+             "numerically fragile, use only if Branch-A doesn't learn.",
+    )
 
     # Logging
     parser.add_argument("--wandb_project", type=str, default="nlp_sudoku_rl")
@@ -154,7 +161,7 @@ def main():
         save_top_k=args.save_top_k,
         seed=args.seed,
         sft_checkpoint_path=args.sft_checkpoint,
-        use_learning_mode_for_logprobs=not args.no_learning_mode,
+        use_learning_mode_for_logprobs=(args.logp_mcmc_grad == "full"),
         data_dir=args.data_dir,
         augment=not args.no_augment,
         num_gpus=args.num_gpus,
