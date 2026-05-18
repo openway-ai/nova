@@ -50,8 +50,10 @@ export PYTHONUNBUFFERED=1
 # export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-sft-0420-from0413_20260420_193427/periodic-s=step=2999-d26-ctx1024.ckpt}"
 
 # ctx2048 sft-train
-export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-20260426/sft_train.v4/checkpoints/s=step=562-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.2264.ckpt}"
+# export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-20260426/sft_train.v4/checkpoints/s=step=562-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.2264.ckpt}"
 
+# ctx2048 sudoku-v3
+export CKPT_PATH="${CKPT_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-mixed-v3-20260515/sft_train.v4/checkpoints/s=step=2999-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=0.9434.ckpt}"
 
 
 if [ -z "$CKPT_PATH" ]; then
