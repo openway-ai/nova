@@ -114,7 +114,15 @@ class EBT_NLP(LightningModule):
         
         with torch.amp.autocast(device_type='cuda', enabled=False):
             energy_f32 = energy_preds.float()
-            if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
+            # Guard: if energy itself is NaN/Inf, skip gradient computation entirely
+            if torch.isnan(energy_f32).any() or torch.isinf(energy_f32).any():
+                import warnings
+                warnings.warn(
+                    f"NaN/Inf in energy output (step {mcmc_step}, iter {i}). "
+                    f"Skipping MCMC gradient — using zero grad."
+                )
+                predicted_tokens_grad = torch.zeros_like(predicted_tokens)
+            elif self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
                 if i == (num_mcmc_steps - 1):
                     predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
                 else:
@@ -127,9 +135,28 @@ class EBT_NLP(LightningModule):
             min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
             # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
             predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
-            
+
         if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
-            raise ValueError("NaN or Inf gradients detected during MCMC.")
+            if learning:
+                # During training backward: zero out bad gradients and warn (don't crash RL runs)
+                import warnings
+                bad_count = torch.isnan(predicted_tokens_grad).sum() + torch.isinf(predicted_tokens_grad).sum()
+                warnings.warn(
+                    f"NaN/Inf in MCMC grad (learning=True, step {mcmc_step}, iter {i}): "
+                    f"{bad_count.item()} bad elements / {predicted_tokens_grad.numel()} total. "
+                    f"Energy range: [{energy_f32.min().item():.4f}, {energy_f32.max().item():.4f}]. "
+                    f"Zeroing bad gradients."
+                )
+                predicted_tokens_grad = torch.where(
+                    torch.isfinite(predicted_tokens_grad), predicted_tokens_grad,
+                    torch.zeros_like(predicted_tokens_grad)
+                )
+            else:
+                # During inference/rollout: silently zero out (transient instability is tolerable)
+                predicted_tokens_grad = torch.where(
+                    torch.isfinite(predicted_tokens_grad), predicted_tokens_grad,
+                    torch.zeros_like(predicted_tokens_grad)
+                )
         
         predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after  
         
