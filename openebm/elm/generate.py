@@ -41,14 +41,16 @@ def sample_top_p(probs, p):
     bad = (probs_sort_sum <= 1e-9).squeeze(-1)
     probs_sort = probs_sort / probs_sort_sum.clamp_min(1e-9)
 
-    next_token = torch.multinomial(probs_sort, num_samples=1)
+    # Fix: for degenerate rows, set uniform over first token so multinomial
+    # never receives an all-zero distribution (which triggers CUDA assert).
     if bad.any():
-        argmax_idx = probs.argmax(dim=-1, keepdim=True)
-        # next_token here indexes into the sorted distribution; for bad rows we
-        # bypass the gather-from-sort logic by storing a sentinel index 0 and
-        # overwriting after the gather. Simpler: gather first, then overwrite.
+        probs_sort[bad] = 0.0
+        probs_sort[bad, 0] = 1.0
+
+    next_token = torch.multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
     if bad.any():
+        argmax_idx = probs.argmax(dim=-1, keepdim=True)
         next_token = torch.where(bad.unsqueeze(-1), argmax_idx, next_token)
     return next_token.long()
 

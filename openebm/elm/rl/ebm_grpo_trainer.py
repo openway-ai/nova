@@ -45,14 +45,33 @@ class EBMGRPOTrainer(LightningModule):
         # Policy model (trainable)
         self.model = model
 
-        # Branch-A: with current_logps using learning=False, alpha receives no
-        # gradient (it participates only in earlier MCMC steps whose graph is
-        # detached via create_graph=False). Freeze it explicitly so optimizer
-        # doesn't waste compute, and so DDP doesn't flag it as unused.
-        # Branch-B (use_learning_mode_for_logprobs=True) keeps alpha trainable.
-        if not config.use_learning_mode_for_logprobs:
-            if hasattr(self.model, 'alpha') and isinstance(self.model.alpha, torch.nn.Parameter):
-                self.model.alpha.requires_grad_(False)
+        # RL stability: only preserve the 2nd-order graph for the LAST MCMC step.
+        # With truncate_mcmc=False (SFT default), ALL steps use create_graph=True
+        # when learning=True, which is expensive and numerically fragile under bf16.
+        # truncate_mcmc=True limits the 2nd-order graph to the final step only —
+        # sufficient gradient signal with much better stability.
+        if hasattr(self.model, 'hparams'):
+            if isinstance(self.model.hparams, dict):
+                self.model.hparams['truncate_mcmc'] = True
+            else:
+                self.model.hparams.truncate_mcmc = True
+
+        # Freeze MCMC step-size (alpha) and Langevin noise std during RL.
+        # These were calibrated during SFT; the 2nd-order gradients through
+        # the MCMC chain are numerically fragile and corrupt alpha via NaN
+        # on the very first optimizer step (confirmed in v6 debug logs).
+        if hasattr(self.model, 'alpha'):
+            self.model.alpha.requires_grad_(False)
+        if hasattr(self.model, 'langevin_dynamics_noise_std'):
+            self.model.langevin_dynamics_noise_std.requires_grad_(False)
+
+        self.tokenizer = tokenizer
+
+        # Build hparams namespace for generate.py compatibility
+        self._gen_hparams = self._build_gen_hparams()
+
+        # Metrics tracking
+        self._step_metrics = {}
 
         # Reference model (frozen) — for KL penalty
         if config.beta > 0.0:
@@ -71,14 +90,6 @@ class EBMGRPOTrainer(LightningModule):
             self.ref_model.eval()
         else:
             self.ref_model = None
-
-        self.tokenizer = tokenizer
-
-        # Build hparams namespace for generate.py compatibility
-        self._gen_hparams = self._build_gen_hparams()
-
-        # Metrics tracking
-        self._step_metrics = {}
 
     def _build_gen_hparams(self):
         """Build a hparams-like namespace for generate.py functions."""
@@ -173,17 +184,25 @@ class EBMGRPOTrainer(LightningModule):
 
         # ── 1. Generate completions ──────────────────────────────────────────
         self.model.eval()
-        completion_ids, completion_texts, completion_masks = generate_completions(
-            model=self.model,
-            prompt_ids=prompt_ids,
-            tokenizer=self.tokenizer,
-            hparams=self._gen_hparams,
-            num_generations=self.config.num_generations,
-            max_completion_length=self.config.max_completion_length,
-            temperature=self.config.temperature,
-            top_p=self.config.top_p,
-            generation_batch_size=self.config.generation_batch_size,
-        )
+        # [DEBUG-RL] Reset debug flags for fresh logging in each phase.
+        self.model._dbg_logged_embed_stats = False
+        self.model._dbg_logged_logps_stats = False
+        # Disable bf16 autocast during rollout: the EBT transformer's energy
+        # head can overflow bf16 range, producing NaN/Inf that cascades to
+        # corrupt logits and multinomial crashes. fp32 rollout is safe — the
+        # generation batch is small and sequential (no backward graph).
+        with torch.amp.autocast('cuda', enabled=False):
+            completion_ids, completion_texts, completion_masks = generate_completions(
+                model=self.model,
+                prompt_ids=prompt_ids,
+                tokenizer=self.tokenizer,
+                hparams=self._gen_hparams,
+                num_generations=self.config.num_generations,
+                max_completion_length=self.config.max_completion_length,
+                temperature=self.config.temperature,
+                top_p=self.config.top_p,
+                generation_batch_size=self.config.generation_batch_size,
+            )
         self.model.train()
 
         # completion_ids: (num_prompts * num_generations, comp_len)
@@ -216,18 +235,33 @@ class EBMGRPOTrainer(LightningModule):
         )
         full_ids = torch.cat([expanded_prompts, completion_ids], dim=1)
 
-        old_per_token_logps = get_per_token_logps(
-            self.model, full_ids, prompt_len, learning=False
-        )
+        # [DEBUG-RL] Reset debug flag before old_logps computation.
+        self.model._fwd_had_nan_energy = False
+        self.model._dbg_logged_logps_stats = False
+        with torch.amp.autocast('cuda', enabled=False):
+            old_per_token_logps = get_per_token_logps(
+                self.model, full_ids, prompt_len, learning=False
+            )
+        # [DEBUG-RL] Check if old_logps forward hit NaN.
+        if getattr(self.model, '_fwd_had_nan_energy', False):
+            import os as _os
+            _rank = _os.environ.get('LOCAL_RANK', '?')
+            print(
+                f"[DBG-RL][rank={_rank}] old_logps forward hit NaN energy! "
+                f"old_logps finite={torch.isfinite(old_per_token_logps).all().item()} "
+                f"range=[{old_per_token_logps.min().item():.4e},{old_per_token_logps.max().item():.4e}]",
+                flush=True,
+            )
         # Mask out padding positions
         old_per_token_logps = old_per_token_logps[:, :comp_len] * completion_masks.float()
 
         # ── 4. Compute ref log-probs (for KL) ────────────────────────────────
         ref_per_token_logps = None
         if self.ref_model is not None and self.config.beta > 0.0:
-            ref_per_token_logps = get_per_token_logps(
-                self.ref_model, full_ids, prompt_len, learning=False
-            )
+            with torch.amp.autocast('cuda', enabled=False):
+                ref_per_token_logps = get_per_token_logps(
+                    self.ref_model, full_ids, prompt_len, learning=False
+                )
             ref_per_token_logps = ref_per_token_logps[:, :comp_len] * completion_masks.float()
             # Defensive detach (we're already inside @torch.no_grad() in
             # _generate_and_score, but after Step 1.1 logprobs.py forces
@@ -286,44 +320,11 @@ class EBMGRPOTrainer(LightningModule):
 
         comp_len = completion_masks.shape[1]
 
-        # Defensive: if rollout produced no signal or NaN logps, return a no-op
-        # loss that still requires grad (to keep DDP all-reduce alive). This is
-        # the last line of defense after Step 0.1-0.3; it replaces a crash with
-        # an observable skipped-step metric.
-        bad = (
-            (not torch.isfinite(old_logps).all())
-            or (not torch.isfinite(advantages).all())
-            or (completion_masks.sum().item() < 1.0)
-        )
-        if bad:
-            # Tiny loss attached to a real parameter so DDP grad hooks still
-            # fire. We pick any trainable param; alpha may be frozen in
-            # Branch-A, so iterate to find one that requires grad.
-            placeholder_param = None
-            for p in self.model.parameters():
-                if p.requires_grad:
-                    placeholder_param = p
-                    break
-            if placeholder_param is None:
-                placeholder = torch.zeros((), device=self.device, requires_grad=True)
-            else:
-                placeholder = (placeholder_param * 0.0).sum()
-            self.log("stability/skipped_step", 1.0)
-            return placeholder, {"policy_loss": 0.0, "kl": 0.0, "clip_ratio": 0.0}
-        else:
-            self.log("stability/skipped_step", 0.0)
-
-        # Current log-probs.
-        # Branch-A (d1-isomorphic, default): both old and current logps use
-        # learning=False — MCMC chain is a black-box sampler with no 2nd-order
-        # graph. Numerator and denominator come from the same estimator, so the
-        # PPO ratio exp(new-old) is well-defined even on the first step.
-        # DDP all-reduce stays alive because the outer set_grad_enabled(True)
-        # in logprobs.py keeps the last MCMC step's transformer params in the
-        # graph, so cross_entropy → current_logps still has requires_grad=True.
-        # Branch-B path (when use_learning_mode_for_logprobs=True) keeps
-        # learning=True for current to retain the 2nd-order graph (alpha grad).
+        # ── Compute current log-probs (with grad) ────────────────────────────
         learning_for_current = bool(self.config.use_learning_mode_for_logprobs)
+        # [DEBUG-RL] Reset NaN flag and debug log flag before current_logps.
+        self.model._fwd_had_nan_energy = False
+        self.model._dbg_logged_logps_stats = False
         current_logps = get_per_token_logps(
             self.model,
             full_ids,
@@ -332,6 +333,45 @@ class EBMGRPOTrainer(LightningModule):
         )
         assert current_logps.requires_grad, "current_logps must require grad for DDP"
         current_logps = current_logps[:, :comp_len] * completion_masks
+
+        # ── Cross-rank NaN sync: if ANY rank hit NaN, ALL ranks skip ─────────
+        # This prevents DDP hang from graph divergence across ranks.
+        import torch.distributed as dist
+        local_bad = torch.tensor(
+            1.0 if (
+                getattr(self.model, "_fwd_had_nan_energy", False)
+                or not torch.isfinite(current_logps).all()
+                or not torch.isfinite(old_logps).all()
+                or not torch.isfinite(advantages).all()
+                or (completion_masks.sum().item() < 1.0)
+            ) else 0.0,
+            device=self.device,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(local_bad, op=dist.ReduceOp.MAX)
+        any_rank_bad = local_bad.item() > 0.5
+
+        if any_rank_bad:
+            import os as _os
+            _rank = _os.environ.get('LOCAL_RANK', '?')
+            _local_nan = getattr(self.model, "_fwd_had_nan_energy", False)
+            _cur_finite = torch.isfinite(current_logps).all().item()
+            _old_finite = torch.isfinite(old_logps).all().item()
+            print(
+                f"[DBG-RL][rank={_rank}] SKIPPING STEP (cross-rank sync): "
+                f"local_nan_energy={_local_nan} "
+                f"current_logps_finite={_cur_finite} "
+                f"old_logps_finite={_old_finite} "
+                f"current_logps_range=[{current_logps.min().item():.4e},{current_logps.max().item():.4e}] "
+                f"old_logps_range=[{old_logps.min().item():.4e},{old_logps.max().item():.4e}]",
+                flush=True,
+            )
+            placeholder = sum(
+                (p * 0.0).sum() for p in self.model.parameters() if p.requires_grad
+            )
+            self.log("stability/skipped_step", 1.0)
+            return placeholder, {"policy_loss": 0.0, "kl": 0.0, "clip_ratio": 0.0}
+        self.log("stability/skipped_step", 0.0)
 
         # PPO ratio
         ratio = torch.exp(current_logps - old_logps)
@@ -389,12 +429,21 @@ class EBMGRPOTrainer(LightningModule):
     # ══════════════════════════════════════════════════════════════════════════
 
     def on_before_optimizer_step(self, optimizer):
-        """Log gradient norms and apply per-parameter clipping."""
+        """Log gradient norms, sanitize NaN grads, and apply per-parameter clipping."""
         total_norm = 0.0
         alpha_grad = None
         max_param_grad_norm = 0.0
+        nan_grad_params = 0
+
         for name, p in self.model.named_parameters():
             if p.grad is not None:
+                # Sanitize NaN/Inf gradients BEFORE clipping — clamp(NaN) is still NaN.
+                if not torch.isfinite(p.grad.data).all():
+                    nan_grad_params += 1
+                    p.grad.data = torch.where(
+                        torch.isfinite(p.grad.data), p.grad.data,
+                        torch.zeros_like(p.grad.data)
+                    )
                 param_norm = p.grad.data.norm(2).item()
                 total_norm += param_norm ** 2
                 max_param_grad_norm = max(max_param_grad_norm, param_norm)
@@ -403,12 +452,20 @@ class EBMGRPOTrainer(LightningModule):
         total_norm = total_norm ** 0.5
         self.log("stability/grad_norm_before_clip", total_norm)
         self.log("stability/max_param_grad_norm", max_param_grad_norm)
+        self.log("stability/nan_grad_params", float(nan_grad_params))
         if alpha_grad is not None:
             self.log("stability/alpha_grad", alpha_grad)
 
-        # Per-parameter gradient clipping: more effective than global norm for EBT
-        # because alpha (scalar) and transformer (millions of params) have vastly
-        # different gradient scales. Global norm clipping barely touches alpha.
+        if nan_grad_params > 0:
+            import os as _os
+            _rank = _os.environ.get('LOCAL_RANK', '?')
+            print(
+                f"[DBG-RL][rank={_rank}] Sanitized NaN grads in {nan_grad_params} params "
+                f"(total_norm_after={total_norm:.4e})",
+                flush=True,
+            )
+
+        # Per-parameter gradient clipping
         if self.config.max_grad_per_param > 0.0:
             clip_val = self.config.max_grad_per_param
             for p in self.model.parameters():
