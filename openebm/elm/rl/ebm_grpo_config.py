@@ -84,23 +84,19 @@ class EBMGRPOConfig:
     """Path to the SFT-trained checkpoint to initialize from."""
 
     # ── EBT-specific ──────────────────────────────────────────────────────────
-    use_learning_mode_for_logprobs: bool = True
-    """Whether to use learning mode when computing current_logps.
-
-    When True (default), current_logps is computed with learning=True, preserving the
-    2nd-order autograd graph in the last MCMC step (or all steps if truncate_mcmc=False).
-    This gives model parameters a differentiable path and is REQUIRED for DDP training.
-    With learning=True, gradients flow to both transformer parameters and alpha.
-
-    When False, current_logps uses learning=False. With truncate_mcmc=False (SFT default),
-    ALL MCMC steps use create_graph=False in autograd.grad, which CONSUMES the forward graph.
-    After autograd.grad returns, there is NO differentiable path from final logits to any
-    model parameter. This causes loss.backward() to produce zero gradients, DDP backward
-    hooks never fire, and DDP hangs waiting for gradient reduction that never completes.
-
-    Note: old_logps always uses learning=False under @torch.no_grad() so it's properly
-    detached regardless of this setting.
+    rl_loss_type: str = "energy_gspo"
+    """RL loss variant for EBT. Options:
+    - 'energy_gspo' (default): Sequence-level energy ratio with PPO clipping.
+      ratio = exp(-(E_θ - E_θ_old) / |y|). First-order, no Hessian.
+    - 'energy_reinforce': Pure on-policy, loss = -advantage * (-E_θ).
+      Simplest, no importance ratio needed. No PPO stability guarantees.
+    - 'token_logprobs': Original token-level logprobs via MCMC chain.
+      Requires create_graph=True (Hessian). Known to produce NaN gradients
+      with EBT's architecture — kept for research/debugging only.
     """
+
+    use_learning_mode_for_logprobs: bool = True
+    """Only used when rl_loss_type='token_logprobs'. Controls create_graph in MCMC."""
 
     # ── Data ──────────────────────────────────────────────────────────────────
     data_dir: str = ""
