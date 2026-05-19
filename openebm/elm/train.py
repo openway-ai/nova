@@ -37,6 +37,7 @@ from openebm.elm.eval import nlp_eval_acc
 from openebm.elm.trainer import ModelTrainer
 from openebm.elm.utils import init_wandb_watch, model_sizes
 
+
 @rank_zero_only # to ensure only one wandb run is created, if didnt do that then each GPU would create its own wandb run
 def setup_wandb(args): 
     import wandb
@@ -191,7 +192,8 @@ def main(args):
     # if args.debug_dataloader:
     #     debug_dataloader(args, model_trainer)
     #     return
-    if args.log_model_archi:
+    is_rank_zero_process = int(os.environ.get("RANK", "0")) == 0
+    if args.log_model_archi and is_rank_zero_process:
         print(str(model_trainer.model))
         print(str(args))
 
@@ -312,8 +314,19 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
     profiler = None if args.profiler == "" else args.profiler
     gradient_clip_val = args.gradient_clip_val if args.gradient_clip_val > 0 else None
     limit_val_batches = 0 if args.overfit_batches > 0 else args.limit_val_batches
+    if (
+        getattr(args, "dataset_name", "") == "nanochat_sft"
+        and isinstance(args.val_check_interval, float)
+        and args.val_check_interval > 1
+        and args.val_check_interval.is_integer()
+    ):
+        args.val_check_interval = int(args.val_check_interval)
     # val_check_interval = args.val_check_interval if args.val_check_interval == 1.0 else args.val_check_interval * args.accumulate_grad_batches  #NOTE the reason we mult by args.accumulate_grad_batches is because of this bug https://github.com/Lightning-AI/pytorch-lightning/issues/12205
     limit_test_batches = args.limit_test_batches if args.limit_test_batches == 1 else args.limit_test_batches * args.accumulate_grad_batches
+    callbacks = [checkpoint_callback] + ([periodic_checkpoint] if periodic_checkpoint else [])
+    if args.log_model_archi:
+        callbacks.append(ModelSummary(max_depth=2))
+
     trainer = Trainer(
         accelerator="auto",
         devices = args.gpus,
@@ -322,7 +335,7 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
         max_steps=args.max_steps,
         logger=wandb_logger,
         enable_model_summary=args.log_model_archi,
-        callbacks = [checkpoint_callback] + ([periodic_checkpoint] if periodic_checkpoint else []) + [ModelSummary(max_depth=-1)],
+        callbacks=callbacks,
         strategy = args.distributed_strategy, 
         enable_checkpointing=True,
         fast_dev_run = args.fast_dev_run,

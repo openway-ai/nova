@@ -14,14 +14,14 @@ set -e
 ### 基础配置 ###
 # EXP_ID 必须指定，指向 base_train 的实验目录
 # 例如: export EXP_ID="d26-ctx1024-muon_adamw-20260413-1235"
-export EXP_ID="d26-ctx2048-20260422"
+export EXP_ID="d26-ctx2048-20260513"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
 
 ### 预训练权重 ###
 # base_train c2048 bpb 0.78
-PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova/logs/checkpoints/2node-8gpu-bf16mixed_0422_1706_d26_ctx2048_bs512_lr0.00025_2nodes_8gpus/s=step=6999-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.6489.ckpt"
+PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova/logs/checkpoints/2node-8gpu-bf16mixed_0513_1739_d26_ctx2048_bs512_lr0.0012_2nodes_8gpus/s=step=6999-d26-ctx2048-lr0.0012-bs1x32-muon_adamw-valid_loss=valid_loss=2.6277.ckpt"
 
 ### 环境变量 (对齐 resume_ebt_muon_adamw.sh + Offline 支持) ###
 HOME="/mnt/shared-storage-user/luyudong/nanochat"
@@ -36,6 +36,7 @@ export NANOCHAT_OFFLINE_MODE=1
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
+export PYTHONUNBUFFERED=1
 
 # mkdir -p logs/slurm/nlp/
 # module purge
@@ -66,14 +67,12 @@ DEVICE_BATCH_SIZE=1
 
 GRAD_ACCUM=32
 
-
-
 ################################################################################
 # SFT 学习率配置
 ################################################################################
 # SFT 使用较低学习率，防止灾难性遗忘
-# 预训练 PEAK_LR=0.00025，SFT 降 5x
-PEAK_LR=0.00005
+# 预训练 PEAK_LR=0.0012，SFT 降 5x
+PEAK_LR=0.00024
 # 注意: 使用 --linear_warmdown 调度时 --warm_up_steps / --warm_up_base_lr_divider / --min_lr_scale
 # 均不生效 (WarmUpLinearWarmdownLR 只接受 warmup_ratio)。warmup 由 --warmup_ratio 控制。
 #
@@ -88,7 +87,7 @@ SFT_SCALAR_LR=0.004         # 预训练 0.04 ÷ 10
 ################################################################################
 # 优化器配置 (对齐预训练)
 ################################################################################
-WEIGHT_DECAY=0.0
+WEIGHT_DECAY=0.2
 BETA1=0.8
 BETA2=0.95
 GRADIENT_CLIP_VAL=1.0
@@ -110,7 +109,10 @@ LIMIT_VAL_BATCHES=50
 ################################################################################
 # 优化选项配置 (SFT: 所有绝对 LR 同比降低)
 ################################################################################
-OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.05 --optimizer muon_adamw --muon_lr ${SFT_MUON_LR} --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr ${SFT_EMBEDDING_LR} --adamw_vocab_to_embed_lr ${SFT_VOCAB_TO_EMBED_LR} --adamw_scalar_lr ${SFT_SCALAR_LR} --adamw_dmodel_lr_scaling"
+OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0057 --warmdown_ratio 0.5 --final_lr_frac 0.05 \
+--optimizer muon_adamw --muon_lr ${SFT_MUON_LR} --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 \
+--adamw_embedding_lr ${SFT_EMBEDDING_LR} --adamw_vocab_to_embed_lr ${SFT_VOCAB_TO_EMBED_LR} --adamw_scalar_lr ${SFT_SCALAR_LR} --adamw_dmodel_lr_scaling \
+--muon_momentum_warmup_steps 300"
 
 ################################################################################
 # torch.compile 配置 (对齐预训练)
@@ -173,7 +175,7 @@ echo ""
 ################################################################################
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/utils/exp_layout.sh"
+source "$(dirname "$SCRIPT_DIR")/utils/exp_layout.sh"
 
 export PRETRAIN_CKPT="${PRETRAIN_CKPT}"
 exp_init_sft "$0"
@@ -254,7 +256,7 @@ echo "[开始训练]"
 echo "================================================================================"
 echo ""
 
-set -e
+set +e
 
 torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/luyudong/nova-sft/nova/openebm/elm/train.py \
 --run_name ${RUN_NAME}_${current_time} \
@@ -289,11 +291,10 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/luyu
 --val_sanity 1 \
 --validation_split_pct 0.0027 \
 --wandb_project 'nlp_sft' \
---log_model_archi \
 --set_matmul_precision "medium" \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --save_periodic_steps ${VAL_CHECK_INTERVAL} \
---float_precision "bf16-true" \
+--float_precision "bf16-mixed" \
 --finetuning_model_ckpt ${PRETRAIN_CKPT} \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
