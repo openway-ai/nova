@@ -70,13 +70,13 @@ def parse_args():
     parser.add_argument(
         "--logp_mcmc_grad",
         type=str,
-        default="none",
+        default="full",
         choices=["none", "full"],
         help="MCMC gradient mode for current_logps. "
-             "'none' (default, Branch-A): no 2nd-order graph; alpha frozen; "
-             "old/current logps use same estimator → ratio well-defined. "
-             "'full' (Branch-B): create_graph=True in MCMC; alpha trainable; "
-             "numerically fragile, use only if Branch-A doesn't learn.",
+             "'full' (default): create_graph=True for last MCMC step; "
+             "gradients flow to transformer+alpha; required for DDP. "
+             "'none': no 2nd-order graph; NO gradient to any parameter; "
+             "will cause DDP hang — only for debugging/profiling.",
     )
 
     # Logging

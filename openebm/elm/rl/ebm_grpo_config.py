@@ -84,24 +84,23 @@ class EBMGRPOConfig:
     """Path to the SFT-trained checkpoint to initialize from."""
 
     # ── EBT-specific ──────────────────────────────────────────────────────────
-    use_learning_mode_for_logprobs: bool = False
-    """MCMC gradient mode for current_logps.
+    use_learning_mode_for_logprobs: bool = True
+    """Whether to use learning mode when computing current_logps.
 
-    False (Branch-A, default, d1-isomorphic): current_logps uses learning=False
-      → MCMC chain has NO 2nd-order graph; alpha is frozen; only the last MCMC
-      step's transformer params are differentiable. Numerator and denominator
-      of the PPO ratio come from the same estimator → exp(new-old) well-defined.
+    When True (default), current_logps is computed with learning=True, preserving the
+    2nd-order autograd graph in the last MCMC step (or all steps if truncate_mcmc=False).
+    This gives model parameters a differentiable path and is REQUIRED for DDP training.
+    With learning=True, gradients flow to both transformer parameters and alpha.
 
-    True (Branch-B): current_logps uses learning=True → create_graph=True in
-      `_mcmc_step_excluded`; alpha receives gradient through the full MCMC
-      chain. Numerically fragile under bf16; use only if Branch-A doesn't learn.
+    When False, current_logps uses learning=False. With truncate_mcmc=False (SFT default),
+    ALL MCMC steps use create_graph=False in autograd.grad, which CONSUMES the forward graph.
+    After autograd.grad returns, there is NO differentiable path from final logits to any
+    model parameter. This causes loss.backward() to produce zero gradients, DDP backward
+    hooks never fire, and DDP hangs waiting for gradient reduction that never completes.
 
-    Earlier comments claimed learning=False causes DDP hangs — that was only
-    true when logprobs.py wrapped the forward in `set_grad_enabled(learning)`.
-    After fixing logprobs.py to always wrap with `set_grad_enabled(True)`
-    (Step 1.1), the last MCMC step's transformer params stay in the graph and
-    cross_entropy → current_logps still has requires_grad=True, so all-reduce
-    hooks fire correctly."""
+    Note: old_logps always uses learning=False under @torch.no_grad() so it's properly
+    detached regardless of this setting.
+    """
 
     # ── Data ──────────────────────────────────────────────────────────────────
     data_dir: str = ""

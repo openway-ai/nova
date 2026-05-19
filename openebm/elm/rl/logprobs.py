@@ -44,7 +44,7 @@ def get_per_token_logps(model, input_ids, prompt_length, learning=True):
     # `create_graph` inside `_mcmc_step_excluded` (i.e., whether MCMC builds a
     # 2nd-order graph). Callers wrap with @torch.no_grad() if they want detach
     # (e.g. old_logps / ref_logps in _generate_and_score).
-    with torch.set_grad_enabled(True):
+    with torch.set_grad_enabled(True), torch.amp.autocast('cuda', enabled=False):
         predicted_distributions, _ = model.forward(
             model_input,
             start_pos=0,
@@ -56,12 +56,44 @@ def get_per_token_logps(model, input_ids, prompt_length, learning=True):
     # Take the final MCMC step's logits
     final_logits = predicted_distributions[-1]  # (B, S-1, V)
 
+    # [DEBUG-RL] Log logit stats on first call per process.
+    if not getattr(model, '_dbg_logged_logps_stats', False):
+        import os as _os
+        _rank = _os.environ.get('LOCAL_RANK', '?')
+        with torch.no_grad():
+            _fl = final_logits.float()
+            _autocast_enabled = torch.is_autocast_enabled()
+            print(
+                f"[DBG-RL][rank={_rank}] logprobs: learning={learning} "
+                f"autocast_enabled={_autocast_enabled} "
+                f"final_logits dtype={final_logits.dtype} shape={tuple(final_logits.shape)} "
+                f"min={_fl.min().item():.4e} max={_fl.max().item():.4e} "
+                f"nan={torch.isnan(_fl).any().item()} inf={torch.isinf(_fl).any().item()} "
+                f"model._fwd_had_nan_energy={getattr(model, '_fwd_had_nan_energy', None)}",
+                flush=True,
+            )
+        model._dbg_logged_logps_stats = True
+
     # Compute per-token log-probs: -cross_entropy(logits, targets)
     # Reshape for cross_entropy: (B*(S-1), V) vs (B*(S-1),)
     flat_logits = final_logits.reshape(-1, final_logits.shape[-1])
     flat_targets = targets.reshape(-1)
     per_token_loss = F.cross_entropy(flat_logits, flat_targets, reduction='none')
     per_token_logps = -per_token_loss.view(B, S - 1)
+
+    # [DEBUG-RL] Check for NaN in logps output.
+    if not torch.isfinite(per_token_logps).all():
+        import os as _os
+        _rank = _os.environ.get('LOCAL_RANK', '?')
+        nan_cnt = int(torch.isnan(per_token_logps).sum().item())
+        inf_cnt = int(torch.isinf(per_token_logps).sum().item())
+        print(
+            f"[DBG-RL][rank={_rank}] NaN-LOGPS: learning={learning} "
+            f"nan={nan_cnt} inf={inf_cnt} total={per_token_logps.numel()} "
+            f"flat_logits_nan={torch.isnan(flat_logits).any().item()} "
+            f"flat_logits_range=[{flat_logits.min().item():.4e},{flat_logits.max().item():.4e}]",
+            flush=True,
+        )
 
     # Return only completion positions
     # prompt_length tokens in input → prompt_length-1 positions in the shifted targets

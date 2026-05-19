@@ -21,7 +21,7 @@ export MODEL_SIZE="d26"
 
 ### SFT 权重 (RL 起点) ###
 # TODO: 替换为实际的 SFT v3 最佳 checkpoint 路径
-SFT_CKPT="${SFT_CKPT:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-mixed-0.6-20260508/sft_train/checkpoints/best.ckpt}"
+SFT_CKPT="${SFT_CKPT:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-mixed-0.6-20260508/sft_train/checkpoints/s=step=2990-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=0.4782.ckpt}"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -226,7 +226,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --seed ${SEED} \
     --data_dir "${SUDOKU_DATA_DIR_V2}" \
     --num_gpus ${NUM_GPUS} \
-    --float_precision "bf16-mixed" \
+    --float_precision "32-true" \
     --wandb_project "nlp_sudoku_rl" \
     --wandb_mode "${WANDB_MODE}" \
     --run_name "${RUN_NAME}_${current_time}" \
