@@ -63,15 +63,9 @@ class EBT_NLP(LightningModule):
             self.replay_buffer_samples = self.hparams.batch_size_per_device * self.hparams.mcmc_replay_buffer_sample_bs_percent
             self.replay_buffer = CausalReplayBuffer(max_size=replay_buffer_max_size, sample_size=self.replay_buffer_samples)
 
-        # [DEBUG-RL] Per-forward NaN flag. Reset at the start of each forward(),
-        # set to True if the energy/MCMC-grad NaN guard is triggered. Used by
-        # the GRPO trainer to synchronize across ranks and avoid DDP hang.
+        # Per-forward NaN flag for GRPO cross-rank sync.
         self._fwd_had_nan_energy = False
-
-        # [DEBUG-RL] Per-forward NaN flag. Reset at the start of each forward(),
-        # set to True if the energy/MCMC-grad NaN guard is triggered. Used by
-        # the GRPO trainer to synchronize across ranks and avoid DDP hang.
-        self._fwd_had_nan_energy = False
+        self._alpha_init_value = float(self.alpha.detach().item())
 
         # DEBUGGING CODE ################################################################################################################################################
         if self.hparams.debug_unused_parameters:
@@ -187,29 +181,22 @@ class EBT_NLP(LightningModule):
                 import warnings, os as _os
                 bad_count = torch.isnan(predicted_tokens_grad).sum() + torch.isinf(predicted_tokens_grad).sum()
                 _rank = _os.environ.get('LOCAL_RANK', '?')
+                finite_grad = predicted_tokens_grad[torch.isfinite(predicted_tokens_grad)]
+                if finite_grad.numel() > 0:
+                    grad_min, grad_max = finite_grad.min().item(), finite_grad.max().item()
+                else:
+                    grad_min = grad_max = float('nan')
                 print(
                     f"[DBG-RL][rank={_rank}] NaN-GRAD step={mcmc_step} iter={i} "
                     f"bad={bad_count.item()}/{predicted_tokens_grad.numel()} "
                     f"energy_range=[{energy_f32.min().item():.4e},{energy_f32.max().item():.4e}] "
-                    f"grad_finite_range=[{predicted_tokens_grad[torch.isfinite(predicted_tokens_grad)].min().item():.4e},"
-                    f"{predicted_tokens_grad[torch.isfinite(predicted_tokens_grad)].max().item():.4e}]",
+                    f"grad_finite_range=[{grad_min:.4e},{grad_max:.4e}]",
                     flush=True,
                 )
-                warnings.warn(
-                    f"NaN/Inf in MCMC grad (learning=True, step {mcmc_step}, iter {i}): "
-                    f"{bad_count.item()} bad elements / {predicted_tokens_grad.numel()} total. "
-                    f"Energy range: [{energy_f32.min().item():.4f}, {energy_f32.max().item():.4f}]. "
-                    f"Zeroing bad gradients."
-                )
-                predicted_tokens_grad = torch.where(
-                    torch.isfinite(predicted_tokens_grad), predicted_tokens_grad,
-                    torch.zeros_like(predicted_tokens_grad)
-                )
-            else:
-                predicted_tokens_grad = torch.where(
-                    torch.isfinite(predicted_tokens_grad), predicted_tokens_grad,
-                    torch.zeros_like(predicted_tokens_grad)
-                )
+            predicted_tokens_grad = torch.where(
+                torch.isfinite(predicted_tokens_grad), predicted_tokens_grad,
+                torch.zeros_like(predicted_tokens_grad)
+            )
         
         predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after  
         
@@ -223,7 +210,7 @@ class EBT_NLP(LightningModule):
         # returning raw logits. Prevents NaN cascading to softmax → multinomial.
         if return_raw_logits and not torch.isfinite(predicted_tokens).all():
             predicted_tokens = torch.nan_to_num(
-                predicted_tokens, nan=0.0, posinf=0.0, neginf=0.0
+                predicted_tokens, nan=0.0, posinf=100.0, neginf=-100.0
             )
 
         if return_raw_logits:
@@ -277,11 +264,12 @@ class EBT_NLP(LightningModule):
         # Safety net: if alpha became NaN (e.g. from a corrupted optimizer step),
         # restore it to the SFT-calibrated default to prevent cascading failure.
         if not torch.isfinite(alpha):
-            alpha = torch.tensor(500.0, device=self.alpha.device, dtype=self.alpha.dtype)
+            _recovery = getattr(self, '_alpha_init_value', 500.0)
+            alpha = torch.tensor(_recovery, device=self.alpha.device, dtype=self.alpha.dtype)
             with torch.no_grad():
-                self.alpha.fill_(500.0)
+                self.alpha.fill_(_recovery)
             if not getattr(self, '_alpha_nan_warned', False):
-                print("[DBG-RL] WARNING: alpha was NaN, restored to 500.0", flush=True)
+                print(f"[DBG-RL] WARNING: alpha was NaN, restored to {_recovery}", flush=True)
                 self._alpha_nan_warned = True
         if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
             expanded_alpha = alpha.expand(batch_size, seq_length, 1)

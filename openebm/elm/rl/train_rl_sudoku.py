@@ -68,15 +68,21 @@ def parse_args():
     parser.add_argument("--num_gpus", type=int, default=-1)
     parser.add_argument("--float_precision", type=str, default="bf16-mixed")
     parser.add_argument(
+        "--rl_loss_type",
+        type=str,
+        default="energy_gspo",
+        choices=["energy_gspo", "energy_reinforce", "token_logprobs"],
+        help="RL loss variant. energy_gspo (default): sequence-level energy ratio. "
+             "energy_reinforce: pure on-policy energy loss. "
+             "token_logprobs: legacy MCMC logprobs (Hessian-unstable).",
+    )
+    parser.add_argument(
         "--logp_mcmc_grad",
         type=str,
         default="full",
         choices=["none", "full"],
-        help="MCMC gradient mode for current_logps. "
-             "'full' (default): create_graph=True for last MCMC step; "
-             "gradients flow to transformer+alpha; required for DDP. "
-             "'none': no 2nd-order graph; NO gradient to any parameter; "
-             "will cause DDP hang — only for debugging/profiling.",
+        help="Only for token_logprobs mode. "
+             "'full': create_graph=True; 'none': create_graph=False.",
     )
 
     # Logging
@@ -161,6 +167,7 @@ def main():
         save_top_k=args.save_top_k,
         seed=args.seed,
         sft_checkpoint_path=args.sft_checkpoint,
+        rl_loss_type=args.rl_loss_type,
         use_learning_mode_for_logprobs=(args.logp_mcmc_grad == "full"),
         data_dir=args.data_dir,
         augment=not args.no_augment,
@@ -234,7 +241,7 @@ def main():
         val_check_interval=config.val_check_interval,
         limit_val_batches=10,
         num_sanity_val_steps=0,
-        gradient_clip_val=config.gradient_clip_val,
+        gradient_clip_val=None,  # per-param clipping in on_before_optimizer_step suffices
         precision=args.float_precision,
         accelerator="gpu" if gpus > 0 else "cpu",
         devices=gpus if gpus > 0 else 1,

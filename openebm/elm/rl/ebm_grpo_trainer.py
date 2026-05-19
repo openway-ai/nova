@@ -28,7 +28,7 @@ except ImportError:
     from pytorch_lightning.callbacks import ModelCheckpoint, Callback
 
 from openebm.elm.rl.ebm_grpo_config import EBMGRPOConfig
-from openebm.elm.rl.logprobs import get_per_token_logps
+from openebm.elm.rl.logprobs import get_per_token_logps, compute_sequence_energy
 from openebm.elm.rl.rewards import compute_sudoku_rewards, compute_sudoku_rewards_detailed
 from openebm.elm.rl.rollout import generate_completions
 from openebm.elm.rl.sudoku_dataset_rl import SudokuRLPromptDataset, collate_rl_prompts
@@ -228,46 +228,32 @@ class EBMGRPOTrainer(LightningModule):
             device=self.device,
         )
 
-        # ── 3. Compute old log-probs ─────────────────────────────────────────
-        # Build full sequences (prompt + completion)
+        # ── 3. Compute old energies / logprobs ───────────────────────────────
         expanded_prompts = prompt_ids.repeat_interleave(
             self.config.num_generations, dim=0
         )
         full_ids = torch.cat([expanded_prompts, completion_ids], dim=1)
 
-        # [DEBUG-RL] Reset debug flag before old_logps computation.
-        self.model._fwd_had_nan_energy = False
-        self.model._dbg_logged_logps_stats = False
-        with torch.amp.autocast('cuda', enabled=False):
-            old_per_token_logps = get_per_token_logps(
-                self.model, full_ids, prompt_len, learning=False
-            )
-        # [DEBUG-RL] Check if old_logps forward hit NaN.
-        if getattr(self.model, '_fwd_had_nan_energy', False):
-            import os as _os
-            _rank = _os.environ.get('LOCAL_RANK', '?')
-            print(
-                f"[DBG-RL][rank={_rank}] old_logps forward hit NaN energy! "
-                f"old_logps finite={torch.isfinite(old_per_token_logps).all().item()} "
-                f"range=[{old_per_token_logps.min().item():.4e},{old_per_token_logps.max().item():.4e}]",
-                flush=True,
-            )
-        # Mask out padding positions
-        old_per_token_logps = old_per_token_logps[:, :comp_len] * completion_masks.float()
+        # Energy-based path (for energy_gspo and energy_reinforce)
+        old_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
+
+        # Token-level logprobs path (for token_logprobs variant or KL)
+        old_per_token_logps = None
+        if self.config.rl_loss_type == "token_logprobs" or (self.ref_model is not None and self.config.beta > 0.0):
+            with torch.amp.autocast('cuda', enabled=False):
+                old_per_token_logps, _ = get_per_token_logps(
+                    self.model, full_ids, prompt_len, learning=False
+                )
+            old_per_token_logps = old_per_token_logps[:, :comp_len] * completion_masks.float()
 
         # ── 4. Compute ref log-probs (for KL) ────────────────────────────────
         ref_per_token_logps = None
         if self.ref_model is not None and self.config.beta > 0.0:
             with torch.amp.autocast('cuda', enabled=False):
-                ref_per_token_logps = get_per_token_logps(
+                ref_per_token_logps, _ = get_per_token_logps(
                     self.ref_model, full_ids, prompt_len, learning=False
                 )
             ref_per_token_logps = ref_per_token_logps[:, :comp_len] * completion_masks.float()
-            # Defensive detach (we're already inside @torch.no_grad() in
-            # _generate_and_score, but after Step 1.1 logprobs.py forces
-            # set_grad_enabled(True) inside, which under the outer no_grad is
-            # still safe — make it explicit anyway).
-            ref_per_token_logps = ref_per_token_logps.detach()
 
         # ── 5. Compute advantages (group-relative) ───────────────────────────
         # Reshape rewards: (num_prompts, num_generations)
@@ -299,6 +285,7 @@ class EBMGRPOTrainer(LightningModule):
             "full_ids": full_ids,
             "prompt_len": prompt_len,
             "completion_masks": completion_masks,
+            "old_energies": old_energies.detach(),
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
@@ -310,62 +297,96 @@ class EBMGRPOTrainer(LightningModule):
         }
 
     def _compute_grpo_loss(self, gen_data, iteration):
-        """Compute PPO-clipped loss + KL penalty for one iteration."""
+        """Compute GRPO loss. Supports three variants via config.rl_loss_type."""
+        full_ids = gen_data["full_ids"]
+        prompt_len = gen_data["prompt_len"]
+        completion_masks = gen_data["completion_masks"].float()
+        advantages = gen_data["advantages"]
+
+        loss_type = self.config.rl_loss_type
+
+        if loss_type == "energy_gspo":
+            loss, metrics = self._loss_energy_gspo(gen_data)
+        elif loss_type == "energy_reinforce":
+            loss, metrics = self._loss_energy_reinforce(gen_data)
+        elif loss_type == "token_logprobs":
+            loss, metrics = self._loss_token_logprobs(gen_data, iteration)
+        else:
+            raise ValueError(f"Unknown rl_loss_type: {loss_type}")
+
+        return loss, metrics
+
+    def _loss_energy_gspo(self, gen_data):
+        """Energy-GSPO: sequence-level energy ratio with PPO clipping."""
+        full_ids = gen_data["full_ids"]
+        prompt_len = gen_data["prompt_len"]
+        completion_masks = gen_data["completion_masks"].float()
+        old_energies = gen_data["old_energies"]
+        advantages = gen_data["advantages"]
+
+        current_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
+
+        # Sequence-level importance ratio via energy difference
+        comp_lengths = completion_masks.sum(dim=1).clamp(min=1.0)
+        log_ratio = -(current_energies - old_energies) / comp_lengths
+        ratio = torch.exp(log_ratio.clamp(-10.0, 10.0))
+
+        clipped_ratio = torch.clamp(ratio, 1.0 - self.config.epsilon, 1.0 + self.config.epsilon)
+        loss1 = ratio * advantages
+        loss2 = clipped_ratio * advantages
+        loss = -torch.min(loss1, loss2).mean()
+
+        clip_ratio = ((ratio - clipped_ratio).abs() > 1e-6).float().mean().item()
+        self.log("train/energy_mean", current_energies.mean().item())
+        self.log("train/ratio_mean", ratio.mean().item())
+
+        return loss, {"policy_loss": loss.item(), "kl": 0.0, "clip_ratio": clip_ratio}
+
+    def _loss_energy_reinforce(self, gen_data):
+        """Energy-REINFORCE: pure on-policy, no importance ratio."""
+        full_ids = gen_data["full_ids"]
+        prompt_len = gen_data["prompt_len"]
+        advantages = gen_data["advantages"]
+
+        current_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
+
+        # loss = -advantage * (-energy) = advantage * energy
+        # Lower energy for high-advantage completions → model learns to assign
+        # low energy to good completions.
+        loss = (advantages * current_energies).mean()
+
+        self.log("train/energy_mean", current_energies.mean().item())
+
+        return loss, {"policy_loss": loss.item(), "kl": 0.0, "clip_ratio": 0.0}
+
+    def _loss_token_logprobs(self, gen_data, iteration):
+        """Token-level logprobs ratio (legacy). Known to produce NaN with EBT."""
         full_ids = gen_data["full_ids"]
         prompt_len = gen_data["prompt_len"]
         completion_masks = gen_data["completion_masks"].float()
         old_logps = gen_data["old_per_token_logps"]
         ref_logps = gen_data["ref_per_token_logps"]
         advantages = gen_data["advantages"]
-
         comp_len = completion_masks.shape[1]
 
-        # ── Compute current log-probs (with grad) ────────────────────────────
         learning_for_current = bool(self.config.use_learning_mode_for_logprobs)
-        # [DEBUG-RL] Reset NaN flag and debug log flag before current_logps.
-        self.model._fwd_had_nan_energy = False
-        self.model._dbg_logged_logps_stats = False
-        current_logps = get_per_token_logps(
-            self.model,
-            full_ids,
-            prompt_len,
-            learning=learning_for_current,
+        current_logps, _ = get_per_token_logps(
+            self.model, full_ids, prompt_len, learning=learning_for_current,
         )
-        assert current_logps.requires_grad, "current_logps must require grad for DDP"
         current_logps = current_logps[:, :comp_len] * completion_masks
 
-        # ── Cross-rank NaN sync: if ANY rank hit NaN, ALL ranks skip ─────────
-        # This prevents DDP hang from graph divergence across ranks.
+        # Cross-rank NaN sync
         import torch.distributed as dist
         local_bad = torch.tensor(
             1.0 if (
-                getattr(self.model, "_fwd_had_nan_energy", False)
-                or not torch.isfinite(current_logps).all()
+                not torch.isfinite(current_logps).all()
                 or not torch.isfinite(old_logps).all()
-                or not torch.isfinite(advantages).all()
-                or (completion_masks.sum().item() < 1.0)
             ) else 0.0,
             device=self.device,
         )
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(local_bad, op=dist.ReduceOp.MAX)
-        any_rank_bad = local_bad.item() > 0.5
-
-        if any_rank_bad:
-            import os as _os
-            _rank = _os.environ.get('LOCAL_RANK', '?')
-            _local_nan = getattr(self.model, "_fwd_had_nan_energy", False)
-            _cur_finite = torch.isfinite(current_logps).all().item()
-            _old_finite = torch.isfinite(old_logps).all().item()
-            print(
-                f"[DBG-RL][rank={_rank}] SKIPPING STEP (cross-rank sync): "
-                f"local_nan_energy={_local_nan} "
-                f"current_logps_finite={_cur_finite} "
-                f"old_logps_finite={_old_finite} "
-                f"current_logps_range=[{current_logps.min().item():.4e},{current_logps.max().item():.4e}] "
-                f"old_logps_range=[{old_logps.min().item():.4e},{old_logps.max().item():.4e}]",
-                flush=True,
-            )
+        if local_bad.item() > 0.5:
             placeholder = sum(
                 (p * 0.0).sum() for p in self.model.parameters() if p.requires_grad
             )
@@ -373,42 +394,25 @@ class EBMGRPOTrainer(LightningModule):
             return placeholder, {"policy_loss": 0.0, "kl": 0.0, "clip_ratio": 0.0}
         self.log("stability/skipped_step", 0.0)
 
-        # PPO ratio
         ratio = torch.exp(current_logps - old_logps)
         clipped_ratio = torch.clamp(ratio, 1.0 - self.config.epsilon, 1.0 + self.config.epsilon)
-
-        # Per-token loss
         per_token_loss1 = ratio * advantages.unsqueeze(1)
         per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
 
-        # KL penalty
         kl_value = 0.0
         if ref_logps is not None and self.config.beta > 0.0:
-            # Approximate KL: exp(ref - cur) - (ref - cur) - 1.
-            # Clamp the difference to prevent exp blowup when cur - ref is huge.
             kl_diff = (ref_logps - current_logps).clamp(-10.0, 10.0)
             per_token_kl = torch.exp(kl_diff) - kl_diff - 1.0
-            # Mask padding positions so they don't contribute to KL.
             per_token_kl = per_token_kl * completion_masks
             per_token_loss = per_token_loss + self.config.beta * per_token_kl
-            kl_value = per_token_kl.sum() / completion_masks.sum().clamp(min=1.0)
-            kl_value = kl_value.item()
+            kl_value = (per_token_kl.sum() / completion_masks.sum().clamp(min=1.0)).item()
 
-        # Aggregate loss (mean over valid tokens)
         loss = (per_token_loss * completion_masks).sum() / completion_masks.sum().clamp(min=1.0)
-
-        # Metrics
         is_clipped = (per_token_loss1 < per_token_loss2).float()
         clip_ratio = (is_clipped * completion_masks).sum() / completion_masks.sum().clamp(min=1.0)
 
-        metrics = {
-            "policy_loss": loss.item(),
-            "kl": kl_value,
-            "clip_ratio": clip_ratio.item(),
-        }
-
-        return loss, metrics
+        return loss, {"policy_loss": loss.item(), "kl": kl_value, "clip_ratio": clip_ratio.item()}
 
     # ══════════════════════════════════════════════════════════════════════════
     # Validation

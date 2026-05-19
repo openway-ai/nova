@@ -25,8 +25,6 @@ def sample_top_p(probs, p):
         exceeds the threshold p. The distribution is renormalized based on the selected tokens.
 
     """
-    # Upcast to fp32 for numerical stability — bf16 cumsum/div/multinomial is
-    # the crash source observed in RL rollouts (device-side multinomial assert).
     probs = probs.float()
     probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
 
@@ -36,22 +34,19 @@ def sample_top_p(probs, p):
     probs_sort = probs_sort.masked_fill(mask, 0.0)
 
     probs_sort_sum = probs_sort.sum(dim=-1, keepdim=True)
-    # Rows where the entire distribution collapsed to 0 → fallback to argmax
-    # of the (post-nan_to_num) original distribution to avoid multinomial NaN.
     bad = (probs_sort_sum <= 1e-9).squeeze(-1)
     probs_sort = probs_sort / probs_sort_sum.clamp_min(1e-9)
 
-    # Fix: for degenerate rows, set uniform over first token so multinomial
-    # never receives an all-zero distribution (which triggers CUDA assert).
-    if bad.any():
+    # For degenerate rows, force deterministic selection of the top token.
+    # probs_idx[..., 0] IS the argmax (sorted descending), so multinomial
+    # on [1, 0, 0, ...] returns it directly — no second pass needed.
+    has_bad = bad.any().item()
+    if has_bad:
         probs_sort[bad] = 0.0
         probs_sort[bad, 0] = 1.0
 
     next_token = torch.multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
-    if bad.any():
-        argmax_idx = probs.argmax(dim=-1, keepdim=True)
-        next_token = torch.where(bad.unsqueeze(-1), argmax_idx, next_token)
     return next_token.long()
 
 def call_model_forward_decode(hparams, model, input_tokens, start_pos, bsz):
