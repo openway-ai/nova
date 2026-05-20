@@ -30,7 +30,7 @@ fi
 # SBATCH --job-name=ebt-xxs-bs_256_s1_lr_
 # SBATCH --output=logs/slurm/nlp/ebt-xxs-bs_256_s1_lr_%A-%a.log
 # export RUN_NAME="ebt-d26-bs_256_s1_lr_"
-export RUN_NAME="ebt-xxs-bs_256_s1_lr_"
+export RUN_NAME="${RUN_NAME:-ebt-xxs-bs_256_s1_lr_}"
 # NOTE ctrl d ALL THREE of above to modify job-name, output, and RUN_NAME (which should all be the same)
 export MODEL_NAME="${RUN_NAME%%-*}"
 export MODEL_SIZE="${RUN_NAME#*-}"; export MODEL_SIZE="${MODEL_SIZE%%-*}"
@@ -50,7 +50,7 @@ MAX_STEP=50000
 WARMUP_STEP=1000
 
 "$PYTHON_BIN" train.py \
---run_name ${RUN_NAME}${lr[${SLURM_ARRAY_TASK_ID}]} \
+--run_name "${RUN_NAME}${RUN_NAME_LR_SUFFIX-${lr[${SLURM_ARRAY_TASK_ID}]}}" \
 --modality "NLP" \
 --model_name ${MODEL_NAME} \
 --model_size ${MODEL_SIZE} \
@@ -63,7 +63,7 @@ WARMUP_STEP=1000
 --mcmc_step_size_learnable \
 --mcmc_step_size ${alpha[${SLURM_ARRAY_TASK_ID}]} \
 --mcmc_step_size_lr_multiplier ${alpha_lr[${SLURM_ARRAY_TASK_ID}]} \
---mcmc_num_steps 2 \
+--mcmc_num_steps "${MCMC_NUM_STEPS:-2}" \
 \
 --context_length 256 \
 \
@@ -93,4 +93,4 @@ WARMUP_STEP=1000
 \
 --set_matmul_precision "medium" \
 --wandb_watch \
-${SLURM_ARRAY_TASK_ID:+--is_slurm_run}
+${SLURM_ARRAY_TASK_ID:+--is_slurm_run --override_slurm_checks}

@@ -51,7 +51,7 @@ fi
 # use a separate run script for it.
 BLOCK_MODE="${BLOCK_MODE:-blockwise}"
 case "$BLOCK_MODE" in
-  mtp_mcmc|future_latent_non_causal|blockwise)
+  mtp_mcmc|future_latent_non_causal|blockwise|future_latent_bidirectional)
     TRAINING_OBJECTIVE="${TRAINING_OBJECTIVE:-blockwise}"
     ;;
   dense_token)
@@ -61,7 +61,7 @@ case "$BLOCK_MODE" in
     ;;
   *)
     echo "ERROR: unknown BLOCK_MODE='$BLOCK_MODE'." >&2
-    echo "       Allowed: mtp_mcmc | future_latent_non_causal | blockwise" >&2
+    echo "       Allowed: mtp_mcmc | future_latent_non_causal | blockwise | future_latent_bidirectional" >&2
     exit 2
     ;;
 esac
@@ -82,6 +82,48 @@ TRAIN_BLOCK_SIZE="${TRAIN_BLOCK_SIZE:-2}"
 # parity with the dense recipe; the blockwise dataloader currently uses
 # CONTEXT_LENGTH directly, so leaving this empty is normal).
 TRAIN_CONTEXT_LENGTH="${TRAIN_CONTEXT_LENGTH:-}"
+
+################################################################################
+# E1 / E2 experimental knobs
+#
+# These default to no-ops (i.e. the pre-E1/E2 behavior). Override via env vars
+# from the launcher to run ablations. Example:
+#   OFFSET_LOSS_WEIGHTS="1.0,0.3" RUN_NAME=ebt-xxs-w10_03 bash run_ebt_blockwise.sh
+#   BLOCK_LATENT_HEAD_TYPE=per_offset_transformer BLOCK_LATENT_HEAD_LAYERS=1 \
+#     RUN_NAME=ebt-xxs-mtphead bash run_ebt_blockwise.sh
+#   # E4: Gemma-style teacher-forced heads (offset j>=1 conditions on
+#   #     embed(realized x_{t+j-1})). Two variants:
+#   BLOCK_LATENT_HEAD_TYPE=per_offset_tf_linear \
+#     RUN_NAME=ebt-xxs-tflinear bash run_ebt_blockwise.sh
+#   BLOCK_LATENT_HEAD_TYPE=per_offset_tf_transformer BLOCK_LATENT_HEAD_LAYERS=1 \
+#     RUN_NAME=ebt-xxs-tfmtphead bash run_ebt_blockwise.sh
+################################################################################
+# E1.1 — per-offset CE weights. Comma-separated, length == TRAIN_BLOCK_SIZE.
+# Empty (default) -> uniform; equivalent to original mean-over-flattened CE.
+OFFSET_LOSS_WEIGHTS="${OFFSET_LOSS_WEIGHTS:-}"
+
+# E2 — readout head. "linear" (default) preserves the original shared head;
+# "per_offset_linear" / "per_offset_mlp" / "per_offset_transformer" build a
+# ModuleList of K heads (one per offset).
+# E4 (teacher-forced, Gemma-drafter style): "per_offset_tf_linear" and
+# "per_offset_tf_transformer" — each offset j conditions on embed(x_{t+j-1})
+# (TF during training, greedy argmax within block at inference).
+BLOCK_LATENT_HEAD_TYPE="${BLOCK_LATENT_HEAD_TYPE:-linear}"
+# E2.3 only: number of causal AR blocks per offset transformer head.
+BLOCK_LATENT_HEAD_LAYERS="${BLOCK_LATENT_HEAD_LAYERS:-1}"
+# E2.2 / E2.3: FFN multiplier inside the per-offset head.
+BLOCK_LATENT_HEAD_FFN_MULT="${BLOCK_LATENT_HEAD_FFN_MULT:-4.0}"
+# E2.3 only: attention heads inside per_offset_transformer head; 0 = inherit
+# the trunk's --multiheaded_attention_heads.
+BLOCK_LATENT_HEAD_N_HEADS="${BLOCK_LATENT_HEAD_N_HEADS:-0}"
+
+# E3.1 — causal-detach in MCMC. Empty/0 = off (default, no-op).
+# Any non-empty value (e.g. "1" or "true") turns it ON via --mcmc_causal_detach.
+MCMC_CAUSAL_DETACH="${MCMC_CAUSAL_DETACH:-}"
+
+# E3.2 — staggered MCMC. Same on/off convention as MCMC_CAUSAL_DETACH.
+# Can be combined with E3.1 (both flags can be on simultaneously).
+MCMC_STAGGERED="${MCMC_STAGGERED:-}"
 
 GPUS="${GPUS:--1}"
 PEAK_LR="${PEAK_LR:-0.0002}"
@@ -132,11 +174,18 @@ CMD=(
   --context_length "$CONTEXT_LENGTH"            # S: # source positions
   --train_block_size "$TRAIN_BLOCK_SIZE"        # K: # future tokens / pos
 
+  # --- E1 / E2 / E3 experimental knobs (no-op when left at defaults) --------
+  --offset_loss_weights "$OFFSET_LOSS_WEIGHTS"             # E1.1
+  --block_latent_head_type "$BLOCK_LATENT_HEAD_TYPE"       # E2.x
+  --block_latent_head_layers "$BLOCK_LATENT_HEAD_LAYERS"   # E2.3
+  --block_latent_head_ffn_mult "$BLOCK_LATENT_HEAD_FFN_MULT"  # E2.2 / E2.3
+  --block_latent_head_n_heads "$BLOCK_LATENT_HEAD_N_HEADS"   # E2.3
+
   # --- MCMC (used by all 3 block_modes here) --------------------------------
   --mcmc_step_size_learnable                    # learn alpha per layer/step
   --mcmc_step_size 500                          # initial alpha (pre-sigmoid)
   --mcmc_step_size_lr_multiplier 1500           # alpha LR multiplier
-  --mcmc_num_steps 2                            # # Langevin steps per forward
+  --mcmc_num_steps "${MCMC_NUM_STEPS:-2}"       # # Langevin steps per forward (env-var overridable)
 
   # --- Distributed / optimizer ----------------------------------------------
   --gpus "$GPUS"                                # -1 = all visible GPUs
@@ -163,6 +212,15 @@ CMD=(
 
 if [ -n "$TRAIN_CONTEXT_LENGTH" ]; then
   CMD+=(--train_context_length "$TRAIN_CONTEXT_LENGTH")
+fi
+
+# E3.1 — append --mcmc_causal_detach only when env var is non-empty / truthy.
+if [ -n "$MCMC_CAUSAL_DETACH" ] && [ "$MCMC_CAUSAL_DETACH" != "0" ] && [ "$MCMC_CAUSAL_DETACH" != "false" ]; then
+  CMD+=(--mcmc_causal_detach)
+fi
+# E3.2 — append --mcmc_staggered only when env var is non-empty / truthy.
+if [ -n "$MCMC_STAGGERED" ] && [ "$MCMC_STAGGERED" != "0" ] && [ "$MCMC_STAGGERED" != "false" ]; then
+  CMD+=(--mcmc_staggered)
 fi
 
 if [ -n "${SLURM_ARRAY_TASK_ID:-}" ]; then
