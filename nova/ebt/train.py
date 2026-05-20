@@ -201,7 +201,7 @@ def main(args):
         raise ValueError(
             "--block_mode dense_token requires --training_objective dense_next_token for training."
         )
-    if args.block_mode in ("future_latent_non_causal", "blockwise"):
+    if args.block_mode in ("future_latent_non_causal", "blockwise", "future_latent_bidirectional"):
         if args.training_objective != "blockwise":
             raise ValueError(
                 f"--block_mode {args.block_mode!r} requires --training_objective blockwise "
@@ -633,7 +633,7 @@ if __name__ == '__main__':
             "If unset, a default is chosen from --training_objective: "
             "dense_next_token -> dense_token, blockwise -> mtp_mcmc."
         ),
-        choices=["dense_token", "mtp_mcmc", "future_latent_non_causal", "blockwise"],
+        choices=["dense_token", "mtp_mcmc", "future_latent_non_causal", "blockwise", "future_latent_bidirectional"],
         type=str,
         default=None,
     )
@@ -641,7 +641,103 @@ if __name__ == '__main__':
     parser.add_argument("--train_context_length", help="[compat-only] legacy sampled-block context length (ignored in dense blockwise mode)", type=int, default=None)
     parser.add_argument("--num_block_samples_per_window", help="[compat-only] legacy sampled-block count (kept for CLI compatibility, ignored by dense blockwise path)", type=int, default=4)
     parser.add_argument("--debug_blockwise_shapes", help="print blockwise context/target/logit shapes and loss during forward_loss_wrapper", action="store_true", default=False)
-          
+
+    # E1 (blockwise loss weighting): per-offset CE weights for the explicit
+    # block-latent loss path. Comma-separated floats of length K
+    # (==--train_block_size). Empty string = uniform 1/K weights, which gives
+    # the original mean-over-flattened-tokens behavior (no-op).
+    # Examples:
+    #   --offset_loss_weights ""           # uniform (default, no-op)
+    #   --offset_loss_weights "1.0,0.3"    # offset1 main, offset2 30% weight
+    #   --offset_loss_weights "1.0,0.5,0.2"  # 3-offset
+    parser.add_argument(
+        "--offset_loss_weights",
+        help=(
+            "comma-separated per-offset CE weights for the explicit-block-latent "
+            "loss path; length must equal --train_block_size. Empty = uniform "
+            "(matches pre-E1 behavior). Weights are normalized to sum to 1 "
+            "internally, so relative ratios are what matter."
+        ),
+        type=str,
+        default="",
+    )
+
+    # E2 (blockwise head capacity ladder): per-offset readout head type for the
+    # explicit-block-latent modes (`future_latent_non_causal`, `blockwise`).
+    # `linear` (default) preserves the original shared `Linear(D, V)` head.
+    # `per_offset_*` types build a `ModuleList` of K independent heads.
+    parser.add_argument(
+        "--block_latent_head_type",
+        help=(
+            "readout head used by explicit-block-latent modes. "
+            "'linear' = shared Linear(D, V) (pre-E2 default). "
+            "'per_offset_linear' = K independent Linear(D, V) (E2.1). "
+            "'per_offset_mlp' = K independent RMSNorm-Linear-GELU-Linear (E2.2). "
+            "'per_offset_transformer' = K independent (num_layers causal AR blocks + Linear) "
+            "(E2.3, DeepSeek-MTP-style). "
+            "'per_offset_tf_linear' = K teacher-forced heads: cat([pred_hidden, embed(x_{t+j-1})]) "
+            "-> Linear(2D, D) -> Linear(D, V) (E4, Gemma-MTP-compressed). "
+            "'per_offset_tf_transformer' = teacher-forced Gemma-drafter style: cat then Linear(2D, D) "
+            "-> num_layers blocks -> RMSNorm -> Linear(D, V) (E4)."
+        ),
+        choices=[
+            "linear",
+            "per_offset_linear",
+            "per_offset_mlp",
+            "per_offset_transformer",
+            "per_offset_tf_linear",
+            "per_offset_tf_transformer",
+        ],
+        type=str,
+        default="linear",
+    )
+    parser.add_argument(
+        "--block_latent_head_layers",
+        help="number of causal AR blocks per offset in `per_offset_transformer` head (E2.3 only)",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--block_latent_head_ffn_mult",
+        help="FFN multiplier inside per-offset head (used by per_offset_mlp / per_offset_transformer)",
+        type=float,
+        default=4.0,
+    )
+    parser.add_argument(
+        "--block_latent_head_n_heads",
+        help="attention heads inside per_offset_transformer head; 0 = inherit --multiheaded_attention_heads",
+        type=int,
+        default=0,
+    )
+
+    # E3.1: causal-detach in MCMC (explicit-block-latent modes only).
+    parser.add_argument(
+        "--mcmc_causal_detach",
+        help=(
+            "Per-offset DIAGONAL gradient in MCMC for explicit-block-latent "
+            "modes: each z_{t,j} only gets gradient from e_{t,j}, never from "
+            "e_{t,k>j}. Preserves forward causal attention. Removes the "
+            "cross-offset gradient pollution that compounding MCMC step "
+            "amplifies. K backward passes per step instead of 1 (~K-x cost)."
+        ),
+        action="store_true",
+        default=False,
+    )
+
+    # E3.2: staggered / wavefront MCMC (explicit-block-latent modes only).
+    parser.add_argument(
+        "--mcmc_staggered",
+        help=(
+            "Wavefront update schedule in MCMC: at step i, only the first "
+            "min(i+1, K) offsets actually move; later offsets stay at init "
+            "until enough steps have passed. Joint forward energy is kept so "
+            "inactive z's still inform their own e_k via the trunk's causal "
+            "mask. Independent of --mcmc_causal_detach (the two can stack)."
+        ),
+        action="store_true",
+        default=False,
+    )
+
     parser.add_argument("--num_transformer_blocks", help="number of transformer blocks, uses default from model size specified", type=int, default=12)
     
     parser.add_argument("--multiheaded_attention_heads", help="number of attention heads for transformer, uses default from model size specified", type=int, default=2)

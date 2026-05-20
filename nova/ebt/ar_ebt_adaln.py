@@ -582,7 +582,7 @@ class EBTAdaLN(nn.Module):
         resolved_block_mode = block_mode if block_mode is not None else getattr(self.params, "block_mode", "dense_token")
         if resolved_block_mode not in BLOCK_MODE_CHOICES:
             raise ValueError(f"Unknown block_mode={resolved_block_mode!r}")
-        if resolved_block_mode in ("future_latent_non_causal", "blockwise"):
+        if resolved_block_mode in ("future_latent_non_causal", "blockwise", "future_latent_bidirectional"):
             raise NotImplementedError(
                 f"EBTAdaLN.forward does not implement block_mode={resolved_block_mode!r} yet; "
                 f"only 'dense_token' and 'mtp_mcmc' are supported."

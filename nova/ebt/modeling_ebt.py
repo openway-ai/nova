@@ -15,8 +15,289 @@ from utils import MLP, Memory_Augmented_MLP, Memory_Gating_MLP, mask_q_tokens
 from utils import EXPLICIT_BLOCK_LATENT_MODES
 from replay_buffer import CausalReplayBuffer
 from metrics import calculate_bpb_score
+# RMSNorm is defined in the AR EBT trunk modules; reuse it for the new
+# per-offset blockwise heads so they match trunk normalization semantics.
+from ar_ebt_time_embed import RMSNorm as _RMSNorm
 
 import ipdb
+
+
+# ============================================================================
+# E2: Per-offset blockwise head modules (used by explicit-block-latent modes
+# `future_latent_non_causal` / `blockwise`). The head receives a single
+# offset's pred_hidden `[B, S, D]` and returns logits `[B, S, V]`. For
+# inference, S is just 1 and the same modules handle that degenerate case.
+#
+# Selection is via the `--block_latent_head_type` CLI flag, which is read by
+# `_build_block_latent_head()` below. Default `linear` preserves the original
+# shared single Linear(D, V) head (byte-identical to pre-E2 behavior).
+# ============================================================================
+
+# Public registry of supported head types. Importable for tests / CLI choices.
+BLOCK_LATENT_HEAD_TYPES = (
+    "linear",                       # E2 baseline: shared single Linear(D, V)
+    "per_offset_linear",            # E2.1: K independent Linear(D, V)
+    "per_offset_mlp",               # E2.2: K independent Linear-GELU-Linear
+    "per_offset_transformer",       # E2.3: K independent (num_layers x causal AR block) + Linear
+    "per_offset_tf_linear",         # E4 (Gemma-style TF): teacher-forced compressed Linear
+    "per_offset_tf_transformer",    # E4 (Gemma-style TF): teacher-forced transformer head
+)
+
+# Head types that require a "previous-offset realized token embedding" as a
+# second forward argument: head_j(pred_hidden, prev_token_embed). These are
+# the Gemma-style teacher-forced heads — each offset's prediction is
+# conditioned on the embedding of the previous offset's token (ground truth
+# during training, sampled/argmax during inference).
+TF_HEAD_TYPES = frozenset({"per_offset_tf_linear", "per_offset_tf_transformer"})
+
+
+class _BlockwiseLinearHead(nn.Module):
+    """Per-offset linear readout: [B, S, D] -> [B, S, V]."""
+
+    def __init__(self, dim: int, vocab_size: int):
+        super().__init__()
+        self.proj = nn.Linear(dim, vocab_size, bias=False)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class _BlockwiseMLPHead(nn.Module):
+    """Per-offset 2-layer MLP readout: RMSNorm -> Linear -> GELU -> Linear.
+
+    Used by E2.2. Cheaper than a transformer block; tests whether non-linear
+    readout alone is enough.
+    """
+
+    def __init__(self, dim: int, vocab_size: int, ffn_mult: float):
+        super().__init__()
+        hidden = int(dim * ffn_mult)
+        hidden = ((hidden + 63) // 64) * 64  # round up to multiple of 64 (matches llama FFN)
+        self.norm = _RMSNorm(dim)
+        self.fc1 = nn.Linear(dim, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, vocab_size, bias=False)
+
+    def forward(self, x):
+        return self.fc2(F.gelu(self.fc1(self.norm(x))))
+
+
+class _BlockwiseHeadBlock(nn.Module):
+    """Minimal causal AR transformer block used inside per-offset transformer heads.
+
+    Pre-norm + causal SDPA + SwiGLU FFN. Independent of EBT trunk's
+    ``block_mode`` / MCMC semantics — operates as a plain causal AR block
+    along the S (source-position) dim. At inference S=1, the attention
+    collapses to a per-token identity (still a valid forward pass).
+    """
+
+    def __init__(self, dim: int, n_heads: int, ffn_mult: float, norm_eps: float = 1e-5):
+        super().__init__()
+        if dim % n_heads != 0:
+            raise ValueError(f"dim {dim} not divisible by n_heads {n_heads}")
+        self.dim = dim
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        # Attention
+        self.attn_norm = _RMSNorm(dim, eps=norm_eps)
+        self.wq = nn.Linear(dim, dim, bias=False)
+        self.wk = nn.Linear(dim, dim, bias=False)
+        self.wv = nn.Linear(dim, dim, bias=False)
+        self.wo = nn.Linear(dim, dim, bias=False)
+        # FFN (SwiGLU, llama-style)
+        ffn_dim = int(dim * ffn_mult)
+        ffn_dim = ((ffn_dim + 63) // 64) * 64
+        self.ffn_norm = _RMSNorm(dim, eps=norm_eps)
+        self.w1 = nn.Linear(dim, ffn_dim, bias=False)
+        self.w2 = nn.Linear(ffn_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, ffn_dim, bias=False)
+
+    def forward(self, x):
+        # x: [B, S, D]
+        B, S, D = x.shape
+        # Pre-norm causal self-attention
+        h = self.attn_norm(x)
+        q = self.wq(h).reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.wk(h).reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.wv(h).reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        if S > 1:
+            attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # Single token: self-attention is identity on v
+            attn = v
+        attn = attn.transpose(1, 2).reshape(B, S, D)
+        x = x + self.wo(attn)
+        # Pre-norm SwiGLU FFN
+        h = self.ffn_norm(x)
+        x = x + self.w2(F.silu(self.w1(h)) * self.w3(h))
+        return x
+
+
+class _BlockwiseTransformerHead(nn.Module):
+    """Per-offset stack of causal AR transformer blocks + Linear readout.
+
+    DeepSeek-MTP-style (E2.3): each offset's pred_hidden `[B, S, D]` is
+    refined by its own small causal AR transformer (``num_layers`` blocks),
+    then projected to `[B, S, V]` via a per-offset Linear. The trunk's
+    pred_hidden already encodes context up to position t, so this head
+    adds *future-offset-specific* capacity without disturbing the trunk.
+    """
+
+    def __init__(self, dim: int, vocab_size: int, num_layers: int, n_heads: int,
+                 ffn_mult: float, norm_eps: float = 1e-5):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            _BlockwiseHeadBlock(dim, n_heads, ffn_mult, norm_eps=norm_eps)
+            for _ in range(num_layers)
+        ])
+        self.final_norm = _RMSNorm(dim, eps=norm_eps)
+        self.proj = nn.Linear(dim, vocab_size, bias=False)
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return self.proj(self.final_norm(x))
+
+
+class _BlockwiseTFLinearHead(nn.Module):
+    """Teacher-forced compressed linear head (Gemma drafter, linear variant).
+
+    Conditions each offset's prediction on the embedding of the realized
+    previous-offset token. Implements the "concat target_hidden + token
+    embedding then down-project" pattern, with a final Linear(D, V) output
+    projection.
+
+    Parameter count: 2D*D (down-proj) + D*V (out-proj) ~= D*V (the dominant
+    D*V term matches a vanilla per-offset linear head). The factorization
+    avoids the 2D*V blow-up of a direct Linear(2D, V).
+    """
+
+    def __init__(self, dim: int, vocab_size: int):
+        super().__init__()
+        self.down_proj = nn.Linear(2 * dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, vocab_size, bias=False)
+
+    def forward(self, pred_hidden, prev_token_embed):
+        # pred_hidden: [..., D], prev_token_embed: [..., D] (same trailing dims)
+        x = torch.cat([pred_hidden, prev_token_embed], dim=-1)  # [..., 2D]
+        return self.out_proj(self.down_proj(x))
+
+
+class _BlockwiseTFTransformerHead(nn.Module):
+    """Teacher-forced transformer head (Gemma drafter, transformer variant).
+
+    Equivalent to ``_BlockwiseTransformerHead`` (E2.3) but with an additional
+    "concat + down-project" front-end that injects ``embed(prev_offset_token)``
+    into the head's input. The transformer blocks then operate on the
+    (compressed, conditioned) hidden state with the same causal AR mask over
+    the S dim as E2.3.
+
+    Mirrors Gemma 4 drafter structure: concat target hidden + token embedding,
+    down-project to drafter dim, run a small transformer, project to vocab.
+    """
+
+    def __init__(self, dim: int, vocab_size: int, num_layers: int, n_heads: int,
+                 ffn_mult: float, norm_eps: float = 1e-5):
+        super().__init__()
+        self.down_proj = nn.Linear(2 * dim, dim, bias=False)
+        self.blocks = nn.ModuleList([
+            _BlockwiseHeadBlock(dim, n_heads, ffn_mult, norm_eps=norm_eps)
+            for _ in range(num_layers)
+        ])
+        self.final_norm = _RMSNorm(dim, eps=norm_eps)
+        self.proj = nn.Linear(dim, vocab_size, bias=False)
+
+    def forward(self, pred_hidden, prev_token_embed):
+        x = torch.cat([pred_hidden, prev_token_embed], dim=-1)
+        x = self.down_proj(x)
+        for block in self.blocks:
+            x = block(x)
+        return self.proj(self.final_norm(x))
+
+
+def _build_block_latent_head(head_type: str, K: int, dim: int, vocab_size: int, hparams):
+    """Construct the block-latent head module(s) for explicit-block-latent modes.
+
+    Returns either an ``nn.Linear`` (for ``linear`` head type, byte-identical
+    to pre-E2 behavior) or an ``nn.ModuleList`` with K independent per-offset
+    heads (for any ``per_offset_*`` type). Each per-offset head must be
+    callable on ``[B, S, D]`` and return ``[B, S, V]``.
+    """
+    if head_type == "linear":
+        return nn.Linear(dim, vocab_size, bias=False)
+    if head_type == "per_offset_linear":
+        return nn.ModuleList([
+            _BlockwiseLinearHead(dim, vocab_size) for _ in range(K)
+        ])
+    if head_type == "per_offset_mlp":
+        ffn_mult = float(getattr(hparams, "block_latent_head_ffn_mult", 4.0))
+        return nn.ModuleList([
+            _BlockwiseMLPHead(dim, vocab_size, ffn_mult=ffn_mult) for _ in range(K)
+        ])
+    if head_type == "per_offset_transformer":
+        ffn_mult = float(getattr(hparams, "block_latent_head_ffn_mult", 4.0))
+        num_layers = int(getattr(hparams, "block_latent_head_layers", 1))
+        n_heads_default = int(getattr(hparams, "multiheaded_attention_heads", 2))
+        n_heads_override = int(getattr(hparams, "block_latent_head_n_heads", 0))
+        n_heads = n_heads_override if n_heads_override > 0 else n_heads_default
+        return nn.ModuleList([
+            _BlockwiseTransformerHead(
+                dim=dim,
+                vocab_size=vocab_size,
+                num_layers=num_layers,
+                n_heads=n_heads,
+                ffn_mult=ffn_mult,
+            ) for _ in range(K)
+        ])
+    if head_type == "per_offset_tf_linear":
+        return nn.ModuleList([
+            _BlockwiseTFLinearHead(dim, vocab_size) for _ in range(K)
+        ])
+    if head_type == "per_offset_tf_transformer":
+        ffn_mult = float(getattr(hparams, "block_latent_head_ffn_mult", 4.0))
+        num_layers = int(getattr(hparams, "block_latent_head_layers", 1))
+        n_heads_default = int(getattr(hparams, "multiheaded_attention_heads", 2))
+        n_heads_override = int(getattr(hparams, "block_latent_head_n_heads", 0))
+        n_heads = n_heads_override if n_heads_override > 0 else n_heads_default
+        return nn.ModuleList([
+            _BlockwiseTFTransformerHead(
+                dim=dim,
+                vocab_size=vocab_size,
+                num_layers=num_layers,
+                n_heads=n_heads,
+                ffn_mult=ffn_mult,
+            ) for _ in range(K)
+        ])
+    raise ValueError(
+        f"Unknown block_latent_head_type={head_type!r}; "
+        f"expected one of {BLOCK_LATENT_HEAD_TYPES}"
+    )
+
+
+def _parse_offset_loss_weights(raw, K: int):
+    """Parse the ``--offset_loss_weights`` CLI value into a normalized [K]-list.
+
+    Empty / None -> uniform 1/K (which makes the weighted aggregate equal to
+    the original ``mean over flattened (B*K*S)`` loss, preserving pre-E1
+    behavior).
+    """
+    if raw is None or str(raw).strip() == "":
+        return [1.0 / K] * K
+    try:
+        values = [float(v) for v in str(raw).split(",") if str(v).strip()]
+    except ValueError as e:
+        raise ValueError(
+            f"--offset_loss_weights must be comma-separated floats, got {raw!r}"
+        ) from e
+    if len(values) != K:
+        raise ValueError(
+            f"--offset_loss_weights length {len(values)} != K={K}; got {values}"
+        )
+    if any(v < 0 for v in values):
+        raise ValueError(f"--offset_loss_weights must be non-negative, got {values}")
+    s = sum(values)
+    if s <= 0:
+        raise ValueError(f"--offset_loss_weights must have positive sum, got {values}")
+    return [v / s for v in values]
 
 class EBT_NLP(LightningModule):
     def __init__(self, hparams):
@@ -58,15 +339,70 @@ class EBT_NLP(LightningModule):
         # state is mapped through this head to produce a single token's logits;
         # there is no joint multi-offset projection here. Kept independent of
         # `blockwise_joint_head` so mtp_mcmc behavior is byte-identical.
-        self.block_latent_token_head = nn.Linear(
-            self.hparams.embedding_dim,
-            self.vocab_size,
-            bias=False,
+        #
+        # E2: the head construction is now driven by `--block_latent_head_type`:
+        #   * `linear`                 (default; byte-identical to pre-E2)
+        #   * `per_offset_linear`      (E2.1)
+        #   * `per_offset_mlp`         (E2.2)
+        #   * `per_offset_transformer` (E2.3, DeepSeek-MTP-style)
+        # For `linear`, `self.block_latent_token_head` is a single `nn.Linear`;
+        # for `per_offset_*` modes it is an `nn.ModuleList` of K heads, one per
+        # offset (selected by index in `_apply_block_latent_head_per_offset`).
+        self._block_latent_head_type = str(
+            getattr(self.hparams, "block_latent_head_type", "linear")
+        )
+        if self._block_latent_head_type not in BLOCK_LATENT_HEAD_TYPES:
+            raise ValueError(
+                f"--block_latent_head_type={self._block_latent_head_type!r} "
+                f"is not in {BLOCK_LATENT_HEAD_TYPES}"
+            )
+        self.block_latent_token_head = _build_block_latent_head(
+            head_type=self._block_latent_head_type,
+            K=max_blockwise_offsets,
+            dim=self.hparams.embedding_dim,
+            vocab_size=self.vocab_size,
+            hparams=self.hparams,
         )
         init_whole_model_weights(
             self.block_latent_token_head,
             self.hparams.weight_initialization_method,
             weight_initialization_gain=self.hparams.weight_initialization_gain,
+        )
+
+        # E1: parse `--offset_loss_weights` once at __init__ so per-step loss
+        # construction is cheap. Stored as a python list (length K) of floats
+        # normalized to sum to 1, so default uniform weights reproduce the
+        # original `mean over flattened (B*K*S)` cross-entropy.
+        self._offset_loss_weights = _parse_offset_loss_weights(
+            getattr(self.hparams, "offset_loss_weights", ""),
+            K=max_blockwise_offsets,
+        )
+
+        # E3.1: causal-detach in MCMC for explicit-block-latent modes. Default
+        # off (no-op, preserves pre-E3 behavior). When on, each per-offset
+        # latent z_{t,j} only receives gradient from its own energy e_{t,j}
+        # during MCMC updates; the forward causal attention path z_{t,k>=j}
+        # ← z_{t,j} is kept so z_{t,k} can still leverage z_{t,j}'s content.
+        # See ``_run_explicit_block_latent_mcmc`` for the diagonal-gradient
+        # implementation. Has no effect on `mtp_mcmc` (different MCMC path)
+        # and is a near no-op on `future_latent_non_causal` (cross-offset
+        # gradient is already zero there).
+        self._mcmc_causal_detach = bool(
+            getattr(self.hparams, "mcmc_causal_detach", False)
+        )
+
+        # E3.2: staggered / wavefront MCMC. At step i, only the first
+        # ``active_K(i) = min(i+1, K)`` offsets are actually updated; later
+        # offsets stay at their initial values until enough steps have passed.
+        # Solves a different problem than E3.1: rather than cleaning the
+        # backward gradient, it controls *when* each latent starts moving so
+        # that z_1 can settle in step 0 before z_2 starts being optimized in
+        # step 1. The forward energy is still computed jointly so that z_2's
+        # initial value still contributes to e_2 (and through the causal mask
+        # to z_2's eventual prediction quality). Default off; compatible with
+        # E3.1 (both flags can be on at the same time).
+        self._mcmc_staggered = bool(
+            getattr(self.hparams, "mcmc_staggered", False)
         )
         
         self.log_softmax = nn.LogSoftmax(dim = -1)
@@ -679,22 +1015,180 @@ class EBT_NLP(LightningModule):
     # block_targets has shape [B, K, S]).
     # ------------------------------------------------------------------
 
-    def _explicit_block_latent_pred_hidden_to_logits(self, pred_hidden, S, K):
+    def _apply_block_latent_head_per_offset(self, pred_hidden, S, K, prev_token_embeds=None):
+        """Apply a per-offset head (E2.1/E2.2/E2.3 or E4 TF variants) to
+        position-major hidden.
+
+        Args:
+            pred_hidden: ``[B, S*K, D]`` position-major flatten (outer t,
+                inner j), or ``[B, K, D]`` at inference (S=1).
+            S: number of source positions (S=1 for the inference layout).
+            K: number of future offsets.
+            prev_token_embeds: required if and only if the head type is in
+                ``TF_HEAD_TYPES``. Shape ``[B, S, K, D]``: for each (t, j),
+                the embedding of the realized PREVIOUS-offset token (i.e.
+                x_{t+j-1}). During training this is teacher-forced from the
+                ground-truth tokens; during inference the caller is
+                responsible for filling it in sequentially (see
+                ``_apply_block_latent_head_sequential_inference``).
+
+        Returns:
+            ``[B, S*K, V]`` position-major logits, so the caller can do the
+            same `reshape -> permute` as the shared-Linear path.
+        """
+        B, P, D = pred_hidden.shape
+        if P != S * K:
+            raise ValueError(
+                f"pred_hidden length {P} != S*K={S*K} (S={S}, K={K})"
+            )
+        if not isinstance(self.block_latent_token_head, nn.ModuleList):
+            raise RuntimeError(
+                "_apply_block_latent_head_per_offset called but "
+                "block_latent_token_head is not a ModuleList "
+                f"(head_type={self._block_latent_head_type!r})"
+            )
+        if len(self.block_latent_token_head) < K:
+            raise RuntimeError(
+                f"block_latent_token_head has {len(self.block_latent_token_head)} entries; "
+                f"need at least K={K}. (Was the model initialized with a smaller "
+                f"train_block_size than the current request?)"
+            )
+        is_tf = self._block_latent_head_type in TF_HEAD_TYPES
+        if is_tf:
+            if prev_token_embeds is None:
+                raise ValueError(
+                    f"head_type={self._block_latent_head_type!r} requires "
+                    f"prev_token_embeds (teacher-forced previous-offset token "
+                    f"embedding) but got None."
+                )
+            if prev_token_embeds.shape != (B, S, K, D):
+                raise ValueError(
+                    f"prev_token_embeds shape {tuple(prev_token_embeds.shape)} "
+                    f"!= expected (B={B}, S={S}, K={K}, D={D})."
+                )
+        # Reshape position-major -> [B, S, K, D] -> permute -> [B, K, S, D]
+        h_kstd = pred_hidden.reshape(B, S, K, D).permute(0, 2, 1, 3).contiguous()
+        if is_tf:
+            pte_kstd = prev_token_embeds.permute(0, 2, 1, 3).contiguous()  # [B, K, S, D]
+        per_offset_logits = []
+        for j in range(K):
+            h_j = h_kstd[:, j]  # [B, S, D]
+            if is_tf:
+                pte_j = pte_kstd[:, j]  # [B, S, D]
+                logits_j = self.block_latent_token_head[j](h_j, pte_j)  # [B, S, V]
+            else:
+                logits_j = self.block_latent_token_head[j](h_j)  # [B, S, V]
+            per_offset_logits.append(logits_j)
+        # Stack -> [B, K, S, V], permute -> [B, S, K, V], flatten -> [B, S*K, V]
+        logits_kstv = torch.stack(per_offset_logits, dim=1)
+        return logits_kstv.permute(0, 2, 1, 3).contiguous().reshape(B, S * K, self.vocab_size)
+
+    def _build_prev_token_embeds_training(self, input_ids, block_targets, K):
+        """Build the teacher-forced ``prev_token_embeds`` tensor for the TF
+        head path during training.
+
+        For each (t, j) the "previous-offset token" is x_{t+j-1}:
+          * j == 0 : prev = input_ids[:, t]                (current input token)
+          * j >= 1 : prev = block_targets[:, j-1, :]       (ground-truth offset target one slot earlier)
+
+        Args:
+            input_ids: ``[B, S]``
+            block_targets: ``[B, K, S]`` (may contain -1 ignore_index; masked
+                to a safe id 0 before embedding so the embedding lookup
+                doesn't blow up — downstream loss already ignores those
+                positions via ignore_index=-1, so the leaked embedding value
+                doesn't contribute to gradient at supervised positions).
+            K: number of offsets.
+
+        Returns:
+            ``[B, S, K, D]`` tensor of per-(t, j) previous-offset embeddings.
+        """
+        B, S = input_ids.shape
+        per_offset_prev = []
+        for j in range(K):
+            if j == 0:
+                prev_j = input_ids
+            else:
+                # block_targets[:, j-1, :] is x_{t+j} (0-indexed j-1 = 1-indexed
+                # offset j-1, which targets x_{t+j-1+1} = x_{t+j}).
+                # Wait — block_targets[:, k, :] = x_{t+k+1} for 0-indexed k.
+                # offset j (0-indexed) predicts x_{t+j+1}; its "prev" is x_{t+j}.
+                # block_targets[:, j-1, :] for 0-indexed j-1 = x_{t+(j-1)+1} = x_{t+j}.
+                # So this is correct.
+                prev_j = block_targets[:, j - 1, :]
+                # Mask out ignore_index (-1) so embedding lookup is safe.
+                prev_j = torch.where(prev_j >= 0, prev_j, torch.zeros_like(prev_j))
+            per_offset_prev.append(self.embeddings(prev_j))  # [B, S, D]
+        return torch.stack(per_offset_prev, dim=2)  # [B, S, K, D]
+
+    def _apply_block_latent_head_sequential_inference(self, pred_hidden, K, anchor_embed):
+        """Sequential application of TF heads at inference (S=1 layout).
+
+        Args:
+            pred_hidden: ``[B, K, D]`` (inference layout — K future latents
+                anchored at the end of context).
+            K: number of offsets.
+            anchor_embed: ``[B, 1, D]`` — embedding of the last context token,
+                used as the "previous-offset" embedding for offset 0.
+
+        Returns:
+            ``[B, K, V]`` per-offset logits. Argmax of offset j's logits is
+            embedded and fed as the "previous-offset" embedding for offset
+            j+1 (greedy autoregressive within block). Caller can re-sample
+            the returned logits stochastically; the conditional structure is
+            already baked in via the sequential argmax path.
+        """
+        if pred_hidden.shape[1] != K:
+            raise ValueError(
+                f"pred_hidden length mismatch: expected K={K}, got {pred_hidden.shape[1]}"
+            )
+        if anchor_embed.dim() != 3 or anchor_embed.shape[1] != 1:
+            raise ValueError(
+                f"anchor_embed shape must be [B, 1, D]; got {tuple(anchor_embed.shape)}"
+            )
+        B = pred_hidden.shape[0]
+        prev_embed = anchor_embed  # [B, 1, D]
+        logits_per_offset = []
+        for j in range(K):
+            h_j = pred_hidden[:, j:j + 1, :]  # [B, 1, D]
+            if self._block_latent_head_type in TF_HEAD_TYPES:
+                logits_j = self.block_latent_token_head[j](h_j, prev_embed)  # [B, 1, V]
+            else:
+                logits_j = self.block_latent_token_head[j](h_j)  # [B, 1, V]
+            logits_per_offset.append(logits_j.squeeze(1))  # [B, V]
+            if j < K - 1:
+                # Greedy: feed argmax of this offset's logits into next offset.
+                next_token = logits_j.argmax(dim=-1)  # [B, 1]
+                prev_embed = self.embeddings(next_token)  # [B, 1, D]
+        return torch.stack(logits_per_offset, dim=1)  # [B, K, V]
+
+    def _explicit_block_latent_pred_hidden_to_logits(self, pred_hidden, S, K, prev_token_embeds=None):
         """Map a position-major pred_hidden ``[B, S*K, D]`` to logits
         ``[B, K, S, V]`` aligned with ``block_targets [B, K, S]``.
 
-        Steps:
-          1. ``self.block_latent_token_head`` : ``[B, S*K, V]`` (single-token
-             head; not the joint head used by mtp_mcmc).
-          2. Reshape to ``[B, S, K, V]`` (position-major: outer t, inner j).
-          3. Permute to ``[B, K, S, V]`` to match ``block_targets``.
+        Dispatches on ``self._block_latent_head_type``:
+          * ``linear`` (default): apply shared ``Linear(D, V)`` to all
+            positions at once; byte-identical to pre-E2 behavior.
+          * ``per_offset_*``: route each offset's hidden through its own
+            head (see ``_apply_block_latent_head_per_offset``).
+          * ``per_offset_tf_*`` (E4 TF heads): additionally require
+            ``prev_token_embeds`` of shape ``[B, S, K, D]`` so each offset
+            j's head can condition on x_{t+j-1}'s embedding.
+
+        Steps after head application are unchanged: ``[B, S*K, V]`` ->
+        ``[B, S, K, V]`` (position-major) -> permute -> ``[B, K, S, V]``.
         """
         B, P, _ = pred_hidden.shape
         if P != S * K:
             raise ValueError(
                 f"pred_hidden length mismatch: expected S*K={S*K}, got {P}"
             )
-        logits = self.block_latent_token_head(pred_hidden)  # [B, S*K, V]
+        if self._block_latent_head_type == "linear":
+            logits = self.block_latent_token_head(pred_hidden)  # [B, S*K, V]
+        else:
+            logits = self._apply_block_latent_head_per_offset(
+                pred_hidden, S=S, K=K, prev_token_embeds=prev_token_embeds,
+            )
         logits = logits.reshape(B, S, K, self.vocab_size)   # [B, S, K, V]
         logits = logits.permute(0, 2, 1, 3).contiguous()    # [B, K, S, V]
         return logits
@@ -810,18 +1304,59 @@ class EBT_NLP(LightningModule):
                 energy_preds_flat = energy_preds.reshape(-1, 1)
                 predicted_energies.append(energy_preds_flat)
 
+                # create_graph for THIS MCMC step's gradient. Matches the
+                # original logic: truncate_mcmc → only last step has graph;
+                # otherwise → always (when learning).
                 if self.hparams.truncate_mcmc:
-                    if i == (len(mcmc_steps) - 1):
-                        predicted_tokens_grad = torch.autograd.grad(
-                            [energy_preds_flat.sum()], [predicted_tokens], create_graph=learning
-                        )[0]
-                    else:
-                        predicted_tokens_grad = torch.autograd.grad(
-                            [energy_preds_flat.sum()], [predicted_tokens], create_graph=False
-                        )[0]
+                    create_graph_step = learning and (i == (len(mcmc_steps) - 1))
+                else:
+                    create_graph_step = learning
+
+                if getattr(self, "_mcmc_causal_detach", False):
+                    # E3.1: per-offset DIAGONAL gradient.
+                    #
+                    # In blockwise (causal intra-block) mode, the joint
+                    # ``energy.sum().backward()`` gives z_{t,j} a gradient
+                    # contribution from EVERY e_{t,k>=j} — because z_{t,k>=j}
+                    # attends to z_{t,j} via the causal intra-block mask. The
+                    # cross-offset terms (``∂e_{t,k>j}/∂z_{t,j}``) pull z_{t,j}
+                    # toward being a useful PREFIX for offset-k, not toward
+                    # being optimal for offset-j itself. Diagnostic results
+                    # (mcmc=4 making blockwise WORSE; flnc being worse than
+                    # blockwise) point to this cross-offset gradient as the
+                    # main source of the offset_1 BPB gap.
+                    #
+                    # This branch keeps the FORWARD causal attention intact
+                    # (so z_{t,k>j} can still leverage z_{t,j} for its own
+                    # prediction) but cuts the BACKWARD gradient: for each
+                    # offset j we run a separate backward on ``e_{*,j}.sum()``
+                    # and keep only the j-th row of the resulting gradient.
+                    # That row is ``∂e_{*,j}/∂z_{*,j}`` — the clean signal.
+                    #
+                    # Cost: K backward passes per MCMC step instead of 1.
+                    # For typical K=2 this is ~2x backward, ~1.x total step.
+                    energy_per_pos = energy_preds.squeeze(-1).reshape(B, P // K, K)
+                    per_offset_diag_slices = []
+                    for j in range(K):
+                        is_last_j = (j == K - 1)
+                        retain_graph_arg = True if (not is_last_j) else create_graph_step
+                        g_j = torch.autograd.grad(
+                            [energy_per_pos[:, :, j].sum()],
+                            [predicted_tokens],
+                            create_graph=create_graph_step,
+                            retain_graph=retain_graph_arg,
+                        )[0]  # [B, P, V]
+                        g_j_v = g_j.reshape(B, P // K, K, V)
+                        # Diagonal: keep only the j-th offset's row of g_j.
+                        per_offset_diag_slices.append(g_j_v[:, :, j, :])  # [B, S, V]
+                    # Stack to [B, S, K, V] then flatten back to [B, S*K, V].
+                    predicted_tokens_grad = torch.stack(
+                        per_offset_diag_slices, dim=2
+                    ).reshape(B, P, V)
                 else:
                     predicted_tokens_grad = torch.autograd.grad(
-                        [energy_preds_flat.sum()], [predicted_tokens], create_graph=learning
+                        [energy_preds_flat.sum()], [predicted_tokens],
+                        create_graph=create_graph_step,
                     )[0]
 
                 if self.hparams.clamp_futures_grad:
@@ -830,6 +1365,25 @@ class EBT_NLP(LightningModule):
 
                 if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
                     raise ValueError("NaN or Inf gradients detected during explicit-block-latent MCMC.")
+
+                if getattr(self, "_mcmc_staggered", False):
+                    # E3.2: staggered MCMC. At step i, only the first
+                    # ``active_K = min(i+1, K)`` offsets actually receive an
+                    # update; the rest are frozen at their previous-step value
+                    # (== initial value for steps before they're activated).
+                    # We implement this by zeroing the gradient on inactive
+                    # offset slots. The forward joint-energy compute is
+                    # unchanged so that the inactive z_{t,k>=active_K}'s
+                    # initial value still informs e_{t,k} and the causal
+                    # forward path z_{t,active_K..} ← z_{t,<active_K}.
+                    active_K = min(i + 1, K)
+                    if active_K < K:
+                        # Mask of shape [1, 1, K, 1], broadcasts over [B, S, K, V]
+                        mask = torch.ones(K, device=predicted_tokens.device,
+                                          dtype=predicted_tokens_grad.dtype)
+                        mask[active_K:] = 0.0
+                        grad_v = predicted_tokens_grad.reshape(B, P // K, K, V)
+                        predicted_tokens_grad = (grad_v * mask.view(1, 1, K, 1)).reshape(B, P, V)
 
                 predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad
                 if self.hparams.absolute_clamp != 0.0:
@@ -907,7 +1461,10 @@ class EBT_NLP(LightningModule):
         )
         return pred_hiddens_per_step, predicted_energies
 
-    def forward_explicit_block_latent_logits(self, input_ids, block_size, no_randomness, return_hidden=False):
+    def forward_explicit_block_latent_logits(
+        self, input_ids, block_size, no_randomness, return_hidden=False,
+        prev_token_embeds=None,
+    ):
         """Training-time per-MCMC-step logits for the new modes.
 
         Returns:
@@ -918,6 +1475,11 @@ class EBT_NLP(LightningModule):
             predicted_energies: list[Tensor] each [B*S*K, 1].
             pred_hiddens_per_step (only if return_hidden=True): list of
                 [B, S*K, D].
+
+        ``prev_token_embeds`` is required when the head type is in
+        ``TF_HEAD_TYPES`` and is forwarded unchanged to every MCMC step's
+        head application (the teacher-forced previous-offset embedding is
+        independent of the MCMC iterate so we build it once and reuse).
         """
         if input_ids.dim() != 2:
             raise ValueError(f"Expected input_ids [B, S], got shape {tuple(input_ids.shape)}")
@@ -934,7 +1496,9 @@ class EBT_NLP(LightningModule):
 
         logits_per_step = []
         for pred_hidden in pred_hiddens_per_step:
-            logits = self._explicit_block_latent_pred_hidden_to_logits(pred_hidden, S=S, K=K)
+            logits = self._explicit_block_latent_pred_hidden_to_logits(
+                pred_hidden, S=S, K=K, prev_token_embeds=prev_token_embeds,
+            )
             logits_per_step.append(logits)
 
         if return_hidden:
@@ -988,17 +1552,40 @@ class EBT_NLP(LightningModule):
             return_pred_hidden=True,
         )
 
-        # Map each step's [B, K, D] pred_hidden through the single-token head
+        # Map each step's [B, K, D] pred_hidden through the block-latent head
         # to produce [B, K, V] logits. These are the inference logits used
         # by sampling code; they are consistent with training where each
         # latent is supervised by exactly one target token.
+        #
+        # E2/E4: dispatch on head type.
+        #   * `linear` (default): shared Linear over [B, K, D].
+        #   * `per_offset_*` (non-TF): S=1 degenerate position-major application.
+        #   * `per_offset_tf_*` (TF heads): each offset's head conditions on
+        #     the realized previous-offset token. At inference we don't have
+        #     ground truth, so we run a sequential greedy-argmax loop within
+        #     the block (anchor = last context embedding), and apply the
+        #     SAME sequential head to every MCMC step (each step gets fresh
+        #     argmaxes from its own pred_hidden).
+        anchor_embed = real_embeddings_input[:, -1:, :]  # [B, 1, D]
         logits_per_step = []
         for pred_hidden in pred_hiddens_per_step:
             if pred_hidden.shape[1] != K:
                 raise RuntimeError(
                     f"pred_hidden length mismatch in inference: expected K={K}, got {pred_hidden.shape[1]}"
                 )
-            logits_per_step.append(self.block_latent_token_head(pred_hidden))  # [B, K, V]
+            if self._block_latent_head_type == "linear":
+                logits_per_step.append(self.block_latent_token_head(pred_hidden))  # [B, K, V]
+            elif self._block_latent_head_type in TF_HEAD_TYPES:
+                logits_per_step.append(
+                    self._apply_block_latent_head_sequential_inference(
+                        pred_hidden, K=K, anchor_embed=anchor_embed,
+                    )
+                )  # [B, K, V]
+            else:
+                # pred_hidden is [B, K, D] == position-major flatten of [B, S=1, K, D].
+                logits_per_step.append(
+                    self._apply_block_latent_head_per_offset(pred_hidden, S=1, K=K)
+                )  # [B, K, V]
 
         return logits_per_step, predicted_energies
 
@@ -1131,7 +1718,20 @@ class EBT_NLP(LightningModule):
                 block_mode=self._block_mode,
                 return_pred_hidden=True,
             )
-            refined_block_logits = self.block_latent_token_head(pred_hidden)  # [B, K, V]
+            # E2/E4: dispatch on head type. Same S=1 inference layout as
+            # `_forward_explicit_block_latent_inference` above. For TF heads
+            # we use the sequential greedy-argmax helper with the last context
+            # token as the anchor previous-offset embedding.
+            if self._block_latent_head_type == "linear":
+                refined_block_logits = self.block_latent_token_head(pred_hidden)  # [B, K, V]
+            elif self._block_latent_head_type in TF_HEAD_TYPES:
+                refined_block_logits = self._apply_block_latent_head_sequential_inference(
+                    pred_hidden, K=K, anchor_embed=real_embeddings_input[:, -1:, :],
+                )  # [B, K, V]
+            else:
+                refined_block_logits = self._apply_block_latent_head_per_offset(
+                    pred_hidden, S=1, K=K,
+                )  # [B, K, V]
             refined_block_ids = torch.argmax(refined_block_logits, dim=-1)
 
         if diagnose:
@@ -1195,80 +1795,184 @@ class EBT_NLP(LightningModule):
         if target_offsets is None:
             target_offsets = torch.arange(1, num_offsets + 1, device=input_ids.device, dtype=torch.long)
 
+        # E4: teacher-forced (TF) heads condition each offset j>=1's head on
+        # the embedding of the realized previous-offset target token. Build
+        # once outside the MCMC loop since the embedding is independent of
+        # the MCMC iterate; the MCMC dynamics still act on the latent (z)
+        # surrogate as in non-TF heads.
+        if self._block_latent_head_type in TF_HEAD_TYPES:
+            prev_token_embeds = self._build_prev_token_embeds_training(
+                input_ids=input_ids, block_targets=block_targets, K=num_offsets,
+            )
+        else:
+            prev_token_embeds = None
+
         logits_per_step, predicted_energies, pred_hiddens_per_step = self.forward_explicit_block_latent_logits(
             input_ids=input_ids,
             block_size=num_offsets,
             no_randomness=no_randomness,
             return_hidden=True,
+            prev_token_embeds=prev_token_embeds,
         )
+
+        # E1.1: per-offset loss weighting. `self._offset_loss_weights` is parsed
+        # once at __init__ (normalized to sum to 1). For default uniform
+        # weights, ``sum_j (1/K) * ce_j == mean_{b,j,t} ce`` so the loss-driving
+        # value matches the pre-E1 ``F.cross_entropy(flat_logits, flat_targets)``
+        # exactly (modulo per-offset ignore_index masking, which our dataloader
+        # currently never triggers).
+        if (
+            self._offset_loss_weights is None
+            or len(self._offset_loss_weights) != num_offsets
+        ):
+            # Robust to a checkpoint trained with K' != current K: fall back to
+            # uniform 1/K so behavior is sensible without forcing a re-parse.
+            weights = [1.0 / num_offsets] * num_offsets
+        else:
+            weights = self._offset_loss_weights
+
         # Flatten targets to match the [B, K, S, V] -> [B*K*S, V] layout.
+        # Only used downstream for BPB token-count bookkeeping.
         next_token_indices = block_targets.reshape(-1)
         reconstruction_loss = 0
         total_mcmc_steps = len(predicted_energies)
-        final_cce_loss = None
+        final_cce_loss_mean = None  # unweighted mean over (b, j, t) — for BPB
 
-        for mcmc_step, (predicted_distribution, predicted_energy) in enumerate(zip(logits_per_step, predicted_energies)):
-            predicted_distribution = predicted_distribution.reshape(-1, self.vocab_size)
+        # E1.2: per-offset diagnostics captured at initial / final MCMC step.
+        per_offset_ce_initial = [None] * num_offsets
+        per_offset_ce_final = [None] * num_offsets
+        per_offset_energy_initial = [None] * num_offsets
+        per_offset_energy_final = [None] * num_offsets
 
+        for mcmc_step, (predicted_distribution, predicted_energy) in enumerate(
+            zip(logits_per_step, predicted_energies)
+        ):
+            # predicted_distribution: [B, K, S_eff, V]
+            # Compute per-offset CE so that (a) loss is per-offset weighted and
+            # (b) we can log offset-resolved diagnostics with no extra forward.
             if self.hparams.soften_target_prob_dist != 0.0:
                 if total_mcmc_steps <= 1:
                     label_smoothing = 0.0
                 else:
-                    label_smoothing = ((total_mcmc_steps - 1) - mcmc_step) / (total_mcmc_steps - 1) * self.hparams.soften_target_prob_dist
-                cce_loss = F.cross_entropy(
-                    predicted_distribution,
-                    next_token_indices,
-                    label_smoothing=label_smoothing,
-                    ignore_index=-1,
-                )
+                    label_smoothing = (
+                        ((total_mcmc_steps - 1) - mcmc_step)
+                        / (total_mcmc_steps - 1)
+                        * self.hparams.soften_target_prob_dist
+                    )
             else:
-                predicted_distribution = self.log_softmax(predicted_distribution)
-                cce_loss = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1)
+                label_smoothing = 0.0
+
+            step_per_offset_ce = []
+            for j in range(num_offsets):
+                logits_j = predicted_distribution[:, j, :, :].reshape(-1, self.vocab_size)
+                targets_j = block_targets[:, j, :].reshape(-1)
+                if self.hparams.soften_target_prob_dist != 0.0:
+                    ce_j = F.cross_entropy(
+                        logits_j, targets_j,
+                        label_smoothing=label_smoothing, ignore_index=-1,
+                    )
+                else:
+                    ce_j = F.nll_loss(
+                        self.log_softmax(logits_j), targets_j, ignore_index=-1,
+                    )
+                step_per_offset_ce.append(ce_j)
+
+            cce_loss_weighted = sum(weights[j] * step_per_offset_ce[j] for j in range(num_offsets))
+            # Backward-compat "mean over flattened tokens" scalar, used for
+            # PPL / BPB so those metrics stay comparable to the pre-E1 runs.
+            cce_loss_mean = sum(step_per_offset_ce) / num_offsets
 
             if self.hparams.truncate_mcmc:
                 if mcmc_step == (total_mcmc_steps - 1):
-                    reconstruction_loss = cce_loss
-                    final_reconstruction_loss = cce_loss.detach()
-                    final_cce_loss = cce_loss.detach()
+                    reconstruction_loss = cce_loss_weighted
+                    final_reconstruction_loss = cce_loss_weighted.detach()
+                    final_cce_loss_mean = cce_loss_mean.detach()
             else:
-                reconstruction_loss += cce_loss
+                reconstruction_loss = reconstruction_loss + cce_loss_weighted
                 if mcmc_step == (total_mcmc_steps - 1):
-                    final_reconstruction_loss = cce_loss.detach()
-                    final_cce_loss = cce_loss.detach()
+                    final_reconstruction_loss = cce_loss_weighted.detach()
+                    final_cce_loss_mean = cce_loss_mean.detach()
                     reconstruction_loss = reconstruction_loss / total_mcmc_steps
 
             if mcmc_step == 0:
-                initial_loss = cce_loss.detach()
+                initial_loss = cce_loss_weighted.detach()
                 initial_pred_energies = predicted_energy.squeeze().mean().detach()
+                for j in range(num_offsets):
+                    per_offset_ce_initial[j] = step_per_offset_ce[j].detach()
             if mcmc_step == (total_mcmc_steps - 1):
                 final_pred_energies = predicted_energy.squeeze().mean().detach()
+                for j in range(num_offsets):
+                    per_offset_ce_final[j] = step_per_offset_ce[j].detach()
+
+            # Per-offset energy diagnostics: predicted_energy is [B*S*K, 1] in
+            # position-major order, so reshape to [B, S, K] for per-offset
+            # mean. (At the inference layout the same code path is not used.)
+            if mcmc_step == 0 or mcmc_step == (total_mcmc_steps - 1):
+                try:
+                    e_bsk = predicted_energy.reshape(-1, S_eff, num_offsets)
+                except RuntimeError:
+                    e_bsk = None
+                if e_bsk is not None:
+                    for j in range(num_offsets):
+                        e_j_mean = e_bsk[:, :, j].mean().detach()
+                        if mcmc_step == 0:
+                            per_offset_energy_initial[j] = e_j_mean
+                        else:
+                            per_offset_energy_final[j] = e_j_mean
 
         initial_final_pred_energies_gap = initial_pred_energies - final_pred_energies
-        ppl_loss = torch.exp(final_reconstruction_loss).detach()
+        ppl_loss = torch.exp(final_cce_loss_mean).detach()  # PPL based on unweighted mean (BC)
         total_loss = self.hparams.reconstruction_coeff * reconstruction_loss
         contrastive_loss = 0.0
 
         if token_bytes is not None:
-            bpb_loss = calculate_bpb_score(next_token_indices, final_cce_loss, token_bytes)
+            bpb_loss = calculate_bpb_score(next_token_indices, final_cce_loss_mean, token_bytes)
         else:
             bpb_loss = 0
 
-        # Per-offset loss logging, computed on the final MCMC step's logits
-        # in the canonical [B, K, S, V] layout. This is the same logging
-        # format mtp_mcmc uses, so downstream dashboards keep working.
+        # Per-offset loss / PPL / BPB logging on the FINAL MCMC step.
+        # `offset_{j}_loss` keeps the unweighted per-offset CE (kept identical
+        # to mtp_mcmc dashboard keys). `offset_{j}_ppl` / `offset_{j}_bpb` are
+        # NEW: they let us directly compare offset 1 of a blockwise run
+        # against a non-blockwise `val/bpb` (which only predicts offset 1),
+        # which is the apples-to-apples comparison the user wants. The model
+        # still does the parallel K-offset forward — we just slice the j-th
+        # latent's logits and the j-th target slice from `block_targets`.
         offset_loss_log_dict = {}
-        final_step_logits = logits_per_step[-1].detach()       # [B, K, S, V]
-        final_step_targets = block_targets.detach()            # [B, K, S]
         for offset_idx in range(num_offsets):
             offset_value = int(target_offsets[offset_idx].item())
-            offset_logits = final_step_logits[:, offset_idx, :, :].reshape(-1, self.vocab_size)
-            offset_targets = final_step_targets[:, offset_idx, :].reshape(-1)
-            offset_loss = F.cross_entropy(
-                offset_logits,
-                offset_targets,
-                ignore_index=-1,
+            ce_j = per_offset_ce_final[offset_idx]
+            offset_loss_log_dict[f"offset_{offset_value}_loss"] = ce_j
+            offset_loss_log_dict[f"offset_{offset_value}_ppl"] = torch.exp(ce_j).detach()
+            if token_bytes is not None:
+                offset_targets_flat = block_targets[:, offset_idx, :].reshape(-1)
+                offset_loss_log_dict[f"offset_{offset_value}_bpb"] = calculate_bpb_score(
+                    offset_targets_flat, ce_j, token_bytes,
+                )
+
+        # E1.2: extra diagnostics — initial CE, initial/final energy, energy
+        # gap per offset, and the effective loss weight applied to each offset.
+        # These are NEW keys; they coexist with existing offset_*_loss keys.
+        offset_diag_log_dict = {}
+        device = block_targets.device
+        for offset_idx in range(num_offsets):
+            offset_value = int(target_offsets[offset_idx].item())
+            if per_offset_ce_initial[offset_idx] is not None:
+                offset_diag_log_dict[f"offset_{offset_value}_initial_ce"] = per_offset_ce_initial[offset_idx]
+            if per_offset_energy_initial[offset_idx] is not None:
+                offset_diag_log_dict[f"offset_{offset_value}_initial_energy"] = per_offset_energy_initial[offset_idx]
+            if per_offset_energy_final[offset_idx] is not None:
+                offset_diag_log_dict[f"offset_{offset_value}_final_energy"] = per_offset_energy_final[offset_idx]
+            if (
+                per_offset_energy_initial[offset_idx] is not None
+                and per_offset_energy_final[offset_idx] is not None
+            ):
+                offset_diag_log_dict[f"offset_{offset_value}_energy_gap"] = (
+                    per_offset_energy_initial[offset_idx] - per_offset_energy_final[offset_idx]
+                )
+            offset_diag_log_dict[f"offset_{offset_value}_loss_weight"] = torch.tensor(
+                float(weights[offset_idx]), device=device,
             )
-            offset_loss_log_dict[f"offset_{offset_value}_loss"] = offset_loss
 
         if getattr(self.hparams, "debug_blockwise_shapes", False):
             print(
@@ -1288,6 +1992,8 @@ class EBT_NLP(LightningModule):
             )
             print(
                 f"[blockwise-debug][phase={phase}][block_mode={self._block_mode}] "
+                f"head_type={self._block_latent_head_type} "
+                f"offset_weights={[round(w, 6) for w in weights]} "
                 f"aggregated_loss={total_loss.detach().item():.6f}",
                 flush=True,
             )
@@ -1307,6 +2013,7 @@ class EBT_NLP(LightningModule):
             'bpb': bpb_loss,
         }
         log_dict.update(offset_loss_log_dict)
+        log_dict.update(offset_diag_log_dict)
         return log_dict
 
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
@@ -1435,6 +2142,14 @@ class EBT_NLP(LightningModule):
                     ignore_index=-1,
                 )
                 offset_loss_log_dict[f"offset_{offset_value}_loss"] = offset_loss
+                # Per-offset PPL / BPB — same intent as in the explicit-block-
+                # latent path. Lets a blockwise mtp_mcmc run's `offset_1_bpb`
+                # be compared directly against a non-blockwise `val/bpb`.
+                offset_loss_log_dict[f"offset_{offset_value}_ppl"] = torch.exp(offset_loss).detach()
+                if token_bytes is not None:
+                    offset_loss_log_dict[f"offset_{offset_value}_bpb"] = calculate_bpb_score(
+                        offset_targets, offset_loss, token_bytes,
+                    )
 
             if getattr(self.hparams, "debug_blockwise_shapes", False):
                 print(

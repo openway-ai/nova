@@ -30,11 +30,22 @@ BLOCK_MODE_CHOICES = (
     "mtp_mcmc",
     "future_latent_non_causal",
     "blockwise",
+    "future_latent_bidirectional",
 )
 
 # Block modes that use the new "K future latents per source position" semantic
 # with a single-token head (latent_token_head : D -> V).
-EXPLICIT_BLOCK_LATENT_MODES = ("future_latent_non_causal", "blockwise")
+#
+# Intra-block visibility differs across modes:
+#   * future_latent_non_causal : z_{t,j} sees only itself (within block).
+#   * blockwise                : z_{t,j} sees z_{t,1..j}        (causal in j).
+#   * future_latent_bidirectional : z_{t,j} sees z_{t,*}        (full intra-
+#                                   block attention; "true joint MCMC plane").
+EXPLICIT_BLOCK_LATENT_MODES = (
+    "future_latent_non_causal",
+    "blockwise",
+    "future_latent_bidirectional",
+)
 
 
 def build_explicit_block_latent_mask(
@@ -146,6 +157,14 @@ def build_explicit_block_latent_mask(
         # z_{t,j} sees only itself (same source position AND same block offset).
         same_j = pred_j_idx.unsqueeze(1) == pred_j_idx.unsqueeze(0)
         pred_to_pred = same_t & same_j
+    elif block_mode == "future_latent_bidirectional":
+        # z_{t,j} sees all z_{t,*}: same source position only, no j-causality.
+        # Realises the "true joint MCMC plane": every pair of latents in the
+        # same block can exchange information in both directions, so the MCMC
+        # update on z_{t,1} sees ∂e_{t,*}/∂z_{t,1} from every offset, and the
+        # MCMC update on z_{t,k} sees ∂e_{t,*}/∂z_{t,k} likewise. Cross
+        # source-position visibility is still blocked (same_t).
+        pred_to_pred = same_t
     else:  # block_mode == "blockwise"
         # z_{t,j} sees z_{t,1..j}: same source position AND key block offset
         # <= query block offset.
@@ -234,6 +253,11 @@ def build_explicit_block_latent_inference_mask(
     if block_mode == "future_latent_non_causal":
         # Only self.
         pred_to_pred = block_idx.unsqueeze(1) == block_idx.unsqueeze(0)
+    elif block_mode == "future_latent_bidirectional":
+        # Full intra-block attention: every latent sees every other latent in
+        # the same anchor block (mirrors the training mask's same_t-only rule
+        # with S=1 at inference).
+        pred_to_pred = torch.ones((K, K), dtype=torch.bool, device=device)
     else:  # blockwise
         # Causal within the block.
         pred_to_pred = block_idx.unsqueeze(0) <= block_idx.unsqueeze(1)
