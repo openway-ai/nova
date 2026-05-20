@@ -563,6 +563,17 @@ class ModelTrainer(LightningModule):
                         generation_batch = (questions, answers)
                         generation_outputs = generate_text(self.model, generation_batch, self.hparams)
 
+                        # Per-offset teacher-forced keys (offset_J_loss / _ppl /
+                        # _bpb) produced by get_ppl for explicit-block-latent
+                        # ckpts. Forward them to results.jsonl so K=2/3/... runs
+                        # surface per-offset BPB at test time too, paralleling
+                        # what wandb shows at train/val time.
+                        per_offset_tf_keys = {
+                            k: v for k, v in ppl_outputs.items()
+                            if k.startswith("offset_") and (
+                                k.endswith("_loss") or k.endswith("_ppl") or k.endswith("_bpb")
+                            )
+                        }
                         # Log generation results with additional context
                         for i, output in enumerate(generation_outputs):
                             # Add PPL info and shard index
@@ -570,6 +581,8 @@ class ModelTrainer(LightningModule):
                             output['teacher_forced_ppl'] = tf_ppl
                             if tf_bpb is not None:
                                 output['teacher_forced_bpb'] = tf_bpb
+                            for k, v in per_offset_tf_keys.items():
+                                output[k] = v
                             output['shard_idx'] = batch['shard_indices'][i]
                             # Note: prompt and target are already in output from generate_text()
                             # No need to add duplicate fields
@@ -726,6 +739,13 @@ class ModelTrainer(LightningModule):
                                 }
                                 if tf_bpb is not None:
                                     output_record["teacher_forced_bpb"] = tf_bpb
+                                # Forward per-offset teacher-forced metrics
+                                # (offset_J_loss/_ppl/_bpb) when present.
+                                for k, v in ppl_outputs.items():
+                                    if k.startswith("offset_") and (
+                                        k.endswith("_loss") or k.endswith("_ppl") or k.endswith("_bpb")
+                                    ):
+                                        output_record[k] = v
                                 self.infer_logger.log_data(output_record)
 
                                 # Also print to console for first few samples

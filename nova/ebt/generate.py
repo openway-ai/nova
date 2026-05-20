@@ -529,7 +529,22 @@ def get_ppl(model, batch, hparams, token_bytes=None): # computes teacher-forced 
 
     with torch.no_grad(): # by default no grad, although ebt will enable grad
         full_ids = batch['input_ids'].squeeze(dim=1)
-        if hparams.model_name == "ebt" and effective_block_mode == "direct_block" and infer_block_size > 1:
+        # Blockwise teacher-forced PPL must use the chunked-loop path whenever
+        # the model's attention semantic is explicit-block-latent — even when
+        # `infer_block_size == 1` (sequential_k1) — because such models do not
+        # produce per-position logits from a single forward pass; they only
+        # emit K logits anchored at the end of context. The original
+        # condition (direct_block + size>1) handled mtp_mcmc-style ckpts,
+        # where the trunk was symmetric and a single dense forward returned
+        # [B, S, V]. Both cases are valid; pick by attention mode + size.
+        _need_chunked_loop = (
+            hparams.model_name == "ebt"
+            and (
+                (effective_block_mode == "direct_block" and infer_block_size > 1)
+                or attention_block_mode in EXPLICIT_BLOCK_LATENT_MODES_INFER
+            )
+        )
+        if _need_chunked_loop:
             # Blockwise teacher-forced:
             # for each chunk starting at cur_pos, condition on real prefix full_ids[:, :cur_pos]
             # and predict the next K tokens in one shot.
@@ -538,6 +553,15 @@ def get_ppl(model, batch, hparams, token_bytes=None): # computes teacher-forced 
                 pad_token_id = -100
 
             all_losses = []
+            # Per-block-offset breakdown. `per_offset_losses[j]` collects every
+            # CE loss observed at the j-th (0-indexed) position WITHIN a block;
+            # `per_offset_targets[j]` collects the matching target token ids so
+            # we can compute BPB later (needs token_bytes lookups). For
+            # batch_size>1 we keep the [B] dim flattened so the lengths line up
+            # with `per_token_loss` aggregation logic below.
+            K_max_offsets = max(1, int(infer_block_size))
+            per_offset_losses = [[] for _ in range(K_max_offsets)]
+            per_offset_targets = [[] for _ in range(K_max_offsets)]
             for cur_pos in range(1, full_ids.shape[1], infer_block_size):
                 block_len = min(infer_block_size, full_ids.shape[1] - cur_pos)
                 if block_len <= 0:
@@ -552,13 +576,21 @@ def get_ppl(model, batch, hparams, token_bytes=None): # computes teacher-forced 
                 )
                 block_logits = ebt_outputs[0][-1]  # [B, block_len, V]
                 block_targets = full_ids[:, cur_pos:cur_pos + block_len]  # [B, block_len]
-                block_losses = F.cross_entropy(
+                B_ = block_logits.shape[0]
+                # Per-offset CE: keep the [B, block_len] structure so we can
+                # slice each offset column. `_per_pos` has shape [B, block_len].
+                _per_pos = F.cross_entropy(
                     block_logits.reshape(-1, block_logits.shape[-1]),
                     block_targets.reshape(-1),
                     ignore_index=pad_token_id,
                     reduction="none",
-                )
-                all_losses.append(block_losses)
+                ).reshape(B_, block_len)
+                for j in range(block_len):
+                    per_offset_losses[j].append(_per_pos[:, j])         # [B]
+                    per_offset_targets[j].append(block_targets[:, j])    # [B]
+                # Flat losses preserve the row-major (B, block_len) layout so
+                # the cat at the end matches full_ids[:, 1:].reshape(-1).
+                all_losses.append(_per_pos.reshape(-1))
 
             if len(all_losses) == 0:
                 per_token_loss = torch.tensor([0.0], device=full_ids.device)
@@ -596,10 +628,13 @@ def get_ppl(model, batch, hparams, token_bytes=None): # computes teacher-forced 
     }
 
     if token_bytes is not None:
-        if hparams.model_name == "ebt" and effective_block_mode == "direct_block" and infer_block_size > 1:
-            # Next-token targets are all tokens after BOS-equivalent first token in full_ids.
+        if _need_chunked_loop:
+            # The chunked loop builds `all_losses` left-to-right matching
+            # full_ids[:, 1:]. The else branch defined next_token_indices via
+            # a single dense forward; the chunked branch did not, so define it
+            # here. Trim to the shorter of the two if they disagree (can
+            # happen if the chunked loop skipped a tail block_len==0).
             next_token_indices = full_ids[:, 1:].reshape(-1)
-            # blockwise all_losses is built in the same left-to-right order; trim to target length if needed
             if per_token_loss.numel() != next_token_indices.numel():
                 min_len = min(per_token_loss.numel(), next_token_indices.numel())
                 per_token_loss = per_token_loss[:min_len]
@@ -623,6 +658,40 @@ def get_ppl(model, batch, hparams, token_bytes=None): # computes teacher-forced 
         bpb = total_nats.item() / (math.log(2) * total_bytes.item()) if total_bytes.item() > 0 else float('inf')
         outputs["bpb"] = bpb  # legacy
         outputs["teacher_forced_bpb"] = bpb
+
+        # Per-offset teacher-forced metrics for the chunked-loop path.
+        # Mirrors the per-offset keys logged during training validation
+        # (`valid_offset_J_bpb` etc) so K=3 / K>=3 runs can be diagnosed at
+        # test/eval time too, not only via wandb. Offsets are 1-indexed:
+        # offset_1 = first slot of each block, offset_2 = second, ...
+        if _need_chunked_loop:
+            for j_idx, losses_list in enumerate(per_offset_losses):
+                if not losses_list:
+                    continue
+                offset_value = j_idx + 1  # 1-indexed for log keys
+                losses_j = torch.cat(losses_list, dim=0)         # [N_j]
+                targets_j = torch.cat(per_offset_targets[j_idx], dim=0)  # [N_j]
+                # Mask out ignore_index (-1 / pad_token_id) before mean.
+                valid_j = (targets_j >= 0) & (targets_j != pad_token_id)
+                losses_j = losses_j[valid_j]
+                targets_j = targets_j[valid_j]
+                if losses_j.numel() == 0:
+                    continue
+                ce_j = losses_j.mean()
+                outputs[f"offset_{offset_value}_loss"] = float(ce_j.item())
+                outputs[f"offset_{offset_value}_ppl"] = float(torch.exp(ce_j).item())
+                # BPB requires token_bytes -> per-target byte counts.
+                if token_bytes.device != targets_j.device:
+                    _tb = token_bytes.to(targets_j.device)
+                else:
+                    _tb = token_bytes
+                num_bytes_j = _tb[targets_j]
+                total_nats_j = (losses_j * (num_bytes_j > 0)).sum()
+                total_bytes_j = num_bytes_j.sum().to(torch.int64)
+                if total_bytes_j.item() > 0:
+                    outputs[f"offset_{offset_value}_bpb"] = float(
+                        total_nats_j.item() / (math.log(2) * total_bytes_j.item())
+                    )
 
     if hparams.model_name == "ebt" and energies is not None:
         energy_tensors = []
