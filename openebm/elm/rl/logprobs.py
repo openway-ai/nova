@@ -43,14 +43,52 @@ def compute_sequence_energy(model, input_ids, prompt_length):
         all_embeddings, start_pos=0, mcmc_step=0,
         real_token_ids=model_input, predicted_tokens=one_hot_targets,
     )
-    energy_preds = energy_preds.float().reshape(B, -1)  # (B, 2*(S-1))
 
-    # Take energy from the "predicted" half (positions S-1 to 2*(S-1)-1),
-    # then slice to completion-only positions.
-    seq_len = S - 1
-    pred_energy = energy_preds[:, seq_len:]  # (B, S-1) — predicted part
+    # ── Debug: log transformer output shape and stats (first call only) ──
+    if not getattr(model, '_dbg_energy_transformer_logged', False):
+        model._dbg_energy_transformer_logged = True
+        import os as _os
+        _rank = _os.environ.get('LOCAL_RANK', '0')
+        if _rank == '0':
+            with torch.no_grad():
+                print(
+                    f"[DBG-ENERGY] transformer raw output: shape={tuple(energy_preds.shape)} "
+                    f"dtype={energy_preds.dtype} "
+                    f"min={energy_preds.min().item():.4f} max={energy_preds.max().item():.4f} "
+                    f"any_nan={torch.isnan(energy_preds).any().item()} "
+                    f"any_inf={torch.isinf(energy_preds).any().item()} "
+                    f"requires_grad={energy_preds.requires_grad}",
+                    flush=True,
+                )
+                print(
+                    f"[DBG-ENERGY] input shapes: B={B} S={S} prompt_len={prompt_length} "
+                    f"all_embeddings={tuple(all_embeddings.shape)} "
+                    f"predicted_embeddings.requires_grad={predicted_embeddings.requires_grad}",
+                    flush=True,
+                )
+
+    energy_preds = energy_preds.float().reshape(B, -1)  # (B, S-1) — transformer returns predicted-half only
+
+    # ── Debug: check reshape result ──
+    if not getattr(model, '_dbg_energy_reshape_logged', False):
+        model._dbg_energy_reshape_logged = True
+        import os as _os
+        _rank = _os.environ.get('LOCAL_RANK', '0')
+        if _rank == '0':
+            seq_len = S - 1
+            actual_cols = energy_preds.shape[1]
+            print(
+                f"[DBG-ENERGY] after reshape: shape={tuple(energy_preds.shape)} "
+                f"seq_len(S-1)={seq_len} actual_cols={actual_cols} "
+                f"match={seq_len == actual_cols}",
+                flush=True,
+            )
+
+    # The transformer energy head outputs one scalar per position in the
+    # predicted half only (not the real half). So energy_preds is (B, S-1),
+    # aligned with targets[0..S-2]. Slice to completion-only positions.
     comp_start = prompt_length - 1
-    comp_energy = pred_energy[:, comp_start:]  # (B, comp_len)
+    comp_energy = energy_preds[:, comp_start:]  # (B, comp_len)
 
     # Mean energy over completion positions
     return comp_energy.mean(dim=1)  # (B,)
