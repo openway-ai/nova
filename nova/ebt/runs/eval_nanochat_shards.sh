@@ -50,6 +50,11 @@ INFER_BLOCK_USE_REFINE="${INFER_BLOCK_USE_REFINE:-true}"
 INFER_BLOCK_REFINE_STEPS="${INFER_BLOCK_REFINE_STEPS:-0}"
 INFER_BLOCK_INIT_LOGIT_SCALE="${INFER_BLOCK_INIT_LOGIT_SCALE:-8.0}"
 INFER_BLOCK_DIAGNOSE="${INFER_BLOCK_DIAGNOSE:-false}"
+# Sampling knobs. Default to the historical (T=0.6, top_p=0.9) sampling that
+# the dashboard expects; override INFER_TEMP=0.0 for deterministic eval (e.g.
+# spec-decoding accept-rate measurement).
+INFER_TEMP="${INFER_TEMP:-0.6}"
+INFER_TOPP="${INFER_TOPP:-0.9}"
 # Attention / training semantic that must match the checkpoint being
 # evaluated. Leave empty to fall back to the checkpoint's recorded block_mode
 # (or dense_token for legacy ckpts). For current dev-blockwise checkpoints
@@ -154,8 +159,21 @@ if [ "$INFER_BLOCK_DIAGNOSE" = "true" ]; then
 fi
 
 BLOCK_MODE_FLAG=""
+TRAINING_OBJECTIVE_FLAG=""
 if [ -n "$BLOCK_MODE" ]; then
     BLOCK_MODE_FLAG="--block_mode $BLOCK_MODE"
+    # train.py enforces (block_mode <-> training_objective) consistency even
+    # in --only_test, because the dataloader is built from training_objective.
+    # Auto-pick the matching objective so eval callers only need to set
+    # BLOCK_MODE (the value already baked into the ckpt's hparams).
+    case "$BLOCK_MODE" in
+        dense_token)
+            TRAINING_OBJECTIVE_FLAG="--training_objective dense_next_token"
+            ;;
+        mtp_mcmc|future_latent_non_causal|blockwise|future_latent_bidirectional)
+            TRAINING_OBJECTIVE_FLAG="--training_objective blockwise"
+            ;;
+    esac
 fi
 
 {
@@ -170,8 +188,8 @@ $PYTHON train.py \
     --max_samples_per_shard "$MAX_SAMPLES_PER_SHARD" \
     $GENERATION_FLAGS \
     --infer_max_gen_len 256 \
-    --infer_temp 0.6 \
-    --infer_topp 0.9 \
+    --infer_temp "$INFER_TEMP" \
+    --infer_topp "$INFER_TOPP" \
     --infer_block_size "$INFER_BLOCK_SIZE" \
     --infer_block_mode "$INFER_BLOCK_MODE" \
     --infer_block_use_refine "$INFER_BLOCK_USE_REFINE" \
@@ -179,6 +197,7 @@ $PYTHON train.py \
     --infer_block_init_logit_scale "$INFER_BLOCK_INIT_LOGIT_SCALE" \
     $BLOCK_DIAG_FLAG \
     $BLOCK_MODE_FLAG \
+    $TRAINING_OBJECTIVE_FLAG \
     --gpus "$GPUS" \
     --distributed_strategy "auto" \
     --batch_size_per_device "$BATCH_SIZE" \
