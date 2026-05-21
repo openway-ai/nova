@@ -56,14 +56,18 @@ def generate_completions(
     # Determine stop tokens — only semantic stoppers, NOT bos/eos.
     # In nanochat bos == eos == pad, so adding eos_token_id here would stop
     # generation on the very first token. See chat_ebt.py:335-343.
+    # CRITICAL: use encode_special (single-token ID) not encode (multi-char text).
     stop_token_ids = set()
-    for special in ['<|user_start|>', '<|assistant_end|>']:
-        try:
-            tid = tokenizer.encode(special)
-            if tid:
-                stop_token_ids.add(tid[0] if isinstance(tid, list) else tid)
-        except Exception:
-            pass
+    inner_tok = getattr(tokenizer, 'tokenizer', tokenizer)
+    encode_special_fn = getattr(inner_tok, 'encode_special', None)
+    if encode_special_fn is not None:
+        for special in ['<|user_start|>', '<|assistant_end|>']:
+            try:
+                tid = encode_special_fn(special)
+                if tid is not None and isinstance(tid, int):
+                    stop_token_ids.add(tid)
+            except Exception:
+                pass
 
     # Expand prompts: each prompt repeated num_generations times
     # Shape: (num_prompts * num_generations, prompt_len)

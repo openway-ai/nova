@@ -51,6 +51,25 @@ class SudokuRLPromptDataset(IterableDataset):
         self.augment = augment and (split == "train")
         self._seed = seed
 
+        # Cache the inner RustBPETokenizer (may be wrapped by NanoChatTokenizerWrapper).
+        # We need the inner one to access render_for_completion / encode_special, which
+        # produce single-token IDs for chat special tokens (matching SFT training).
+        self._inner_tok = getattr(tokenizer, 'tokenizer', tokenizer)
+
+        # Sanity check: encode_special must return single int IDs in the special range
+        # (>32000 in nanochat). Guards against the v9 regression where string-concat
+        # chat prompts silently produced reward=0 for an entire training run because
+        # encode_ordinary tokenized "<|user_start|>" as 7 character tokens instead of
+        # the single special-token ID 32760.
+        asst_start_id = self._inner_tok.encode_special('<|assistant_start|>')
+        asst_end_id = self._inner_tok.encode_special('<|assistant_end|>')
+        assert isinstance(asst_start_id, int) and asst_start_id > 32000, (
+            f"Tokenizer special-token encoding broken: <|assistant_start|>={asst_start_id}"
+        )
+        assert isinstance(asst_end_id, int) and asst_end_id > 32000, (
+            f"Tokenizer special-token encoding broken: <|assistant_end|>={asst_end_id}"
+        )
+
         # Load puzzle data
         effective_split = "val" if split == "val" else "train"
         self.samples = _load_sudoku_split_v2(effective_split, self.data_dir)
@@ -101,9 +120,21 @@ class SudokuRLPromptDataset(IterableDataset):
                 prompt_tpl = PROMPT_TEMPLATES[prompt_idx]
                 user_content = prompt_tpl.format(puzzle=puzzle_str)
 
-                # Build the conversation prompt (up to assistant turn)
-                # Using nanochat chat format
-                prompt_text = self._format_chat_prompt(user_content)
+                # Build prompt using nanochat's render_for_completion: this is the
+                # canonical RL entry point that produces single-token IDs for
+                # <|user_start|>, <|user_end|>, <|assistant_start|>, matching the
+                # exact distribution the model saw during SFT.
+                conv = {
+                    "messages": [
+                        {"role": "user", "content": user_content},
+                        # placeholder assistant message — popped by render_for_completion
+                        {"role": "assistant", "content": ""},
+                    ]
+                }
+                prompt_ids = self._inner_tok.render_for_completion(conv)
+                # Left-truncate to preserve the trailing <|assistant_start|>.
+                if len(prompt_ids) > self.max_prompt_length:
+                    prompt_ids = prompt_ids[-self.max_prompt_length:]
 
                 # Compute difficulty
                 num_givens = sum(1 for c in puzzle_flat if c != '0')
@@ -115,7 +146,7 @@ class SudokuRLPromptDataset(IterableDataset):
                     difficulty = "easy"
 
                 yield {
-                    "prompt_text": prompt_text,
+                    "prompt_ids": prompt_ids,
                     "puzzle": puzzle_flat,
                     "solution": solution,
                     "difficulty": difficulty,
@@ -126,10 +157,10 @@ class SudokuRLPromptDataset(IterableDataset):
             rng.shuffle(indices)
 
     def _format_chat_prompt(self, user_content: str) -> str:
-        """Format as nanochat conversation up to assistant turn.
-
-        Uses the nanochat special tokens:
-          <|user_start|>content<|user_end|><|assistant_start|>
+        """Deprecated: kept only for diagnostic comparisons. Do NOT use for RL prompts —
+        the resulting string, when passed to tokenizer.encode(), tokenizes special
+        tokens as multi-char text instead of single special IDs. See `__iter__` for
+        the correct render_for_completion path.
         """
         return (
             f"<|user_start|>{user_content}<|user_end|>"
@@ -141,31 +172,25 @@ def collate_rl_prompts(batch, tokenizer, max_prompt_length):
     """Collate a batch of RL prompt dicts into tensors.
 
     Args:
-        batch: list of dicts from SudokuRLPromptDataset
-        tokenizer: nanochat tokenizer
+        batch: list of dicts from SudokuRLPromptDataset, each with pre-encoded `prompt_ids`
+        tokenizer: nanochat tokenizer (only used for pad_id)
         max_prompt_length: max token length for prompts
 
     Returns:
         dict with:
-          - prompt_ids: (B, max_len) padded token IDs
+          - prompt_ids: (B, max_len) padded token IDs (left-padded)
           - prompt_lengths: (B,) actual lengths
           - puzzles: list of 81-char strings
           - solutions: list of 9x9 grids
           - difficulties: list of str
     """
-    prompt_texts = [item["prompt_text"] for item in batch]
+    all_ids = [item["prompt_ids"] for item in batch]
     puzzles = [item["puzzle"] for item in batch]
     solutions = [item["solution"] for item in batch]
     difficulties = [item["difficulty"] for item in batch]
 
-    # Tokenize prompts
-    all_ids = []
-    for text in prompt_texts:
-        ids = tokenizer.encode(text)
-        # Truncate from the left if too long
-        if len(ids) > max_prompt_length:
-            ids = ids[-max_prompt_length:]
-        all_ids.append(ids)
+    # Defensive truncate (should already be capped by dataset)
+    all_ids = [ids[-max_prompt_length:] if len(ids) > max_prompt_length else ids for ids in all_ids]
 
     # Pad to max length in batch (left-pad for generation)
     max_len = max(len(ids) for ids in all_ids)
