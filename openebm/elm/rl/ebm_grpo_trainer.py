@@ -132,7 +132,8 @@ class EBMGRPOTrainer(LightningModule):
                 total_metrics[k] += v / self.config.num_iterations
 
         # ── Logging ───────────────────────────────────────────────────────────
-        self.log("train/loss", total_loss.item(), prog_bar=True)
+        loss_val = total_loss.item()
+        self.log("train/loss", loss_val, prog_bar=True)
         self.log("train/reward_mean", gen_data["reward_mean"], prog_bar=True)
         self.log("train/reward_std", gen_data["reward_std"])
         self.log("train/policy_loss", total_metrics["policy_loss"])
@@ -147,6 +148,21 @@ class EBMGRPOTrainer(LightningModule):
         # ── Stability diagnostics ────────────────────────────────────────────
         self.log("stability/degenerate_group_rate", gen_data.get("degenerate_rate", 0.0))
         self._log_stability_metrics()
+
+        # ── Stdout metrics (visible in train.log via pipe) ───────────────────
+        step = self.global_step
+        if step % self.config.log_interval == 0:
+            rc = gen_data.get("reward_components", {})
+            print(
+                f"[GRPO] step={step} | "
+                f"loss={loss_val:.4f} | "
+                f"reward={gen_data['reward_mean']:.3f}±{gen_data['reward_std']:.3f} | "
+                f"fmt={rc.get('format', 0):.2f} clue={rc.get('clue_preservation', 0):.2f} "
+                f"blank_acc={rc.get('blank_accuracy', 0):.3f} solve={rc.get('full_solve', 0):.2f} | "
+                f"comp_len={gen_data['avg_completion_length']:.0f} | "
+                f"clip={total_metrics['clip_ratio']:.2f} degen={gen_data.get('degenerate_rate', 0):.2f}",
+                flush=True,
+            )
 
         return total_loss
 
@@ -227,6 +243,13 @@ class EBMGRPOTrainer(LightningModule):
             dtype=torch.float32,
             device=self.device,
         )
+
+        # One-time debug: print first completion and reward to catch format regressions early.
+        if not getattr(self, '_dbg_logged_first_rollout', False):
+            self._dbg_logged_first_rollout = True
+            sample_text = completion_texts[0][:300] if completion_texts else "(empty)"
+            print(f"[DBG-RL] first rollout sample: {repr(sample_text)}", flush=True)
+            print(f"[DBG-RL] first rollout reward detail: {reward_details[0]}", flush=True)
 
         # ── 3. Compute old energies / logprobs ───────────────────────────────
         expanded_prompts = prompt_ids.repeat_interleave(
@@ -468,6 +491,17 @@ class EBMGRPOTrainer(LightningModule):
                 f"(total_norm_after={total_norm:.4e})",
                 flush=True,
             )
+
+        # Stdout grad stats (rank 0 only, every log_interval steps)
+        step = self.global_step
+        if step % self.config.log_interval == 0:
+            import os as _os
+            if _os.environ.get('LOCAL_RANK', '0') == '0':
+                print(
+                    f"[GRPO] step={step} grad_norm={total_norm:.4e} "
+                    f"max_param_grad={max_param_grad_norm:.4e} nan_params={nan_grad_params}",
+                    flush=True,
+                )
 
         # Per-parameter gradient clipping
         if self.config.max_grad_per_param > 0.0:
