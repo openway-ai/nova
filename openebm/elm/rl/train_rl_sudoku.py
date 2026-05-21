@@ -127,16 +127,22 @@ def load_sft_model_and_tokenizer(checkpoint_path):
 
     model = EBT_NLP(hp)
 
-    # Load state dict (handle the "model." prefix from Lightning)
+    # Load state dict (handle "model." from Lightning + "_orig_mod." from torch.compile)
     state_dict = ckpt["state_dict"]
     model_state = {}
     for key, val in state_dict.items():
-        if key.startswith("model."):
-            model_state[key[6:]] = val  # strip "model." prefix
-        else:
-            model_state[key] = val
+        clean_key = key
+        if clean_key.startswith("model."):
+            clean_key = clean_key[6:]
+        if clean_key.startswith("_orig_mod."):
+            clean_key = clean_key[10:]
+        model_state[clean_key] = val
 
-    model.load_state_dict(model_state, strict=False)
+    missing, unexpected = model.load_state_dict(model_state, strict=False)
+    if missing:
+        print(f"  WARNING: {len(missing)} missing keys: {missing[:5]}...")
+    if unexpected:
+        print(f"  WARNING: {len(unexpected)} unexpected keys: {unexpected[:5]}...")
     print(f"  Model loaded successfully. Params: {sum(p.numel() for p in model.parameters()):,}")
 
     return model, tokenizer, hparams
