@@ -56,7 +56,6 @@ python train.py \
 --warm_up_steps ${WARMUP_STEP} \
 \
 --dataset_name "fineweb" \
---num_workers 12 \
 --val_check_interval 50 \
 --limit_val_batches 10 \
 --val_sanity 1 \

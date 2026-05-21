@@ -1,7 +1,9 @@
-import sys
-sys.path.append("../../")
+import os, sys
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.dataloader import StatefulBestFitDataLoader, tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 
 import torch
 from torch.utils.data import IterableDataset as _IterableDataset
@@ -9,12 +11,11 @@ from torch.utils.data import IterableDataset, DataLoader
 
 class IterableDataset(_IterableDataset):
     """
-    Wraps tokenizing_distributed_data_loader_with_state_bos_bestfit
-    into a PyTorch IterableDataset.
+    Wraps StatefulBestFitDataLoader into a PyTorch IterableDataset.
 
     This keeps:
     - infinite streaming
-    - resume state support
+    - exact resume state support (doc_buffer + doc_batch_index)
     - no padding
     - distributed compatibility
     """
@@ -45,6 +46,7 @@ class IterableDataset(_IterableDataset):
         self.resume_state_dict = resume_state_dict
         self.batch_idx = 0
         self.last_state_dict = None  # 最新的 dataloader 位置，用于 checkpoint 恢复
+        self._stateful_loader = None  # holds StatefulBestFitDataLoader instance
         self.training_objective = training_objective
         self.train_block_size = int(train_block_size)
         self.train_context_length = train_context_length
@@ -105,19 +107,26 @@ class IterableDataset(_IterableDataset):
         }
 
     def __iter__(self):
-        for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        self._stateful_loader = StatefulBestFitDataLoader(
             tokenizer=self.tokenizer,
             B=self.B,
             T=self.T,
             split=self.split,
             device=self.device,
             resume_state_dict=self.resume_state_dict,
-        ):
+        )
+        for inputs, targets, state_dict in self._stateful_loader:
             self.last_state_dict = state_dict
             if self.training_objective == "blockwise":
                 yield self._build_blockwise_batch(inputs, targets)
             else:
                 yield inputs, targets
+
+    def get_dataloader_state(self):
+        """Return exact-resume state (includes doc_buffer)."""
+        if self._stateful_loader is not None:
+            return self._stateful_loader.state_dict()
+        return self.last_state_dict  # fallback
 
     def __len__(self):
         return self.max_iter

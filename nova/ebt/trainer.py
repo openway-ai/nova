@@ -91,9 +91,15 @@ from metrics import get_torchmetrics
 import sys
 from transformers import AutoTokenizer
 
-import ipdb
+try:
+    import ipdb  # type: ignore
+except ImportError:
+    ipdb = None
+import os, sys
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-sys.path.append("../../")
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
 class ModelTrainer(LightningModule):
@@ -263,10 +269,11 @@ class ModelTrainer(LightningModule):
             #     raise ValueError(f"do not recognize model name: {self.hparams.model_name}")
 
         # torch.compile 支持
-        # 注意: EBT 使用 autograd.grad 进行 MCMC 更新，与 fullgraph=True 可能不兼容
-        # 推荐使用 --compile_model --compile_mode transformer_only 仅编译 transformer 部分
+        # EBT 训练时 autograd.grad(create_graph=True) 产生二阶梯度,
+        # torch.compile (aot_autograd) 不支持 double backward, 因此训练时跳过编译.
+        # 推理时 learning=False → create_graph=False, 可以安全编译.
         if self.hparams.compile_model:
-            compile_mode = getattr(self.hparams, 'compile_mode', 'full')
+            compile_mode = getattr(self.hparams, 'compile_mode', 'transformer_only')
             compile_backend = getattr(self.hparams, 'compile_backend', 'inductor')
             compile_dynamic = getattr(self.hparams, 'compile_dynamic', False)
 
@@ -287,23 +294,42 @@ class ModelTrainer(LightningModule):
                 print(f"{'='*80}\n")
 
             elif compile_mode == 'transformer_only':
-                # 仅编译 transformer 部分 (推荐，避开 MCMC 循环)
+                # 仅编译 transformer 部分 (避开 MCMC )
+                # 保留 eager 引用供 _mcmc_step_excluded 中 create_graph=True 时使用
                 print(f"[torch.compile] 仅编译 transformer 部分 (mode=transformer_only, backend={compile_backend})")
                 if hasattr(self.model, 'transformer'):
+                    self.model.transformer_eager = self.model.transformer  # 保留 eager 引用
                     self.model.transformer = torch.compile(
                         self.model.transformer,
                         backend=compile_backend,
                         dynamic=compile_dynamic
                     )
-                    print(f"[torch.compile] transformer 编译成功")
+                    print(f"[torch.compile] transformer 编译成功，transformer_eager 已保留用于 MCMC")
                 else:
                     print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过编译")
 
             elif compile_mode == 'disabled':
                 print(f"[torch.compile] 编译已禁用")
 
+            elif (self.hparams.execution_mode == "inference") or getattr(self.hparams, 'only_test', False):
+                # 推理模式: learning=False → 无 double backward, 可以安全编译
+                if compile_mode == 'full':
+                    print(f"[torch.compile] 推理模式: 编译整个模型 (backend={compile_backend})")
+                    self.model = torch.compile(self.model, backend=compile_backend, dynamic=compile_dynamic)
+                elif compile_mode == 'transformer_only':
+                    if hasattr(self.model, 'transformer'):
+                        print(f"[torch.compile] 推理模式: 编译 transformer (backend={compile_backend})")
+                        self.model.transformer = torch.compile(
+                            self.model.transformer, backend=compile_backend, dynamic=compile_dynamic
+                        )
+                    else:
+                        print(f"[torch.compile] 警告: 模型没有 transformer 属性，跳过")
+                else:
+                    raise ValueError(f"未知 compile_mode: {compile_mode}")
+
             else:
-                raise ValueError(f"未知的 compile_mode: {compile_mode}，可选: full, transformer_only, disabled")
+                # 训练模式: 跳过编译 (EBT MCMC 需要 double backward)
+                print(f"[torch.compile] 训练模式下跳过编译 (EBT MCMC 需要 create_graph=True, aot_autograd 不支持 double backward)")
 
         phases = ['train', 'valid', 'test']
         self.torchmetrics_dict = nn.ModuleDict()
@@ -323,6 +349,17 @@ class ModelTrainer(LightningModule):
 
         
     def on_train_start(self):
+        # --- RNG 恢复 (在 val sanity check 之后、第一个 training step 之前) ---
+        import random
+        rng = getattr(self, '_rng_resume_state', None)
+        if rng is not None:
+            torch.random.set_rng_state(rng['torch_cpu'])
+            if rng.get('torch_cuda') is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state(rng['torch_cuda'])
+            random.setstate(rng['python'])
+            self._rng_resume_state = None
+            print(f"[Exact Resume] RNG states restored for rank {self.global_rank}")
+
         if self.hparams.debug_unused_parameters: 
             for name, param in self.model.named_parameters():
                 if param.requires_grad and "image_encoder" not in name: # NOTE need to modify this code to exclude specific frozen portions
@@ -432,9 +469,26 @@ class ModelTrainer(LightningModule):
             print(f"Used parameters: {self.model.used_parameters}")
 
         if self.hparams.manual_gc_collect_every_n_steps != -1:
-            if self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
+            if self.global_step > 0 and self.global_step % self.hparams.manual_gc_collect_every_n_steps == 0:
                 print("calling GC manually")
                 gc.collect()
+                torch.cuda.empty_cache()
+
+        # --- Muon momentum 预热调度 (参考 NanoChat base_train.py:360-363) ---
+        # Muon momentum 从 0.85 线性预热到 0.95，前 300 步完成
+        # 通过 --muon_momentum_warmup_steps 控制（默认 300，设 0 禁用）
+        muon_warmup_steps = getattr(self.hparams, 'muon_momentum_warmup_steps', 300)
+        if muon_warmup_steps > 0 and self.global_step <= muon_warmup_steps:
+            if hasattr(self, 'trainer') and self.trainer.optimizers:
+                optimizer = self.trainer.optimizers[0]
+                if hasattr(optimizer, 'param_groups'):
+                    target_momentum = getattr(self.hparams, 'muon_momentum', 0.95)
+                    base_momentum = 0.85
+                    frac = min(self.global_step / muon_warmup_steps, 1.0)
+                    current_momentum = (1 - frac) * base_momentum + frac * target_momentum
+                    for group in optimizer.param_groups:
+                        if group.get('kind') == 'muon':
+                            group['momentum'] = current_momentum
 
         # Record step end time for dt calculation
         import time as _time
@@ -453,22 +507,78 @@ class ModelTrainer(LightningModule):
     #         optimizer.update_epoch(self.current_epoch)
 
     def on_save_checkpoint(self, checkpoint):
-        # 保存 dataloader 的位置信息到 checkpoint，用于 resume 时跳过已训练数据
+        # 保存 per-rank dataloader 位置 + RNG 状态到 checkpoint，用于精确续训
+        import torch.distributed as dist
+        import random
+
+        # 1. 收集当前 rank 的 dataloader state（精确版，含 doc_buffer）
+        local_dl_state = None
         try:
             train_dl = self.trainer.train_dataloader
             if train_dl is not None:
                 dataset = train_dl.dataset
-                if hasattr(dataset, 'last_state_dict') and dataset.last_state_dict is not None:
-                    checkpoint['dataloader_state_dict'] = dataset.last_state_dict
-                    print(f"[Checkpoint] 保存 dataloader state: {dataset.last_state_dict}")
+                if hasattr(dataset, 'get_dataloader_state'):
+                    local_dl_state = dataset.get_dataloader_state()
+                elif hasattr(dataset, 'last_state_dict') and dataset.last_state_dict is not None:
+                    local_dl_state = dataset.last_state_dict
         except Exception:
             pass  # 非训练阶段可能没有 train_dataloader
 
+        # 2. 收集当前 rank 的 RNG state
+        local_rng_state = {
+            'torch_cpu': torch.random.get_rng_state(),
+            'torch_cuda': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            'python': random.getstate(),
+        }
+
+        # 3. DDP: all_gather 收集所有 rank 的状态到 rank 0
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            all_dl_states = [None] * dist.get_world_size()
+            dist.all_gather_object(all_dl_states, local_dl_state)
+            all_rng_states = [None] * dist.get_world_size()
+            dist.all_gather_object(all_rng_states, local_rng_state)
+        else:
+            all_dl_states = [local_dl_state]
+            all_rng_states = [local_rng_state]
+
+        # 4. 写入 checkpoint
+        checkpoint['dataloader_state_dict_by_rank'] = all_dl_states
+        checkpoint['dataloader_state_dict'] = all_dl_states[0]  # 旧格式兼容
+        checkpoint['rng_states_by_rank'] = all_rng_states
+
+        print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
+
     def on_load_checkpoint(self, checkpoint):
-        # 从 checkpoint 恢复 dataloader 位置信息
-        if 'dataloader_state_dict' in checkpoint:
+        # 从 checkpoint 恢复 per-rank dataloader 位置 + RNG 状态
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # Dataloader state: 优先 per-rank，回退旧格式
+        if 'dataloader_state_dict_by_rank' in checkpoint:
+            states = checkpoint['dataloader_state_dict_by_rank']
+            self._dataloader_resume_state = states[rank] if rank < len(states) else None
+        elif 'dataloader_state_dict' in checkpoint:
             self._dataloader_resume_state = checkpoint['dataloader_state_dict']
-            print(f"[Checkpoint] 恢复 dataloader state: {self._dataloader_resume_state}")
+
+        # RNG state: per-rank
+        if 'rng_states_by_rank' in checkpoint:
+            rng_states = checkpoint['rng_states_by_rank']
+            self._rng_resume_state = rng_states[rank] if rank < len(rng_states) else None
+        else:
+            self._rng_resume_state = None
+
+        if self._dataloader_resume_state:
+            print(f"[Checkpoint] Rank {rank} 恢复 dataloader state: "
+                  f"pq_idx={self._dataloader_resume_state.get('pq_idx')}, "
+                  f"rg_idx={self._dataloader_resume_state.get('rg_idx')}, "
+                  f"state_version={self._dataloader_resume_state.get('state_version', 'legacy')}")
+        if self._rng_resume_state:
+            print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
+
+    def on_validation_epoch_start(self):
+        """Reset BPB accumulators at the start of each validation epoch."""
+        self._val_bpb_nats_by_metric = {}
+        self._val_bpb_bytes_by_metric = {}
 
     def validation_step(self, batch, batch_idx):
         # Move token_bytes to the same device as the model if needed
@@ -477,14 +587,56 @@ class ModelTrainer(LightningModule):
             token_bytes = token_bytes.to(self.device)
         eval_step_dict = self.eval_step(batch, "valid", token_bytes)
         self.log_metrics(eval_step_dict, "valid")
+
+        # 累积 BPB 的 nats/bytes，用于 epoch-level 正确计算
+        # (BPB = sum(nats) / (log2 * sum(bytes)), 不能对 per-batch BPB 做算术平均)
+        for key, value in eval_step_dict.items():
+            if key.endswith("bpb_nats"):
+                metric_name = key[:-5]  # strip "_nats"
+                if isinstance(value, torch.Tensor):
+                    value = value.item()
+                self._val_bpb_nats_by_metric[metric_name] = self._val_bpb_nats_by_metric.get(metric_name, 0.0) + value
+            elif key.endswith("bpb_bytes"):
+                metric_name = key[:-6]  # strip "_bytes"
+                if isinstance(value, torch.Tensor):
+                    value = value.item()
+                self._val_bpb_bytes_by_metric[metric_name] = self._val_bpb_bytes_by_metric.get(metric_name, 0) + value
+
         # 缓存最新 valid 指标，供 train 进度条显示
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
         for k, v in eval_step_dict.items():
+            # 跳过 BPB 累积中间量，它们不应作为独立指标显示
+            if k.endswith('bpb_nats') or k.endswith('bpb_bytes'):
+                continue
             if isinstance(v, torch.Tensor) and v.dim() == 0:
                 self._last_valid_metrics[k] = v.detach().item()
             elif isinstance(v, (int, float)):
                 self._last_valid_metrics[k] = v
+
+    def on_validation_epoch_end(self):
+        """Compute epoch-level BPB from accumulated nats/bytes and override the cached value."""
+        import math
+        if not hasattr(self, '_last_valid_metrics'):
+            self._last_valid_metrics = {}
+        logged_bpb_metrics = {}
+        metric_names = set(self._val_bpb_nats_by_metric.keys()) | set(self._val_bpb_bytes_by_metric.keys())
+        for metric_name in metric_names:
+            total_nats = self._val_bpb_nats_by_metric.get(metric_name, 0.0)
+            total_bytes = self._val_bpb_bytes_by_metric.get(metric_name, 0)
+            if total_bytes > 0:
+                epoch_bpb = total_nats / (math.log(2) * total_bytes)
+            else:
+                epoch_bpb = float('inf')
+            self._last_valid_metrics[metric_name] = epoch_bpb
+            logged_bpb_metrics[f"valid_{metric_name}"] = epoch_bpb
+
+        # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
+        if self.logger is not None and logged_bpb_metrics:
+            try:
+                self.logger.experiment.log(logged_bpb_metrics, step=self.global_step)
+            except Exception:
+                pass
 
     def on_test_epoch_start(self):
         """Reset test metrics at the start of test epoch"""
@@ -1065,12 +1217,14 @@ class ModelTrainer(LightningModule):
         - alpha: AdamW, 高 LR (mcmc_step_size_lr_multiplier × peak_lr), 无 weight decay [EBT 特有]
         - embeddings: AdamW, 独立绝对 LR (对齐 NanoChat embedding_lr), 无 weight decay
         - vocab_to_embed: AdamW, 独立绝对 LR (EBT 特有, 保守), 无 weight decay
+        - blockwise 输出头: AdamW, 与 embedding/output head 同类, 无 weight decay
         - transformer 标量 (ndim < 2): AdamW, 独立绝对 LR, 无 weight decay
         - transformer 矩阵 (ndim >= 2): Muon, 按 shape 分组 (Muon 要求同组参数 shape 相同)
 
         LR 设计原理:
         - embedding 不在 MCMC 循环内, 梯度行为与 NanoChat 一致, 可用高 LR
         - vocab_to_embed 在 MCMC 循环内 (autograd.grad create_graph=True), 二阶梯度, 需保守
+        - blockwise 输出头是最终 token 分类头, 不应走 Muon
         - transformer scalar (RMSNorm) 在 MCMC 循环内, 需适度保守
         - 当 adamw_*_lr > 0 时使用绝对 LR, 否则 fallback 到 peak_lr × mult
 
@@ -1123,6 +1277,11 @@ class ModelTrainer(LightningModule):
         # --- 参数收集 ---
         alpha_params = [self.model.alpha]
         embedding_params = list(self.model.embeddings.parameters())
+        output_head_params = []
+        if hasattr(self.model, 'block_latent_token_head') and self.model.block_latent_token_head is not None:
+            output_head_params.extend(list(self.model.block_latent_token_head.parameters()))
+        if hasattr(self.model, 'blockwise_joint_head') and self.model.blockwise_joint_head is not None:
+            output_head_params.extend(list(self.model.blockwise_joint_head.parameters()))
 
         vocab_to_embed_params = []
         if hasattr(self.model, 'vocab_to_embed') and self.model.vocab_to_embed is not None:
@@ -1150,6 +1309,11 @@ class ModelTrainer(LightningModule):
                 kind='adamw', params=embedding_params,
                 lr=embedding_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
+        if output_head_params:
+            param_groups.append(dict(
+                kind='adamw', params=output_head_params,
+                lr=embedding_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
         if vocab_to_embed_params:
             param_groups.append(dict(
                 kind='adamw', params=vocab_to_embed_params,
@@ -1175,17 +1339,97 @@ class ModelTrainer(LightningModule):
                 weight_decay=self.hparams.weight_decay,
             ))
 
+        covered_param_ids = {id(p) for group in param_groups for p in group['params']}
+        missing_trainable = [
+            name
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and id(param) not in covered_param_ids
+        ]
+        if missing_trainable:
+            raise RuntimeError(
+                "Muon+AdamW optimizer is missing trainable parameters: "
+                + ", ".join(sorted(missing_trainable))
+            )
+
         # --- 创建优化器 ---
         # PL 调用 optimizer.step(closure=closure), 但 MuonAdamW.step() 不接受 closure 参数
         # 包装一下使其兼容 PL 的调用约定
-        class PLMuonAdamW(MuonAdamW):
-            """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
-            @torch.no_grad()
-            def step(self, closure=None):
-                if closure is not None:
-                    with torch.enable_grad():
-                        closure()
-                super().step()
+        use_cpu_offload = getattr(self.hparams, 'cpu_offload_optimizer', False)
+        if use_cpu_offload:
+            class PLMuonAdamW(MuonAdamW):
+                """MuonAdamW + CPU offload: AdamW 和 Muon 优化器状态均存放在 CPU。"""
+
+                @torch.no_grad()
+                def step(self, closure=None):
+                    if closure is not None:
+                        with torch.enable_grad():
+                            closure()
+
+                    # 遍历所有 param group，按 kind 分别处理
+                    for group in self.param_groups:
+                        kind = group.get('kind')
+
+                        if kind == 'adamw':
+                            # AdamW: 逐参数搬运 exp_avg / exp_avg_sq
+                            for p in group['params']:
+                                if p.grad is None:
+                                    continue
+                                state = self.state[p]
+                                if not state:
+                                    continue
+                                for k in ('exp_avg', 'exp_avg_sq'):
+                                    if k in state and state[k].device.type == 'cpu':
+                                        state[k] = state[k].to(p.device, non_blocking=False)
+
+                        elif kind == 'muon':
+                            # Muon: group-level buffer 存在 params[0] 的 state 里
+                            if not group['params']:
+                                continue
+                            p0 = group['params'][0]
+                            state = self.state[p0]
+                            if not state:
+                                continue
+                            for k in ('momentum_buffer', 'second_momentum_buffer'):
+                                if k in state and state[k].device.type == 'cpu':
+                                    state[k] = state[k].to(p0.device, non_blocking=False)
+
+                    # 执行实际的优化器 step（fused kernel 要求 state 在 GPU 上）
+                    super().step()
+
+                    # step 完成后，将所有 state 搬回 CPU
+                    for group in self.param_groups:
+                        kind = group.get('kind')
+
+                        if kind == 'adamw':
+                            for p in group['params']:
+                                state = self.state[p]
+                                for k in ('exp_avg', 'exp_avg_sq'):
+                                    if k in state and state[k].device.type != 'cpu':
+                                        cpu_t = state[k].to('cpu', non_blocking=False)
+                                        del state[k]
+                                        state[k] = cpu_t
+
+                        elif kind == 'muon':
+                            if not group['params']:
+                                continue
+                            p0 = group['params'][0]
+                            state = self.state[p0]
+                            for k in ('momentum_buffer', 'second_momentum_buffer'):
+                                if k in state and state[k].device.type != 'cpu':
+                                    cpu_t = state[k].to('cpu', non_blocking=False)
+                                    del state[k]
+                                    state[k] = cpu_t
+
+                    torch.cuda.synchronize()
+        else:
+            class PLMuonAdamW(MuonAdamW):
+                """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
+                @torch.no_grad()
+                def step(self, closure=None):
+                    if closure is not None:
+                        with torch.enable_grad():
+                            closure()
+                    super().step()
 
         optimizer = PLMuonAdamW(param_groups)
 
@@ -1615,14 +1859,6 @@ class ModelTrainer(LightningModule):
             # Default: use val_dataloader for pretrain mode
             return self.val_dataloader()
         
-    # def train_dataloader(self):
-    #     return DataLoader(self.train_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = not self.hparams.no_shuffle, prefetch_factor=self.hparams.prefetch_factor)
-
-    # def val_dataloader(self):
-    #     return DataLoader(self.val_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
-
-    # def test_dataloader(self):
-    #     return DataLoader(self.test_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
 
     def log_metrics(self, metrics_dict, phase, log_torchmetrics = True):
         # first log torchmetrics if there are any
@@ -1634,6 +1870,16 @@ class ModelTrainer(LightningModule):
         scalar_metrics = {}
         keys = list(metrics_dict.keys()) # Iterate over a copy of the keys to avoid modification issues during iteration
         for key in keys:
+            # 跳过 BPB 相关指标，它们不应通过 Lightning log_dict 上报：
+            # - bpb_nats/bpb_bytes: BPB 累积中间量
+            # - bpb (非 train 阶段): BPB 是比率指标 (nats/bytes)，
+            #   Lightning 的 on_epoch=True 会对 per-batch bpb 做算术平均，这是数学错误的
+            #   正确做法是在 on_validation_epoch_end 中从累积 nats/bytes 重新计算
+            if key.endswith('bpb_nats') or key.endswith('bpb_bytes'):
+                continue
+            if key.endswith('bpb') and phase != 'train':
+                continue
+
             value = metrics_dict[key]
             # if 'image' in key: # images
             #     image = self.to_pil(value)
@@ -1813,6 +2059,11 @@ class ModelTrainer(LightningModule):
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
 
                 # --- 打印 ---
+                alpha_val_str = ""
+                if self.hparams.mcmc_step_size_learnable:
+                    alpha_val = self.model.alpha.detach()
+                    alpha_grad_str = f" grad={self.model.alpha.grad.item():.6f}" if self.model.alpha.grad is not None else " grad=None"
+                    alpha_val_str = f" | alpha: {alpha_val.item():.6f} ({alpha_val.dtype}){alpha_grad_str}"
                 print(
                     f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
                     f"loss: {loss_val:.6f}"
@@ -1823,6 +2074,7 @@ class ModelTrainer(LightningModule):
                     f"mfu: {mfu:.2f} | "
                     f"epoch: {epoch} | "
                     f"total time: {total_min:.2f}m"
-                    f"{eta_str}",
+                    f"{eta_str}"
+                    f"{alpha_val_str}",
                     flush=True,
                 )

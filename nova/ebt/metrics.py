@@ -4,7 +4,10 @@ import nltk
 import string
 from typing import List
 import torch.distributed as dist
-import ipdb
+try:
+    import ipdb  # type: ignore
+except ImportError:
+    ipdb = None
 import math
 
 custom_nltk_path = "/mnt/shared-storage-user/lixueyan/datasets/nltk_data"
@@ -80,23 +83,27 @@ def normalize_text(text: str) -> str:
 
 
 @torch.no_grad()
-def calculate_bpb_score(next_token_indices, per_token_loss,token_bytes):
+def calculate_bpb_score(next_token_indices, per_token_loss, token_bytes):
     """
       Compute bits-per-byte (BPB) loss, a vocab-size agnostic evaluation metric.
       Mirrors forward_loss_wrapper's structure. Normalizes cross-entropy (nats) by
       the byte length of each target token, following nanochat/loss_eval.py:evaluate_bpb().
 
       Args:
-          x: same tuple format as forward_loss_wrapper — (input_ids_batch, targets_batch, ...)
+          next_token_indices: 1D LongTensor of target token indices (BS,)
+          per_token_loss: 1D tensor of per-token losses (reduction='none') or
+                          scalar mean loss (reduction='mean', backward compatible but less accurate)
           token_bytes: 1D LongTensor of shape (vocab_size,), byte count per token id;
                        0 marks special tokens (e.g. <|bos|>) excluded from the metric.
-          phase: "val" or "test" — always uses no_randomness=True
 
       Returns:
-          log_dict with 'bpb' and auxiliary keys matching forward_loss_wrapper.
-    """
+          (bpb, total_nats, total_bytes) tuple where:
+          - bpb: bits per byte (float)
+          - total_nats: sum of per-token losses for valid positions (float)
+          - total_bytes: sum of byte counts for valid positions (int)
+      """
     # Map target tokens → byte lengths; explicitly handle ignore_index (y < 0) from finetune masking
-    
+
     if (next_token_indices.int() < 0).any():
         valid = next_token_indices >= 0
         y_safe = torch.where(valid, next_token_indices, torch.zeros_like(next_token_indices))
@@ -121,6 +128,4 @@ def calculate_bpb_score(next_token_indices, per_token_loss,token_bytes):
     total_bytes_val = total_bytes.item()
     bpb = total_nats_val / (math.log(2) * total_bytes_val) if total_bytes_val > 0 else float('inf')
 
-    if isinstance(per_token_loss, torch.Tensor):
-        return per_token_loss.new_tensor(bpb)
-    return torch.tensor(bpb, dtype=torch.float32)
+    return bpb, total_nats_val, total_bytes_val

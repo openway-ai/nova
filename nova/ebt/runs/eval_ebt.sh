@@ -194,7 +194,6 @@ $PYTHON train.py \
     --distributed_strategy "auto" \
     --batch_size_per_device "$BATCH_SIZE" \
     --limit_test_batches "$LIMIT_TEST_BATCHES" \
-    --num_workers 4 \
     --infer_output_dir "$INFER_OUTPUT_DIR" \
     --set_matmul_precision "medium" \
     $WANDB_FLAGS \
