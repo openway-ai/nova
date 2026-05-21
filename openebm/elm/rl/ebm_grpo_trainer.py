@@ -349,6 +349,35 @@ class EBMGRPOTrainer(LightningModule):
 
         current_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
 
+        # ── Debug: trace NaN source in energy-GSPO ────────────────────────
+        if not getattr(self, '_dbg_energy_gspo_logged', False):
+            self._dbg_energy_gspo_logged = True
+            import os as _os
+            _rank = _os.environ.get('LOCAL_RANK', '0')
+            if _rank == '0':
+                print(
+                    f"[DBG-GSPO] current_energies: shape={current_energies.shape} "
+                    f"min={current_energies.min().item():.4f} max={current_energies.max().item():.4f} "
+                    f"mean={current_energies.mean().item():.4f} "
+                    f"any_nan={torch.isnan(current_energies).any().item()} "
+                    f"requires_grad={current_energies.requires_grad}",
+                    flush=True,
+                )
+                print(
+                    f"[DBG-GSPO] old_energies: shape={old_energies.shape} "
+                    f"min={old_energies.min().item():.4f} max={old_energies.max().item():.4f} "
+                    f"mean={old_energies.mean().item():.4f} "
+                    f"any_nan={torch.isnan(old_energies).any().item()}",
+                    flush=True,
+                )
+                print(
+                    f"[DBG-GSPO] advantages: min={advantages.min().item():.4f} "
+                    f"max={advantages.max().item():.4f} "
+                    f"any_nan={torch.isnan(advantages).any().item()} "
+                    f"any_nonzero={(advantages != 0).any().item()}",
+                    flush=True,
+                )
+
         # Sequence-level importance ratio via energy difference
         comp_lengths = completion_masks.sum(dim=1).clamp(min=1.0)
         log_ratio = -(current_energies - old_energies) / comp_lengths
@@ -358,6 +387,23 @@ class EBMGRPOTrainer(LightningModule):
         loss1 = ratio * advantages
         loss2 = clipped_ratio * advantages
         loss = -torch.min(loss1, loss2).mean()
+
+        # ── Debug: check final loss state ─────────────────────────────────
+        if not getattr(self, '_dbg_loss_logged', False):
+            self._dbg_loss_logged = True
+            import os as _os
+            _rank = _os.environ.get('LOCAL_RANK', '0')
+            if _rank == '0':
+                print(
+                    f"[DBG-GSPO] ratio: min={ratio.min().item():.4f} max={ratio.max().item():.4f} "
+                    f"any_nan={torch.isnan(ratio).any().item()}",
+                    flush=True,
+                )
+                print(
+                    f"[DBG-GSPO] loss={loss.item():.6f} requires_grad={loss.requires_grad} "
+                    f"grad_fn={loss.grad_fn}",
+                    flush=True,
+                )
 
         clip_ratio = ((ratio - clipped_ratio).abs() > 1e-6).float().mean().item()
         self.log("train/energy_mean", current_energies.mean().item())
