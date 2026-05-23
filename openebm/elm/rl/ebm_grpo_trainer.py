@@ -117,6 +117,27 @@ class EBMGRPOTrainer(LightningModule):
         # ── Phase 1: Generate and Score (no grad) ─────────────────────────────
         gen_data = self._generate_and_score(batch)
 
+        # ── Skip-degenerate: if every group has zero reward variance, the
+        # advantage is identically zero and an optimizer step would only
+        # consume warmup/scheduler budget without learning anything.
+        # Returning None lets Lightning skip the step cleanly.
+        skip_thr = getattr(self.config, "skip_degenerate_threshold", 1.01)
+        if gen_data["degenerate_rate"] > skip_thr:
+            self.log("stability/skipped_step", 1.0)
+            self.log("stability/degenerate_group_rate", gen_data["degenerate_rate"])
+            self.log("train/reward_mean", gen_data["reward_mean"], prog_bar=True)
+            step = self.global_step
+            if step % self.config.log_interval == 0:
+                import os as _os
+                if _os.environ.get('LOCAL_RANK', '0') == '0':
+                    print(
+                        f"[GRPO] step={step} SKIPPED degen={gen_data['degenerate_rate']:.2f} "
+                        f"reward={gen_data['reward_mean']:.3f}",
+                        flush=True,
+                    )
+            return None
+        self.log("stability/skipped_step", 0.0)
+
         # ── Phase 2: Policy Update (with grad) ───────────────────────────────
         total_loss = torch.tensor(0.0, device=self.device)
         total_metrics = {
@@ -136,6 +157,8 @@ class EBMGRPOTrainer(LightningModule):
         self.log("train/loss", loss_val, prog_bar=True)
         self.log("train/reward_mean", gen_data["reward_mean"], prog_bar=True)
         self.log("train/reward_std", gen_data["reward_std"])
+        self.log("train/reward_var", gen_data["reward_var"])
+        self.log("train/advantage_var", gen_data["advantage_var"])
         self.log("train/policy_loss", total_metrics["policy_loss"])
         self.log("train/kl", total_metrics["kl"])
         self.log("train/clip_ratio", total_metrics["clip_ratio"])
@@ -260,18 +283,20 @@ class EBMGRPOTrainer(LightningModule):
         # Energy-based path (for energy_gspo and energy_reinforce)
         old_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
 
-        # Token-level logprobs path (for token_logprobs variant or KL)
+        # Token-level logprobs path (for token_logprobs variant; KL is now
+        # handled via sequence-energy proxy in _loss_energy_reinforce when
+        # beta>0, so we don't need per-token ref logprobs there).
         old_per_token_logps = None
-        if self.config.rl_loss_type == "token_logprobs" or (self.ref_model is not None and self.config.beta > 0.0):
+        if self.config.rl_loss_type == "token_logprobs":
             with torch.amp.autocast('cuda', enabled=False):
                 old_per_token_logps, _ = get_per_token_logps(
                     self.model, full_ids, prompt_len, learning=False
                 )
             old_per_token_logps = old_per_token_logps[:, :comp_len] * completion_masks.float()
 
-        # ── 4. Compute ref log-probs (for KL) ────────────────────────────────
+        # ── 4. Compute ref log-probs (for token_logprobs KL) ─────────────────
         ref_per_token_logps = None
-        if self.ref_model is not None and self.config.beta > 0.0:
+        if self.config.rl_loss_type == "token_logprobs" and self.ref_model is not None and self.config.beta > 0.0:
             with torch.amp.autocast('cuda', enabled=False):
                 ref_per_token_logps, _ = get_per_token_logps(
                     self.ref_model, full_ids, prompt_len, learning=False
@@ -287,9 +312,17 @@ class EBMGRPOTrainer(LightningModule):
         # sudoku task early-stage rollouts almost always degenerate because all
         # completions fail to parse → reward=0 for all → std=0.
         degenerate = (group_std_raw.squeeze(-1) < 1e-6)  # (num_prompts,)
-        # Use a saner lower bound than 1e-8 to prevent advantage explosion.
-        group_std_safe = group_std_raw.clamp(min=1e-4)
-        advantages = ((grouped_rewards - group_mean) / group_std_safe).view(-1)
+        # Choose normalization: legacy per-group std vs. batch-wide std.
+        # Global std prevents tiny intra-group std from amplifying noise.
+        if getattr(self.config, "advantage_norm", "group") == "group_mean_global_std":
+            global_std = grouped_rewards.flatten().std().clamp(
+                min=self.config.global_std_min
+            )
+            advantages = ((grouped_rewards - group_mean) / global_std).view(-1)
+        else:
+            # Use a saner lower bound than 1e-8 to prevent advantage explosion.
+            group_std_safe = group_std_raw.clamp(min=1e-4)
+            advantages = ((grouped_rewards - group_mean) / group_std_safe).view(-1)
         # Zero-out degenerate groups (no learning signal anyway).
         deg_mask = degenerate.repeat_interleave(self.config.num_generations)
         advantages = torch.where(deg_mask, torch.zeros_like(advantages), advantages)
@@ -303,6 +336,8 @@ class EBMGRPOTrainer(LightningModule):
         reward_components = {}
         for key in ["format", "clue_preservation", "blank_accuracy", "full_solve"]:
             reward_components[key] = sum(d[key] for d in reward_details) / len(reward_details)
+        advantage_var = advantages.var(unbiased=False).item() if advantages.numel() > 1 else 0.0
+        reward_var = float(rewards.var(unbiased=False).item()) if rewards.numel() > 1 else 0.0
 
         return {
             "full_ids": full_ids,
@@ -314,6 +349,8 @@ class EBMGRPOTrainer(LightningModule):
             "advantages": advantages,
             "reward_mean": rewards.mean().item(),
             "reward_std": rewards.std().item(),
+            "reward_var": reward_var,
+            "advantage_var": advantage_var,
             "avg_completion_length": avg_comp_len,
             "reward_components": reward_components,
             "degenerate_rate": degenerate_rate,
@@ -412,7 +449,13 @@ class EBMGRPOTrainer(LightningModule):
         return loss, {"policy_loss": loss.item(), "kl": 0.0, "clip_ratio": clip_ratio}
 
     def _loss_energy_reinforce(self, gen_data):
-        """Energy-REINFORCE: pure on-policy, no importance ratio."""
+        """Energy-REINFORCE: pure on-policy, no importance ratio.
+
+        With config.beta>0 and a ref_model, adds a sequence-level energy-KL
+        anchor: beta * mean((E_θ - E_ref)^2). This is much cheaper than the
+        token-logprobs KL and provides "don't drift away from SFT" pressure
+        which is critical for preventing policy collapse on Sudoku.
+        """
         full_ids = gen_data["full_ids"]
         prompt_len = gen_data["prompt_len"]
         advantages = gen_data["advantages"]
@@ -422,11 +465,22 @@ class EBMGRPOTrainer(LightningModule):
         # loss = -advantage * (-energy) = advantage * energy
         # Lower energy for high-advantage completions → model learns to assign
         # low energy to good completions.
-        loss = (advantages * current_energies).mean()
+        policy_loss = (advantages * current_energies).mean()
+
+        kl_value = 0.0
+        if self.ref_model is not None and self.config.beta > 0.0:
+            with torch.no_grad():
+                ref_energies = compute_sequence_energy(self.ref_model, full_ids, prompt_len)
+            energy_kl = (current_energies - ref_energies.detach()).pow(2).mean()
+            loss = policy_loss + self.config.beta * energy_kl
+            kl_value = energy_kl.item()
+            self.log("train/energy_kl_proxy", kl_value)
+        else:
+            loss = policy_loss
 
         self.log("train/energy_mean", current_energies.mean().item())
 
-        return loss, {"policy_loss": loss.item(), "kl": 0.0, "clip_ratio": 0.0}
+        return loss, {"policy_loss": policy_loss.item(), "kl": kl_value, "clip_ratio": 0.0}
 
     def _loss_token_logprobs(self, gen_data, iteration):
         """Token-level logprobs ratio (legacy). Known to produce NaN with EBT."""

@@ -39,10 +39,29 @@ class EBMGRPOConfig:
     """PPO clip range."""
 
     beta: float = 0.0
-    """KL penalty coefficient. 0.0 disables KL (no reference model needed)."""
+    """KL penalty coefficient. 0.0 disables KL (no reference model needed).
+
+    For energy_reinforce, this scales a sequence-level energy-KL proxy:
+    beta * mean((E_θ - E_ref)^2). For token_logprobs it scales the
+    per-token KL via k1 estimator (legacy)."""
 
     reward_weights: Optional[List[float]] = None
     """Weights for each reward component. None = equal weighting."""
+
+    advantage_norm: str = "group"
+    """Advantage normalization mode:
+    - 'group' (default, legacy): per-prompt mean/std.
+    - 'group_mean_global_std': subtract per-prompt mean, divide by batch-wide std.
+      Prevents tiny intra-group std from amplifying noise into huge advantages."""
+
+    global_std_min: float = 0.1
+    """Lower clamp for the batch-wide reward std (only used when
+    advantage_norm='group_mean_global_std')."""
+
+    skip_degenerate_threshold: float = 0.9
+    """If degenerate_group_rate exceeds this in a step, the optimizer step is
+    skipped (training_step returns None). Prevents pretending to train while
+    every advantage is zero. Set to 1.01 to disable."""
 
     # ── Optimization ──────────────────────────────────────────────────────────
     learning_rate: float = 1e-6

@@ -4,24 +4,30 @@ Reuses the existing sudoku_evaluator.py for board parsing and validation.
 
 Reward components:
   1. Format reward (0.0-0.5): parseable 9x9 board?
+     - If a full 9x9 board parses cleanly:      0.5
+     - If completion contains >=40 ASCII digits: up to 0.1 (partial credit,
+       prevents reward variance from collapsing to 0 when the model is
+       still emitting reasonable token streams but mis-formatted output).
   2. Clue preservation (0.0-0.5): all given clues unchanged?
-  3. Blank accuracy reward (0.0-1.5): fraction of blanks filled correctly × 1.5
+  3. Blank accuracy reward (0.0-1.5): blank fill quality. Even when no
+     blanks are correct, a tiny "effort floor" (0.02) is granted so reward
+     std doesn't degenerate to 0 on a bad batch.
   4. Full solve bonus (0.0-0.5): perfect solution (implies validity)
 
-Total reward range: [0.0, 3.0]
-
-Note: We removed the separate 'validity bonus' because:
-  - If clues are preserved AND blanks are all correct → full_solve=true → validity is guaranteed
-  - If clues are NOT preserved → the solution is invalid regardless of constraints
-  - Validity without correctness is not useful (could be a different puzzle's solution)
+Total reward range: [0.0, 3.0] (effort floors keep it just above 0 when the
+completion at least looks like sudoku output).
 """
 
 from typing import List, Optional
+import re
 
 from openebm.elm.data.sudoku_evaluator import (
     parse_board_from_text,
     validate_sudoku_board,
 )
+
+
+_DIGIT_RE = re.compile(r"[0-9]")
 
 
 def compute_sudoku_rewards(
@@ -80,10 +86,17 @@ def _score_single_detailed(
         "full_solve": 0.0,
     }
 
-    # 1. Format reward: can we parse a 9x9 board?
+    # 1. Format reward
     pred_board = parse_board_from_text(completion)
     if pred_board is None:
-        return result  # all zeros
+        # Partial credit: completion at least contains lots of digits (shape
+        # the model is trying to produce sudoku output). Capped at 0.1 to
+        # stay well below the 0.5 awarded for clean parse.
+        n_digits = len(_DIGIT_RE.findall(completion or ""))
+        if n_digits >= 40:
+            result["format"] = min(0.1, 0.1 * n_digits / 81.0)
+            result["total"] = result["format"]
+        return result
 
     result["format"] = 0.5
 
@@ -108,7 +121,9 @@ def _score_single_detailed(
         result["clue_preservation"] = 0.5
 
     # 3. Blank accuracy reward: fraction of blank cells filled correctly
-    # Only count cells that were blank in the original puzzle
+    # Only count cells that were blank in the original puzzle. A small
+    # "effort floor" is added so that even all-wrong fills still produce
+    # >0 reward — prevents reward_std → 0 when the entire batch is bad.
     blank_count = 0
     correct_blank_count = 0
 
@@ -125,7 +140,10 @@ def _score_single_detailed(
     else:
         blank_accuracy_frac = 1.0  # no blanks = trivially correct
 
-    result["blank_accuracy"] = blank_accuracy_frac * 1.5
+    # Effort floor: parseable board with any digit fill gets 0.02 baseline,
+    # then scaled accuracy on top. This keeps the gradient signal alive
+    # when a batch has uniformly poor accuracy.
+    result["blank_accuracy"] = 0.02 + blank_accuracy_frac * 1.48
 
     # 4. Full solve bonus: perfect match with ground truth
     # This implicitly checks validity (correct solution must satisfy constraints)
