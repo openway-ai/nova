@@ -84,6 +84,28 @@ def parse_args():
         help="Only for token_logprobs mode. "
              "'full': create_graph=True; 'none': create_graph=False.",
     )
+    parser.add_argument(
+        "--advantage_norm",
+        type=str,
+        default="group",
+        choices=["group", "group_mean_global_std"],
+        help="Advantage normalization: per-group std (legacy) or "
+             "per-group mean with batch-wide std (more stable).",
+    )
+    parser.add_argument(
+        "--global_std_min",
+        type=float,
+        default=0.1,
+        help="Lower clamp for batch-wide reward std (advantage_norm="
+             "group_mean_global_std only).",
+    )
+    parser.add_argument(
+        "--skip_degenerate_threshold",
+        type=float,
+        default=0.9,
+        help="If degenerate_group_rate > threshold, skip the optimizer step. "
+             "Set to 1.01 to disable.",
+    )
 
     # Logging
     parser.add_argument("--wandb_project", type=str, default="nlp_sudoku_rl")
@@ -175,6 +197,9 @@ def main():
         sft_checkpoint_path=args.sft_checkpoint,
         rl_loss_type=args.rl_loss_type,
         use_learning_mode_for_logprobs=(args.logp_mcmc_grad == "full"),
+        advantage_norm=args.advantage_norm,
+        global_std_min=args.global_std_min,
+        skip_degenerate_threshold=args.skip_degenerate_threshold,
         data_dir=args.data_dir,
         augment=not args.no_augment,
         num_gpus=args.num_gpus,

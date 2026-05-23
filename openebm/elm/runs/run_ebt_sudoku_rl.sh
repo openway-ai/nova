@@ -46,25 +46,31 @@ export EXP_ID="d26-ctx2048-sudoku-rl-grpo-$(date +%Y%m%d)"
 ################################################################################
 # GRPO 超参数
 ################################################################################
-NUM_GENERATIONS=8             # completions per prompt
-MAX_COMPLETION_LENGTH=224     # 9x9 sudoku needs ~200-400 tokens
+NUM_GENERATIONS=16            # completions per prompt (raised from 8 → stabler advantage estimates)
+MAX_COMPLETION_LENGTH=180     # tightened from 224: 9x9 board ≤162 chars; long tails just produce gibberish
 MAX_PROMPT_LENGTH=192
 TEMPERATURE=0.9
 TOP_P=0.9                     # narrowed from 0.95 to reduce long-tail sampling noise
 GENERATION_BATCH_SIZE=8       # sub-batch for generation (VRAM management)
 
 NUM_ITERATIONS=1              # GRPO inner loop (μ in paper)
-EPSILON=0.2                   # PPO clip range
-BETA=0.0                      # KL penalty coefficient (0 disables ref_model)
-LEARNING_RATE=1e-6            # RL learning rate (much lower than SFT due to MCMC grads)
+EPSILON=0.2                   # PPO clip range (only used by energy_gspo)
+BETA=0.05                     # KL anchor coeff: pulls policy back toward SFT ref (energy-KL proxy)
+LEARNING_RATE=2e-6            # lowered from 5e-6 to slow collapse-prone transformer drift
+RL_LOSS_TYPE="energy_reinforce"  # removes 1/|y| dilution
 WEIGHT_DECAY=0.01
-GRADIENT_CLIP_VAL=0.5         # tightened from 1.0 for RL stability
-MAX_GRAD_PER_PARAM=0.05       # tightened from 0.1 (alpha frozen in Branch-A anyway)
-WARMUP_STEPS=20
+GRADIENT_CLIP_VAL=0.3         # tightened from 0.5 for RL stability
+MAX_GRAD_PER_PARAM=0.02       # tightened from 0.05 (alpha frozen)
+WARMUP_STEPS=50               # raised from 20 to give KL anchor time to engage
+ADVANTAGE_NORM="group_mean_global_std"  # batch-wide std prevents tiny intra-group std blow-ups
+GLOBAL_STD_MIN=0.1
+SKIP_DEGENERATE_THRESHOLD=0.9 # skip optimizer step when nearly every group is degenerate
 
-MAX_STEPS=1000
-VAL_CHECK_INTERVAL=50
-LOG_INTERVAL=10
+# MAX_STEPS=300                 # short-train verification of new pipeline; raise to 1000 after green
+MAX_STEPS=3000                 # short-train verification of new pipeline; raise to 1000 after green
+           
+VAL_CHECK_INTERVAL=25
+LOG_INTERVAL=5
 SAVE_TOP_K=3
 SEED=42
 
@@ -131,6 +137,13 @@ exp_save_hparams "${EXP_DIR}/sft_train" \
     "epsilon=${EPSILON}" \
     "beta=${BETA}" \
     "learning_rate=${LEARNING_RATE}" \
+    "warmup_steps=${WARMUP_STEPS}" \
+    "gradient_clip_val=${GRADIENT_CLIP_VAL}" \
+    "max_grad_per_param=${MAX_GRAD_PER_PARAM}" \
+    "advantage_norm=${ADVANTAGE_NORM}" \
+    "global_std_min=${GLOBAL_STD_MIN}" \
+    "skip_degenerate_threshold=${SKIP_DEGENERATE_THRESHOLD}" \
+    "rl_loss_type=${RL_LOSS_TYPE}" \
     "max_steps=${MAX_STEPS}" \
     "num_gpus=${NUM_GPUS}" \
     "save_top_k=${SAVE_TOP_K}"
@@ -145,13 +158,18 @@ echo "=================================="
 echo "  EBT Sudoku RL (GRPO) 训练"
 echo "=================================="
 echo "SFT checkpoint:          ${SFT_CKPT}"
-echo "Algorithm:               GRPO"
+echo "Algorithm:               GRPO (${RL_LOSS_TYPE})"
 echo "Num generations:         ${NUM_GENERATIONS}"
 echo "Max completion length:   ${MAX_COMPLETION_LENGTH}"
 echo "Temperature:             ${TEMPERATURE}"
 echo "Epsilon (clip):          ${EPSILON}"
-echo "Beta (KL):               ${BETA}"
+echo "Beta (KL anchor):        ${BETA}"
 echo "Learning rate:           ${LEARNING_RATE}"
+echo "Warmup steps:            ${WARMUP_STEPS}"
+echo "Gradient clip (global):  ${GRADIENT_CLIP_VAL}"
+echo "Max grad per param:      ${MAX_GRAD_PER_PARAM}"
+echo "Advantage norm:          ${ADVANTAGE_NORM}"
+echo "Skip degen threshold:    ${SKIP_DEGENERATE_THRESHOLD}"
 echo "Max steps:               ${MAX_STEPS}"
 echo "Val interval:            ${VAL_CHECK_INTERVAL}"
 echo "GPUs:                    ${NUM_GPUS}"
@@ -215,10 +233,14 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --epsilon ${EPSILON} \
     --beta ${BETA} \
     --learning_rate ${LEARNING_RATE} \
+    --rl_loss_type ${RL_LOSS_TYPE} \
     --weight_decay ${WEIGHT_DECAY} \
     --gradient_clip_val ${GRADIENT_CLIP_VAL} \
     --max_grad_per_param ${MAX_GRAD_PER_PARAM} \
     --warmup_steps ${WARMUP_STEPS} \
+    --advantage_norm ${ADVANTAGE_NORM} \
+    --global_std_min ${GLOBAL_STD_MIN} \
+    --skip_degenerate_threshold ${SKIP_DEGENERATE_THRESHOLD} \
     --max_steps ${MAX_STEPS} \
     --val_check_interval ${VAL_CHECK_INTERVAL} \
     --log_interval ${LOG_INTERVAL} \
