@@ -72,6 +72,7 @@ class EBMGRPOTrainer(LightningModule):
 
         # Metrics tracking
         self._step_metrics = {}
+        self._skip_optim_step = False
 
         # Reference model (frozen) — for KL penalty
         if config.beta > 0.0:
@@ -117,12 +118,30 @@ class EBMGRPOTrainer(LightningModule):
         # ── Phase 1: Generate and Score (no grad) ─────────────────────────────
         gen_data = self._generate_and_score(batch)
 
-        # ── Skip-degenerate: if every group has zero reward variance, the
-        # advantage is identically zero and an optimizer step would only
-        # consume warmup/scheduler budget without learning anything.
-        # Returning None lets Lightning skip the step cleanly.
+        # ── Skip-degenerate (DDP-safe) ─────────────────────────────────────
+        # Lightning forbids returning None under DDP. Instead we:
+        #   1. all-reduce the per-rank skip decision so every rank takes the
+        #      same branch (avoids DDP collective mismatch / hang),
+        #   2. on agreement, return a graph-attached placeholder loss whose
+        #      gradient is identically zero,
+        #   3. set self._skip_optim_step so on_before_optimizer_step clears
+        #      every p.grad to None — AdamW's per-param branch is
+        #      `if p.grad is None: continue`, which truly skips the update
+        #      (including weight_decay).
         skip_thr = getattr(self.config, "skip_degenerate_threshold", 1.01)
-        if gen_data["degenerate_rate"] > skip_thr:
+        local_skip = float(gen_data["degenerate_rate"] > skip_thr)
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            flag = torch.tensor([local_skip], device=self.device)
+            # MIN: skip only when every rank agrees the batch is degenerate.
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+            global_skip = flag.item() > 0.5
+        else:
+            global_skip = local_skip > 0.5
+
+        self._skip_optim_step = global_skip
+
+        if global_skip:
             self.log("stability/skipped_step", 1.0)
             self.log("stability/degenerate_group_rate", gen_data["degenerate_rate"])
             self.log("train/reward_mean", gen_data["reward_mean"], prog_bar=True)
@@ -135,7 +154,15 @@ class EBMGRPOTrainer(LightningModule):
                         f"reward={gen_data['reward_mean']:.3f}",
                         flush=True,
                     )
-            return None
+            # Placeholder loss: every trainable parameter contributes a
+            # zero-valued term so DDP's backward all-reduce covers them all
+            # (required when find_unused_parameters=True with no real grad).
+            placeholder = sum(
+                (p * 0.0).sum()
+                for p in self.model.parameters()
+                if p.requires_grad
+            )
+            return placeholder
         self.log("stability/skipped_step", 0.0)
 
         # ── Phase 2: Policy Update (with grad) ───────────────────────────────
@@ -557,6 +584,18 @@ class EBMGRPOTrainer(LightningModule):
 
     def on_before_optimizer_step(self, optimizer):
         """Log gradient norms, sanitize NaN grads, and apply per-parameter clipping."""
+        # If training_step flagged this batch as skip-degen, drop every grad
+        # to None so AdamW (and any stateful optimizer) leaves params untouched.
+        # Lightning still steps the LR scheduler — that's a small acceptable cost.
+        if getattr(self, "_skip_optim_step", False):
+            for p in self.model.parameters():
+                p.grad = None
+            self._skip_optim_step = False
+            self.log("stability/grad_norm_before_clip", 0.0)
+            self.log("stability/max_param_grad_norm", 0.0)
+            self.log("stability/nan_grad_params", 0.0)
+            return
+
         total_norm = 0.0
         alpha_grad = None
         max_param_grad_norm = 0.0
