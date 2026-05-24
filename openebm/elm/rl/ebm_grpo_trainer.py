@@ -32,6 +32,12 @@ from openebm.elm.rl.logprobs import get_per_token_logps, compute_sequence_energy
 from openebm.elm.rl.rewards import compute_sudoku_rewards, compute_sudoku_rewards_detailed
 from openebm.elm.rl.rollout import generate_completions
 from openebm.elm.rl.sudoku_dataset_rl import SudokuRLPromptDataset, collate_rl_prompts
+from openebm.elm.rl.trajectory_logger import (
+    AlignedMetricsPrinter,
+    TrajectoryLogger,
+    TrajLoggerConfig,
+    logp,
+)
 
 
 class EBMGRPOTrainer(LightningModule):
@@ -65,6 +71,16 @@ class EBMGRPOTrainer(LightningModule):
         if hasattr(self.model, 'langevin_dynamics_noise_std'):
             self.model.langevin_dynamics_noise_std.requires_grad_(False)
 
+        # v3 fix C1: explicitly freeze input embeddings during RL.
+        # `compute_sequence_energy` already detaches `real_embeddings` from the
+        # graph (logprobs.py:39), so embeddings.weight receives no task signal.
+        # However AdamW + weight_decay still drift it on every step. Freezing
+        # eliminates that silent drift (and saves DDP all_reduce on a 32k×1664
+        # matrix). Output projection `vocab_to_embed` stays trainable.
+        if hasattr(self.model, 'embeddings'):
+            for p in self.model.embeddings.parameters():
+                p.requires_grad_(False)
+
         self.tokenizer = tokenizer
 
         # Build hparams namespace for generate.py compatibility
@@ -73,6 +89,12 @@ class EBMGRPOTrainer(LightningModule):
         # Metrics tracking
         self._step_metrics = {}
         self._skip_optim_step = False
+
+        # Trajectory logger — initialised lazily on first use so the output
+        # dir is available. Set output_dir via TRAJ_OUTPUT_DIR env var or
+        # falls back to <checkpoint_dir>/../trajectories.
+        self._traj_logger: TrajectoryLogger | None = None
+        self._metrics_printer = AlignedMetricsPrinter()
 
         # Reference model (frozen) — for KL penalty
         if config.beta > 0.0:
@@ -214,6 +236,45 @@ class EBMGRPOTrainer(LightningModule):
                 flush=True,
             )
 
+        # ── Trajectory logging & collapse detection ──────────────────────────
+        self._maybe_init_traj_logger()
+        if self._traj_logger is not None:
+            completions = gen_data.get("_completion_texts", [])
+            rewards_list = gen_data.get("_rewards", [])
+            energies_list = gen_data.get("_old_energies", [])
+            adv_list = gen_data.get("_advantages", [])
+            lens_list = gen_data.get("_completion_masks_lens", [])
+            puzzles_list = gen_data.get("_puzzles", [])
+
+            # Periodic stdout + JSONL dump
+            self._traj_logger.maybe_log(
+                step=step,
+                prompts=puzzles_list,
+                completions=completions,
+                rewards=rewards_list,
+                ground_truths=puzzles_list,
+                energies=energies_list,
+                advantages=adv_list,
+                kls=[total_metrics["kl"]] * len(completions),
+                response_lens=lens_list,
+            )
+
+            # Collapse detection
+            unique_ratio = (
+                len(set(completions)) / max(1, len(completions))
+                if completions else 0.0
+            )
+            self._traj_logger.detect_collapse(
+                step=step,
+                rewards=rewards_list,
+                unique_completion_ratio=unique_ratio,
+                prompts=puzzles_list,
+                completions=completions,
+                ground_truths=puzzles_list,
+                energies=energies_list,
+            )
+            self.log("train/unique_completion_ratio", unique_ratio)
+
         return total_loss
 
     def _log_stability_metrics(self):
@@ -233,6 +294,36 @@ class EBMGRPOTrainer(LightningModule):
             if t_params:
                 last_norm = t_params[-1].data.norm().item()
                 self.log("stability/transformer_last_param_norm", last_norm)
+
+    def _maybe_init_traj_logger(self):
+        """Lazily initialise TrajectoryLogger on first call (rank-0 only).
+
+        Output dir resolution order:
+          1. config.traj_output_dir (CLI flag)
+          2. TRAJ_OUTPUT_DIR env var
+          3. <trainer.log_dir>/trajectories (Lightning sets log_dir after fit starts)
+          4. fallback to ./trajectories
+
+        Returns the logger instance (may be None on non-rank-0).
+        """
+        if self._traj_logger is not None:
+            return self._traj_logger
+        traj_root = (
+            getattr(self.config, "traj_output_dir", "")
+            or os.environ.get("TRAJ_OUTPUT_DIR")
+            or (str(self.trainer.log_dir) if self.trainer and hasattr(self.trainer, "log_dir") and self.trainer.log_dir else None)
+            or "."
+        )
+        overrides = {}
+        if getattr(self.config, "traj_log_interval", 0) > 0:
+            overrides["sample_every_n_steps"] = self.config.traj_log_interval
+        if getattr(self.config, "traj_num_samples", 0) > 0:
+            overrides["samples_per_dump"] = self.config.traj_num_samples
+        if getattr(self.config, "collapse_check_window", 0) > 0:
+            overrides["collapse_window"] = self.config.collapse_check_window
+        cfg = TrajLoggerConfig.from_env(output_dir=traj_root, **overrides)
+        self._traj_logger = TrajectoryLogger(cfg)
+        return self._traj_logger
 
     @torch.no_grad()
     def _generate_and_score(self, batch):
@@ -307,8 +398,11 @@ class EBMGRPOTrainer(LightningModule):
         )
         full_ids = torch.cat([expanded_prompts, completion_ids], dim=1)
 
-        # Energy-based path (for energy_gspo and energy_reinforce)
-        old_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
+        # Energy-based path (for energy_gspo and energy_reinforce).
+        # P0b: keep autocast disabled to match _loss_energy_*'s autocast(False)
+        # block. Mismatched precision causes systematic bias in (curr - old).
+        with torch.amp.autocast('cuda', enabled=False):
+            old_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
 
         # Token-level logprobs path (for token_logprobs variant; KL is now
         # handled via sequence-energy proxy in _loss_energy_reinforce when
@@ -381,6 +475,15 @@ class EBMGRPOTrainer(LightningModule):
             "avg_completion_length": avg_comp_len,
             "reward_components": reward_components,
             "degenerate_rate": degenerate_rate,
+            # Raw arrays carried through for trajectory logging in training_step.
+            "_completion_texts": completion_texts,
+            "_rewards": rewards.detach().cpu().tolist(),
+            "_old_energies": old_energies.detach().cpu().tolist(),
+            "_advantages": advantages.detach().cpu().tolist(),
+            "_completion_masks_lens": completion_masks.sum(dim=1).long().cpu().tolist(),
+            "_puzzles": list(expanded_puzzles),
+            "_solutions": list(expanded_solutions),
+            "_prompt_ids_per_seq": expanded_prompts.cpu().tolist(),
         }
 
     def _compute_grpo_loss(self, gen_data, iteration):
@@ -391,6 +494,19 @@ class EBMGRPOTrainer(LightningModule):
         advantages = gen_data["advantages"]
 
         loss_type = self.config.rl_loss_type
+
+        # P0d: energy_reinforce assumes strict on-policy. With num_iterations>1
+        # the policy has drifted but no importance ratio compensates. Warn once.
+        if (loss_type == "energy_reinforce" and iteration > 0
+                and not getattr(self, "_warned_reinforce_multi_iter", False)):
+            self._warned_reinforce_multi_iter = True
+            import os as _os
+            if _os.environ.get('LOCAL_RANK', '0') == '0':
+                print(
+                    "[WARN] energy_reinforce with num_iterations>1 is biased "
+                    "(no importance ratio). Consider energy_gspo for multi-iter PPO.",
+                    flush=True,
+                )
 
         if loss_type == "energy_gspo":
             loss, metrics = self._loss_energy_gspo(gen_data)
@@ -403,109 +519,147 @@ class EBMGRPOTrainer(LightningModule):
 
         return loss, metrics
 
+    def _energy_kl_anchor(self, full_ids, prompt_len, current_energies):
+        """One-sided energy-KL anchor against ref_model.
+
+        Returns (kl_penalty_term, kl_value, energy_drift). The penalty is
+        ``relu(E_θ - E_ref).mean()`` — only punishes drift to higher energy
+        than the SFT reference (= drift to lower likelihood than ref).
+        Returns zeros + None when no ref_model / beta=0.
+
+        Shared by `_loss_energy_gspo` and `_loss_energy_reinforce` so both
+        loss types get the same SFT-anchoring behavior on top of their
+        respective stability mechanisms (PPO clip vs. pure on-policy).
+        """
+        if self.ref_model is None or self.config.beta <= 0.0:
+            return None, 0.0, 0.0
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+            ref_energies = compute_sequence_energy(self.ref_model, full_ids, prompt_len)
+        energy_diff = current_energies - ref_energies.detach()
+        energy_kl = energy_diff.clamp(min=0.0).mean()
+        return energy_kl, energy_kl.item(), energy_diff.mean().item()
+
     def _loss_energy_gspo(self, gen_data):
-        """Energy-GSPO: sequence-level energy ratio with PPO clipping."""
+        """Energy-GSPO: sequence-level energy ratio with PPO clipping.
+
+        v3 fix: `compute_sequence_energy` already returns per-token MEAN
+        energy (logprobs.py:94 does `comp_energy.mean(dim=1)`). Therefore
+        `log_ratio = -(curr - old)` is already length-normalized; dividing
+        by `comp_lengths` again is double-normalization, shrinking log_ratio
+        to O(1/L²) and effectively disabling PPO clipping (sudoku v2 logs
+        showed clip=0.00 throughout). Removing the extra `/comp_lengths`
+        also brings GSPO into mathematical agreement with energy_reinforce.
+        """
         full_ids = gen_data["full_ids"]
         prompt_len = gen_data["prompt_len"]
         completion_masks = gen_data["completion_masks"].float()
         old_energies = gen_data["old_energies"]
         advantages = gen_data["advantages"]
 
-        current_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
+        # P0b: keep both energy computations under the same autocast context
+        # (rollout-time `old_energies` runs under autocast(enabled=False)).
+        with torch.amp.autocast('cuda', enabled=False):
+            current_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
 
-        # ── Debug: trace NaN source in energy-GSPO ────────────────────────
-        if not getattr(self, '_dbg_energy_gspo_logged', False):
-            self._dbg_energy_gspo_logged = True
-            import os as _os
-            _rank = _os.environ.get('LOCAL_RANK', '0')
-            if _rank == '0':
-                print(
-                    f"[DBG-GSPO] current_energies: shape={current_energies.shape} "
-                    f"min={current_energies.min().item():.4f} max={current_energies.max().item():.4f} "
-                    f"mean={current_energies.mean().item():.4f} "
-                    f"any_nan={torch.isnan(current_energies).any().item()} "
-                    f"requires_grad={current_energies.requires_grad}",
-                    flush=True,
-                )
-                print(
-                    f"[DBG-GSPO] old_energies: shape={old_energies.shape} "
-                    f"min={old_energies.min().item():.4f} max={old_energies.max().item():.4f} "
-                    f"mean={old_energies.mean().item():.4f} "
-                    f"any_nan={torch.isnan(old_energies).any().item()}",
-                    flush=True,
-                )
-                print(
-                    f"[DBG-GSPO] advantages: min={advantages.min().item():.4f} "
-                    f"max={advantages.max().item():.4f} "
-                    f"any_nan={torch.isnan(advantages).any().item()} "
-                    f"any_nonzero={(advantages != 0).any().item()}",
-                    flush=True,
-                )
-
-        # Sequence-level importance ratio via energy difference
-        comp_lengths = completion_masks.sum(dim=1).clamp(min=1.0)
-        log_ratio = -(current_energies - old_energies) / comp_lengths
-        ratio = torch.exp(log_ratio.clamp(-10.0, 10.0))
+        # Sequence-level importance ratio. Energies are already per-token mean.
+        raw_log_ratio = -(current_energies - old_energies)
+        log_ratio = raw_log_ratio.clamp(-10.0, 10.0)
+        ratio = torch.exp(log_ratio)
 
         clipped_ratio = torch.clamp(ratio, 1.0 - self.config.epsilon, 1.0 + self.config.epsilon)
         loss1 = ratio * advantages
         loss2 = clipped_ratio * advantages
-        loss = -torch.min(loss1, loss2).mean()
+        policy_loss = -torch.min(loss1, loss2).mean()
 
-        # ── Debug: check final loss state ─────────────────────────────────
-        if not getattr(self, '_dbg_loss_logged', False):
-            self._dbg_loss_logged = True
-            import os as _os
-            _rank = _os.environ.get('LOCAL_RANK', '0')
-            if _rank == '0':
-                print(
-                    f"[DBG-GSPO] ratio: min={ratio.min().item():.4f} max={ratio.max().item():.4f} "
-                    f"any_nan={torch.isnan(ratio).any().item()}",
-                    flush=True,
-                )
-                print(
-                    f"[DBG-GSPO] loss={loss.item():.6f} requires_grad={loss.requires_grad} "
-                    f"grad_fn={loss.grad_fn}",
-                    flush=True,
-                )
+        # KL anchor on top of PPO clip. PPO clip bounds per-step ratio drift,
+        # the KL term bounds cumulative drift from SFT ref. They're orthogonal.
+        kl_term, kl_value, energy_drift = self._energy_kl_anchor(
+            full_ids, prompt_len, current_energies)
+        if kl_term is not None:
+            loss = policy_loss + self.config.beta * kl_term
+            self.log("train/energy_kl_proxy", kl_value)
+            self.log("train/energy_drift", energy_drift)
+        else:
+            loss = policy_loss
 
-        clip_ratio = ((ratio - clipped_ratio).abs() > 1e-6).float().mean().item()
+        # P1a: log_ratio clamp visibility.
+        log_ratio_abs_max = raw_log_ratio.abs().max().item()
+        log_ratio_clamp_rate = (raw_log_ratio.abs() > 10.0).float().mean().item()
+        # P1b: "effective clip rate" = how often PPO `min` actually selected
+        # the clipped branch (matches PPO paper's definition).
+        effective_clip_rate = (loss2 < loss1).float().mean().item()
+
         self.log("train/energy_mean", current_energies.mean().item())
         self.log("train/ratio_mean", ratio.mean().item())
+        self.log("stability/log_ratio_abs_max", log_ratio_abs_max)
+        self.log("stability/log_ratio_clamp_rate", log_ratio_clamp_rate)
+        self.log("train/effective_clip_rate", effective_clip_rate)
 
-        return loss, {"policy_loss": loss.item(), "kl": 0.0, "clip_ratio": clip_ratio}
+        if self.global_step % self.config.log_interval == 0:
+            import os as _os
+            if _os.environ.get('LOCAL_RANK', '0') == '0':
+                print(
+                    f"[GRPO-EXT] step={self.global_step} "
+                    f"ratio_mean={ratio.mean().item():.4f} "
+                    f"log_ratio_abs_max={log_ratio_abs_max:.4f} "
+                    f"clamp_rate={log_ratio_clamp_rate:.3f} "
+                    f"effective_clip={effective_clip_rate:.3f}",
+                    flush=True,
+                )
+
+        return loss, {
+            "policy_loss": policy_loss.item(),
+            "kl": kl_value,
+            "clip_ratio": effective_clip_rate,
+        }
 
     def _loss_energy_reinforce(self, gen_data):
-        """Energy-REINFORCE: pure on-policy, no importance ratio.
+        """Energy-REINFORCE with one-sided energy-KL anchor.
 
-        With config.beta>0 and a ref_model, adds a sequence-level energy-KL
-        anchor: beta * mean((E_θ - E_ref)^2). This is much cheaper than the
-        token-logprobs KL and provides "don't drift away from SFT" pressure
-        which is critical for preventing policy collapse on Sudoku.
+        v3 fixes:
+          - P0b: keep `current_energies` under autocast(enabled=False) to
+            match the rollout-time `old_energies` (avoids ratio drift between
+            energy snapshots; also matters when ref_model energies are taken).
+          - P0c: replace symmetric (E_θ - E_ref)^2 with one-sided ReLU
+            penalty `relu(E_θ - E_ref)`. The squared form penalises *both*
+            directions, including the desired "E_θ < E_ref on high-reward
+            samples" — this directly explains the "reward stuck oscillating"
+            symptom in v2 (analysis_output_20260524). One-sided penalises
+            only the unwanted direction (drift to higher energy than ref).
         """
         full_ids = gen_data["full_ids"]
         prompt_len = gen_data["prompt_len"]
         advantages = gen_data["advantages"]
 
-        current_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
+        with torch.amp.autocast('cuda', enabled=False):
+            current_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
 
-        # loss = -advantage * (-energy) = advantage * energy
-        # Lower energy for high-advantage completions → model learns to assign
-        # low energy to good completions.
+        # Energies are already per-token mean (logprobs.py:94), so no length
+        # normalisation needed here.
         policy_loss = (advantages * current_energies).mean()
 
-        kl_value = 0.0
-        if self.ref_model is not None and self.config.beta > 0.0:
-            with torch.no_grad():
-                ref_energies = compute_sequence_energy(self.ref_model, full_ids, prompt_len)
-            energy_kl = (current_energies - ref_energies.detach()).pow(2).mean()
-            loss = policy_loss + self.config.beta * energy_kl
-            kl_value = energy_kl.item()
+        # One-sided energy-KL anchor (shared with _loss_energy_gspo).
+        kl_term, kl_value, energy_drift = self._energy_kl_anchor(
+            full_ids, prompt_len, current_energies)
+        if kl_term is not None:
+            loss = policy_loss + self.config.beta * kl_term
             self.log("train/energy_kl_proxy", kl_value)
+            self.log("train/energy_drift", energy_drift)
         else:
             loss = policy_loss
 
-        self.log("train/energy_mean", current_energies.mean().item())
+        cur_energy_mean = current_energies.mean().item()
+        self.log("train/energy_mean", cur_energy_mean)
+
+        if self.global_step % self.config.log_interval == 0:
+            import os as _os
+            if _os.environ.get('LOCAL_RANK', '0') == '0':
+                print(
+                    f"[GRPO-EXT] step={self.global_step} "
+                    f"kl_proxy={kl_value:.4f} energy_drift={energy_drift:+.4f} "
+                    f"energy_mean={cur_energy_mean:+.4f} policy_loss={policy_loss.item():+.4f}",
+                    flush=True,
+                )
 
         return loss, {"policy_loss": policy_loss.item(), "kl": kl_value, "clip_ratio": 0.0}
 

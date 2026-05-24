@@ -140,3 +140,16 @@ class EBMGRPOConfig:
 
     run_name: str = ""
     """Run name for logging."""
+
+    # ── Trajectory logging ────────────────────────────────────────────────────
+    traj_log_interval: int = 50
+    """Print periodic completion dump every N steps (0 = disabled)."""
+
+    traj_output_dir: str = ""
+    """Root dir for trajectory JSONL files. Empty = auto-detect from trainer.log_dir."""
+
+    traj_num_samples: int = 2
+    """Number of completions to print per periodic dump."""
+
+    collapse_check_window: int = 5
+    """Number of consecutive degenerate steps before WARN-COLLAPSE fires."""
