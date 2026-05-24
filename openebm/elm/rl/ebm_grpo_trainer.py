@@ -804,24 +804,311 @@ class EBMGRPOTrainer(LightningModule):
                     p.grad.data.clamp_(-clip_val, clip_val)
 
     def configure_optimizers(self):
-        """AdamW optimizer with linear warmup + cosine decay."""
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-            betas=(0.9, 0.95),
-        )
+        """Dispatch to the configured optimizer kind."""
+        if getattr(self.config, "rl_optimizer", "adamw") == "muon_adamw":
+            return self._configure_muon_adamw_optimizer()
+        return self._configure_adamw_optimizer()
 
-        # Linear warmup then cosine decay
+    def _build_lr_lambda(self):
+        """Linear warmup → cosine decay schedule (shared by both optimizer paths)."""
+        import math
+
         def lr_lambda(step):
             if step < self.config.warmup_steps:
                 return step / max(1, self.config.warmup_steps)
             progress = (step - self.config.warmup_steps) / max(
                 1, self.config.max_steps - self.config.warmup_steps
             )
-            return 0.5 * (1.0 + __import__("math").cos(__import__("math").pi * progress))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return lr_lambda
+
+    def _configure_adamw_optimizer(self):
+        """AdamW optimizer with param-group LRs + linear warmup + cosine decay.
+
+        v3 P0: Multi-group LR inherits SFT design philosophy (different
+        parameter families need different effective LRs):
+          - transformer   : base_lr        (transformer body)
+          - vocab_to_embed: base_lr * 0.5  (54M output projection; halve to
+                                            slow hidden drift seen in v2)
+          - scalar/alpha  : base_lr * 2.0  (alpha is frozen, but kept for any
+                                            future scalar params)
+          - other         : base_lr        (catch-all)
+
+        Embedding is frozen in __init__ (v3 C1) so receives no entry here.
+        """
+        base_lr = self.config.learning_rate
+        transformer_lr    = base_lr
+        vocab_to_embed_lr = base_lr * 0.5
+        scalar_lr         = base_lr * 2.0
+
+        transformer_params, v2e_params, scalar_params, other_params = [], [], [], []
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.startswith("vocab_to_embed.") or ".vocab_to_embed." in n:
+                v2e_params.append(p)
+            elif p.ndim == 0 or n.endswith(".alpha") or n == "alpha":
+                scalar_params.append(p)
+            elif n.startswith("transformer.") or ".transformer." in n:
+                transformer_params.append(p)
+            else:
+                other_params.append(p)
+
+        param_groups = []
+        if transformer_params:
+            param_groups.append({"params": transformer_params, "lr": transformer_lr,
+                                 "group_name": "transformer"})
+        if v2e_params:
+            param_groups.append({"params": v2e_params, "lr": vocab_to_embed_lr,
+                                 "group_name": "vocab_to_embed"})
+        if scalar_params:
+            param_groups.append({"params": scalar_params, "lr": scalar_lr,
+                                 "group_name": "scalar"})
+        if other_params:
+            param_groups.append({"params": other_params, "lr": base_lr,
+                                 "group_name": "other"})
+
+        import os as _os
+        if _os.environ.get("LOCAL_RANK", "0") == "0":
+            print("[INFO] Optimizer param-groups:", flush=True)
+            for g in param_groups:
+                n_params = sum(p.numel() for p in g["params"])
+                print(f"  {g['group_name']:<16} lr={g['lr']:.2e}  n_params={n_params:,}",
+                      flush=True)
+
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            weight_decay=self.config.weight_decay,
+            betas=(0.9, 0.95),
+        )
+
+        # Linear warmup then cosine decay (shared with _configure_muon_adamw_optimizer).
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, self._build_lr_lambda())
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
+
+    def _configure_muon_adamw_optimizer(self):
+        """Muon (transformer matrices) + AdamW (everything else) — RL variant.
+
+        Mirrors openebm.elm.trainer._configure_muon_adamw_optimizer (used in
+        SFT) but is simplified for the RL setting:
+          - alpha / embeddings / langevin_noise are already frozen in __init__
+            (requires_grad=False), so they auto-skip; no group is created.
+          - vocab_to_embed → AdamW, lr = base_lr * 0.5 (matches v3 P0 ratio).
+          - transformer matrices (ndim>=2) → Muon, grouped by shape.
+          - transformer scalars (ndim<2) + any other trainable params → AdamW,
+            lr = base_lr * 2.0 (matches v3 P0 ratio).
+        """
+        from nanochat.optim import MuonAdamW
+
+        base_lr = self.config.learning_rate
+        v2e_lr = base_lr * 0.5
+        scalar_lr = base_lr * 2.0
+        muon_lr = self.config.muon_lr
+        adam_betas = (0.9, 0.95)
+
+        v2e_params, scalar_params, matrix_params, other_params = [], [], [], []
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.startswith("vocab_to_embed.") or ".vocab_to_embed." in n:
+                v2e_params.append(p)
+            elif n.startswith("transformer.") or ".transformer." in n:
+                if p.ndim >= 2:
+                    matrix_params.append(p)
+                else:
+                    scalar_params.append(p)
+            else:
+                # alpha / scalars outside transformer → AdamW scalar lane
+                other_params.append(p)
+
+        param_groups = []
+        if v2e_params:
+            param_groups.append(dict(
+                kind='adamw', params=v2e_params,
+                lr=v2e_lr, betas=adam_betas, eps=1e-10,
+                weight_decay=0.0,
+            ))
+        if scalar_params:
+            param_groups.append(dict(
+                kind='adamw', params=scalar_params,
+                lr=scalar_lr, betas=adam_betas, eps=1e-10,
+                weight_decay=0.0,
+            ))
+        if other_params:
+            param_groups.append(dict(
+                kind='adamw', params=other_params,
+                lr=base_lr, betas=adam_betas, eps=1e-10,
+                weight_decay=self.config.weight_decay,
+            ))
+
+        # Muon needs same-shape stacking — group transformer matrices by shape.
+        shape_groups = {}
+        for p in matrix_params:
+            shape_groups.setdefault(p.shape, []).append(p)
+        for shape in sorted(shape_groups.keys(), key=lambda s: tuple(s)):
+            param_groups.append(dict(
+                kind='muon', params=shape_groups[shape],
+                lr=muon_lr,
+                momentum=self.config.muon_momentum,
+                ns_steps=self.config.muon_ns_steps,
+                beta2=self.config.muon_beta2,
+                weight_decay=self.config.weight_decay,
+            ))
+
+        # PL closure compatibility (mirrors trainer.py:1562 PLMuonAdamW).
+        class PLMuonAdamW(MuonAdamW):
+            @torch.no_grad()
+            def step(self, closure=None):
+                if closure is not None:
+                    with torch.enable_grad():
+                        closure()
+                super().step()
+
+        optimizer = PLMuonAdamW(param_groups)
+        for g in optimizer.param_groups:
+            g['initial_lr'] = g['lr']
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, self._build_lr_lambda())
+
+        import os as _os
+        if _os.environ.get("LOCAL_RANK", "0") == "0":
+            n_muon = sum(p.numel() for p in matrix_params)
+            n_v2e = sum(p.numel() for p in v2e_params)
+            n_scalar = sum(p.numel() for p in scalar_params)
+            n_other = sum(p.numel() for p in other_params)
+            n_total = n_muon + n_v2e + n_scalar + n_other
+            print("=" * 80, flush=True)
+            print("[Muon+AdamW] RL hybrid optimizer enabled:", flush=True)
+            print(f"  Muon  groups (by shape): {len(shape_groups)}", flush=True)
+            print(f"  Muon  params: {n_muon:,} ({n_muon/max(1,n_total)*100:.1f}%) lr={muon_lr:.2e}",
+                  flush=True)
+            print(f"  AdamW vocab_to_embed:    {n_v2e:,} lr={v2e_lr:.2e}", flush=True)
+            print(f"  AdamW transformer scalar:{n_scalar:,} lr={scalar_lr:.2e}", flush=True)
+            print(f"  AdamW other (catch-all): {n_other:,} lr={base_lr:.2e}", flush=True)
+            print(f"  Muon  momentum={self.config.muon_momentum} "
+                  f"ns_steps={self.config.muon_ns_steps} beta2={self.config.muon_beta2}",
+                  flush=True)
+            print("=" * 80, flush=True)
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
+
+    def _configure_muon_adamw_optimizer(self):
+        """Muon (transformer matrices) + AdamW (everything else) — RL variant.
+
+        Mirrors openebm.elm.trainer._configure_muon_adamw_optimizer (used in
+        SFT) but is simplified for the RL setting:
+          - alpha / embeddings / langevin_noise are already frozen in __init__
+            (requires_grad=False), so they auto-skip; no group is created.
+          - vocab_to_embed → AdamW, lr = base_lr * 0.5 (matches v3 P0 ratio).
+          - transformer matrices (ndim>=2) → Muon, grouped by shape.
+          - transformer scalars (ndim<2) + any other trainable params → AdamW,
+            lr = base_lr * 2.0 (matches v3 P0 ratio).
+        """
+        from nanochat.optim import MuonAdamW
+
+        base_lr = self.config.learning_rate
+        v2e_lr = base_lr * 0.5
+        scalar_lr = base_lr * 2.0
+        muon_lr = self.config.muon_lr
+        adam_betas = (0.9, 0.95)
+
+        v2e_params, scalar_params, matrix_params, other_params = [], [], [], []
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.startswith("vocab_to_embed.") or ".vocab_to_embed." in n:
+                v2e_params.append(p)
+            elif n.startswith("transformer.") or ".transformer." in n:
+                if p.ndim >= 2:
+                    matrix_params.append(p)
+                else:
+                    scalar_params.append(p)
+            else:
+                # alpha / scalars outside transformer → AdamW scalar lane
+                other_params.append(p)
+
+        param_groups = []
+        if v2e_params:
+            param_groups.append(dict(
+                kind='adamw', params=v2e_params,
+                lr=v2e_lr, betas=adam_betas, eps=1e-10,
+                weight_decay=0.0,
+            ))
+        if scalar_params:
+            param_groups.append(dict(
+                kind='adamw', params=scalar_params,
+                lr=scalar_lr, betas=adam_betas, eps=1e-10,
+                weight_decay=0.0,
+            ))
+        if other_params:
+            param_groups.append(dict(
+                kind='adamw', params=other_params,
+                lr=base_lr, betas=adam_betas, eps=1e-10,
+                weight_decay=self.config.weight_decay,
+            ))
+
+        # Muon needs same-shape stacking — group transformer matrices by shape.
+        shape_groups = {}
+        for p in matrix_params:
+            shape_groups.setdefault(p.shape, []).append(p)
+        for shape in sorted(shape_groups.keys(), key=lambda s: tuple(s)):
+            param_groups.append(dict(
+                kind='muon', params=shape_groups[shape],
+                lr=muon_lr,
+                momentum=self.config.muon_momentum,
+                ns_steps=self.config.muon_ns_steps,
+                beta2=self.config.muon_beta2,
+                weight_decay=self.config.weight_decay,
+            ))
+
+        # PL closure compatibility (mirrors trainer.py:1562 PLMuonAdamW).
+        class PLMuonAdamW(MuonAdamW):
+            @torch.no_grad()
+            def step(self, closure=None):
+                if closure is not None:
+                    with torch.enable_grad():
+                        closure()
+                super().step()
+
+        optimizer = PLMuonAdamW(param_groups)
+        for g in optimizer.param_groups:
+            g['initial_lr'] = g['lr']
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, self._build_lr_lambda())
+
+        import os as _os
+        if _os.environ.get("LOCAL_RANK", "0") == "0":
+            n_muon = sum(p.numel() for p in matrix_params)
+            n_v2e = sum(p.numel() for p in v2e_params)
+            n_scalar = sum(p.numel() for p in scalar_params)
+            n_other = sum(p.numel() for p in other_params)
+            n_total = n_muon + n_v2e + n_scalar + n_other
+            print("=" * 80, flush=True)
+            print("[Muon+AdamW] RL hybrid optimizer enabled:", flush=True)
+            print(f"  Muon  groups (by shape): {len(shape_groups)}", flush=True)
+            print(f"  Muon  params: {n_muon:,} ({n_muon/max(1,n_total)*100:.1f}%) lr={muon_lr:.2e}",
+                  flush=True)
+            print(f"  AdamW vocab_to_embed:    {n_v2e:,} lr={v2e_lr:.2e}", flush=True)
+            print(f"  AdamW transformer scalar:{n_scalar:,} lr={scalar_lr:.2e}", flush=True)
+            print(f"  AdamW other (catch-all): {n_other:,} lr={base_lr:.2e}", flush=True)
+            print(f"  Muon  momentum={self.config.muon_momentum} "
+                  f"ns_steps={self.config.muon_ns_steps} beta2={self.config.muon_beta2}",
+                  flush=True)
+            print("=" * 80, flush=True)
 
         return {
             "optimizer": optimizer,

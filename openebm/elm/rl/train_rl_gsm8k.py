@@ -294,6 +294,14 @@ def parse_args():
     parser.add_argument("--global_std_min", type=float, default=0.1)
     parser.add_argument("--skip_degenerate_threshold", type=float, default=0.9)
 
+    # Optimizer
+    parser.add_argument("--rl_optimizer", type=str, default="adamw",
+                        choices=["adamw", "muon_adamw"])
+    parser.add_argument("--muon_lr", type=float, default=2e-4)
+    parser.add_argument("--muon_momentum", type=float, default=0.95)
+    parser.add_argument("--muon_ns_steps", type=int, default=5)
+    parser.add_argument("--muon_beta2", type=float, default=0.95)
+
     # Logging / trajectory
     parser.add_argument("--traj_log_interval", type=int, default=50,
                         help="Print periodic completion every N steps")
@@ -354,19 +362,46 @@ def load_sft_model_and_tokenizer(checkpoint_path):
 
     state_dict = ckpt["state_dict"]
     model_state = {}
+    n_renamed_eager = 0
     for key, val in state_dict.items():
         clean_key = key
         if clean_key.startswith("model."):
             clean_key = clean_key[6:]
         if clean_key.startswith("_orig_mod."):
             clean_key = clean_key[10:]
+        # SFT ckpts trained with use_sdpa_attention=True (older luyudong runs)
+        # store transformer params under `transformer_eager.*` while the
+        # current EBT_NLP build always names it `self.transformer`. Rename
+        # to keep the loader compatible across both naming conventions.
+        if clean_key.startswith("transformer_eager."):
+            clean_key = "transformer." + clean_key[len("transformer_eager."):]
+            n_renamed_eager += 1
+        # Some ckpts duplicate weights in BOTH transformer.* and
+        # transformer_eager.*; in that case we keep the first occurrence.
+        if clean_key in model_state:
+            continue
         model_state[clean_key] = val
+    if n_renamed_eager > 0:
+        print(f"  [INFO] Renamed {n_renamed_eager} `transformer_eager.*` keys to `transformer.*`")
 
     missing, unexpected = model.load_state_dict(model_state, strict=False)
-    if missing:
-        print(f"  [WARN] {len(missing)} missing keys: {missing[:3]}...")
     if unexpected:
-        print(f"  [WARN] {len(unexpected)} unexpected keys: {unexpected[:3]}...")
+        print(f"  [WARN] {len(unexpected)} unexpected keys (ignored): {unexpected[:3]}...")
+    if missing:
+        # Hard-fail: missing keys mean part of the model is randomly initialised,
+        # so any RL rollout would produce gibberish and training is meaningless.
+        sample = missing[:10]
+        raise RuntimeError(
+            f"SFT checkpoint loaded with {len(missing)} missing keys — these "
+            f"parameters would remain randomly initialised, making RL rollouts "
+            f"produce gibberish. Refusing to continue.\n"
+            f"  ckpt: {checkpoint_path}\n"
+            f"  first {len(sample)} missing keys: {sample}\n"
+            f"Likely causes: (a) ckpt uses a key naming this loader doesn't "
+            f"handle yet — extend the prefix-rewrite block above; (b) model "
+            f"hparams (use_sdpa_attention, ebt_type, use_ve, etc.) don't match "
+            f"the ckpt's training-time architecture."
+        )
     print(f"  [INFO] Model loaded. Params: {sum(p.numel() for p in model.parameters()):,}")
     return model, tokenizer, hparams
 
@@ -399,6 +434,11 @@ def main():
         advantage_norm=args.advantage_norm,
         global_std_min=args.global_std_min,
         skip_degenerate_threshold=args.skip_degenerate_threshold,
+        rl_optimizer=args.rl_optimizer,
+        muon_lr=args.muon_lr,
+        muon_momentum=args.muon_momentum,
+        muon_ns_steps=args.muon_ns_steps,
+        muon_beta2=args.muon_beta2,
         augment=False,           # no augmentation for GSM8K
         num_gpus=args.num_gpus,
         wandb_project=args.wandb_project,
