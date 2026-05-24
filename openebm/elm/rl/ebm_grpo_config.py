@@ -153,3 +153,22 @@ class EBMGRPOConfig:
 
     collapse_check_window: int = 5
     """Number of consecutive degenerate steps before WARN-COLLAPSE fires."""
+
+    # ── Optimizer ─────────────────────────────────────────────────────────────
+    rl_optimizer: str = "adamw"
+    """Optimizer kind: 'adamw' (default, v3 P0 multi-group lr) or
+    'muon_adamw' (Muon for transformer matrices + AdamW for the rest, mirrors
+    the SFT-stage optimizer used by openebm.elm.trainer)."""
+
+    muon_lr: float = 2e-4
+    """Learning rate for Muon group (transformer matrices). Only used when
+    rl_optimizer='muon_adamw'. Default = SFT muon_lr (2e-3) / 10."""
+
+    muon_momentum: float = 0.95
+    """Muon momentum. Inherits SFT default."""
+
+    muon_ns_steps: int = 5
+    """Newton-Schulz iteration count in Muon. Inherits SFT default."""
+
+    muon_beta2: float = 0.95
+    """Muon second-moment EMA coefficient. Inherits SFT default."""

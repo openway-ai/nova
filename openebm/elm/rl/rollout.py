@@ -5,6 +5,8 @@ generation (reusing logic from generate.py). Returns both token IDs (for log-pro
 computation) and decoded text (for reward computation).
 """
 
+from typing import List, Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -21,6 +23,7 @@ def generate_completions(
     temperature: float = 0.9,
     top_p: float = 0.95,
     generation_batch_size: int = 4,
+    extra_stop_strings: Optional[List[str]] = None,
 ):
     """Generate multiple completions per prompt.
 
@@ -151,9 +154,11 @@ def generate_completions(
             all_completion_ids[batch_start:batch_end, :completions.shape[1]] = completions
             all_completion_masks[batch_start:batch_end, :completions.shape[1]] = comp_masks
 
-            # Free memory
+            # NOTE: do NOT call torch.cuda.empty_cache() here. It forces a
+            # full GPU sync + allocator reset on every sub-batch (very
+            # expensive on long-completion runs). PyTorch's caching allocator
+            # already reuses buffers efficiently across sub-batches.
             del tokens, logits
-            torch.cuda.empty_cache()
 
     # Decode completions to text
     completion_texts = []

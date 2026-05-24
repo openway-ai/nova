@@ -51,8 +51,8 @@ export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
 # RL 实验 ID
-export EXP_ID="d26-ctx2048-gsm8k-rl-gspo-$(date +%Y%m%d)"
-# export EXP_ID="d26-ctx2048-gsm8k-rl-reinforce-$(date +%Y%m%d)"
+# export EXP_ID="d26-ctx2048-gsm8k-rl-gspo-$(date +%Y%m%d)"
+export EXP_ID="d26-ctx2048-gsm8k-rl-reinforce-$(date +%Y%m%d)"
 
 ################################################################################
 # GRPO 超参数
@@ -62,29 +62,40 @@ export EXP_ID="d26-ctx2048-gsm8k-rl-gspo-$(date +%Y%m%d)"
 #   - group_mean_global_std: 防止 advantage 在低多样性批次中爆炸
 ################################################################################
 NUM_GENERATIONS=8             # completions per prompt (GSM8K 比 sudoku 简单，8 足够)
-MAX_COMPLETION_LENGTH=512     # CoT 推理需要更长空间 (数学 ≤512 tokens 够用)
-MAX_PROMPT_LENGTH=256         # GSM8K 题目通常较短
+
+# MAX_COMPLETION_LENGTH=512     # CoT 推理需要更长空间 (数学 ≤512 tokens 够用)
+# MAX_PROMPT_LENGTH=256         # GSM8K 题目通常较短
+
+MAX_COMPLETION_LENGTH=320     # ↓ 1024 → 320: GSM8K answer ≤200 tok; O(L²) generation, 16x speedup
+MAX_PROMPT_LENGTH=192         # ↓ 512 → 192: actual GSM8K prompt is ~120 tok
+
 TEMPERATURE=0.9
 TOP_P=0.9
-GENERATION_BATCH_SIZE=4       # 更保守: 512 completion 比 180 耗更多显存
+GENERATION_BATCH_SIZE=8       # ↑ 4 → 8: more parallel sampling, fits VRAM after length reduction
 
 NUM_ITERATIONS=1              # GRPO inner loop
 EPSILON=0.2                   # PPO clip range (仅 energy_gspo 用)
 BETA=0.2                      # KL anchor: aligned with sudoku v3. v2 evidence shows BETA<0.1 → grad_norm 20× drift
 LEARNING_RATE=2e-6            # 同 sudoku v2; 能量梯度幅度大，不宜太高
-# RL_LOSS_TYPE="energy_reinforce"
-RL_LOSS_TYPE="energy_gspo"
+RL_LOSS_TYPE="energy_reinforce"
+# RL_LOSS_TYPE="energy_gspo"
 
 WEIGHT_DECAY=0.01
-GRADIENT_CLIP_VAL=0.3
-MAX_GRAD_PER_PARAM=0.02
+GRADIENT_CLIP_VAL=1.0         # v3 P1: 0.3 → 1.0 (KL anchor BETA=0.2 主导稳定; per-param clip 之前压制了学习信号)
+MAX_GRAD_PER_PARAM=0.05       # v3 P1: 0.02 → 0.05 (v2 实测真实梯度信号需要更大空间)
 WARMUP_STEPS=50
+
+# ── Optimizer (v3 P0+P1+muon) ─────────────────────────────────────────────────
+# adamw      : v3 P0 multi-group AdamW (transformer/v2e/scalar/other split LR)
+# muon_adamw : Muon for transformer matrices + AdamW for the rest (matches SFT)
+RL_OPTIMIZER="${RL_OPTIMIZER:-adamw}"          # set to "muon_adamw" to enable Muon hybrid
+MUON_LR="${MUON_LR:-2e-4}"                  # default = SFT muon_lr (2e-3) / 10
 ADVANTAGE_NORM="group_mean_global_std"
 GLOBAL_STD_MIN=0.1
 SKIP_DEGENERATE_THRESHOLD=0.9
 
 MAX_STEPS=5000                 # 首次验证: 短训 500 步观察 reward 是否上升
-VAL_CHECK_INTERVAL=50
+VAL_CHECK_INTERVAL=100
 LOG_INTERVAL=5
 SAVE_TOP_K=2
 SEED=42
@@ -146,11 +157,11 @@ exp_init_sft "$0"
 export RUN_NAME="${EXP_ID}-gsm8k-rl-grpo"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# 轨迹输出目录跟着实验目录走
-TRAJ_OUTPUT_DIR="${EXP_DIR}/sft_train/trajectories"
+# 轨迹输出目录跟着实验目录走 (EXP_SFT_DIR 由 exp_init_sft 自动 export, 含 v{N} 后缀)
+TRAJ_OUTPUT_DIR="${EXP_SFT_DIR}/trajectories"
 export TRAJ_OUTPUT_DIR
 
-exp_save_hparams "${EXP_DIR}/sft_train" \
+exp_save_hparams "${EXP_SFT_DIR}" \
     "model_size=${MODEL_SIZE}" \
     "algorithm=grpo" \
     "task=gsm8k" \
@@ -274,6 +285,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --gradient_clip_val ${GRADIENT_CLIP_VAL} \
     --max_grad_per_param ${MAX_GRAD_PER_PARAM} \
     --warmup_steps ${WARMUP_STEPS} \
+    --rl_optimizer ${RL_OPTIMIZER} \
+    --muon_lr ${MUON_LR} \
     --advantage_norm ${ADVANTAGE_NORM} \
     --global_std_min ${GLOBAL_STD_MIN} \
     --skip_degenerate_threshold ${SKIP_DEGENERATE_THRESHOLD} \
@@ -296,7 +309,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
 TRAIN_EXIT_CODE=$?
 set -e
 
-exp_save_status "${EXP_DIR}/sft_train" "gsm8k_rl_grpo_train" "$TRAIN_EXIT_CODE"
+exp_save_status "${EXP_SFT_DIR}" "gsm8k_rl_grpo_train" "$TRAIN_EXIT_CODE"
 
 if [ $TRAIN_EXIT_CODE -eq 0 ]; then
     echo -e "\033[0;32m✓ GSM8K RL (GRPO) 训练成功完成\033[0m"

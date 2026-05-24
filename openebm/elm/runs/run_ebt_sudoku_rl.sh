@@ -62,9 +62,15 @@ LEARNING_RATE=2e-6            # lowered from 5e-6 to slow collapse-prone transfo
 RL_LOSS_TYPE="energy_gspo" 
 
 WEIGHT_DECAY=0.01
-GRADIENT_CLIP_VAL=0.3         # tightened from 0.5 for RL stability
-MAX_GRAD_PER_PARAM=0.02       # tightened from 0.05 (alpha frozen)
+GRADIENT_CLIP_VAL=1.0         # v3 P1: 0.3 → 1.0 (KL anchor BETA=0.2 主导稳定; per-param clip 之前压制了学习信号)
+MAX_GRAD_PER_PARAM=0.05       # v3 P1: 0.02 → 0.05 (v2 实测真实梯度信号需要更大空间)
 WARMUP_STEPS=50               # raised from 20 to give KL anchor time to engage
+
+# ── Optimizer (v3 P0+P1+muon) ─────────────────────────────────────────────────
+# adamw      : v3 P0 multi-group AdamW (transformer/v2e/scalar/other split LR)
+# muon_adamw : Muon for transformer matrices + AdamW for the rest (matches SFT)
+RL_OPTIMIZER="${RL_OPTIMIZER:-adamw}"          # set to "muon_adamw" to enable Muon hybrid
+MUON_LR="${MUON_LR:-2e-4}"                  # default = SFT muon_lr (2e-3) / 10
 ADVANTAGE_NORM="group_mean_global_std"  # batch-wide std prevents tiny intra-group std blow-ups
 GLOBAL_STD_MIN=0.1
 SKIP_DEGENERATE_THRESHOLD=0.9 # skip optimizer step when nearly every group is degenerate
@@ -130,7 +136,7 @@ exp_init_sft "$0"
 export RUN_NAME="${EXP_ID}-sudoku-rl-grpo"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
-exp_save_hparams "${EXP_DIR}/sft_train" \
+exp_save_hparams "${EXP_SFT_DIR}" \
     "model_size=${MODEL_SIZE}" \
     "algorithm=grpo" \
     "sft_checkpoint=${SFT_CKPT}" \
@@ -241,6 +247,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --gradient_clip_val ${GRADIENT_CLIP_VAL} \
     --max_grad_per_param ${MAX_GRAD_PER_PARAM} \
     --warmup_steps ${WARMUP_STEPS} \
+    --rl_optimizer ${RL_OPTIMIZER} \
+    --muon_lr ${MUON_LR} \
     --advantage_norm ${ADVANTAGE_NORM} \
     --global_std_min ${GLOBAL_STD_MIN} \
     --skip_degenerate_threshold ${SKIP_DEGENERATE_THRESHOLD} \
@@ -260,7 +268,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
 TRAIN_EXIT_CODE=$?
 set -e
 
-exp_save_status "${EXP_DIR}/sft_train" "sudoku_rl_grpo_train" "$TRAIN_EXIT_CODE"
+exp_save_status "${EXP_SFT_DIR}" "sudoku_rl_grpo_train" "$TRAIN_EXIT_CODE"
 
 if [ $TRAIN_EXIT_CODE -eq 0 ]; then
     echo -e "\033[0;32m✓ Sudoku RL (GRPO) 训练成功完成\033[0m"

@@ -107,6 +107,16 @@ def parse_args():
              "Set to 1.01 to disable.",
     )
 
+    # Optimizer
+    parser.add_argument("--rl_optimizer", type=str, default="adamw",
+                        choices=["adamw", "muon_adamw"],
+                        help="adamw (default) or muon_adamw (Muon for transformer matrices).")
+    parser.add_argument("--muon_lr", type=float, default=2e-4,
+                        help="LR for Muon group (only used when rl_optimizer=muon_adamw).")
+    parser.add_argument("--muon_momentum", type=float, default=0.95)
+    parser.add_argument("--muon_ns_steps", type=int, default=5)
+    parser.add_argument("--muon_beta2", type=float, default=0.95)
+
     # Logging
     parser.add_argument("--wandb_project", type=str, default="nlp_sudoku_rl")
     parser.add_argument("--wandb_mode", type=str, default="offline")
@@ -167,19 +177,43 @@ def load_sft_model_and_tokenizer(checkpoint_path):
     # Load state dict (handle "model." from Lightning + "_orig_mod." from torch.compile)
     state_dict = ckpt["state_dict"]
     model_state = {}
+    n_renamed_eager = 0
     for key, val in state_dict.items():
         clean_key = key
         if clean_key.startswith("model."):
             clean_key = clean_key[6:]
         if clean_key.startswith("_orig_mod."):
             clean_key = clean_key[10:]
+        # Compat: SFT ckpts trained with use_sdpa_attention=True (older runs)
+        # store transformer params under `transformer_eager.*`. Current
+        # EBT_NLP build always names it `self.transformer`.
+        if clean_key.startswith("transformer_eager."):
+            clean_key = "transformer." + clean_key[len("transformer_eager."):]
+            n_renamed_eager += 1
+        if clean_key in model_state:
+            continue
         model_state[clean_key] = val
+    if n_renamed_eager > 0:
+        print(f"  Renamed {n_renamed_eager} `transformer_eager.*` keys to `transformer.*`")
 
     missing, unexpected = model.load_state_dict(model_state, strict=False)
-    if missing:
-        print(f"  WARNING: {len(missing)} missing keys: {missing[:5]}...")
     if unexpected:
-        print(f"  WARNING: {len(unexpected)} unexpected keys: {unexpected[:5]}...")
+        print(f"  WARNING: {len(unexpected)} unexpected keys (ignored): {unexpected[:5]}...")
+    if missing:
+        # Hard-fail: missing keys mean part of the model is randomly initialised,
+        # so any RL rollout produces gibberish and training is meaningless.
+        sample = missing[:10]
+        raise RuntimeError(
+            f"SFT checkpoint loaded with {len(missing)} missing keys — these "
+            f"parameters would remain randomly initialised, making RL rollouts "
+            f"produce gibberish. Refusing to continue.\n"
+            f"  ckpt: {checkpoint_path}\n"
+            f"  first {len(sample)} missing keys: {sample}\n"
+            f"Likely causes: (a) ckpt uses a key naming this loader doesn't "
+            f"handle yet — extend the prefix-rewrite block above; (b) model "
+            f"hparams (use_sdpa_attention, ebt_type, use_ve, etc.) don't match "
+            f"the ckpt's training-time architecture."
+        )
     print(f"  Model loaded successfully. Params: {sum(p.numel() for p in model.parameters()):,}")
 
     return model, tokenizer, hparams
@@ -215,6 +249,11 @@ def main():
         advantage_norm=args.advantage_norm,
         global_std_min=args.global_std_min,
         skip_degenerate_threshold=args.skip_degenerate_threshold,
+        rl_optimizer=args.rl_optimizer,
+        muon_lr=args.muon_lr,
+        muon_momentum=args.muon_momentum,
+        muon_ns_steps=args.muon_ns_steps,
+        muon_beta2=args.muon_beta2,
         data_dir=args.data_dir,
         augment=not args.no_augment,
         num_gpus=args.num_gpus,
