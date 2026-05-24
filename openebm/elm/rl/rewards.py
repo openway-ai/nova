@@ -8,14 +8,16 @@ Reward components:
      - If completion contains >=40 ASCII digits: up to 0.1 (partial credit,
        prevents reward variance from collapsing to 0 when the model is
        still emitting reasonable token streams but mis-formatted output).
-  2. Clue preservation (0.0-0.5): all given clues unchanged?
-  3. Blank accuracy reward (0.0-1.5): blank fill quality. Even when no
-     blanks are correct, a tiny "effort floor" (0.02) is granted so reward
-     std doesn't degenerate to 0 on a bad batch.
+  2. Clue preservation (-0.5..+0.5): SYMMETRIC penalty/reward.
+     full preservation → +0.5; full corruption → −0.5.
+     v3: changed from one-sided (0..0.5) after v2 showed clue dropping
+     0.34 → 0.07 because corruption had no explicit cost.
+  3. Blank accuracy reward (0.0-1.5): blank fill quality. The 0.02 effort
+     floor only applies when ALL clues are preserved (prevents the model
+     from sacrificing clue fidelity for blank fill exploration).
   4. Full solve bonus (0.0-0.5): perfect solution (implies validity)
 
-Total reward range: [0.0, 3.0] (effort floors keep it just above 0 when the
-completion at least looks like sudoku output).
+Total reward range: [-0.5, 3.0]
 """
 
 from typing import List, Optional
@@ -115,15 +117,19 @@ def _score_single_detailed(
 
     if clue_count > 0:
         clue_preservation_frac = clue_preserved_count / clue_count
-        result["clue_preservation"] = clue_preservation_frac * 0.5
+        # SYMMETRIC: full preserve → +0.5, full corrupt → −0.5.
+        # v3 fix: v2 had (frac * 0.5) which lets the model corrupt clues for
+        # free if blank gain exceeds preservation cost. v3 makes corruption
+        # strictly punished, breaking the cheat path observed in 20260524 log.
+        result["clue_preservation"] = (2.0 * clue_preservation_frac - 1.0) * 0.5
+        all_clues_preserved = (clue_preserved_count == clue_count)
     else:
         # No clues (empty board) - give full credit
         result["clue_preservation"] = 0.5
+        all_clues_preserved = True
 
     # 3. Blank accuracy reward: fraction of blank cells filled correctly
-    # Only count cells that were blank in the original puzzle. A small
-    # "effort floor" is added so that even all-wrong fills still produce
-    # >0 reward — prevents reward_std → 0 when the entire batch is bad.
+    # Only count cells that were blank in the original puzzle.
     blank_count = 0
     correct_blank_count = 0
 
@@ -140,10 +146,11 @@ def _score_single_detailed(
     else:
         blank_accuracy_frac = 1.0  # no blanks = trivially correct
 
-    # Effort floor: parseable board with any digit fill gets 0.02 baseline,
-    # then scaled accuracy on top. This keeps the gradient signal alive
-    # when a batch has uniformly poor accuracy.
-    result["blank_accuracy"] = 0.02 + blank_accuracy_frac * 1.48
+    # Effort floor 0.02 ONLY when ALL clues preserved. v3 fix: previously
+    # the floor was unconditional, giving the model a free 0.02 even after
+    # corrupting clues, which compounded the clue-corruption attractor.
+    floor = 0.02 if all_clues_preserved else 0.0
+    result["blank_accuracy"] = floor + blank_accuracy_frac * 1.48
 
     # 4. Full solve bonus: perfect match with ground truth
     # This implicitly checks validity (correct solution must satisfy constraints)

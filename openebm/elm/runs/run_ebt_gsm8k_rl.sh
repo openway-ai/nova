@@ -1,16 +1,21 @@
 #!/bin/bash
 
 ################################################################################
-# EBT Sudoku RL (GRPO) 训练脚本
+# EBT GSM8K RL (GRPO) 训练脚本
 # ─────────────────────────────────────────────────────────────────────────────
-# 基于 SFT v3 最佳 checkpoint 进行 GRPO 强化学习后训练。
+# 基于 SFT checkpoint 对 GSM8K 数学推理任务进行 GRPO 强化学习后训练。
 #
-# 算法: Group Relative Policy Optimization (GRPO)
+# 算法: Energy-REINFORCE with KL anchor
 #   - 每个 prompt 生成 N 个 completion
-#   - 多组件奖励 (format + accuracy + validity + full_solve)
-#   - PPO-clipped policy gradient + KL penalty
+#   - 奖励 = format(0.3) + exact_match(0.7) + length_penalty(-0.1)
+#   - sequence-level energy-KL anchor (防 policy collapse)
 #
-# 参考: d1/diffu-grpo (adapted for EBT's energy-based paradigm)
+# 日志与轨迹采样:
+#   - 每 TRAJ_LOG_INTERVAL 步打印 [DBG-RL-PERIODIC] 样本
+#   - JSONL 持久化到 ${EXP_DIR}/trajectories/
+#   - collapse 预警: unique_ratio < 0.3 持续 K 步 → [WARN-COLLAPSE] + dump
+#
+# 参考: run_ebt_sudoku_rl.sh (风格对齐)
 ################################################################################
 
 set -e
@@ -20,8 +25,16 @@ export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
 
 ### SFT 权重 (RL 起点) ###
-# TODO: 替换为实际的 SFT v3 最佳 checkpoint 路径
+# TODO: 替换为实际的 SFT checkpoint 路径
 SFT_CKPT="${SFT_CKPT:-/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-mixed-0.6-20260508/sft_train/checkpoints/s=step=2990-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=0.4782.ckpt}"
+
+### GSM8K 数据路径 ###
+# 直接复用 run_ebt_sft.sh pipeline 已下载好的 HF 缓存 (openai/gsm8k 完整数据)
+#   train: 7473 examples (gsm8k-train.arrow)
+#   test:  1319 examples (gsm8k-test.arrow) — RL 的 "val" 自动映射到 HF test split
+# 数据集加载逻辑见 gsm8k_dataset_rl.py:_load_gsm8k
+# 通过传入 HF cache 根目录, dataset 会自动定位 openai___gsm8k/main/<ver>/<hash>/gsm8k-<split>.arrow
+GSM8K_DATA_PATH="${GSM8K_DATA_PATH:-${NANOCHAT_SFT_DATA_DIR:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/sft_data}/gsm8k}"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -37,86 +50,89 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
-# Sudoku V2 数据缓存目录
-export SUDOKU_DATA_DIR_V2="${SUDOKU_DATA_DIR_V2:-/mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/data/sudoku_cache_v2}"
-
 # RL 实验 ID
-export EXP_ID="d26-ctx2048-sudoku-rl-gspo-$(date +%Y%m%d)"
-# export EXP_ID="d26-ctx2048-sudoku-rl-reinforce-$(date +%Y%m%d)"
+export EXP_ID="d26-ctx2048-gsm8k-rl-gspo-$(date +%Y%m%d)"
+# export EXP_ID="d26-ctx2048-gsm8k-rl-reinforce-$(date +%Y%m%d)"
 
 ################################################################################
 # GRPO 超参数
+# 设计参考:
+#   - v2 sudoku RL 经验: KL anchor(BETA≥0.05) + 低LR 防 collapse
+#   - GSM8K max_completion_length 更大 (512 vs 180): 数学推理需要 CoT 空间
+#   - group_mean_global_std: 防止 advantage 在低多样性批次中爆炸
 ################################################################################
-NUM_GENERATIONS=16            # completions per prompt (raised from 8 → stabler advantage estimates)
-MAX_COMPLETION_LENGTH=165     # v3: ↓ from 180. 9x9 board ≤162 chars; tail tokens produce gibberish + waste VRAM
-MAX_PROMPT_LENGTH=192
+NUM_GENERATIONS=8             # completions per prompt (GSM8K 比 sudoku 简单，8 足够)
+MAX_COMPLETION_LENGTH=512     # CoT 推理需要更长空间 (数学 ≤512 tokens 够用)
+MAX_PROMPT_LENGTH=256         # GSM8K 题目通常较短
 TEMPERATURE=0.9
-TOP_P=0.9                     # narrowed from 0.95 to reduce long-tail sampling noise
-GENERATION_BATCH_SIZE=8       # sub-batch for generation (VRAM management)
+TOP_P=0.9
+GENERATION_BATCH_SIZE=4       # 更保守: 512 completion 比 180 耗更多显存
 
-NUM_ITERATIONS=1              # GRPO inner loop (μ in paper)
-EPSILON=0.2                   # PPO clip range (only used by energy_gspo)
-BETA=0.2                      # v3: ↑ 0.05→0.2 (4x). v2 grad_norm 0.07→1.58 evidence KL anchor too weak
-LEARNING_RATE=2e-6            # lowered from 5e-6 to slow collapse-prone transformer drift
-# RL_LOSS_TYPE="energy_reinforce"  # removes 1/|y| dilution
-RL_LOSS_TYPE="energy_gspo" 
+NUM_ITERATIONS=1              # GRPO inner loop
+EPSILON=0.2                   # PPO clip range (仅 energy_gspo 用)
+BETA=0.2                      # KL anchor: aligned with sudoku v3. v2 evidence shows BETA<0.1 → grad_norm 20× drift
+LEARNING_RATE=2e-6            # 同 sudoku v2; 能量梯度幅度大，不宜太高
+# RL_LOSS_TYPE="energy_reinforce"
+RL_LOSS_TYPE="energy_gspo"
 
 WEIGHT_DECAY=0.01
-GRADIENT_CLIP_VAL=0.3         # tightened from 0.5 for RL stability
-MAX_GRAD_PER_PARAM=0.02       # tightened from 0.05 (alpha frozen)
-WARMUP_STEPS=50               # raised from 20 to give KL anchor time to engage
-ADVANTAGE_NORM="group_mean_global_std"  # batch-wide std prevents tiny intra-group std blow-ups
+GRADIENT_CLIP_VAL=0.3
+MAX_GRAD_PER_PARAM=0.02
+WARMUP_STEPS=50
+ADVANTAGE_NORM="group_mean_global_std"
 GLOBAL_STD_MIN=0.1
-SKIP_DEGENERATE_THRESHOLD=0.9 # skip optimizer step when nearly every group is degenerate
+SKIP_DEGENERATE_THRESHOLD=0.9
 
-# MAX_STEPS=300                 # short-train verification of new pipeline; raise to 1000 after green
-MAX_STEPS=3000                 # short-train verification of new pipeline; raise to 1000 after green
-           
-VAL_CHECK_INTERVAL=25
+MAX_STEPS=5000                 # 首次验证: 短训 500 步观察 reward 是否上升
+VAL_CHECK_INTERVAL=50
 LOG_INTERVAL=5
-SAVE_TOP_K=3
+SAVE_TOP_K=2
 SEED=42
+
+################################################################################
+# 轨迹采样与日志配置
+################################################################################
+TRAJ_LOG_INTERVAL=50          # 每 50 step 打印 [DBG-RL-PERIODIC] 样本
+TRAJ_NUM_SAMPLES=2            # 每次打印 2 条 completion
+COLLAPSE_CHECK_WINDOW=5       # K 步连续 degenerate → WARN-COLLAPSE
+
+# LOG_LEVEL: DEBUG / INFO / WARN / ERROR
+export LOG_LEVEL="INFO"
 
 ################################################################################
 # GPU 配置
 ################################################################################
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)}
-NUM_GPUS=${NUM_GPUS:-8}
+NUM_GPUS=${NUM_GPUS:-6}
 
 ################################################################################
-# 数据集检查
+# 数据与 checkpoint 检查
 ################################################################################
 echo ""
 echo "=================================="
-echo "  检查 Sudoku V2 数据集 (RL 复用)"
+echo "  检查 GSM8K 数据与 SFT checkpoint"
 echo "=================================="
-echo "数据集路径: ${SUDOKU_DATA_DIR_V2}"
 
-MISSING=()
-[ ! -f "${SUDOKU_DATA_DIR_V2}/rrn_train.pt" ] && MISSING+=("rrn_train.pt")
-[ ! -f "${SUDOKU_DATA_DIR_V2}/rrn_val.pt" ] && MISSING+=("rrn_val.pt")
+# HF cache 根目录下应能找到 openai___gsm8k/main/*/*/gsm8k-{train,test}.arrow
+GSM8K_TRAIN_ARROW=$(ls ${GSM8K_DATA_PATH}/openai___gsm8k/main/*/*/gsm8k-train.arrow 2>/dev/null | head -1)
+GSM8K_TEST_ARROW=$(ls ${GSM8K_DATA_PATH}/openai___gsm8k/main/*/*/gsm8k-test.arrow 2>/dev/null | head -1)
 
-if [ ${#MISSING[@]} -gt 0 ]; then
-    echo "✗ 缺少以下 V2 数据文件:"
-    for f in "${MISSING[@]}"; do
-        echo "  - $f"
-    done
-    echo ""
-    echo "请先运行 V2 数据准备脚本:"
-    echo "  python openebm/elm/data/prepare_sudoku_data_v2.py --data_dir ${SUDOKU_DATA_DIR_V2}"
+if [ -z "${GSM8K_TRAIN_ARROW}" ] || [ -z "${GSM8K_TEST_ARROW}" ]; then
+    echo "✗ GSM8K HF cache 不完整: ${GSM8K_DATA_PATH}"
+    echo "  期望路径: \${GSM8K_DATA_PATH}/openai___gsm8k/main/*/*/gsm8k-{train,test}.arrow"
+    echo "  请先跑过 SFT pipeline 以生成 HF cache, 或设置 GSM8K_DATA_PATH 指向其他 HF cache 根"
     exit 1
 fi
+echo "✓ GSM8K HF cache 根:  ${GSM8K_DATA_PATH}"
+echo "  train arrow:  ${GSM8K_TRAIN_ARROW}"
+echo "  test arrow:   ${GSM8K_TEST_ARROW}"
 
-echo "✓ rrn_train.pt"
-echo "✓ rrn_val.pt"
-
-# 检查 SFT checkpoint
 if [ ! -f "${SFT_CKPT}" ]; then
-    echo "✗ SFT Checkpoint 不存在: ${SFT_CKPT}"
-    echo "  请设置 SFT_CKPT 环境变量指向 SFT v3 最佳 checkpoint"
+    echo "✗ SFT checkpoint 不存在: ${SFT_CKPT}"
+    echo "  请设置 SFT_CKPT 环境变量"
     exit 1
 fi
-echo "✓ SFT Checkpoint: ${SFT_CKPT}"
+echo "✓ SFT checkpoint: ${SFT_CKPT}"
 echo ""
 
 ################################################################################
@@ -127,12 +143,17 @@ source "${SCRIPT_DIR}/utils/exp_layout.sh"
 
 export PRETRAIN_CKPT="${SFT_CKPT}"
 exp_init_sft "$0"
-export RUN_NAME="${EXP_ID}-sudoku-rl-grpo"
+export RUN_NAME="${EXP_ID}-gsm8k-rl-grpo"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+
+# 轨迹输出目录跟着实验目录走
+TRAJ_OUTPUT_DIR="${EXP_DIR}/sft_train/trajectories"
+export TRAJ_OUTPUT_DIR
 
 exp_save_hparams "${EXP_DIR}/sft_train" \
     "model_size=${MODEL_SIZE}" \
     "algorithm=grpo" \
+    "task=gsm8k" \
     "sft_checkpoint=${SFT_CKPT}" \
     "num_generations=${NUM_GENERATIONS}" \
     "max_completion_length=${MAX_COMPLETION_LENGTH}" \
@@ -144,7 +165,6 @@ exp_save_hparams "${EXP_DIR}/sft_train" \
     "gradient_clip_val=${GRADIENT_CLIP_VAL}" \
     "max_grad_per_param=${MAX_GRAD_PER_PARAM}" \
     "advantage_norm=${ADVANTAGE_NORM}" \
-    "global_std_min=${GLOBAL_STD_MIN}" \
     "skip_degenerate_threshold=${SKIP_DEGENERATE_THRESHOLD}" \
     "rl_loss_type=${RL_LOSS_TYPE}" \
     "max_steps=${MAX_STEPS}" \
@@ -158,14 +178,14 @@ current_time=$(date +"%Y%m%d_%H%M%S")
 # 显示配置
 ################################################################################
 echo "=================================="
-echo "  EBT Sudoku RL (GRPO) 训练"
+echo "  EBT GSM8K RL (GRPO) 训练"
 echo "=================================="
 echo "SFT checkpoint:          ${SFT_CKPT}"
+echo "GSM8K data:              ${GSM8K_DATA_PATH}"
 echo "Algorithm:               GRPO (${RL_LOSS_TYPE})"
 echo "Num generations:         ${NUM_GENERATIONS}"
 echo "Max completion length:   ${MAX_COMPLETION_LENGTH}"
 echo "Temperature:             ${TEMPERATURE}"
-echo "Epsilon (clip):          ${EPSILON}"
 echo "Beta (KL anchor):        ${BETA}"
 echo "Learning rate:           ${LEARNING_RATE}"
 echo "Warmup steps:            ${WARMUP_STEPS}"
@@ -176,6 +196,9 @@ echo "Skip degen threshold:    ${SKIP_DEGENERATE_THRESHOLD}"
 echo "Max steps:               ${MAX_STEPS}"
 echo "Val interval:            ${VAL_CHECK_INTERVAL}"
 echo "GPUs:                    ${NUM_GPUS}"
+echo "Traj log interval:       ${TRAJ_LOG_INTERVAL}"
+echo "Traj output dir:         ${TRAJ_OUTPUT_DIR}"
+echo "Log level:               ${LOG_LEVEL}"
 echo "Log file:                ${LOG_FILE}"
 echo ""
 read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
@@ -185,22 +208,31 @@ read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
 ################################################################################
 cat << LOG_HEADER > "${LOG_FILE}"
 ################################################################################
-#                    EBT Sudoku RL (GRPO) 训练日志
+#                    EBT GSM8K RL (GRPO) 训练日志
 ################################################################################
 #
 # Run Name:        ${RUN_NAME}_${current_time}
 # SFT From:        ${SFT_CKPT}
 # Start Time:      $(date '+%Y-%m-%d %H:%M:%S')
 # Log File:        ${LOG_FILE}
+# Traj Dir:        ${TRAJ_OUTPUT_DIR}
 #
 # GRPO Config:
+#   task=gsm8k
 #   num_generations=${NUM_GENERATIONS}
 #   max_completion_length=${MAX_COMPLETION_LENGTH}
 #   temperature=${TEMPERATURE}
-#   epsilon=${EPSILON}
 #   beta=${BETA}
 #   learning_rate=${LEARNING_RATE}
+#   rl_loss_type=${RL_LOSS_TYPE}
 #   max_steps=${MAX_STEPS}
+#
+# Log grep patterns:
+#   [GRPO]            — per-step training metrics
+#   [DBG-RL-PERIODIC] — periodic completion samples (every TRAJ_LOG_INTERVAL steps)
+#   [WARN-COLLAPSE]   — collapse detection alert
+#   [METRIC]          — aligned columnar metrics line
+#   [INFO]            — informational messages
 ################################################################################
 
 LOG_HEADER
@@ -217,15 +249,16 @@ echo "CUDA Available:   $(python3 -c 'import torch; print(torch.cuda.is_availabl
 echo "GPU Count:        $(python3 -c 'import torch; print(torch.cuda.device_count())' 2>/dev/null || echo '0')"
 echo ""
 echo "================================================================================"
-echo "[开始 RL 训练]"
+echo "[开始 GSM8K RL 训练]"
 echo "================================================================================"
 echo ""
 
 set -e
 
 torchrun --standalone --nproc_per_node=${NUM_GPUS} \
-    -m openebm.elm.rl.train_rl_sudoku \
+    -m openebm.elm.rl.train_rl_gsm8k \
     --sft_checkpoint "${SFT_CKPT}" \
+    --data_path "${GSM8K_DATA_PATH}" \
     --num_generations ${NUM_GENERATIONS} \
     --max_completion_length ${MAX_COMPLETION_LENGTH} \
     --max_prompt_length ${MAX_PROMPT_LENGTH} \
@@ -249,26 +282,52 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --log_interval ${LOG_INTERVAL} \
     --save_top_k ${SAVE_TOP_K} \
     --seed ${SEED} \
-    --data_dir "${SUDOKU_DATA_DIR_V2}" \
     --num_gpus ${NUM_GPUS} \
     --float_precision "32-true" \
-    --wandb_project "nlp_sudoku_rl" \
+    --wandb_project "nlp_gsm8k_rl" \
     --wandb_mode "${WANDB_MODE}" \
     --run_name "${RUN_NAME}_${current_time}" \
-    --checkpoint_dir "${EXP_CKPT_DIR}"
+    --checkpoint_dir "${EXP_CKPT_DIR}" \
+    --traj_log_interval ${TRAJ_LOG_INTERVAL} \
+    --traj_output_dir "${TRAJ_OUTPUT_DIR}" \
+    --traj_num_samples ${TRAJ_NUM_SAMPLES} \
+    --collapse_check_window ${COLLAPSE_CHECK_WINDOW}
 
 TRAIN_EXIT_CODE=$?
 set -e
 
-exp_save_status "${EXP_DIR}/sft_train" "sudoku_rl_grpo_train" "$TRAIN_EXIT_CODE"
+exp_save_status "${EXP_DIR}/sft_train" "gsm8k_rl_grpo_train" "$TRAIN_EXIT_CODE"
 
 if [ $TRAIN_EXIT_CODE -eq 0 ]; then
-    echo -e "\033[0;32m✓ Sudoku RL (GRPO) 训练成功完成\033[0m"
+    echo -e "\033[0;32m✓ GSM8K RL (GRPO) 训练成功完成\033[0m"
 else
-    echo -e "\033[0;31m✗ Sudoku RL (GRPO) 训练异常退出 (exit code: $TRAIN_EXIT_CODE)\033[0m"
+    echo -e "\033[0;31m✗ GSM8K RL (GRPO) 训练异常退出 (exit code: $TRAIN_EXIT_CODE)\033[0m"
 fi
 
 } 2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush() }' | tee -a "${LOG_FILE}"
 
 echo ""
 echo "日志已保存到: ${LOG_FILE}"
+echo "轨迹 JSONL:  ${TRAJ_OUTPUT_DIR}"
+
+################################################################################
+# 日志分析速查
+################################################################################
+# grep 模式:
+#   实时 loss/reward:   grep -E '\[GRPO\] step=' ${LOG_FILE}
+#   周期采样:           grep '\[DBG-RL-PERIODIC\]' ${LOG_FILE}
+#   collapse 预警:      grep '\[WARN-COLLAPSE\]' ${LOG_FILE}
+#   对齐列 metrics:     grep '\[METRIC\]' ${LOG_FILE}
+#
+# 轨迹分析示例:
+#   # 查看 step 50 的所有 completion 及 reward
+#   cat ${TRAJ_OUTPUT_DIR}/step_000050/rollout_samples.jsonl | python3 -c \
+#     "import sys,json; [print(json.loads(l)['reward'], json.loads(l)['completion'][:100]) for l in sys.stdin]"
+#
+#   # 统计各 step 的 exact_match 准确率
+#   grep -h '' ${TRAJ_OUTPUT_DIR}/*/summary.json | python3 -c \
+#     "import sys,json; [print(json.loads(l)['step'], json.loads(l).get('reward_mean','?')) for l in sys.stdin]"
+#
+#   # 找到所有 collapse dump
+#   ls ${TRAJ_OUTPUT_DIR}/../collapse_dump/
+################################################################################

@@ -137,6 +137,21 @@ def load_sft_model_and_tokenizer(checkpoint_path):
     tokenizer = get_tokenizer()
     hparams["tokenizer_obj"] = tokenizer
 
+    # Backfill VE attributes for SFT ckpts saved before commit 2fe9418
+    # ("Add VE support"), which made `use_ve` / `vocab_size` mandatory.
+    if "use_ve" not in hparams:
+        hparams["use_ve"] = False
+    if "vocab_size" not in hparams:
+        for attr in ("get_vocab_size", "vocab_size", "n_vocab"):
+            obj = getattr(tokenizer, attr, None)
+            if obj is None:
+                continue
+            hparams["vocab_size"] = obj() if callable(obj) else int(obj)
+            break
+        else:
+            hparams["vocab_size"] = 32768   # nanochat default
+        print(f"  Backfilled vocab_size={hparams['vocab_size']} (ckpt missing the field)")
+
     # Create model
     from openebm.elm.modeling_ebt import EBT_NLP
 
