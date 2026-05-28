@@ -50,9 +50,16 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
-# RL 实验 ID
-# export EXP_ID="d26-ctx2048-gsm8k-rl-gspo-$(date +%Y%m%d)"
-export EXP_ID="d26-ctx2048-gsm8k-rl-reinforce-$(date +%Y%m%d)"
+# RL loss / experiment ID. Keep this before EXP_ID so the directory name
+# follows the actual algorithm instead of a stale hard-coded suffix.
+RL_LOSS_TYPE="${RL_LOSS_TYPE:-energy_gspo}"
+case "${RL_LOSS_TYPE}" in
+    energy_gspo) RL_ALGO_SUFFIX="gspo" ;;
+    energy_reinforce) RL_ALGO_SUFFIX="reinforce" ;;
+    token_logprobs) RL_ALGO_SUFFIX="token-logprobs" ;;
+    *) RL_ALGO_SUFFIX="${RL_LOSS_TYPE}" ;;
+esac
+export EXP_ID="${EXP_ID:-d26-ctx2048-gsm8k-rl-${RL_ALGO_SUFFIX}-$(date +%Y%m%d)}"
 
 ################################################################################
 # GRPO 超参数
@@ -73,12 +80,12 @@ TEMPERATURE=0.9
 TOP_P=0.9
 GENERATION_BATCH_SIZE=8       # ↑ 4 → 8: more parallel sampling, fits VRAM after length reduction
 
-NUM_ITERATIONS=1              # GRPO inner loop
+NUM_ITERATIONS=1              # legacy loss recomputation; keep 1 when using GSPO_UPDATE_EPOCHS
+GSPO_UPDATE_EPOCHS="${GSPO_UPDATE_EPOCHS:-1}"  # true optimizer steps per rollout for energy_gspo
 EPSILON=0.2                   # PPO clip range (仅 energy_gspo 用)
 BETA=0.2                      # KL anchor: aligned with sudoku v3. v2 evidence shows BETA<0.1 → grad_norm 20× drift
 LEARNING_RATE=2e-6            # 同 sudoku v2; 能量梯度幅度大，不宜太高
-RL_LOSS_TYPE="energy_reinforce"
-# RL_LOSS_TYPE="energy_gspo"
+# Set RL_LOSS_TYPE=energy_gspo GSPO_UPDATE_EPOCHS=2 to reuse each rollout.
 
 WEIGHT_DECAY=0.01
 GRADIENT_CLIP_VAL=1.0         # v3 P1: 0.3 → 1.0 (KL anchor BETA=0.2 主导稳定; per-param clip 之前压制了学习信号)
@@ -109,6 +116,9 @@ COLLAPSE_CHECK_WINDOW=5       # K 步连续 degenerate → WARN-COLLAPSE
 
 # LOG_LEVEL: DEBUG / INFO / WARN / ERROR
 export LOG_LEVEL="INFO"
+# 0 disables per-rank NaN-gradient sanitize debug lines. Metrics are still logged
+# as stability/nan_grad_params; set e.g. 50 for occasional rank-level diagnostics.
+export NAN_GRAD_DEBUG_INTERVAL="${NAN_GRAD_DEBUG_INTERVAL:-0}"
 
 ################################################################################
 # GPU 配置
@@ -154,7 +164,7 @@ source "${SCRIPT_DIR}/utils/exp_layout.sh"
 
 export PRETRAIN_CKPT="${SFT_CKPT}"
 exp_init_sft "$0"
-export RUN_NAME="${EXP_ID}-gsm8k-rl-grpo"
+export RUN_NAME="${EXP_ID}-grpo"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
 # 轨迹输出目录跟着实验目录走 (EXP_SFT_DIR 由 exp_init_sft 自动 export, 含 v{N} 后缀)
@@ -170,6 +180,7 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "max_completion_length=${MAX_COMPLETION_LENGTH}" \
     "temperature=${TEMPERATURE}" \
     "epsilon=${EPSILON}" \
+    "gspo_update_epochs=${GSPO_UPDATE_EPOCHS}" \
     "beta=${BETA}" \
     "learning_rate=${LEARNING_RATE}" \
     "warmup_steps=${WARMUP_STEPS}" \
@@ -194,6 +205,7 @@ echo "=================================="
 echo "SFT checkpoint:          ${SFT_CKPT}"
 echo "GSM8K data:              ${GSM8K_DATA_PATH}"
 echo "Algorithm:               GRPO (${RL_LOSS_TYPE})"
+echo "GSPO update epochs:      ${GSPO_UPDATE_EPOCHS}"
 echo "Num generations:         ${NUM_GENERATIONS}"
 echo "Max completion length:   ${MAX_COMPLETION_LENGTH}"
 echo "Temperature:             ${TEMPERATURE}"
@@ -277,6 +289,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --top_p ${TOP_P} \
     --generation_batch_size ${GENERATION_BATCH_SIZE} \
     --num_iterations ${NUM_ITERATIONS} \
+    --gspo_update_epochs ${GSPO_UPDATE_EPOCHS} \
     --epsilon ${EPSILON} \
     --beta ${BETA} \
     --learning_rate ${LEARNING_RATE} \

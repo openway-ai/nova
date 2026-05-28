@@ -46,12 +46,18 @@ def parse_args():
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--generation_batch_size", type=int, default=8)
     parser.add_argument("--num_iterations", type=int, default=1)
+    parser.add_argument("--gspo_update_epochs", type=int, default=1,
+                        help="True optimizer steps per rollout for energy_gspo. Values >1 enable verl-style rollout reuse.")
     parser.add_argument("--epsilon", type=float, default=0.2)
-    parser.add_argument("--beta", type=float, default=0.0)
+    parser.add_argument("--clip_ratio_low", type=float, default=None,
+                        help="Lower PPO/GSPO clip range; defaults to epsilon.")
+    parser.add_argument("--clip_ratio_high", type=float, default=None,
+                        help="Upper PPO/GSPO clip range; defaults to epsilon. verl GSPO recipes often use 0.28.")
+    parser.add_argument("--beta", type=float, default=0.05)
     parser.add_argument("--learning_rate", type=float, default=1e-6)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
-    parser.add_argument("--max_grad_per_param", type=float, default=0.1,
+    parser.add_argument("--max_grad_per_param", type=float, default=0.05,
                         help="Per-parameter gradient clipping value (0=disabled)")
     parser.add_argument("--warmup_steps", type=int, default=20)
     parser.add_argument("--max_steps", type=int, default=1000)
@@ -66,7 +72,7 @@ def parse_args():
 
     # Training
     parser.add_argument("--num_gpus", type=int, default=-1)
-    parser.add_argument("--float_precision", type=str, default="bf16-mixed")
+    parser.add_argument("--float_precision", type=str, default="32-true")
     parser.add_argument(
         "--rl_loss_type",
         type=str,
@@ -87,7 +93,7 @@ def parse_args():
     parser.add_argument(
         "--advantage_norm",
         type=str,
-        default="group",
+        default="group_mean_global_std",
         choices=["group", "group_mean_global_std"],
         help="Advantage normalization: per-group std (legacy) or "
              "per-group mean with batch-wide std (more stable).",
@@ -106,9 +112,13 @@ def parse_args():
         help="If degenerate_group_rate > threshold, skip the optimizer step. "
              "Set to 1.01 to disable.",
     )
+    parser.add_argument("--min_reward_std_to_update", type=float, default=1e-4,
+                        help="Skip update when rollout reward std is below this value.")
+    parser.add_argument("--min_unique_completion_ratio_to_update", type=float, default=0.0,
+                        help="Optional diversity guard; 0 disables update skipping by unique ratio.")
 
     # Optimizer
-    parser.add_argument("--rl_optimizer", type=str, default="adamw",
+    parser.add_argument("--rl_optimizer", type=str, default="muon_adamw",
                         choices=["adamw", "muon_adamw"],
                         help="adamw (default) or muon_adamw (Muon for transformer matrices).")
     parser.add_argument("--muon_lr", type=float, default=2e-4,
@@ -231,7 +241,10 @@ def main():
         top_p=args.top_p,
         generation_batch_size=args.generation_batch_size,
         num_iterations=args.num_iterations,
+        gspo_update_epochs=args.gspo_update_epochs,
         epsilon=args.epsilon,
+        clip_ratio_low=args.clip_ratio_low,
+        clip_ratio_high=args.clip_ratio_high,
         beta=args.beta,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -249,6 +262,8 @@ def main():
         advantage_norm=args.advantage_norm,
         global_std_min=args.global_std_min,
         skip_degenerate_threshold=args.skip_degenerate_threshold,
+        min_reward_std_to_update=args.min_reward_std_to_update,
+        min_unique_completion_ratio_to_update=args.min_unique_completion_ratio_to_update,
         rl_optimizer=args.rl_optimizer,
         muon_lr=args.muon_lr,
         muon_momentum=args.muon_momentum,

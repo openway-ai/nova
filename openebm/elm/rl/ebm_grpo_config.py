@@ -33,10 +33,23 @@ class EBMGRPOConfig:
 
     # ── GRPO Algorithm ────────────────────────────────────────────────────────
     num_iterations: int = 1
-    """GRPO inner loop iterations per batch (μ in paper). Set >1 for multi-step updates."""
+    """Legacy automatic-optimization loss recomputation count. Keep at 1 for
+    energy_reinforce. Prefer gspo_update_epochs for true rollout reuse."""
+
+    gspo_update_epochs: int = 1
+    """True optimizer steps per rollout for energy_gspo, verl-style.
+    Values >1 switch the trainer to manual optimization and reuse one rollout
+    batch for multiple clipped GSPO updates."""
 
     epsilon: float = 0.2
-    """PPO clip range."""
+    """Fallback symmetric PPO/GSPO clip range."""
+
+    clip_ratio_low: Optional[float] = None
+    """Lower GSPO/PPO clip range. If None, uses epsilon."""
+
+    clip_ratio_high: Optional[float] = None
+    """Upper GSPO/PPO clip range. If None, uses epsilon. verl recipes often
+    use a slightly larger high clip, e.g. 0.28, for GRPO/GSPO."""
 
     beta: float = 0.0
     """KL penalty coefficient. 0.0 disables KL (no reference model needed).
@@ -62,6 +75,16 @@ class EBMGRPOConfig:
     """If degenerate_group_rate exceeds this in a step, the optimizer step is
     skipped (training_step returns None). Prevents pretending to train while
     every advantage is zero. Set to 1.01 to disable."""
+
+    min_reward_std_to_update: float = 1e-4
+    """Skip optimizer update when rollout reward std is below this value.
+    This catches all-zero/all-identical reward batches even when the per-rank
+    degenerate-group statistic is diluted by DDP aggregation."""
+
+    min_unique_completion_ratio_to_update: float = 0.0
+    """Optional collapse guard. When >0, skip updates whose unique completion
+    ratio is below this threshold. Keep 0.0 by default so low diversity is
+    logged first and used as a manual diagnostic before enforcing the guard."""
 
     # ── Optimization ──────────────────────────────────────────────────────────
     learning_rate: float = 1e-6
