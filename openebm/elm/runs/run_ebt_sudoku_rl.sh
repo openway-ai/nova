@@ -54,12 +54,13 @@ TEMPERATURE=0.9
 TOP_P=0.9                     # narrowed from 0.95 to reduce long-tail sampling noise
 GENERATION_BATCH_SIZE=8       # sub-batch for generation (VRAM management)
 
-NUM_ITERATIONS=1              # GRPO inner loop (μ in paper)
+NUM_ITERATIONS=1              # legacy loss recomputation; keep 1 when using GSPO_UPDATE_EPOCHS
+GSPO_UPDATE_EPOCHS="${GSPO_UPDATE_EPOCHS:-1}"  # true optimizer steps per rollout for energy_gspo
 EPSILON=0.2                   # PPO clip range (only used by energy_gspo)
 BETA=0.2                      # v3: ↑ 0.05→0.2 (4x). v2 grad_norm 0.07→1.58 evidence KL anchor too weak
 LEARNING_RATE=2e-6            # lowered from 5e-6 to slow collapse-prone transformer drift
 # RL_LOSS_TYPE="energy_reinforce"  # removes 1/|y| dilution
-RL_LOSS_TYPE="energy_gspo" 
+RL_LOSS_TYPE="${RL_LOSS_TYPE:-energy_gspo}"
 
 WEIGHT_DECAY=0.01
 GRADIENT_CLIP_VAL=1.0         # v3 P1: 0.3 → 1.0 (KL anchor BETA=0.2 主导稳定; per-param clip 之前压制了学习信号)
@@ -144,6 +145,7 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "max_completion_length=${MAX_COMPLETION_LENGTH}" \
     "temperature=${TEMPERATURE}" \
     "epsilon=${EPSILON}" \
+    "gspo_update_epochs=${GSPO_UPDATE_EPOCHS}" \
     "beta=${BETA}" \
     "learning_rate=${LEARNING_RATE}" \
     "warmup_steps=${WARMUP_STEPS}" \
@@ -168,6 +170,7 @@ echo "  EBT Sudoku RL (GRPO) 训练"
 echo "=================================="
 echo "SFT checkpoint:          ${SFT_CKPT}"
 echo "Algorithm:               GRPO (${RL_LOSS_TYPE})"
+echo "GSPO update epochs:      ${GSPO_UPDATE_EPOCHS}"
 echo "Num generations:         ${NUM_GENERATIONS}"
 echo "Max completion length:   ${MAX_COMPLETION_LENGTH}"
 echo "Temperature:             ${TEMPERATURE}"
@@ -239,6 +242,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --top_p ${TOP_P} \
     --generation_batch_size ${GENERATION_BATCH_SIZE} \
     --num_iterations ${NUM_ITERATIONS} \
+    --gspo_update_epochs ${GSPO_UPDATE_EPOCHS} \
     --epsilon ${EPSILON} \
     --beta ${BETA} \
     --learning_rate ${LEARNING_RATE} \

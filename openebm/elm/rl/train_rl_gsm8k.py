@@ -100,7 +100,11 @@ class EBMGRPOTrainerGSM8K(EBMGRPOTrainer):
         comp_len = completion_ids.shape[1]
 
         # ── 2. Compute rewards (GSM8K) ────────────────────────────────────────
-        reward_details = self._compute_rewards(completion_texts, batch)
+        expanded_answers = [
+            batch["answers"][i // self.config.num_generations]
+            for i in range(len(completion_texts))
+        ]
+        reward_details = compute_gsm8k_rewards_detailed(completion_texts, expanded_answers)
         rewards = torch.tensor(
             [d["total"] for d in reward_details],
             dtype=torch.float32, device=self.device,
@@ -158,36 +162,17 @@ class EBMGRPOTrainerGSM8K(EBMGRPOTrainer):
         for key in ["format", "exact_match", "partial_credit", "length_penalty"]:
             vals = [d.get(key, 0.0) for d in reward_details]
             reward_components[key] = sum(vals) / max(len(vals), 1)
+        parsed_vals = [1.0 if d.get("parsed_answer") is not None else 0.0 for d in reward_details]
+        correct_vals = [1.0 if d.get("is_correct") else 0.0 for d in reward_details]
+        reward_components["parse_rate"] = sum(parsed_vals) / max(len(parsed_vals), 1)
+        reward_components["answer_acc"] = sum(correct_vals) / max(len(correct_vals), 1)
 
         advantage_var = advantages.var(unbiased=False).item() if advantages.numel() > 1 else 0.0
         reward_var = float(rewards.var(unbiased=False).item()) if rewards.numel() > 1 else 0.0
 
-        # ── 5. Trajectory logging (periodic) ─────────────────────────────────
-        step = self.global_step
-        if os.environ.get('LOCAL_RANK', '0') == '0':
-            traj_logger = self._maybe_init_traj_logger()
-            if traj_logger is not None:
-                energies_list = old_energies.detach().cpu().tolist()
-                advantages_list = advantages.detach().cpu().tolist()
-                rewards_list = rewards.detach().cpu().tolist()
-                # decode prompts for logging
-                prompt_texts = []
-                for i in range(num_prompts):
-                    ids = prompt_ids[i].tolist()
-                    prompt_texts.append(self.tokenizer.decode(
-                        [t for t in ids if t != getattr(self.tokenizer, 'bos_token_id', 0)]
-                    ))
-                traj_logger.maybe_log(
-                    step=step,
-                    prompts=prompt_texts,
-                    completions=completion_texts,
-                    rewards=rewards_list,
-                    ground_truths=[batch["answers"][i // self.config.num_generations]
-                                   for i in range(len(completion_texts))],
-                    energies=energies_list,
-                    advantages=advantages_list,
-                )
-
+        # Parent training_step handles trajectory logging and collapse detection
+        # using the raw arrays returned below. Keeping it in one place avoids
+        # duplicate dumps and keeps Sudoku/GSM8K diagnostics comparable.
         return {
             "full_ids": full_ids,
             "prompt_len": prompt_len,
@@ -204,6 +189,15 @@ class EBMGRPOTrainerGSM8K(EBMGRPOTrainer):
             "avg_completion_length": avg_comp_len,
             "reward_components": reward_components,
             "degenerate_rate": degenerate_rate,
+            # Raw arrays carried through for parent trajectory logging and collapse detection.
+            "_completion_texts": completion_texts,
+            "_rewards": rewards.detach().cpu().tolist(),
+            "_old_energies": old_energies.detach().cpu().tolist(),
+            "_advantages": advantages.detach().cpu().tolist(),
+            "_completion_masks_lens": completion_masks.sum(dim=1).long().cpu().tolist(),
+            "_puzzles": [batch["questions"][i // self.config.num_generations] for i in range(len(completion_texts))],
+            "_solutions": expanded_answers,
+            "_prompt_ids_per_seq": expanded_prompts.cpu().tolist(),
         }
 
     # ── Dataloaders (override) ────────────────────────────────────────────────
@@ -269,13 +263,19 @@ def parse_args():
 
     # GRPO config
     parser.add_argument("--num_generations", type=int, default=8)
-    parser.add_argument("--max_completion_length", type=int, default=512)
+    parser.add_argument("--max_completion_length", type=int, default=320)
     parser.add_argument("--max_prompt_length", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.9)
-    parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--top_p", type=float, default=0.92)
     parser.add_argument("--generation_batch_size", type=int, default=8)
     parser.add_argument("--num_iterations", type=int, default=1)
+    parser.add_argument("--gspo_update_epochs", type=int, default=1,
+                        help="True optimizer steps per rollout for energy_gspo. Values >1 enable verl-style rollout reuse.")
     parser.add_argument("--epsilon", type=float, default=0.2)
+    parser.add_argument("--clip_ratio_low", type=float, default=None,
+                        help="Lower PPO/GSPO clip range; defaults to epsilon.")
+    parser.add_argument("--clip_ratio_high", type=float, default=None,
+                        help="Upper PPO/GSPO clip range; defaults to epsilon. verl GSPO recipes often use 0.28.")
     parser.add_argument("--beta", type=float, default=0.05)
     parser.add_argument("--learning_rate", type=float, default=2e-6)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -288,14 +288,18 @@ def parse_args():
     parser.add_argument("--save_top_k", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--rl_loss_type", type=str, default="energy_reinforce",
+    parser.add_argument("--rl_loss_type", type=str, default="energy_gspo",
                         choices=["energy_gspo", "energy_reinforce", "token_logprobs"])
     parser.add_argument("--advantage_norm", type=str, default="group_mean_global_std")
     parser.add_argument("--global_std_min", type=float, default=0.1)
     parser.add_argument("--skip_degenerate_threshold", type=float, default=0.9)
+    parser.add_argument("--min_reward_std_to_update", type=float, default=1e-4,
+                        help="Skip update when rollout reward std is below this value.")
+    parser.add_argument("--min_unique_completion_ratio_to_update", type=float, default=0.0,
+                        help="Optional diversity guard; 0 disables update skipping by unique ratio.")
 
     # Optimizer
-    parser.add_argument("--rl_optimizer", type=str, default="adamw",
+    parser.add_argument("--rl_optimizer", type=str, default="muon_adamw",
                         choices=["adamw", "muon_adamw"])
     parser.add_argument("--muon_lr", type=float, default=2e-4)
     parser.add_argument("--muon_momentum", type=float, default=0.95)
@@ -417,7 +421,10 @@ def main():
         top_p=args.top_p,
         generation_batch_size=args.generation_batch_size,
         num_iterations=args.num_iterations,
+        gspo_update_epochs=args.gspo_update_epochs,
         epsilon=args.epsilon,
+        clip_ratio_low=args.clip_ratio_low,
+        clip_ratio_high=args.clip_ratio_high,
         beta=args.beta,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -434,6 +441,8 @@ def main():
         advantage_norm=args.advantage_norm,
         global_std_min=args.global_std_min,
         skip_degenerate_threshold=args.skip_degenerate_threshold,
+        min_reward_std_to_update=args.min_reward_std_to_update,
+        min_unique_completion_ratio_to_update=args.min_unique_completion_ratio_to_update,
         rl_optimizer=args.rl_optimizer,
         muon_lr=args.muon_lr,
         muon_momentum=args.muon_momentum,

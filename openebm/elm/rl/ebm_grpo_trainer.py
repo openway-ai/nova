@@ -12,6 +12,7 @@ Key difference from d1's diffu-GRPO:
 """
 
 import copy
+import json
 import os
 import time
 from typing import Optional
@@ -89,6 +90,14 @@ class EBMGRPOTrainer(LightningModule):
         # Metrics tracking
         self._step_metrics = {}
         self._skip_optim_step = False
+        self._manual_gspo_updates = (
+            getattr(config, "gspo_update_epochs", 1) > 1
+            and config.rl_loss_type == "energy_gspo"
+        )
+        if getattr(config, "gspo_update_epochs", 1) > 1 and config.rl_loss_type != "energy_gspo":
+            raise ValueError("gspo_update_epochs > 1 is only supported for rl_loss_type='energy_gspo'")
+        if self._manual_gspo_updates:
+            self.automatic_optimization = False
 
         # Trajectory logger — initialised lazily on first use so the output
         # dir is available. Set output_dir via TRAJ_OUTPUT_DIR env var or
@@ -113,6 +122,54 @@ class EBMGRPOTrainer(LightningModule):
             self.ref_model.eval()
         else:
             self.ref_model = None
+
+    def _is_rank0(self):
+        return os.environ.get("LOCAL_RANK", "0") == "0" and os.environ.get("RANK", "0") == "0"
+
+    def _json_safe(self, value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return self._json_safe(value.detach().item())
+            return [self._json_safe(v) for v in value.detach().cpu().tolist()]
+        if isinstance(value, dict):
+            return {str(k): self._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(v) for v in value]
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _log_json_event(self, event, step, payload):
+        if not self._is_rank0():
+            return
+        record = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "event": event,
+            "step": int(step),
+            **self._json_safe(payload),
+        }
+        print("[GRPO-JSON] " + json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
+
+    def _reward_component_short_names(self, components):
+        short = {
+            "format": "fmt",
+            "clue_preservation": "clue",
+            "blank_accuracy": "blank_acc",
+            "full_solve": "solve",
+            "exact_match": "exact",
+            "partial_credit": "partial",
+            "length_penalty": "len_pen",
+        }
+        return {short.get(k, k): v for k, v in components.items()}
+
+    def _component_text(self, components):
+        short_components = self._reward_component_short_names(components)
+        return " ".join(f"{k}={float(v):.3f}" for k, v in short_components.items())
+
+    def _completion_unique_ratio(self, completions):
+        if not completions:
+            return 0.0
+        return len(set(completions)) / max(1, len(completions))
 
     def _build_gen_hparams(self):
         """Build a hparams-like namespace for generate.py functions."""
@@ -150,17 +207,30 @@ class EBMGRPOTrainer(LightningModule):
         #      every p.grad to None — AdamW's per-param branch is
         #      `if p.grad is None: continue`, which truly skips the update
         #      (including weight_decay).
+        completions_for_skip = gen_data.get("_completion_texts", [])
+        unique_ratio_for_skip = self._completion_unique_ratio(completions_for_skip)
         skip_thr = getattr(self.config, "skip_degenerate_threshold", 1.01)
-        local_skip = float(gen_data["degenerate_rate"] > skip_thr)
+        min_reward_std = getattr(self.config, "min_reward_std_to_update", 0.0)
+        min_unique_ratio = getattr(self.config, "min_unique_completion_ratio_to_update", 0.0)
+        skip_reasons = []
+        if gen_data["degenerate_rate"] > skip_thr:
+            skip_reasons.append("degenerate_group_rate")
+        if min_reward_std > 0.0 and gen_data.get("reward_std", 0.0) < min_reward_std:
+            skip_reasons.append("low_reward_std")
+        if min_unique_ratio > 0.0 and unique_ratio_for_skip < min_unique_ratio:
+            skip_reasons.append("low_unique_completion_ratio")
+        local_skip = float(bool(skip_reasons))
         import torch.distributed as dist
         if dist.is_available() and dist.is_initialized():
             flag = torch.tensor([local_skip], device=self.device)
-            # MIN: skip only when every rank agrees the batch is degenerate.
+            # MIN: skip only when every rank agrees the batch has no useful signal.
             dist.all_reduce(flag, op=dist.ReduceOp.MIN)
             global_skip = flag.item() > 0.5
         else:
             global_skip = local_skip > 0.5
 
+        self.log("stability/reward_std_too_low", float("low_reward_std" in skip_reasons))
+        self.log("stability/unique_completion_ratio", unique_ratio_for_skip)
         self._skip_optim_step = global_skip
 
         if global_skip:
@@ -169,13 +239,31 @@ class EBMGRPOTrainer(LightningModule):
             self.log("train/reward_mean", gen_data["reward_mean"], prog_bar=True)
             step = self.global_step
             if step % self.config.log_interval == 0:
-                import os as _os
-                if _os.environ.get('LOCAL_RANK', '0') == '0':
+                if self._is_rank0():
                     print(
-                        f"[GRPO] step={step} SKIPPED degen={gen_data['degenerate_rate']:.2f} "
-                        f"reward={gen_data['reward_mean']:.3f}",
+                        f"[GRPO] step={step} SKIPPED reason={','.join(skip_reasons) or 'ddp_consensus'} "
+                        f"degen={gen_data['degenerate_rate']:.2f} "
+                        f"reward={gen_data['reward_mean']:.3f}±{gen_data['reward_std']:.3f} "
+                        f"uniq={unique_ratio_for_skip:.2f}",
                         flush=True,
                     )
+                self._log_json_event("rl_step", step, {
+                    "loss": {"total": 0.0, "policy": 0.0, "kl": 0.0, "clip_ratio": 0.0},
+                    "reward": {
+                        "mean": gen_data["reward_mean"],
+                        "std": gen_data["reward_std"],
+                        "var": gen_data.get("reward_var", 0.0),
+                        "advantage_var": gen_data.get("advantage_var", 0.0),
+                        "components": gen_data.get("reward_components", {}),
+                    },
+                    "rollout": {
+                        "completion_len_mean": gen_data.get("avg_completion_length", 0.0),
+                        "unique_completion_ratio": unique_ratio_for_skip,
+                        "degenerate_group_rate": gen_data.get("degenerate_rate", 0.0),
+                        "skipped_step": 1.0,
+                        "skip_reasons": skip_reasons,
+                    },
+                })
             # Placeholder loss: every trainable parameter contributes a
             # zero-valued term so DDP's backward all-reduce covers them all
             # (required when find_unused_parameters=True with no real grad).
@@ -187,19 +275,47 @@ class EBMGRPOTrainer(LightningModule):
             return placeholder
         self.log("stability/skipped_step", 0.0)
 
-        # ── Phase 2: Policy Update (with grad) ───────────────────────────────
-        total_loss = torch.tensor(0.0, device=self.device)
-        total_metrics = {
-            "policy_loss": 0.0,
-            "kl": 0.0,
-            "clip_ratio": 0.0,
-        }
+        if self._manual_gspo_updates:
+            total_loss, total_metrics = self._manual_gspo_rollout_updates(gen_data)
+            if total_loss is None:
+                return sum((p * 0.0).sum() for p in self.model.parameters() if p.requires_grad)
+            self.log("train/gspo_update_epochs", float(self.config.gspo_update_epochs))
+        else:
+            # ── Phase 2: Policy Update (with grad) ───────────────────────────
+            total_loss = torch.tensor(0.0, device=self.device)
+            total_metrics = {
+                "policy_loss": 0.0,
+                "kl": 0.0,
+                "clip_ratio": 0.0,
+            }
 
-        for iteration in range(self.config.num_iterations):
-            loss, metrics = self._compute_grpo_loss(gen_data, iteration)
-            total_loss = total_loss + loss / self.config.num_iterations
-            for k, v in metrics.items():
-                total_metrics[k] += v / self.config.num_iterations
+            for iteration in range(self.config.num_iterations):
+                loss, metrics = self._compute_grpo_loss(gen_data, iteration)
+                total_loss = total_loss + loss / self.config.num_iterations
+                for k, v in metrics.items():
+                    total_metrics[k] = total_metrics.get(k, 0.0) + v / self.config.num_iterations
+
+        # Automatic optimization path returns this tensor for Lightning backward.
+        # Manual GSPO path has already stepped the optimizer and returns a
+        # detached scalar only for logging/progress display.
+        if not torch.isfinite(total_loss):
+            self._skip_optim_step = True
+            step = self.global_step
+            self.log("stability/nonfinite_loss", 1.0)
+            self._log_json_event("rl_nonfinite_loss", step, {
+                "loss": {"total": str(total_loss.detach().cpu().item())},
+                "reward": {
+                    "mean": gen_data.get("reward_mean"),
+                    "std": gen_data.get("reward_std"),
+                    "components": gen_data.get("reward_components", {}),
+                },
+                "rollout": {
+                    "degenerate_group_rate": gen_data.get("degenerate_rate", 0.0),
+                    "unique_completion_ratio": unique_ratio_for_skip,
+                },
+            })
+            return sum((p * 0.0).sum() for p in self.model.parameters() if p.requires_grad)
+        self.log("stability/nonfinite_loss", 0.0)
 
         # ── Logging ───────────────────────────────────────────────────────────
         loss_val = total_loss.item()
@@ -221,38 +337,80 @@ class EBMGRPOTrainer(LightningModule):
         self.log("stability/degenerate_group_rate", gen_data.get("degenerate_rate", 0.0))
         self._log_stability_metrics()
 
-        # ── Stdout metrics (visible in train.log via pipe) ───────────────────
+        # ── Stdout/JSON metrics (visible in train.log via pipe) ──────────────
         step = self.global_step
+        rc = gen_data.get("reward_components", {})
+        completions = gen_data.get("_completion_texts", [])
+        unique_ratio = self._completion_unique_ratio(completions)
+        self.log("train/unique_completion_ratio", unique_ratio)
+
         if step % self.config.log_interval == 0:
-            rc = gen_data.get("reward_components", {})
-            print(
-                f"[GRPO] step={step} | "
-                f"loss={loss_val:.4f} | "
-                f"reward={gen_data['reward_mean']:.3f}±{gen_data['reward_std']:.3f} | "
-                f"fmt={rc.get('format', 0):.2f} clue={rc.get('clue_preservation', 0):.2f} "
-                f"blank_acc={rc.get('blank_accuracy', 0):.3f} solve={rc.get('full_solve', 0):.2f} | "
-                f"comp_len={gen_data['avg_completion_length']:.0f} | "
-                f"clip={total_metrics['clip_ratio']:.2f} degen={gen_data.get('degenerate_rate', 0):.2f}",
-                flush=True,
-            )
+            component_text = self._component_text(rc)
+            if self._is_rank0():
+                print(
+                    f"[GRPO] step={step} | "
+                    f"loss={loss_val:.4f} | "
+                    f"reward={gen_data['reward_mean']:.3f}±{gen_data['reward_std']:.3f} | "
+                    f"{component_text} | "
+                    f"comp_len={gen_data['avg_completion_length']:.0f} | "
+                    f"clip={total_metrics.get('clip_ratio', 0.0):.2f} "
+                    f"degen={gen_data.get('degenerate_rate', 0):.2f} "
+                    f"uniq={unique_ratio:.2f}",
+                    flush=True,
+                )
+            self._log_json_event("rl_step", step, {
+                "loss": {
+                    "total": loss_val,
+                    "policy": total_metrics.get("policy_loss", 0.0),
+                    "kl": total_metrics.get("kl", 0.0),
+                    "clip_ratio": total_metrics.get("clip_ratio", 0.0),
+                    "reinforce_surrogate": total_metrics.get("reinforce_surrogate"),
+                },
+                "reward": {
+                    "mean": gen_data["reward_mean"],
+                    "std": gen_data["reward_std"],
+                    "var": gen_data["reward_var"],
+                    "advantage_var": gen_data["advantage_var"],
+                    "components": rc,
+                },
+                "rollout": {
+                    "completion_len_mean": gen_data["avg_completion_length"],
+                    "unique_completion_ratio": unique_ratio,
+                    "degenerate_group_rate": gen_data.get("degenerate_rate", 0.0),
+                    "skipped_step": 0.0,
+                },
+                "energy": {
+                    "current_mean": total_metrics.get("energy_mean"),
+                    "old_mean": total_metrics.get("old_energy_mean"),
+                    "drift": total_metrics.get("energy_drift"),
+                    "kl_proxy": total_metrics.get("kl", 0.0),
+                    "ratio_mean": total_metrics.get("ratio_mean"),
+                    "log_ratio_abs_max": total_metrics.get("log_ratio_abs_max"),
+                    "log_ratio_clamp_rate": total_metrics.get("log_ratio_clamp_rate"),
+                    "effective_clip_rate": total_metrics.get("effective_clip_rate"),
+                    "energy_ppo_kl": total_metrics.get("energy_ppo_kl"),
+                    "clip_ratio_low": total_metrics.get("clip_ratio_low"),
+                    "clip_ratio_high": total_metrics.get("clip_ratio_high"),
+                },
+            })
 
         # ── Trajectory logging & collapse detection ──────────────────────────
         self._maybe_init_traj_logger()
         if self._traj_logger is not None:
-            completions = gen_data.get("_completion_texts", [])
             rewards_list = gen_data.get("_rewards", [])
             energies_list = gen_data.get("_old_energies", [])
             adv_list = gen_data.get("_advantages", [])
             lens_list = gen_data.get("_completion_masks_lens", [])
-            puzzles_list = gen_data.get("_puzzles", [])
+            prompts_list = gen_data.get("_puzzles", [])
+            ground_truths_list = gen_data.get("_solutions", prompts_list)
 
             # Periodic stdout + JSONL dump
             self._traj_logger.maybe_log(
                 step=step,
-                prompts=puzzles_list,
+                prompts=prompts_list,
                 completions=completions,
                 rewards=rewards_list,
-                ground_truths=puzzles_list,
+                ground_truths=ground_truths_list,
                 energies=energies_list,
                 advantages=adv_list,
                 kls=[total_metrics["kl"]] * len(completions),
@@ -260,21 +418,15 @@ class EBMGRPOTrainer(LightningModule):
             )
 
             # Collapse detection
-            unique_ratio = (
-                len(set(completions)) / max(1, len(completions))
-                if completions else 0.0
-            )
             self._traj_logger.detect_collapse(
                 step=step,
                 rewards=rewards_list,
                 unique_completion_ratio=unique_ratio,
-                prompts=puzzles_list,
+                prompts=prompts_list,
                 completions=completions,
-                ground_truths=puzzles_list,
+                ground_truths=ground_truths_list,
                 energies=energies_list,
             )
-            self.log("train/unique_completion_ratio", unique_ratio)
-
         return total_loss
 
     def _log_stability_metrics(self):
@@ -486,6 +638,67 @@ class EBMGRPOTrainer(LightningModule):
             "_prompt_ids_per_seq": expanded_prompts.cpu().tolist(),
         }
 
+    def _manual_gspo_rollout_updates(self, gen_data):
+        """Reuse one rollout for multiple clipped GSPO optimizer updates.
+
+        This mirrors verl's ppo_epochs idea but is restricted to energy_gspo,
+        where old_energies provide a sequence-level proximal anchor.
+        """
+        optimizer = self.optimizers()
+        scheduler = self.lr_schedulers()
+        total_loss = torch.tensor(0.0, device=self.device)
+        total_metrics = {"policy_loss": 0.0, "kl": 0.0, "clip_ratio": 0.0}
+        completed = 0
+
+        for update_epoch in range(self.config.gspo_update_epochs):
+            optimizer.zero_grad()
+            loss, metrics = self._compute_grpo_loss(gen_data, update_epoch)
+            if not torch.isfinite(loss):
+                self.log("stability/nonfinite_loss", 1.0)
+                self._log_json_event("gspo_update_skipped", self.global_step, {
+                    "update_epoch": update_epoch,
+                    "reason": "nonfinite_loss",
+                    "loss": str(loss.detach().cpu().item()),
+                    "reward": {
+                        "mean": gen_data.get("reward_mean"),
+                        "std": gen_data.get("reward_std"),
+                        "components": gen_data.get("reward_components", {}),
+                    },
+                })
+                optimizer.zero_grad()
+                break
+
+            self.manual_backward(loss)
+            grad_metrics = self._sanitize_log_and_clip_gradients()
+            optimizer.step()
+            if scheduler is not None:
+                if isinstance(scheduler, (list, tuple)):
+                    for sch in scheduler:
+                        sch.step()
+                else:
+                    scheduler.step()
+
+            completed += 1
+            total_loss = total_loss + loss.detach()
+            for k, v in metrics.items():
+                total_metrics[k] = total_metrics.get(k, 0.0) + v
+
+            if self.global_step % self.config.log_interval == 0:
+                self._log_json_event("gspo_update_epoch", self.global_step, {
+                    "update_epoch": update_epoch + 1,
+                    "update_epochs": self.config.gspo_update_epochs,
+                    "loss": {"total": loss.detach().item(), **metrics},
+                    "grad": grad_metrics,
+                })
+
+        if completed == 0:
+            return None, total_metrics
+        total_loss = total_loss / completed
+        for k in list(total_metrics.keys()):
+            total_metrics[k] = total_metrics[k] / completed
+        total_metrics["gspo_completed_update_epochs"] = float(completed)
+        return total_loss, total_metrics
+
     def _compute_grpo_loss(self, gen_data, iteration):
         """Compute GRPO loss. Supports three variants via config.rl_loss_type."""
         full_ids = gen_data["full_ids"]
@@ -561,15 +774,24 @@ class EBMGRPOTrainer(LightningModule):
         with torch.amp.autocast('cuda', enabled=False):
             current_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
 
-        # Sequence-level importance ratio. Energies are already per-token mean.
+        # Sequence-level importance ratio, adapted from verl's GSPO loss.
+        # Treat -E as a sequence log-prob surrogate. The forward ratio is the
+        # rollout-vs-current sequence ratio, while the gradient flows through
+        # `-current_energies - sg(-current_energies)`, matching verl's
+        # `log_prob - log_prob.detach() + seq_ratio.detach()` pattern.
         raw_log_ratio = -(current_energies - old_energies)
-        log_ratio = raw_log_ratio.clamp(-10.0, 10.0)
+        log_ratio_for_grad = (
+            -current_energies + current_energies.detach() + raw_log_ratio.detach()
+        )
+        log_ratio = torch.clamp(log_ratio_for_grad, max=10.0)
         ratio = torch.exp(log_ratio)
 
-        clipped_ratio = torch.clamp(ratio, 1.0 - self.config.epsilon, 1.0 + self.config.epsilon)
-        loss1 = ratio * advantages
-        loss2 = clipped_ratio * advantages
-        policy_loss = -torch.min(loss1, loss2).mean()
+        clip_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else self.config.epsilon
+        clip_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else self.config.epsilon
+        clipped_ratio = torch.clamp(ratio, 1.0 - clip_low, 1.0 + clip_high)
+        pg_losses1 = -advantages * ratio
+        pg_losses2 = -advantages * clipped_ratio
+        policy_loss = torch.maximum(pg_losses1, pg_losses2).mean()
 
         # KL anchor on top of PPO clip. PPO clip bounds per-step ratio drift,
         # the KL term bounds cumulative drift from SFT ref. They're orthogonal.
@@ -584,13 +806,27 @@ class EBMGRPOTrainer(LightningModule):
 
         # P1a: log_ratio clamp visibility.
         log_ratio_abs_max = raw_log_ratio.abs().max().item()
-        log_ratio_clamp_rate = (raw_log_ratio.abs() > 10.0).float().mean().item()
-        # P1b: "effective clip rate" = how often PPO `min` actually selected
-        # the clipped branch (matches PPO paper's definition).
-        effective_clip_rate = (loss2 < loss1).float().mean().item()
+        log_ratio_clamp_rate = (raw_log_ratio > 10.0).float().mean().item()
+        # P1b: effective clip rate = how often clipped branch is selected.
+        effective_clip_rate = (pg_losses2 > pg_losses1).float().mean().item()
+        energy_ppo_kl = (current_energies - old_energies).mean().item()
+
+        # Diagnostic: equivalent REINFORCE loss surrogate.
+        # When num_iterations=1 the on-policy ratio is ≡1 → policy_loss is
+        # mathematically -mean(A) = 0 (A is group-relative z-score with
+        # mean=0). The displayed `loss=0` is a numerical artefact; actual
+        # gradients are non-zero. Logging `mean(A * E)` gives a visible,
+        # non-zero signal whose magnitude tracks the true update direction
+        # — same form as the REINFORCE branch — so users can monitor
+        # learning progress in GSPO mode despite the misleading zero loss.
+        # `.detach()` avoids touching the autograd graph.
+        reinforce_surrogate = (
+            advantages.detach() * current_energies.detach()
+        ).mean().item()
 
         self.log("train/energy_mean", current_energies.mean().item())
         self.log("train/ratio_mean", ratio.mean().item())
+        self.log("train/reinforce_surrogate", reinforce_surrogate)
         self.log("stability/log_ratio_abs_max", log_ratio_abs_max)
         self.log("stability/log_ratio_clamp_rate", log_ratio_clamp_rate)
         self.log("train/effective_clip_rate", effective_clip_rate)
@@ -603,7 +839,9 @@ class EBMGRPOTrainer(LightningModule):
                     f"ratio_mean={ratio.mean().item():.4f} "
                     f"log_ratio_abs_max={log_ratio_abs_max:.4f} "
                     f"clamp_rate={log_ratio_clamp_rate:.3f} "
-                    f"effective_clip={effective_clip_rate:.3f}",
+                    f"effective_clip={effective_clip_rate:.3f} "
+                    f"energy_ppo_kl={energy_ppo_kl:+.4f} "
+                    f"reinforce_surrogate={reinforce_surrogate:+.6f}",
                     flush=True,
                 )
 
@@ -611,6 +849,17 @@ class EBMGRPOTrainer(LightningModule):
             "policy_loss": policy_loss.item(),
             "kl": kl_value,
             "clip_ratio": effective_clip_rate,
+            "effective_clip_rate": effective_clip_rate,
+            "energy_mean": current_energies.mean().item(),
+            "old_energy_mean": old_energies.mean().item(),
+            "energy_drift": energy_drift,
+            "ratio_mean": ratio.mean().item(),
+            "log_ratio_abs_max": log_ratio_abs_max,
+            "log_ratio_clamp_rate": log_ratio_clamp_rate,
+            "energy_ppo_kl": energy_ppo_kl,
+            "clip_ratio_low": clip_low,
+            "clip_ratio_high": clip_high,
+            "reinforce_surrogate": reinforce_surrogate,
         }
 
     def _loss_energy_reinforce(self, gen_data):
@@ -661,7 +910,14 @@ class EBMGRPOTrainer(LightningModule):
                     flush=True,
                 )
 
-        return loss, {"policy_loss": policy_loss.item(), "kl": kl_value, "clip_ratio": 0.0}
+        return loss, {
+            "policy_loss": policy_loss.item(),
+            "kl": kl_value,
+            "clip_ratio": 0.0,
+            "energy_mean": cur_energy_mean,
+            "old_energy_mean": gen_data["old_energies"].mean().item(),
+            "energy_drift": energy_drift,
+        }
 
     def _loss_token_logprobs(self, gen_data, iteration):
         """Token-level logprobs ratio (legacy). Known to produce NaN with EBT."""
@@ -736,20 +992,7 @@ class EBMGRPOTrainer(LightningModule):
     # Optimizer
     # ══════════════════════════════════════════════════════════════════════════
 
-    def on_before_optimizer_step(self, optimizer):
-        """Log gradient norms, sanitize NaN grads, and apply per-parameter clipping."""
-        # If training_step flagged this batch as skip-degen, drop every grad
-        # to None so AdamW (and any stateful optimizer) leaves params untouched.
-        # Lightning still steps the LR scheduler — that's a small acceptable cost.
-        if getattr(self, "_skip_optim_step", False):
-            for p in self.model.parameters():
-                p.grad = None
-            self._skip_optim_step = False
-            self.log("stability/grad_norm_before_clip", 0.0)
-            self.log("stability/max_param_grad_norm", 0.0)
-            self.log("stability/nan_grad_params", 0.0)
-            return
-
+    def _sanitize_log_and_clip_gradients(self):
         total_norm = 0.0
         alpha_grad = None
         max_param_grad_norm = 0.0
@@ -757,7 +1000,6 @@ class EBMGRPOTrainer(LightningModule):
 
         for name, p in self.model.named_parameters():
             if p.grad is not None:
-                # Sanitize NaN/Inf gradients BEFORE clipping — clamp(NaN) is still NaN.
                 if not torch.isfinite(p.grad.data).all():
                     nan_grad_params += 1
                     p.grad.data = torch.where(
@@ -776,17 +1018,21 @@ class EBMGRPOTrainer(LightningModule):
         if alpha_grad is not None:
             self.log("stability/alpha_grad", alpha_grad)
 
+        step = self.global_step
         if nan_grad_params > 0:
             import os as _os
-            _rank = _os.environ.get('LOCAL_RANK', '?')
-            print(
-                f"[DBG-RL][rank={_rank}] Sanitized NaN grads in {nan_grad_params} params "
-                f"(total_norm_after={total_norm:.4e})",
-                flush=True,
-            )
+            try:
+                nan_debug_interval = int(_os.environ.get("NAN_GRAD_DEBUG_INTERVAL", "0"))
+            except ValueError:
+                nan_debug_interval = 0
+            if nan_debug_interval > 0 and step % nan_debug_interval == 0:
+                _rank = _os.environ.get('LOCAL_RANK', '?')
+                print(
+                    f"[DBG-RL][rank={_rank}] Sanitized NaN grads in {nan_grad_params} params "
+                    f"(total_norm_after={total_norm:.4e})",
+                    flush=True,
+                )
 
-        # Stdout grad stats (rank 0 only, every log_interval steps)
-        step = self.global_step
         if step % self.config.log_interval == 0:
             import os as _os
             if _os.environ.get('LOCAL_RANK', '0') == '0':
@@ -796,12 +1042,29 @@ class EBMGRPOTrainer(LightningModule):
                     flush=True,
                 )
 
-        # Per-parameter gradient clipping
         if self.config.max_grad_per_param > 0.0:
             clip_val = self.config.max_grad_per_param
             for p in self.model.parameters():
                 if p.grad is not None:
                     p.grad.data.clamp_(-clip_val, clip_val)
+
+        return {
+            "grad_norm_before_clip": total_norm,
+            "max_param_grad_norm": max_param_grad_norm,
+            "nan_grad_params": float(nan_grad_params),
+        }
+
+    def on_before_optimizer_step(self, optimizer):
+        """Log gradient norms, sanitize NaN grads, and apply per-parameter clipping."""
+        if getattr(self, "_skip_optim_step", False):
+            for p in self.model.parameters():
+                p.grad = None
+            self._skip_optim_step = False
+            self.log("stability/grad_norm_before_clip", 0.0)
+            self.log("stability/max_param_grad_norm", 0.0)
+            self.log("stability/nan_grad_params", 0.0)
+            return
+        self._sanitize_log_and_clip_gradients()
 
     def configure_optimizers(self):
         """Dispatch to the configured optimizer kind."""
@@ -964,12 +1227,23 @@ class EBMGRPOTrainer(LightningModule):
             ))
 
         # PL closure compatibility (mirrors trainer.py:1562 PLMuonAdamW).
+        # Also guards against None grads in Muon groups: skip-degen sets every
+        # p.grad = None to halt the optimizer step, but nanochat's _step_muon
+        # does `torch.stack([p.grad for p in params])` which crashes on None.
+        # We zero-fill missing grads so Muon stacks zeros (effectively a no-op).
         class PLMuonAdamW(MuonAdamW):
             @torch.no_grad()
             def step(self, closure=None):
                 if closure is not None:
                     with torch.enable_grad():
                         closure()
+                for g in self.param_groups:
+                    if g.get('kind') != 'muon':
+                        continue
+                    if any(p.grad is None for p in g['params']):
+                        for p in g['params']:
+                            if p.grad is None:
+                                p.grad = torch.zeros_like(p)
                 super().step()
 
         optimizer = PLMuonAdamW(param_groups)
@@ -1006,120 +1280,6 @@ class EBMGRPOTrainer(LightningModule):
             },
         }
 
-    def _configure_muon_adamw_optimizer(self):
-        """Muon (transformer matrices) + AdamW (everything else) — RL variant.
-
-        Mirrors openebm.elm.trainer._configure_muon_adamw_optimizer (used in
-        SFT) but is simplified for the RL setting:
-          - alpha / embeddings / langevin_noise are already frozen in __init__
-            (requires_grad=False), so they auto-skip; no group is created.
-          - vocab_to_embed → AdamW, lr = base_lr * 0.5 (matches v3 P0 ratio).
-          - transformer matrices (ndim>=2) → Muon, grouped by shape.
-          - transformer scalars (ndim<2) + any other trainable params → AdamW,
-            lr = base_lr * 2.0 (matches v3 P0 ratio).
-        """
-        from nanochat.optim import MuonAdamW
-
-        base_lr = self.config.learning_rate
-        v2e_lr = base_lr * 0.5
-        scalar_lr = base_lr * 2.0
-        muon_lr = self.config.muon_lr
-        adam_betas = (0.9, 0.95)
-
-        v2e_params, scalar_params, matrix_params, other_params = [], [], [], []
-        for n, p in self.model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if n.startswith("vocab_to_embed.") or ".vocab_to_embed." in n:
-                v2e_params.append(p)
-            elif n.startswith("transformer.") or ".transformer." in n:
-                if p.ndim >= 2:
-                    matrix_params.append(p)
-                else:
-                    scalar_params.append(p)
-            else:
-                # alpha / scalars outside transformer → AdamW scalar lane
-                other_params.append(p)
-
-        param_groups = []
-        if v2e_params:
-            param_groups.append(dict(
-                kind='adamw', params=v2e_params,
-                lr=v2e_lr, betas=adam_betas, eps=1e-10,
-                weight_decay=0.0,
-            ))
-        if scalar_params:
-            param_groups.append(dict(
-                kind='adamw', params=scalar_params,
-                lr=scalar_lr, betas=adam_betas, eps=1e-10,
-                weight_decay=0.0,
-            ))
-        if other_params:
-            param_groups.append(dict(
-                kind='adamw', params=other_params,
-                lr=base_lr, betas=adam_betas, eps=1e-10,
-                weight_decay=self.config.weight_decay,
-            ))
-
-        # Muon needs same-shape stacking — group transformer matrices by shape.
-        shape_groups = {}
-        for p in matrix_params:
-            shape_groups.setdefault(p.shape, []).append(p)
-        for shape in sorted(shape_groups.keys(), key=lambda s: tuple(s)):
-            param_groups.append(dict(
-                kind='muon', params=shape_groups[shape],
-                lr=muon_lr,
-                momentum=self.config.muon_momentum,
-                ns_steps=self.config.muon_ns_steps,
-                beta2=self.config.muon_beta2,
-                weight_decay=self.config.weight_decay,
-            ))
-
-        # PL closure compatibility (mirrors trainer.py:1562 PLMuonAdamW).
-        class PLMuonAdamW(MuonAdamW):
-            @torch.no_grad()
-            def step(self, closure=None):
-                if closure is not None:
-                    with torch.enable_grad():
-                        closure()
-                super().step()
-
-        optimizer = PLMuonAdamW(param_groups)
-        for g in optimizer.param_groups:
-            g['initial_lr'] = g['lr']
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, self._build_lr_lambda())
-
-        import os as _os
-        if _os.environ.get("LOCAL_RANK", "0") == "0":
-            n_muon = sum(p.numel() for p in matrix_params)
-            n_v2e = sum(p.numel() for p in v2e_params)
-            n_scalar = sum(p.numel() for p in scalar_params)
-            n_other = sum(p.numel() for p in other_params)
-            n_total = n_muon + n_v2e + n_scalar + n_other
-            print("=" * 80, flush=True)
-            print("[Muon+AdamW] RL hybrid optimizer enabled:", flush=True)
-            print(f"  Muon  groups (by shape): {len(shape_groups)}", flush=True)
-            print(f"  Muon  params: {n_muon:,} ({n_muon/max(1,n_total)*100:.1f}%) lr={muon_lr:.2e}",
-                  flush=True)
-            print(f"  AdamW vocab_to_embed:    {n_v2e:,} lr={v2e_lr:.2e}", flush=True)
-            print(f"  AdamW transformer scalar:{n_scalar:,} lr={scalar_lr:.2e}", flush=True)
-            print(f"  AdamW other (catch-all): {n_other:,} lr={base_lr:.2e}", flush=True)
-            print(f"  Muon  momentum={self.config.muon_momentum} "
-                  f"ns_steps={self.config.muon_ns_steps} beta2={self.config.muon_beta2}",
-                  flush=True)
-            print("=" * 80, flush=True)
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-            },
-        }
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Data
     # ══════════════════════════════════════════════════════════════════════════
 
     def train_dataloader(self):

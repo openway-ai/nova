@@ -1,9 +1,10 @@
 """GSM8K reward functions for EBM-GRPO RL.
 
 Reward components:
-  1. format_reward  (0.0 or 0.3): completion contains "####" marker
-  2. exact_match    (0.0 or 0.7): extracted number == ground truth
-  3. length_penalty (0.0 to -0.1): penalise very short (<50 chars) gibberish
+  1. format_reward  (0.0 or 0.2): completion contains "####" marker
+  2. partial_credit (0.0 or 0.1): any numerical answer can be parsed
+  3. exact_match    (0.0 or 0.7): extracted number == ground truth
+  4. length_penalty (0.0 to -0.1): penalise very short (<50 chars) gibberish
 
 Total range: [-0.1, 1.0]
 
@@ -71,14 +72,15 @@ def compute_gsm8k_reward(
 
     correct = (parsed is not None) and (parsed == gt_norm)
 
-    format_r = 0.3 if has_marker else 0.0
+    format_r = 0.2 if has_marker else 0.0
+    partial_r = 0.1 if parsed is not None else 0.0
     exact_r = 0.7 if correct else 0.0
 
     # Length penalty: punish extremely short completions (< 50 chars)
     # that are unlikely to contain real reasoning.
     length_r = -0.1 if len(completion.strip()) < 50 else 0.0
 
-    return format_r + exact_r + length_r
+    return format_r + partial_r + exact_r + length_r
 
 
 def compute_gsm8k_rewards(
@@ -109,10 +111,14 @@ def compute_gsm8k_rewards_detailed(
         correct = (parsed is not None) and (parsed == gt_norm)
         length_r = -0.1 if len(completion.strip()) < 50 else 0.0
 
+        format_r = 0.2 if has_marker else 0.0
+        partial_r = 0.1 if parsed is not None else 0.0
+        exact_r = 0.7 if correct else 0.0
         d = {
-            "total": (0.3 if has_marker else 0.0) + (0.7 if correct else 0.0) + length_r,
-            "format": 0.3 if has_marker else 0.0,
-            "exact_match": 0.7 if correct else 0.0,
+            "total": format_r + partial_r + exact_r + length_r,
+            "format": format_r,
+            "partial_credit": partial_r,
+            "exact_match": exact_r,
             "length_penalty": length_r,
             "parsed_answer": parsed,
             "is_correct": correct,
