@@ -246,9 +246,16 @@ class EBT_NLP(LightningModule):
             # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
             # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
 
-        if self.hparams.execution_mode == "finetune": # Only tokens after "[[Answer]]: " will be calculated in finetune
+        dataset_name = getattr(self.hparams, 'dataset_name', '')
+        if self.hparams.execution_mode == "finetune" and dataset_name != "nanochat_sft":
+            # Legacy SFT datasets use the "[[Answer]]:" text marker.
             next_token_indices = mask_q_tokens(next_token_indices, self.tokenizer)
         next_token_indices = next_token_indices.reshape(-1) # BS * S; reshape since targets are supposed to be 1D
+        supervised_tokens = (next_token_indices != -1).sum()
+        # Empty SFT rows still continue through BPB/DDP reductions; early return
+        # can deadlock mixed empty/non-empty ranks.
+        supervised_tokens_denom = supervised_tokens.clamp_min(1)
+        empty_supervision_batch = (supervised_tokens == 0).to(dtype=torch.int64)
 
         reconstruction_loss = 0
         total_mcmc_steps = len(predicted_energies) # in general this equals self.hparams.mcmc_num_steps, isnt in case of rand number
@@ -259,10 +266,22 @@ class EBT_NLP(LightningModule):
                 else:
                     label_smoothing = ((total_mcmc_steps - 1) - mcmc_step) / (total_mcmc_steps - 1) * self.hparams.soften_target_prob_dist
                 predicted_distribution = predicted_distribution.reshape(-1, self.vocab_size)
-                cce_loss = F.cross_entropy(predicted_distribution, next_token_indices, label_smoothing=label_smoothing, ignore_index=-1)
+                per_token_step_loss = F.cross_entropy(
+                    predicted_distribution,
+                    next_token_indices,
+                    label_smoothing=label_smoothing,
+                    ignore_index=-1,
+                    reduction='none',
+                )
             else:
                 predicted_distribution = self.log_softmax(predicted_distribution).reshape(-1, self.vocab_size)
-                cce_loss = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1)
+                per_token_step_loss = F.nll_loss(
+                    predicted_distribution,
+                    next_token_indices,
+                    ignore_index=-1,
+                    reduction='none',
+                )
+            cce_loss = per_token_step_loss.sum() / supervised_tokens_denom
             
             if self.hparams.truncate_mcmc:
                 if mcmc_step == (total_mcmc_steps - 1):
@@ -320,6 +339,8 @@ class EBT_NLP(LightningModule):
             'bpb': bpb_loss,
             'bpb_nats': bpb_nats,    # accumulated nats for epoch-level BPB
             'bpb_bytes': bpb_bytes,  # accumulated bytes for epoch-level BPB
+            'supervised_tokens': supervised_tokens.detach(),
+            'empty_supervision_batch': empty_supervision_batch.detach(),
         }
         return log_dict
     
