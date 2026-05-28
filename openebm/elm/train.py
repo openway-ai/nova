@@ -162,9 +162,10 @@ def main(args):
         num_gpus = int(args.gpus)
     print("devices/args.gpus: ", args.gpus)
 
-    # NOTE: num_workers is NOT configurable — nanochat DataLoader hardcodes num_workers=0
-    # because the generator holds GPU state (pre-allocated CUDA buffers) that cannot be
-    # pickled into worker processes. See dataset.py generate_dataloader() for details.
+    # NOTE: num_workers is NOT configurable — nanochat pretrain DataLoader hardcodes
+    # num_workers=0. The IterableDataset owns mutable exact-resume state
+    # (parquet cursor + doc_buffer) and materializes CUDA tensors inside __iter__(),
+    # so worker processes would duplicate iterator state and break resume semantics.
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     assert (device == torch.device('cuda') and num_gpus > 0), "using cpu instead of cuda. if you would like to proceed please remove this line and change code below to not use GPUs, otherwise check packages to ensure torch/others have cuda support"
@@ -191,7 +192,8 @@ def main(args):
     # if args.debug_dataloader:
     #     debug_dataloader(args, model_trainer)
     #     return
-    if args.log_model_archi:
+    is_rank_zero_process = int(os.environ.get("RANK", "0")) == 0
+    if args.log_model_archi and is_rank_zero_process:
         print(str(model_trainer.model))
         print(str(args))
 
@@ -312,8 +314,19 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
     profiler = None if args.profiler == "" else args.profiler
     gradient_clip_val = args.gradient_clip_val if args.gradient_clip_val > 0 else None
     limit_val_batches = 0 if args.overfit_batches > 0 else args.limit_val_batches
+    if (
+        getattr(args, "dataset_name", "") == "nanochat_sft"
+        and isinstance(args.val_check_interval, float)
+        and args.val_check_interval > 1
+        and args.val_check_interval.is_integer()
+    ):
+        args.val_check_interval = int(args.val_check_interval)
     # val_check_interval = args.val_check_interval if args.val_check_interval == 1.0 else args.val_check_interval * args.accumulate_grad_batches  #NOTE the reason we mult by args.accumulate_grad_batches is because of this bug https://github.com/Lightning-AI/pytorch-lightning/issues/12205
     limit_test_batches = args.limit_test_batches if args.limit_test_batches == 1 else args.limit_test_batches * args.accumulate_grad_batches
+    callbacks = [checkpoint_callback] + ([periodic_checkpoint] if periodic_checkpoint else [])
+    if args.log_model_archi:
+        callbacks.append(ModelSummary(max_depth=2))
+
     trainer = Trainer(
         accelerator="auto",
         devices = args.gpus,
@@ -322,7 +335,7 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
         max_steps=args.max_steps,
         logger=wandb_logger,
         enable_model_summary=args.log_model_archi,
-        callbacks = [checkpoint_callback] + ([periodic_checkpoint] if periodic_checkpoint else []) + [ModelSummary(max_depth=-1)],
+        callbacks=callbacks,
         strategy = args.distributed_strategy, 
         enable_checkpointing=True,
         fast_dev_run = args.fast_dev_run,
@@ -685,10 +698,10 @@ if __name__ == '__main__':
     #DATASET AND DATALOADER #########################################################
 
     # NOTE: --num_workers and --prefetch_factor have been removed.
-    # The nanochat DataLoader hardcodes num_workers=0 because its generator holds
-    # GPU state (pre-allocated CUDA buffers) that cannot be pickled into worker
-    # processes. pin_memory=False because data is already on GPU.
-    # See dataset.py generate_dataloader() for details.
+    # The nanochat pretrain DataLoader hardcodes num_workers=0 because it is a
+    # stateful IterableDataset with exact-resume cursor/doc_buffer ownership and
+    # it also copies CUDA tensors inside __iter__(). pin_memory=False because
+    # yielded pretrain batches are already on GPU.
     
     parser.add_argument("--dataset_name", help="dataset name", default="ucf101")
     

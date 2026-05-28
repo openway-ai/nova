@@ -96,6 +96,16 @@ class StatefulBestFitDataLoader:
             "doc_buffer": [list(doc) for doc in self.doc_buffer],  # deep copy
         }
 
+    def lightweight_state_dict(self):
+        """Export streaming position without copying doc_buffer."""
+        return {
+            "state_version": EXACT_RESUME_STATE_VERSION,
+            "pq_idx": self.next_pq_idx,
+            "rg_idx": self.next_rg_idx,
+            "epoch": self.next_epoch,
+            "doc_batch_index": self.next_doc_batch_index,
+        }
+
     def _apply_resume_state(self, state):
         """Restore internal state from a checkpoint dict."""
         if state.get("state_version") == EXACT_RESUME_STATE_VERSION:
@@ -263,7 +273,7 @@ class StatefulBestFitDataLoader:
             cpu_inputs.copy_(row_buffer[:, :-1])
             cpu_targets.copy_(row_buffer[:, 1:])
 
-            sd = self.state_dict()
+            sd = self.lightweight_state_dict()
 
             gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
             yield inputs, targets, sd

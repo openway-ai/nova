@@ -1,12 +1,24 @@
 #!/bin/bash
 
 ################################################################################
-# EBT d26 训练脚本 - 2节点 × 8卡
+# EBT d26 System 2 训练脚本 - 2节点 × 8卡 (v2)
+#
+# 基于 run_ebt_2node_8gpu.sh 骨架 + run_ebt_s2_2node_8gpu.sh 的 S2 训练参数
+#
+# System 2 核心变更 (相对 S1):
+#   1. 移除 MCMC step 间 detach (--no_mcmc_detach)
+#   2. Loss 截断，只用最后一步 (--truncate_mcmc)
+#   3. alpha 固定不可学习 (不传 --mcmc_step_size_learnable)
+#   4. 同一 energy landscape 上随机重复 2-4 步优化
+#   5. 开启 Replay Buffer (B=1 时 sample percent 必须为 1.0)
+#   6. Langevin Dynamics noise=3.0
+#   7. 随机 alpha scale=2.0
+#
+# 硬件/优化器骨架保留: 2×8 GPU, ctx2048, 7.34B tokens, Muon+AdamW
 #
 # 用法:
-#   通过 rjob 提交 (见配套的 rjob_ebt_2node_8gpu.sh)
-#   本地调试: NODE_RANK=0 NODE_COUNT=1 MASTER_ADDR=127.0.0.1 PROC_PER_NODE=8 bash run_ebt_2node_8gpu.sh
-#
+#   通过 rjob 提交 (见配套的 rjob_ebt_s2_2node_8gpu.sh)
+#   本地调试: NODE_RANK=0 NODE_COUNT=1 MASTER_ADDR=127.0.0.1 PROC_PER_NODE=8 bash run_ebt_s2_2node_8gpu_v2.sh
 ################################################################################
 
 # Conda 环境激活（仅远程集群需要，本地调试可跳过）
@@ -30,7 +42,7 @@ cd "${NOVA_HOME}"
 export PYTHONPATH="${NOVA_HOME}:${PYTHONPATH}"
 
 ### 基础配置 ###
-RUN_PREFIX="2node-8gpu-bf16mixed"
+RUN_PREFIX="s2-2node-8gpu-bf16mixed-ebtsync"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -40,9 +52,10 @@ HOME="${NANOCHAT_HOME}"
 export NANOCHAT_BASE_DIR="${HOME}/.cache/nanochat"
 
 # PyTorch 内存优化
-export PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.6"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 # WandB 配置（offline 模式可以不提供 api key，同步时再提供即可）
+export WANDB_API_KEY="968275bc822c87ac741ecce2f06cdfb54dbc1608"
 export WANDB_MODE="offline"
 
 ################################################################################
@@ -59,7 +72,6 @@ export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=0
 export NCCL_IB_TIMEOUT=60
 export NCCL_IB_RETRY_CNT=20
-export NCCL_DEBUG=WARN
 
 ################################################################################
 # 多机节点与 GPU 配置
@@ -91,16 +103,38 @@ echo "MASTER_PORT:    ${MASTER_PORT}"
 echo "PROC_PER_NODE:  ${PROC_PER_NODE}"
 echo "WORLD_SIZE:     ${WORLD_SIZE}"
 
-# EBT 核心超参数
-MCMC_STEP_SIZE=500.0
-MCMC_STEP_SIZE_LR_MULTIPLIER=1500  # 3 × 500 (官方推荐比例)
-MCMC_NUM_STEPS=2                    # 官方建议: 2 is very safe
-EBT_TYPE="time_embed"               # 官方建议: can almost always stay
+################################################################################
+# System 2 核心参数
+################################################################################
+
+MCMC_STEP_SIZE=470.0                 # 后续按 sweep 结果替换 (候选: 250/500/750/1000)
+MCMC_STEP_SIZE_LR_MULTIPLIER=1.0     # alpha 固定时无实际作用，设小值避免误解
+MCMC_NUM_STEPS=1                     # S2: 单一 landscape 上重复优化
+EBT_TYPE="time_embed"
 NORMALIZE_INITIAL_CONDITION=true
 DENOISING_INITIAL_CONDITION="random_noise"
-MCMC_STEP_SIZE_LEARNABLE=true
-NO_MCMC_DETACH=false
-USE_SDPA_ATTENTION=false              # 启用 SDPA 注意力 (大幅减少 Path B 显存占用)，设为 true 启用
+
+# S2 高级项
+NO_MCMC_DETACH=true
+TRUNCATE_MCMC=true
+
+# Randomized steps on same landscape
+RANDOMIZE_MCMC_NUM_STEPS=4
+RANDOMIZE_MCMC_NUM_STEPS_MIN=2
+RANDOMIZE_MCMC_NUM_STEPS_FINAL_LANDSCAPE=true
+
+# Replay buffer (B=1 时 sample percent 必须为 1.0)
+MCMC_REPLAY_BUFFER=false
+MCMC_REPLAY_BUFFER_SAMPLE_BS_PERCENT=0.0
+# MCMC_REPLAY_BUFFER=true
+# MCMC_REPLAY_BUFFER_SAMPLE_BS_PERCENT=1.0
+# MCMC_REPLAY_BUFFER_SIZE=32
+
+# Langevin dynamics + randomized alpha
+LANGEVIN_DYNAMICS_NOISE=3.0
+RANDOMIZE_MCMC_STEP_SIZE_SCALE=2.0
+
+USE_SDPA_ATTENTION=false
 
 ################################################################################
 # Batch 配置与训练步数自动计算
@@ -125,13 +159,13 @@ echo "  - 计算得出总 Steps:  ${MAX_STEPS}"
 # 学习率配置
 ################################################################################
 
-PEAK_LR=0.00025
+PEAK_LR=0.0012
 WARM_UP_STEPS=0
 WARM_UP_BASE_LR_DIVIDER=10
 MIN_LR_SCALE=50
 
 ################################################################################
-# 优化器配置 (Muon+AdamW 模式)
+# 优化器配置 (Muon+AdamW)
 ################################################################################
 
 WEIGHT_DECAY=0.2
@@ -148,16 +182,16 @@ LIMIT_VAL_BATCHES=50
 SAVE_TOP_K=2
 
 ################################################################################
-# 优化选项
+# 优化选项 (与 S1 共享的 Muon+AdamW 骨架)
 ################################################################################
 
-OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.05 \
+OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0057 --warmdown_ratio 0.65 --final_lr_frac 0.05 \
 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 \
 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling \
---muon_momentum_warmup_steps 0"
+--muon_momentum_warmup_steps 300 --ffn_dim_multiplier 2.67"
 
 ################################################################################
-# torch.compile 配置
+# torch.compile (S2 sweep 阶段建议关闭，减少排错变量)
 ################################################################################
 
 # COMPILE_FLAGS=""
@@ -179,13 +213,15 @@ fi
 WANDB_FLAGS=""
 # WANDB_FLAGS="--disable_wandb"
 
+SAVE_PERIODIC_STEPS=1000
+
 ################################################################################
 # 日志配置
 ################################################################################
 
 TIMESTAMP=$(date +"%m%d_%H%M")
 DATE_DIR=$(date +"%Y%m%d")
-CONFIG_TAG="${MODEL_SIZE}_ctx${CONTEXT_LENGTH}_bs$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM))_lr${PEAK_LR}_${NUM_NODES}nodes_${GPUS_PER_NODE}gpus"
+CONFIG_TAG="${MODEL_SIZE}_s2_ctx${CONTEXT_LENGTH}_bs$((NUM_GPUS * DEVICE_BATCH_SIZE * GRAD_ACCUM))_lr${PEAK_LR}_${NUM_NODES}nodes_${GPUS_PER_NODE}gpus"
 export RUN_NAME="${RUN_PREFIX}_${TIMESTAMP}_${CONFIG_TAG}"
 
 LOG_DIR="${NOVA_HOME}/logs_base_train/${DATE_DIR}"
@@ -196,6 +232,17 @@ LOG_FILE="${LOG_DIR}/${RUN_NAME}_rank${NODE_RANK}.log"
 # 启动训练
 ################################################################################
 
+echo "=== System 2 参数汇总 ==="
+echo "  mcmc_step_size:            ${MCMC_STEP_SIZE}"
+echo "  mcmc_num_steps:            ${MCMC_NUM_STEPS}"
+echo "  no_mcmc_detach:            ${NO_MCMC_DETACH}"
+echo "  truncate_mcmc:             ${TRUNCATE_MCMC}"
+echo "  randomize_mcmc_num_steps:  ${RANDOMIZE_MCMC_NUM_STEPS} (min: ${RANDOMIZE_MCMC_NUM_STEPS_MIN})"
+echo "  replay_buffer:             ${MCMC_REPLAY_BUFFER} (sample_bs_percent: ${MCMC_REPLAY_BUFFER_SAMPLE_BS_PERCENT}, size: ${MCMC_REPLAY_BUFFER_SIZE})"
+echo "  langevin_dynamics_noise:   ${LANGEVIN_DYNAMICS_NOISE}"
+echo "  randomize_step_size_scale: ${RANDOMIZE_MCMC_STEP_SIZE_SCALE}"
+echo "  alpha learnable:           false"
+echo ""
 echo "=== 启动训练 ==="
 echo "RUN_NAME: ${RUN_NAME}"
 echo "LOG_FILE: ${LOG_FILE}"
@@ -221,10 +268,19 @@ torchrun \
   --normalize_initial_condition \
   --ebt_type "${EBT_TYPE}" \
   --denoising_initial_condition "${DENOISING_INITIAL_CONDITION}" \
-  --mcmc_step_size_learnable \
   --mcmc_step_size "${MCMC_STEP_SIZE}" \
   --mcmc_step_size_lr_multiplier "${MCMC_STEP_SIZE_LR_MULTIPLIER}" \
   --mcmc_num_steps "${MCMC_NUM_STEPS}" \
+  \
+  --no_mcmc_detach \
+  --truncate_mcmc \
+  \
+  --randomize_mcmc_num_steps "${RANDOMIZE_MCMC_NUM_STEPS}" \
+  --randomize_mcmc_num_steps_min "${RANDOMIZE_MCMC_NUM_STEPS_MIN}" \
+  --randomize_mcmc_num_steps_final_landscape \
+  \
+  --langevin_dynamics_noise "${LANGEVIN_DYNAMICS_NOISE}" \
+  --randomize_mcmc_step_size_scale "${RANDOMIZE_MCMC_STEP_SIZE_SCALE}" \
   \
   --context_length "${CONTEXT_LENGTH}" \
   \
@@ -253,16 +309,20 @@ torchrun \
   --wandb_project 'nlp_pretrain' \
   --log_model_archi \
   --set_matmul_precision "medium" \
-  --float_precision "bf16-true" \
+  --float_precision "bf16-mixed" \
   --manual_gc_collect_every_n_steps -1 \
   --save_top_k_ckpts "${SAVE_TOP_K}" \
-  --save_periodic_steps 1000 \
+  --save_periodic_steps "${SAVE_PERIODIC_STEPS}" \
   ${WANDB_FLAGS} \
   ${OPTION_FLAGS} \
   ${COMPILE_FLAGS} \
   ${SDPA_FLAGS}
-  
-# --use_ve \
+
+
+#   --mcmc_replay_buffer \
+#   --mcmc_replay_buffer_sample_bs_percent "${MCMC_REPLAY_BUFFER_SAMPLE_BS_PERCENT}" \
+#   --mcmc_replay_buffer_size "${MCMC_REPLAY_BUFFER_SIZE}" \
+#   \
 
 TRAIN_EXIT_CODE=$?
 set -e

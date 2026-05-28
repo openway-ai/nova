@@ -425,13 +425,18 @@ def mask_q_tokens(input_tensor, tokenizer):
     '''
     batch_size = input_tensor.shape[0]
     seq_length = input_tensor.shape[1]
-    answer_tag = tokenizer.encode("[[Answer]]:", add_special_tokens=True)
+    try:
+        answer_tag = tokenizer.encode("[[Answer]]:", add_special_tokens=True)
+    except TypeError as exc:
+        if "add_special_tokens" not in str(exc):
+            raise
+        answer_tag = tokenizer.encode("[[Answer]]:")
     
     answer_start_pos = find_subsequences(input_tensor, answer_tag)
     answer_start_pos += len(answer_tag)
     mask = torch.arange(seq_length, device=input_tensor.device).expand(batch_size, seq_length)
     mask = mask < answer_start_pos.unsqueeze(1)
-    input_tensor = torch.where(mask, tokenizer.pad_token_id, input_tensor)
+    input_tensor = torch.where(mask, torch.full_like(input_tensor, -1), input_tensor)
     
     return input_tensor
 
