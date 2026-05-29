@@ -77,6 +77,7 @@ class SudokuMixedIterableDataset(_IterableDataset):
         self.it = 0
         # v3: source of the most-recently yielded batch ('sudoku' | 'sft').
         self.last_batch_source = None
+        self.last_batch_meta = {}
 
         # 预估两侧 iterator 的 max_iter 上界。因为按概率采样，每侧实际用量 ≈ max_iter * ratio。
         # 给 1.5 倍缓冲避免 StopIteration（底层 iterator 对 train split 是循环的）
@@ -190,6 +191,10 @@ class SudokuMixedIterableDataset(_IterableDataset):
 
             self.it += 1
             self.last_batch_source = chosen
+            if chosen == 'sudoku':
+                self.last_batch_meta = dict(getattr(self.sudoku_ds, 'last_batch_meta', {}) or {})
+            else:
+                self.last_batch_meta = {}
             self.last_state_dict = self._build_state_dict()
             yield batch
 

@@ -54,6 +54,10 @@ def parse_args():
     parser.add_argument("--clip_ratio_high", type=float, default=None,
                         help="Upper PPO/GSPO clip range; defaults to epsilon. verl GSPO recipes often use 0.28.")
     parser.add_argument("--beta", type=float, default=0.05)
+    parser.add_argument("--energy_kl_mode", type=str, default="symmetric_huber",
+                        choices=["symmetric_huber", "symmetric_l2", "one_sided"],
+                        help="Energy anchor mode against frozen SFT reference.")
+    parser.add_argument("--energy_kl_huber_delta", type=float, default=0.5)
     parser.add_argument("--learning_rate", type=float, default=1e-6)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
@@ -246,6 +250,8 @@ def main():
         clip_ratio_low=args.clip_ratio_low,
         clip_ratio_high=args.clip_ratio_high,
         beta=args.beta,
+        energy_kl_mode=args.energy_kl_mode,
+        energy_kl_huber_delta=args.energy_kl_huber_delta,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         gradient_clip_val=args.gradient_clip_val,
@@ -362,6 +368,7 @@ def main():
     print(f"  Temperature:        {config.temperature}")
     print(f"  Epsilon (clip):     {config.epsilon}")
     print(f"  Beta (KL):          {config.beta}")
+    print(f"  Energy KL mode:     {config.energy_kl_mode}")
     print(f"  Learning rate:      {config.learning_rate}")
     print(f"  Max steps:          {config.max_steps}")
     print(f"  GPUs:               {gpus}")

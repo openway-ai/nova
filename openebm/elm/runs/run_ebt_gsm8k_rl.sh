@@ -68,44 +68,50 @@ export EXP_ID="${EXP_ID:-d26-ctx2048-gsm8k-rl-${RL_ALGO_SUFFIX}-$(date +%Y%m%d)}
 #   - GSM8K max_completion_length 更大 (512 vs 180): 数学推理需要 CoT 空间
 #   - group_mean_global_std: 防止 advantage 在低多样性批次中爆炸
 ################################################################################
-NUM_GENERATIONS=8             # completions per prompt (GSM8K 比 sudoku 简单，8 足够)
+NUM_GENERATIONS="${NUM_GENERATIONS:-8}"             # GSM8K reward is sparse; keep 8 until format/parse is healthy
 
 # MAX_COMPLETION_LENGTH=512     # CoT 推理需要更长空间 (数学 ≤512 tokens 够用)
 # MAX_PROMPT_LENGTH=256         # GSM8K 题目通常较短
 
-MAX_COMPLETION_LENGTH=320     # ↓ 1024 → 320: GSM8K answer ≤200 tok; O(L²) generation, 16x speedup
-MAX_PROMPT_LENGTH=192         # ↓ 512 → 192: actual GSM8K prompt is ~120 tok
+MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-256}"     # shorter smoke default; raise to 320 if truncation is observed
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-192}"             # actual GSM8K prompt is ~120 tok
 
-TEMPERATURE=0.9
-TOP_P=0.9
-GENERATION_BATCH_SIZE=8       # ↑ 4 → 8: more parallel sampling, fits VRAM after length reduction
+TEMPERATURE="${TEMPERATURE:-0.7}"             # lower entropy first; current run collapsed with many low-quality samples
+TOP_P="${TOP_P:-0.85}"
+GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-8}"
 
-NUM_ITERATIONS=1              # legacy loss recomputation; keep 1 when using GSPO_UPDATE_EPOCHS
+NUM_ITERATIONS="${NUM_ITERATIONS:-1}"              # legacy loss recomputation; keep 1 when using GSPO_UPDATE_EPOCHS
 GSPO_UPDATE_EPOCHS="${GSPO_UPDATE_EPOCHS:-1}"  # true optimizer steps per rollout for energy_gspo
-EPSILON=0.2                   # PPO clip range (仅 energy_gspo 用)
-BETA=0.2                      # KL anchor: aligned with sudoku v3. v2 evidence shows BETA<0.1 → grad_norm 20× drift
-LEARNING_RATE=2e-6            # 同 sudoku v2; 能量梯度幅度大，不宜太高
+EPSILON="${EPSILON:-0.2}"                   # PPO clip range (仅 energy_gspo 用)
+CLIP_RATIO_LOW="${CLIP_RATIO_LOW:-0.2}"     # verl/DAPO-style asymmetric GSPO clip
+CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-0.28}"
+BETA="${BETA:-0.4}"                         # GSM8K run had stronger negative drift than Sudoku
+ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
+ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
+LEARNING_RATE="${LEARNING_RATE:-7e-7}"       # sparse reward + EBM energy drift: start lower than Sudoku
 # Set RL_LOSS_TYPE=energy_gspo GSPO_UPDATE_EPOCHS=2 to reuse each rollout.
 
-WEIGHT_DECAY=0.01
-GRADIENT_CLIP_VAL=1.0         # v3 P1: 0.3 → 1.0 (KL anchor BETA=0.2 主导稳定; per-param clip 之前压制了学习信号)
-MAX_GRAD_PER_PARAM=0.05       # v3 P1: 0.02 → 0.05 (v2 实测真实梯度信号需要更大空间)
-WARMUP_STEPS=50
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
+MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.03}"
+WARMUP_STEPS="${WARMUP_STEPS:-100}"
 
 # ── Optimizer (v3 P0+P1+muon) ─────────────────────────────────────────────────
 # adamw      : v3 P0 multi-group AdamW (transformer/v2e/scalar/other split LR)
 # muon_adamw : Muon for transformer matrices + AdamW for the rest (matches SFT)
-RL_OPTIMIZER="${RL_OPTIMIZER:-adamw}"          # set to "muon_adamw" to enable Muon hybrid
+RL_OPTIMIZER="${RL_OPTIMIZER:-adamw}"       # keep AdamW first for sparse reward stability
 MUON_LR="${MUON_LR:-2e-4}"                  # default = SFT muon_lr (2e-3) / 10
-ADVANTAGE_NORM="group_mean_global_std"
-GLOBAL_STD_MIN=0.1
-SKIP_DEGENERATE_THRESHOLD=0.9
+ADVANTAGE_NORM="${ADVANTAGE_NORM:-group_mean_global_std}"
+GLOBAL_STD_MIN="${GLOBAL_STD_MIN:-0.2}"
+SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.85}"
+MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-0.01}"
+MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.0}"
 
-MAX_STEPS=5000                 # 首次验证: 短训 500 步观察 reward 是否上升
-VAL_CHECK_INTERVAL=100
-LOG_INTERVAL=5
-SAVE_TOP_K=2
-SEED=42
+MAX_STEPS="${MAX_STEPS:-500}"                # first validate parse/format/reward before long run
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-50}"
+LOG_INTERVAL="${LOG_INTERVAL:-5}"
+SAVE_TOP_K="${SAVE_TOP_K:-2}"
+SEED="${SEED:-42}"
 
 ################################################################################
 # 轨迹采样与日志配置
@@ -180,14 +186,20 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "max_completion_length=${MAX_COMPLETION_LENGTH}" \
     "temperature=${TEMPERATURE}" \
     "epsilon=${EPSILON}" \
+    "clip_ratio_low=${CLIP_RATIO_LOW}" \
+    "clip_ratio_high=${CLIP_RATIO_HIGH}" \
     "gspo_update_epochs=${GSPO_UPDATE_EPOCHS}" \
     "beta=${BETA}" \
+    "energy_kl_mode=${ENERGY_KL_MODE}" \
+    "energy_kl_huber_delta=${ENERGY_KL_HUBER_DELTA}" \
     "learning_rate=${LEARNING_RATE}" \
     "warmup_steps=${WARMUP_STEPS}" \
     "gradient_clip_val=${GRADIENT_CLIP_VAL}" \
     "max_grad_per_param=${MAX_GRAD_PER_PARAM}" \
     "advantage_norm=${ADVANTAGE_NORM}" \
     "skip_degenerate_threshold=${SKIP_DEGENERATE_THRESHOLD}" \
+    "min_reward_std_to_update=${MIN_REWARD_STD_TO_UPDATE}" \
+    "min_unique_completion_ratio_to_update=${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE}" \
     "rl_loss_type=${RL_LOSS_TYPE}" \
     "max_steps=${MAX_STEPS}" \
     "num_gpus=${NUM_GPUS}" \
@@ -209,13 +221,16 @@ echo "GSPO update epochs:      ${GSPO_UPDATE_EPOCHS}"
 echo "Num generations:         ${NUM_GENERATIONS}"
 echo "Max completion length:   ${MAX_COMPLETION_LENGTH}"
 echo "Temperature:             ${TEMPERATURE}"
+echo "Epsilon / clip low/high: ${EPSILON} / ${CLIP_RATIO_LOW} / ${CLIP_RATIO_HIGH}"
 echo "Beta (KL anchor):        ${BETA}"
+echo "Energy KL mode:          ${ENERGY_KL_MODE} (delta=${ENERGY_KL_HUBER_DELTA})"
 echo "Learning rate:           ${LEARNING_RATE}"
 echo "Warmup steps:            ${WARMUP_STEPS}"
 echo "Gradient clip (global):  ${GRADIENT_CLIP_VAL}"
 echo "Max grad per param:      ${MAX_GRAD_PER_PARAM}"
 echo "Advantage norm:          ${ADVANTAGE_NORM}"
 echo "Skip degen threshold:    ${SKIP_DEGENERATE_THRESHOLD}"
+echo "Min reward std update:   ${MIN_REWARD_STD_TO_UPDATE}"
 echo "Max steps:               ${MAX_STEPS}"
 echo "Val interval:            ${VAL_CHECK_INTERVAL}"
 echo "GPUs:                    ${NUM_GPUS}"
@@ -224,7 +239,9 @@ echo "Traj output dir:         ${TRAJ_OUTPUT_DIR}"
 echo "Log level:               ${LOG_LEVEL}"
 echo "Log file:                ${LOG_FILE}"
 echo ""
-read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
+if [ "${SKIP_CONFIRM:-0}" != "1" ]; then
+    read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
+fi
 
 ################################################################################
 # 写入日志头
@@ -245,7 +262,11 @@ cat << LOG_HEADER > "${LOG_FILE}"
 #   num_generations=${NUM_GENERATIONS}
 #   max_completion_length=${MAX_COMPLETION_LENGTH}
 #   temperature=${TEMPERATURE}
+#   epsilon=${EPSILON}
+#   clip_ratio_low=${CLIP_RATIO_LOW}
+#   clip_ratio_high=${CLIP_RATIO_HIGH}
 #   beta=${BETA}
+#   energy_kl_mode=${ENERGY_KL_MODE}
 #   learning_rate=${LEARNING_RATE}
 #   rl_loss_type=${RL_LOSS_TYPE}
 #   max_steps=${MAX_STEPS}
@@ -291,7 +312,11 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --num_iterations ${NUM_ITERATIONS} \
     --gspo_update_epochs ${GSPO_UPDATE_EPOCHS} \
     --epsilon ${EPSILON} \
+    --clip_ratio_low ${CLIP_RATIO_LOW} \
+    --clip_ratio_high ${CLIP_RATIO_HIGH} \
     --beta ${BETA} \
+    --energy_kl_mode ${ENERGY_KL_MODE} \
+    --energy_kl_huber_delta ${ENERGY_KL_HUBER_DELTA} \
     --learning_rate ${LEARNING_RATE} \
     --rl_loss_type ${RL_LOSS_TYPE} \
     --weight_decay ${WEIGHT_DECAY} \
@@ -303,6 +328,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --advantage_norm ${ADVANTAGE_NORM} \
     --global_std_min ${GLOBAL_STD_MIN} \
     --skip_degenerate_threshold ${SKIP_DEGENERATE_THRESHOLD} \
+    --min_reward_std_to_update ${MIN_REWARD_STD_TO_UPDATE} \
+    --min_unique_completion_ratio_to_update ${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE} \
     --max_steps ${MAX_STEPS} \
     --val_check_interval ${VAL_CHECK_INTERVAL} \
     --log_interval ${LOG_INTERVAL} \
@@ -335,6 +362,11 @@ fi
 echo ""
 echo "日志已保存到: ${LOG_FILE}"
 echo "轨迹 JSONL:  ${TRAJ_OUTPUT_DIR}"
+
+if [ "${ANALYZE_AFTER_TRAIN:-1}" = "1" ] && [ -f "${SCRIPT_DIR}/../scripts/analyze_rl_run.py" ]; then
+    echo "正在生成 RL 分析报告..."
+    python "${SCRIPT_DIR}/../scripts/analyze_rl_run.py" "${EXP_SFT_DIR}" || true
+fi
 
 ################################################################################
 # 日志分析速查
