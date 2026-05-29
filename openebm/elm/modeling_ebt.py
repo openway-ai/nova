@@ -231,10 +231,24 @@ class EBT_NLP(LightningModule):
         batch_size = x.shape[0]
         seq_length = x.shape[1]
 
-        # [DEBUG-RL] Log input embedding stats — first call only, per process.
-        if not getattr(self, '_dbg_logged_embed_stats', False):
+        # [DEBUG-RL] Optional forward stats. Disabled by default because RL
+        # rollout generation calls this on every rank and can flood train.log.
+        # Enable with DBG_RL_FORWARD=1; tune frequency with
+        # DBG_RL_FORWARD_INTERVAL (default: first call only).
+        import os as _os
+        _dbg_forward = _os.environ.get('DBG_RL_FORWARD', '0').lower() in ('1', 'true', 'yes')
+        _dbg_forward_interval = int(_os.environ.get('DBG_RL_FORWARD_INTERVAL', '0') or 0)
+        _dbg_forward_count = int(getattr(self, '_dbg_forward_count', 0))
+        self._dbg_forward_count = _dbg_forward_count + 1
+        _dbg_should_log = (
+            _dbg_forward
+            and (
+                (_dbg_forward_interval <= 0 and not getattr(self, '_dbg_logged_embed_stats', False))
+                or (_dbg_forward_interval > 0 and _dbg_forward_count % _dbg_forward_interval == 0)
+            )
+        )
+        if _dbg_should_log:
             try:
-                import os as _os
                 _rank = _os.environ.get('LOCAL_RANK', '?')
                 with torch.no_grad():
                     _e = real_embeddings_input.float()
@@ -258,7 +272,8 @@ class EBT_NLP(LightningModule):
                     )
                 self._dbg_logged_embed_stats = True
             except Exception as _e_dbg:
-                print(f"[DBG-RL] embed stats logging failed: {_e_dbg}", flush=True)
+                if _dbg_forward:
+                    print(f"[DBG-RL] embed stats logging failed: {_e_dbg}", flush=True)
 
         alpha = torch.clamp(self.alpha, min=0.0001)
         # Safety net: if alpha became NaN (e.g. from a corrupted optimizer step),

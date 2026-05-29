@@ -89,6 +89,10 @@ LOG_INTERVAL="${LOG_INTERVAL:-5}"
 SAVE_TOP_K="${SAVE_TOP_K:-3}"
 SEED="${SEED:-42}"
 
+TRAJ_LOG_INTERVAL="${TRAJ_LOG_INTERVAL:-50}"
+TRAJ_NUM_SAMPLES="${TRAJ_NUM_SAMPLES:-2}"
+COLLAPSE_CHECK_WINDOW="${COLLAPSE_CHECK_WINDOW:-5}"
+
 ################################################################################
 # GPU 配置
 ################################################################################
@@ -142,6 +146,12 @@ exp_init_sft "$0"
 export RUN_NAME="${EXP_ID}-sudoku-rl-grpo"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
+# 轨迹输出目录跟着实际 stage 目录走。TrajectoryLogger 会写入:
+#   ${TRAJ_OUTPUT_DIR}/trajectories/step_*/rollout_samples.jsonl
+#   ${TRAJ_OUTPUT_DIR}/collapse_dump/step_*.jsonl
+TRAJ_OUTPUT_DIR="${EXP_SFT_DIR}"
+export TRAJ_OUTPUT_DIR
+
 exp_save_hparams "${EXP_SFT_DIR}" \
     "model_size=${MODEL_SIZE}" \
     "algorithm=grpo" \
@@ -166,6 +176,10 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "min_reward_std_to_update=${MIN_REWARD_STD_TO_UPDATE}" \
     "min_unique_completion_ratio_to_update=${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE}" \
     "rl_loss_type=${RL_LOSS_TYPE}" \
+    "traj_output_dir=${TRAJ_OUTPUT_DIR}" \
+    "traj_log_interval=${TRAJ_LOG_INTERVAL}" \
+    "traj_num_samples=${TRAJ_NUM_SAMPLES}" \
+    "collapse_check_window=${COLLAPSE_CHECK_WINDOW}" \
     "max_steps=${MAX_STEPS}" \
     "num_gpus=${NUM_GPUS}" \
     "save_top_k=${SAVE_TOP_K}"
@@ -198,6 +212,7 @@ echo "Skip degen threshold:    ${SKIP_DEGENERATE_THRESHOLD}"
 echo "Min reward std update:   ${MIN_REWARD_STD_TO_UPDATE}"
 echo "Max steps:               ${MAX_STEPS}"
 echo "Val interval:            ${VAL_CHECK_INTERVAL}"
+echo "Trajectory dir:          ${TRAJ_OUTPUT_DIR}/trajectories"
 echo "GPUs:                    ${NUM_GPUS}"
 echo "Log file:                ${LOG_FILE}"
 echo ""
@@ -217,6 +232,7 @@ cat << LOG_HEADER > "${LOG_FILE}"
 # SFT From:        ${SFT_CKPT}
 # Start Time:      $(date '+%Y-%m-%d %H:%M:%S')
 # Log File:        ${LOG_FILE}
+# Traj Dir:        ${TRAJ_OUTPUT_DIR}/trajectories
 #
 # GRPO Config:
 #   num_generations=${NUM_GENERATIONS}
@@ -292,7 +308,11 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --wandb_project "nlp_sudoku_rl" \
     --wandb_mode "${WANDB_MODE}" \
     --run_name "${RUN_NAME}_${current_time}" \
-    --checkpoint_dir "${EXP_CKPT_DIR}"
+    --checkpoint_dir "${EXP_CKPT_DIR}" \
+    --traj_log_interval ${TRAJ_LOG_INTERVAL} \
+    --traj_output_dir "${TRAJ_OUTPUT_DIR}" \
+    --traj_num_samples ${TRAJ_NUM_SAMPLES} \
+    --collapse_check_window ${COLLAPSE_CHECK_WINDOW}
 
 TRAIN_EXIT_CODE=$?
 set -e
@@ -309,6 +329,7 @@ fi
 
 echo ""
 echo "日志已保存到: ${LOG_FILE}"
+echo "轨迹 JSONL:  ${TRAJ_OUTPUT_DIR}/trajectories"
 
 if [ "${ANALYZE_AFTER_TRAIN:-1}" = "1" ] && [ -f "${SCRIPT_DIR}/../scripts/analyze_rl_run.py" ]; then
     echo "正在生成 RL 分析报告..."

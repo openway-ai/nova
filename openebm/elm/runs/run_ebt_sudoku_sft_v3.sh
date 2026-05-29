@@ -13,7 +13,7 @@
 #   - MCMC stays at 2, randomize=0 by default (OOM-safe); override if memory allows
 #   - Prompt 5→20, response 3→8, 新增 flat 格式 (70/30 grid/flat)[P8 user req]
 #   - 报告 valid_loss_sft / valid_loss_sudoku / valid_loss_balanced
-#   - SAVE_TOP_K 2 → 5 + periodic ckpt, 保留更多 RL 起点候选
+#   - SAVE_TOP_K 2 → 3 + periodic ckpt, 在磁盘压力下保留少量 RL 起点候选
 ################################################################################
 
 set -e
@@ -29,6 +29,7 @@ export MODEL_SIZE="d26"
 
 # 最新core最高的 sft权重 core 0.20
 PRETRAIN_CKPT="${PRETRAIN_CKPT:-/mnt/shared-storage-user/luyudong/nova-sft/nova/logs/ebt_runs/d26-ctx2048-20260513/sft_train.v2/checkpoints/s=step=1703-d26-ctx2048-lr0.00024-bs1x32-muon_adamw-valid_loss=valid_loss=0.7257.ckpt}"
+MIN_FINETUNE_LOAD_FRACTION="${MIN_FINETUNE_LOAD_FRACTION:-0.99}"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -149,7 +150,7 @@ WANDB_FLAGS=""
 ################################################################################
 # Checkpoint 管理: 保留更多候选，便于后续用 sample eval 选择 RL 起点
 ################################################################################
-SAVE_TOP_K="${SAVE_TOP_K:-5}"
+SAVE_TOP_K="${SAVE_TOP_K:-3}"
 SAVE_PERIODIC_STEPS="${SAVE_PERIODIC_STEPS:-500}"
 RUN_SUDOKU_CKPT_SWEEP_AFTER_TRAIN="${RUN_SUDOKU_CKPT_SWEEP_AFTER_TRAIN:-1}"
 SUDOKU_CKPT_SWEEP_MAX_CKPTS="${SUDOKU_CKPT_SWEEP_MAX_CKPTS:-8}"
@@ -204,7 +205,7 @@ exp_init_sft "$0"
 export RUN_NAME="${EXP_ID}-sudoku-mixed-sft-v3"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
-exp_save_hparams "${EXP_DIR}/sft_train" \
+exp_save_hparams "${EXP_SFT_DIR}" \
     "model_size=${MODEL_SIZE}" \
     "context_length=${CONTEXT_LENGTH}" \
     "peak_lr=${PEAK_LR}" \
@@ -224,6 +225,7 @@ exp_save_hparams "${EXP_DIR}/sft_train" \
     "mcmc_num_steps=${MCMC_NUM_STEPS}" \
     "randomize_mcmc_num_steps=${RANDOMIZE_MCMC_NUM_STEPS}" \
     "pretrain_ckpt=${PRETRAIN_CKPT}" \
+    "min_finetune_load_fraction=${MIN_FINETUNE_LOAD_FRACTION}" \
     "optimizer=muon_adamw" \
     "dataset=sudoku_mixed_v3" \
     "sudoku_ratio_initial=${SUDOKU_RATIO}" \
@@ -258,6 +260,7 @@ echo "=================================="
 echo "  EBT Sudoku SFT V3 训练"
 echo "=================================="
 echo "Pretrain ckpt:           ${PRETRAIN_CKPT}"
+echo "Min ckpt load fraction:  ${MIN_FINETUNE_LOAD_FRACTION}"
 echo "Dataset:                 sudoku_mixed (v3)"
 echo "sudoku_ratio (initial):  ${SUDOKU_RATIO}"
 echo "sudoku_ratio_schedule:   ${SUDOKU_RATIO_SCHEDULE}    [P3+P4]"
@@ -326,6 +329,7 @@ echo "==========================================================================
 echo "[Sudoku SFT V3 训练配置]"
 echo "================================================================================"
 echo "Pretrain Checkpoint:        ${PRETRAIN_CKPT}"
+echo "Min ckpt load fraction:     ${MIN_FINETUNE_LOAD_FRACTION}"
 echo "Dataset:                    sudoku_mixed (v3)"
 echo "sudoku_ratio (initial):     ${SUDOKU_RATIO}"
 echo "sudoku_ratio_schedule:      ${SUDOKU_RATIO_SCHEDULE}"
@@ -419,6 +423,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --save_periodic_steps ${SAVE_PERIODIC_STEPS} \
 --float_precision "bf16-mixed" \
 --finetuning_model_ckpt ${PRETRAIN_CKPT} \
+--min_finetune_load_fraction ${MIN_FINETUNE_LOAD_FRACTION} \
 ${WANDB_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}
@@ -426,7 +431,7 @@ ${COMPILE_FLAGS}
 TRAIN_EXIT_CODE=$?
 set -e
 
-exp_save_status "${EXP_DIR}/sft_train" "sudoku_sft_v3_train" "$TRAIN_EXIT_CODE"
+exp_save_status "${EXP_SFT_DIR}" "sudoku_sft_v3_train" "$TRAIN_EXIT_CODE"
 
 if [ $TRAIN_EXIT_CODE -eq 0 ]; then
     echo -e "\033[0;32m✓ Sudoku SFT V3 训练成功完成\033[0m"
@@ -443,7 +448,7 @@ if [ "${RUN_SUDOKU_CKPT_SWEEP_AFTER_TRAIN}" = "1" ]; then
     echo ""
     echo "开始按 Sudoku 生成指标重排 checkpoint 候选..."
     python /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/scripts/select_sudoku_sft_ckpt.py \
-        "${EXP_DIR}/sft_train" \
+        "${EXP_SFT_DIR}" \
         --ckpt_dir "${EXP_CKPT_DIR}" \
         --max_ckpts "${SUDOKU_CKPT_SWEEP_MAX_CKPTS}" \
         --num_samples "${SUDOKU_CKPT_SWEEP_NUM_SAMPLES}" \
@@ -458,12 +463,12 @@ if [ "${RUN_SUDOKU_EVAL_AFTER_TRAIN:-0}" = "1" ] && [ -n "${BEST_CKPT}" ]; then
     python /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/scripts/eval_sudoku_samples.py \
         --checkpoint "${BEST_CKPT}" \
         --num_samples "${SUDOKU_EVAL_NUM_SAMPLES:-512}" \
-        --run_dir "${EXP_DIR}/sft_train" \
+        --run_dir "${EXP_SFT_DIR}" \
         2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush() }' | tee -a "${LOG_FILE}"
 elif [ -n "${BEST_CKPT}" ]; then
     echo ""
     echo "推荐下一步评估 RL 起点候选:"
-    echo "python /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/scripts/eval_sudoku_samples.py --checkpoint \"${BEST_CKPT}\" --num_samples 1024 --run_dir \"${EXP_DIR}/sft_train\""
+    echo "python /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/scripts/eval_sudoku_samples.py --checkpoint \"${BEST_CKPT}\" --num_samples 1024 --run_dir \"${EXP_SFT_DIR}\""
 fi
 
 ################################################################################
@@ -481,5 +486,5 @@ fi
 #   with 70/30 grid/flat mix. (P8 + user req, must-have)
 # - Eval script: lenient parse, by-givens bucket, SIGINT-safe finalize, error dumps;
 #   new parse_eval_log.py.
-# - SAVE_TOP_K defaults to 5 and periodic ckpts default to 500 steps for RL-start selection.
+# - SAVE_TOP_K defaults to 3 and periodic ckpts default to 500 steps for disk-aware RL-start selection.
 ################################################################################
