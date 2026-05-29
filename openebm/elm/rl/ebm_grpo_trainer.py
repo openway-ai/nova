@@ -733,23 +733,34 @@ class EBMGRPOTrainer(LightningModule):
         return loss, metrics
 
     def _energy_kl_anchor(self, full_ids, prompt_len, current_energies):
-        """One-sided energy-KL anchor against ref_model.
+        """Sequence-energy anchor against the frozen SFT reference.
 
-        Returns (kl_penalty_term, kl_value, energy_drift). The penalty is
-        ``relu(E_θ - E_ref).mean()`` — only punishes drift to higher energy
-        than the SFT reference (= drift to lower likelihood than ref).
-        Returns zeros + None when no ref_model / beta=0.
-
-        Shared by `_loss_energy_gspo` and `_loss_energy_reinforce` so both
-        loss types get the same SFT-anchoring behavior on top of their
-        respective stability mechanisms (PPO clip vs. pure on-policy).
+        The earlier one-sided anchor only punished ``E_theta > E_ref`` and
+        allowed large negative drift. The analyzed Sudoku/GSM8K runs collapsed
+        exactly in that unconstrained direction, so the default is now a smooth
+        two-sided Huber penalty. This keeps the policy close to the SFT energy
+        scale while GSPO clipping handles per-rollout policy drift.
         """
         if self.ref_model is None or self.config.beta <= 0.0:
             return None, 0.0, 0.0
         with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
             ref_energies = compute_sequence_energy(self.ref_model, full_ids, prompt_len)
         energy_diff = current_energies - ref_energies.detach()
-        energy_kl = energy_diff.clamp(min=0.0).mean()
+        mode = getattr(self.config, "energy_kl_mode", "symmetric_huber")
+        if mode == "one_sided":
+            energy_kl = energy_diff.clamp(min=0.0).mean()
+        elif mode == "symmetric_l2":
+            energy_kl = energy_diff.pow(2).mean()
+        elif mode == "symmetric_huber":
+            target = torch.zeros_like(energy_diff)
+            energy_kl = F.smooth_l1_loss(
+                energy_diff,
+                target,
+                beta=getattr(self.config, "energy_kl_huber_delta", 0.5),
+                reduction="mean",
+            )
+        else:
+            raise ValueError(f"Unknown energy_kl_mode: {mode}")
         return energy_kl, energy_kl.item(), energy_diff.mean().item()
 
     def _loss_energy_gspo(self, gen_data):

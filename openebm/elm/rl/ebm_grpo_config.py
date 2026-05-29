@@ -58,6 +58,18 @@ class EBMGRPOConfig:
     beta * mean((E_θ - E_ref)^2). For token_logprobs it scales the
     per-token KL via k1 estimator (legacy)."""
 
+    energy_kl_mode: str = "symmetric_huber"
+    """Sequence-energy anchor mode against the frozen SFT reference:
+    - 'symmetric_huber' (default): smooth two-sided penalty on E_θ - E_ref.
+      This is the safest RL default because both positive and negative energy
+      drift can indicate policy collapse.
+    - 'symmetric_l2': stronger two-sided squared penalty.
+    - 'one_sided': legacy relu(E_θ - E_ref), only punishes worse-than-ref
+      energy and allows large negative drift."""
+
+    energy_kl_huber_delta: float = 0.5
+    """Huber delta for energy_kl_mode='symmetric_huber'."""
+
     reward_weights: Optional[List[float]] = None
     """Weights for each reward component. None = equal weighting."""
 

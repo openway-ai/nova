@@ -47,42 +47,47 @@ export EXP_ID="d26-ctx2048-sudoku-rl-gspo-$(date +%Y%m%d)"
 ################################################################################
 # GRPO 超参数
 ################################################################################
-NUM_GENERATIONS=16            # completions per prompt (raised from 8 → stabler advantage estimates)
-MAX_COMPLETION_LENGTH=165     # v3: ↓ from 180. 9x9 board ≤162 chars; tail tokens produce gibberish + waste VRAM
-MAX_PROMPT_LENGTH=192
-TEMPERATURE=0.9
-TOP_P=0.9                     # narrowed from 0.95 to reduce long-tail sampling noise
-GENERATION_BATCH_SIZE=8       # sub-batch for generation (VRAM management)
+NUM_GENERATIONS="${NUM_GENERATIONS:-12}"            # 12 is a stable smoke default; use 16 after curves are healthy
+MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-165}"     # 9x9 board ≤162 chars; tail tokens add noise
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-192}"
+TEMPERATURE="${TEMPERATURE:-0.75}"                  # lower than 0.9: reduce invalid-format exploration
+TOP_P="${TOP_P:-0.85}"
+GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-6}" # sub-batch for generation (VRAM management)
 
-NUM_ITERATIONS=1              # legacy loss recomputation; keep 1 when using GSPO_UPDATE_EPOCHS
+NUM_ITERATIONS="${NUM_ITERATIONS:-1}"              # legacy loss recomputation; keep 1 when using GSPO_UPDATE_EPOCHS
 GSPO_UPDATE_EPOCHS="${GSPO_UPDATE_EPOCHS:-1}"  # true optimizer steps per rollout for energy_gspo
-EPSILON=0.2                   # PPO clip range (only used by energy_gspo)
-BETA=0.2                      # v3: ↑ 0.05→0.2 (4x). v2 grad_norm 0.07→1.58 evidence KL anchor too weak
-LEARNING_RATE=2e-6            # lowered from 5e-6 to slow collapse-prone transformer drift
+EPSILON="${EPSILON:-0.2}"                   # PPO clip range (only used by energy_gspo)
+CLIP_RATIO_LOW="${CLIP_RATIO_LOW:-0.2}"     # verl/DAPO-style asymmetric GSPO clip
+CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-0.28}"
+BETA="${BETA:-0.3}"                         # stronger anchor after negative energy-drift collapse
+ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
+ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
+LEARNING_RATE="${LEARNING_RATE:-1e-6}"       # lower than collapsed v2/v3 runs
 # RL_LOSS_TYPE="energy_reinforce"  # removes 1/|y| dilution
 RL_LOSS_TYPE="${RL_LOSS_TYPE:-energy_gspo}"
 
-WEIGHT_DECAY=0.01
-GRADIENT_CLIP_VAL=1.0         # v3 P1: 0.3 → 1.0 (KL anchor BETA=0.2 主导稳定; per-param clip 之前压制了学习信号)
-MAX_GRAD_PER_PARAM=0.05       # v3 P1: 0.02 → 0.05 (v2 实测真实梯度信号需要更大空间)
-WARMUP_STEPS=50               # raised from 20 to give KL anchor time to engage
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
+MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.03}"
+WARMUP_STEPS="${WARMUP_STEPS:-80}"
 
 # ── Optimizer (v3 P0+P1+muon) ─────────────────────────────────────────────────
 # adamw      : v3 P0 multi-group AdamW (transformer/v2e/scalar/other split LR)
 # muon_adamw : Muon for transformer matrices + AdamW for the rest (matches SFT)
-RL_OPTIMIZER="${RL_OPTIMIZER:-adamw}"          # set to "muon_adamw" to enable Muon hybrid
+RL_OPTIMIZER="${RL_OPTIMIZER:-adamw}"       # keep AdamW first; Muon can amplify collapse in short RL runs
 MUON_LR="${MUON_LR:-2e-4}"                  # default = SFT muon_lr (2e-3) / 10
-ADVANTAGE_NORM="group_mean_global_std"  # batch-wide std prevents tiny intra-group std blow-ups
-GLOBAL_STD_MIN=0.1
-SKIP_DEGENERATE_THRESHOLD=0.9 # skip optimizer step when nearly every group is degenerate
+ADVANTAGE_NORM="${ADVANTAGE_NORM:-group_mean_global_std}"  # batch-wide std prevents tiny intra-group std blow-ups
+GLOBAL_STD_MIN="${GLOBAL_STD_MIN:-0.2}"
+SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.85}"
+MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-0.01}"
+MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.0}"
 
-# MAX_STEPS=300                 # short-train verification of new pipeline; raise to 1000 after green
-MAX_STEPS=3000                 # short-train verification of new pipeline; raise to 1000 after green
+MAX_STEPS="${MAX_STEPS:-600}"                # smoke first; raise only after analysis_overview is healthy
            
-VAL_CHECK_INTERVAL=25
-LOG_INTERVAL=5
-SAVE_TOP_K=3
-SEED=42
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-25}"
+LOG_INTERVAL="${LOG_INTERVAL:-5}"
+SAVE_TOP_K="${SAVE_TOP_K:-3}"
+SEED="${SEED:-42}"
 
 ################################################################################
 # GPU 配置
@@ -145,8 +150,12 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "max_completion_length=${MAX_COMPLETION_LENGTH}" \
     "temperature=${TEMPERATURE}" \
     "epsilon=${EPSILON}" \
+    "clip_ratio_low=${CLIP_RATIO_LOW}" \
+    "clip_ratio_high=${CLIP_RATIO_HIGH}" \
     "gspo_update_epochs=${GSPO_UPDATE_EPOCHS}" \
     "beta=${BETA}" \
+    "energy_kl_mode=${ENERGY_KL_MODE}" \
+    "energy_kl_huber_delta=${ENERGY_KL_HUBER_DELTA}" \
     "learning_rate=${LEARNING_RATE}" \
     "warmup_steps=${WARMUP_STEPS}" \
     "gradient_clip_val=${GRADIENT_CLIP_VAL}" \
@@ -154,6 +163,8 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "advantage_norm=${ADVANTAGE_NORM}" \
     "global_std_min=${GLOBAL_STD_MIN}" \
     "skip_degenerate_threshold=${SKIP_DEGENERATE_THRESHOLD}" \
+    "min_reward_std_to_update=${MIN_REWARD_STD_TO_UPDATE}" \
+    "min_unique_completion_ratio_to_update=${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE}" \
     "rl_loss_type=${RL_LOSS_TYPE}" \
     "max_steps=${MAX_STEPS}" \
     "num_gpus=${NUM_GPUS}" \
@@ -175,19 +186,24 @@ echo "Num generations:         ${NUM_GENERATIONS}"
 echo "Max completion length:   ${MAX_COMPLETION_LENGTH}"
 echo "Temperature:             ${TEMPERATURE}"
 echo "Epsilon (clip):          ${EPSILON}"
+echo "Clip low/high:           ${CLIP_RATIO_LOW}/${CLIP_RATIO_HIGH}"
 echo "Beta (KL anchor):        ${BETA}"
+echo "Energy KL mode:          ${ENERGY_KL_MODE} (delta=${ENERGY_KL_HUBER_DELTA})"
 echo "Learning rate:           ${LEARNING_RATE}"
 echo "Warmup steps:            ${WARMUP_STEPS}"
 echo "Gradient clip (global):  ${GRADIENT_CLIP_VAL}"
 echo "Max grad per param:      ${MAX_GRAD_PER_PARAM}"
 echo "Advantage norm:          ${ADVANTAGE_NORM}"
 echo "Skip degen threshold:    ${SKIP_DEGENERATE_THRESHOLD}"
+echo "Min reward std update:   ${MIN_REWARD_STD_TO_UPDATE}"
 echo "Max steps:               ${MAX_STEPS}"
 echo "Val interval:            ${VAL_CHECK_INTERVAL}"
 echo "GPUs:                    ${NUM_GPUS}"
 echo "Log file:                ${LOG_FILE}"
 echo ""
-read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
+if [ "${SKIP_CONFIRM:-0}" != "1" ]; then
+    read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
+fi
 
 ################################################################################
 # 写入日志头
@@ -207,7 +223,10 @@ cat << LOG_HEADER > "${LOG_FILE}"
 #   max_completion_length=${MAX_COMPLETION_LENGTH}
 #   temperature=${TEMPERATURE}
 #   epsilon=${EPSILON}
+#   clip_ratio_low=${CLIP_RATIO_LOW}
+#   clip_ratio_high=${CLIP_RATIO_HIGH}
 #   beta=${BETA}
+#   energy_kl_mode=${ENERGY_KL_MODE}
 #   learning_rate=${LEARNING_RATE}
 #   max_steps=${MAX_STEPS}
 ################################################################################
@@ -244,7 +263,11 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --num_iterations ${NUM_ITERATIONS} \
     --gspo_update_epochs ${GSPO_UPDATE_EPOCHS} \
     --epsilon ${EPSILON} \
+    --clip_ratio_low ${CLIP_RATIO_LOW} \
+    --clip_ratio_high ${CLIP_RATIO_HIGH} \
     --beta ${BETA} \
+    --energy_kl_mode ${ENERGY_KL_MODE} \
+    --energy_kl_huber_delta ${ENERGY_KL_HUBER_DELTA} \
     --learning_rate ${LEARNING_RATE} \
     --rl_loss_type ${RL_LOSS_TYPE} \
     --weight_decay ${WEIGHT_DECAY} \
@@ -256,6 +279,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --advantage_norm ${ADVANTAGE_NORM} \
     --global_std_min ${GLOBAL_STD_MIN} \
     --skip_degenerate_threshold ${SKIP_DEGENERATE_THRESHOLD} \
+    --min_reward_std_to_update ${MIN_REWARD_STD_TO_UPDATE} \
+    --min_unique_completion_ratio_to_update ${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE} \
     --max_steps ${MAX_STEPS} \
     --val_check_interval ${VAL_CHECK_INTERVAL} \
     --log_interval ${LOG_INTERVAL} \
@@ -284,3 +309,8 @@ fi
 
 echo ""
 echo "日志已保存到: ${LOG_FILE}"
+
+if [ "${ANALYZE_AFTER_TRAIN:-1}" = "1" ] && [ -f "${SCRIPT_DIR}/../scripts/analyze_rl_run.py" ]; then
+    echo "正在生成 RL 分析报告..."
+    python "${SCRIPT_DIR}/../scripts/analyze_rl_run.py" "${EXP_SFT_DIR}" || true
+fi

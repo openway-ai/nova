@@ -342,6 +342,19 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
             AdaptiveRatioCallback(
                 ratio_schedule=getattr(args, 'sudoku_ratio_schedule', 'fixed'),
                 difficulty_schedule=getattr(args, 'sudoku_difficulty_schedule', 'fixed'),
+                phase1_steps=getattr(args, 'sudoku_phase1_steps', 600),
+                phase2_steps=getattr(args, 'sudoku_phase2_steps', 2400),
+                warmup_ratio=getattr(args, 'sudoku_warmup_ratio', 0.60),
+                focus_ratio=getattr(args, 'sudoku_focus_ratio', 0.85),
+                consolidate_ratio=getattr(args, 'sudoku_consolidate_ratio', 0.70),
+                sft_baseline=getattr(args, 'sudoku_guard_sft_baseline', 1.121),
+                sft_tolerance=getattr(args, 'sudoku_guard_tolerance', 0.03),
+                ratio_floor=getattr(args, 'sudoku_ratio_floor', 0.50),
+                ratio_ceil=getattr(args, 'sudoku_ratio_ceil', 0.85),
+                ratio_step=getattr(args, 'sudoku_ratio_step', 0.05),
+                warmup_bucket_weights=getattr(args, 'sudoku_warmup_bucket_weights', None),
+                focus_bucket_weights=getattr(args, 'sudoku_focus_bucket_weights', None),
+                consolidate_bucket_weights=getattr(args, 'sudoku_consolidate_bucket_weights', None),
             )
         )
 
@@ -757,6 +770,20 @@ if __name__ == '__main__':
         choices=["fixed", "three_phase"],
         default="fixed",
     )
+    parser.add_argument("--sudoku_phase1_steps", help="Sudoku three-phase schedule warmup/focus boundary.", type=int, default=600)
+    parser.add_argument("--sudoku_phase2_steps", help="Sudoku three-phase schedule focus/consolidation boundary.", type=int, default=2400)
+    parser.add_argument("--sudoku_warmup_ratio", help="Sudoku sample ratio during warmup phase.", type=float, default=0.60)
+    parser.add_argument("--sudoku_focus_ratio", help="Sudoku sample ratio during hard-focus phase.", type=float, default=0.85)
+    parser.add_argument("--sudoku_consolidate_ratio", help="Sudoku sample ratio during consolidation phase.", type=float, default=0.70)
+    parser.add_argument("--sudoku_guard_sft_baseline", help="valid_loss_sft baseline used by the Sudoku retention guard.", type=float, default=1.121)
+    parser.add_argument("--sudoku_guard_tolerance", help="Allowed valid_loss_sft drift before lowering Sudoku ratio.", type=float, default=0.03)
+    parser.add_argument("--sudoku_ratio_floor", help="Minimum Sudoku ratio allowed by retention guard.", type=float, default=0.50)
+    parser.add_argument("--sudoku_ratio_ceil", help="Maximum Sudoku ratio allowed by retention guard.", type=float, default=0.85)
+    parser.add_argument("--sudoku_ratio_step", help="Sudoku ratio adjustment step used by retention guard.", type=float, default=0.05)
+    parser.add_argument("--sudoku_warmup_bucket_weights", help="Hard/medium/easy bucket weights for Sudoku warmup phase.", nargs=3, type=float, default=None)
+    parser.add_argument("--sudoku_focus_bucket_weights", help="Hard/medium/easy bucket weights for Sudoku focus phase.", nargs=3, type=float, default=None)
+    parser.add_argument("--sudoku_consolidate_bucket_weights", help="Hard/medium/easy bucket weights for Sudoku consolidation phase.", nargs=3, type=float, default=None)
+    parser.add_argument("--dataset_seed", help="Optional dataset RNG seed. -1 keeps dataset default behavior.", type=int, default=-1)
     
     parser.add_argument("--dataset_dir", help="dataset base directory", default="")
 
