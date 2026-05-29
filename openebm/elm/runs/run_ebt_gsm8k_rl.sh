@@ -173,8 +173,10 @@ exp_init_sft "$0"
 export RUN_NAME="${EXP_ID}-grpo"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# 轨迹输出目录跟着实验目录走 (EXP_SFT_DIR 由 exp_init_sft 自动 export, 含 v{N} 后缀)
-TRAJ_OUTPUT_DIR="${EXP_SFT_DIR}/trajectories"
+# 轨迹输出目录跟着实际 stage 目录走。TrajectoryLogger 会写入:
+#   ${TRAJ_OUTPUT_DIR}/trajectories/step_*/rollout_samples.jsonl
+#   ${TRAJ_OUTPUT_DIR}/collapse_dump/step_*.jsonl
+TRAJ_OUTPUT_DIR="${EXP_SFT_DIR}"
 export TRAJ_OUTPUT_DIR
 
 exp_save_hparams "${EXP_SFT_DIR}" \
@@ -235,7 +237,7 @@ echo "Max steps:               ${MAX_STEPS}"
 echo "Val interval:            ${VAL_CHECK_INTERVAL}"
 echo "GPUs:                    ${NUM_GPUS}"
 echo "Traj log interval:       ${TRAJ_LOG_INTERVAL}"
-echo "Traj output dir:         ${TRAJ_OUTPUT_DIR}"
+echo "Traj output dir:         ${TRAJ_OUTPUT_DIR}/trajectories"
 echo "Log level:               ${LOG_LEVEL}"
 echo "Log file:                ${LOG_FILE}"
 echo ""
@@ -255,7 +257,7 @@ cat << LOG_HEADER > "${LOG_FILE}"
 # SFT From:        ${SFT_CKPT}
 # Start Time:      $(date '+%Y-%m-%d %H:%M:%S')
 # Log File:        ${LOG_FILE}
-# Traj Dir:        ${TRAJ_OUTPUT_DIR}
+# Traj Dir:        ${TRAJ_OUTPUT_DIR}/trajectories
 #
 # GRPO Config:
 #   task=gsm8k
@@ -361,7 +363,7 @@ fi
 
 echo ""
 echo "日志已保存到: ${LOG_FILE}"
-echo "轨迹 JSONL:  ${TRAJ_OUTPUT_DIR}"
+echo "轨迹 JSONL:  ${TRAJ_OUTPUT_DIR}/trajectories"
 
 if [ "${ANALYZE_AFTER_TRAIN:-1}" = "1" ] && [ -f "${SCRIPT_DIR}/../scripts/analyze_rl_run.py" ]; then
     echo "正在生成 RL 分析报告..."
@@ -379,13 +381,13 @@ fi
 #
 # 轨迹分析示例:
 #   # 查看 step 50 的所有 completion 及 reward
-#   cat ${TRAJ_OUTPUT_DIR}/step_000050/rollout_samples.jsonl | python3 -c \
+#   cat ${TRAJ_OUTPUT_DIR}/trajectories/step_000050/rollout_samples.jsonl | python3 -c \
 #     "import sys,json; [print(json.loads(l)['reward'], json.loads(l)['completion'][:100]) for l in sys.stdin]"
 #
 #   # 统计各 step 的 exact_match 准确率
-#   grep -h '' ${TRAJ_OUTPUT_DIR}/*/summary.json | python3 -c \
+#   grep -h '' ${TRAJ_OUTPUT_DIR}/trajectories/*/summary.json | python3 -c \
 #     "import sys,json; [print(json.loads(l)['step'], json.loads(l).get('reward_mean','?')) for l in sys.stdin]"
 #
 #   # 找到所有 collapse dump
-#   ls ${TRAJ_OUTPUT_DIR}/../collapse_dump/
+#   ls ${TRAJ_OUTPUT_DIR}/collapse_dump/
 ################################################################################

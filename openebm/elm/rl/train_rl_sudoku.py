@@ -136,6 +136,14 @@ def parse_args():
     parser.add_argument("--wandb_mode", type=str, default="offline")
     parser.add_argument("--run_name", type=str, default="")
     parser.add_argument("--checkpoint_dir", type=str, default="")
+    parser.add_argument("--traj_log_interval", type=int, default=50,
+                        help="Dump rollout samples every N steps (0 = disabled)")
+    parser.add_argument("--traj_output_dir", type=str, default="",
+                        help="Run/stage root for trajectory outputs; files go under <dir>/trajectories/")
+    parser.add_argument("--traj_num_samples", type=int, default=2,
+                        help="Number of rollout samples to print per periodic dump")
+    parser.add_argument("--collapse_check_window", type=int, default=5,
+                        help="Consecutive degenerate rollout windows before collapse dump")
 
     return parser.parse_args()
 
@@ -281,6 +289,10 @@ def main():
         wandb_project=args.wandb_project,
         wandb_mode=args.wandb_mode,
         run_name=args.run_name,
+        traj_log_interval=args.traj_log_interval,
+        traj_output_dir=args.traj_output_dir,
+        traj_num_samples=args.traj_num_samples,
+        collapse_check_window=args.collapse_check_window,
     )
 
     # Seed
@@ -373,6 +385,7 @@ def main():
     print(f"  Max steps:          {config.max_steps}")
     print(f"  GPUs:               {gpus}")
     print(f"  Precision:          {args.float_precision}")
+    print(f"  Trajectory dir:     {config.traj_output_dir or os.environ.get('TRAJ_OUTPUT_DIR') or '<trainer.log_dir>'}/trajectories")
     print("=" * 80 + "\n")
 
     trainer.fit(grpo_module)

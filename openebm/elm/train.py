@@ -58,6 +58,139 @@ from openebm.elm import logger
 from openebm.elm.trainer import ModelTrainer
 from openebm.elm.eval import nlp_eval_acc
 
+
+def _candidate_finetune_keys(key):
+    """Return compatible key variants across torch.compile checkpoint layouts.
+
+    Older runs in this repo saved the fully compiled model as
+    ``model._orig_mod.*``. Some stronger Sudoku SFT checkpoints were saved with
+    only the transformer compiled, producing ``model.transformer._orig_mod.*``
+    plus a duplicate ``model.transformer_eager.*``. Lightning's
+    ``strict=False`` would otherwise silently skip most of the model.
+    """
+    candidates = [key]
+
+    if key.startswith("model.transformer_eager."):
+        rest = key[len("model.transformer_eager."):]
+        candidates.extend([
+            "model.transformer." + rest,
+            "model._orig_mod.transformer." + rest,
+        ])
+    elif key.startswith("model.transformer._orig_mod."):
+        rest = key[len("model.transformer._orig_mod."):]
+        candidates.extend([
+            "model.transformer." + rest,
+            "model._orig_mod.transformer." + rest,
+        ])
+    elif key.startswith("model._orig_mod.transformer."):
+        rest = key[len("model._orig_mod.transformer."):]
+        candidates.extend([
+            "model.transformer._orig_mod." + rest,
+            "model.transformer." + rest,
+        ])
+    elif key.startswith("model._orig_mod."):
+        rest = key[len("model._orig_mod."):]
+        candidates.append("model." + rest)
+    elif key.startswith("model."):
+        rest = key[len("model."):]
+        candidates.append("model._orig_mod." + rest)
+
+    # Preserve order while deduplicating.
+    seen = set()
+    out = []
+    for cand in candidates:
+        if cand not in seen:
+            out.append(cand)
+            seen.add(cand)
+    return out
+
+
+def load_finetune_checkpoint_weights(model_trainer, ckpt_path, min_load_fraction=0.95, allow_partial=False):
+    """Load a finetuning checkpoint with compile-layout key remapping and guards."""
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    source_state = ckpt.get('state_dict', ckpt)
+    if not isinstance(source_state, dict):
+        raise TypeError(f"Checkpoint state_dict is not a dict: {type(source_state)}")
+
+    target_state = model_trainer.state_dict()
+    remapped_state = {}
+    source_to_target = {}
+    shape_mismatches = []
+    unmatched_source = []
+
+    for src_key, tensor in source_state.items():
+        matched_key = None
+        for cand in _candidate_finetune_keys(src_key):
+            target_tensor = target_state.get(cand)
+            if target_tensor is None:
+                continue
+            if hasattr(tensor, 'shape') and hasattr(target_tensor, 'shape') and tensor.shape != target_tensor.shape:
+                shape_mismatches.append((src_key, cand, tuple(tensor.shape), tuple(target_tensor.shape)))
+                continue
+            matched_key = cand
+            break
+
+        if matched_key is None:
+            unmatched_source.append(src_key)
+            continue
+
+        # Prefer the first source key for duplicate aliases such as transformer_eager.
+        if matched_key not in remapped_state:
+            remapped_state[matched_key] = tensor
+            source_to_target[src_key] = matched_key
+
+    incompatible = model_trainer.load_state_dict(remapped_state, strict=False)
+
+    trainable_target_keys = {
+        name for name, param in model_trainer.named_parameters()
+        if param.requires_grad
+    }
+    trainable_loaded = trainable_target_keys.intersection(remapped_state.keys())
+    target_tensor_count = len(target_state)
+    loaded_tensor_count = len(remapped_state)
+    target_param_elems = sum(
+        param.numel() for name, param in model_trainer.named_parameters()
+        if param.requires_grad
+    )
+    loaded_param_elems = sum(
+        model_trainer.state_dict()[name].numel()
+        for name in trainable_loaded
+        if name in model_trainer.state_dict()
+    )
+    load_fraction = loaded_param_elems / max(1, target_param_elems)
+
+    print("[SFT] checkpoint load compatibility report")
+    print(f"[SFT]   source tensors: {len(source_state)}")
+    print(f"[SFT]   target tensors: {target_tensor_count}")
+    print(f"[SFT]   loaded tensors: {loaded_tensor_count}")
+    print(f"[SFT]   trainable loaded tensors: {len(trainable_loaded)}/{len(trainable_target_keys)}")
+    print(f"[SFT]   trainable parameter coverage: {load_fraction:.6f}")
+    print(f"[SFT]   missing after remap: {len(incompatible.missing_keys)}")
+    print(f"[SFT]   unexpected after remap: {len(incompatible.unexpected_keys)}")
+    print(f"[SFT]   unmatched source tensors: {len(unmatched_source)}")
+    print(f"[SFT]   shape mismatches: {len(shape_mismatches)}")
+    if source_to_target:
+        examples = list(source_to_target.items())[:8]
+        print("[SFT]   remap examples:")
+        for src, dst in examples:
+            if src != dst:
+                print(f"[SFT]     {src} -> {dst}")
+    if incompatible.missing_keys:
+        print(f"[SFT]   missing sample: {incompatible.missing_keys[:12]}")
+    if unmatched_source:
+        print(f"[SFT]   unmatched source sample: {unmatched_source[:12]}")
+    if shape_mismatches:
+        print(f"[SFT]   shape mismatch sample: {shape_mismatches[:8]}")
+
+    if load_fraction < float(min_load_fraction) and not allow_partial:
+        raise RuntimeError(
+            f"Finetune checkpoint coverage too low ({load_fraction:.4f} < {min_load_fraction}). "
+            "This usually means the checkpoint was saved with an incompatible model/compile layout. "
+            "Set --allow_partial_finetune_load only if you intentionally want partial initialization."
+        )
+    return incompatible
+
+
 @rank_zero_only # to ensure only one wandb run is created, if didnt do that then each GPU would create its own wandb run
 def setup_wandb(args): 
     import wandb
@@ -187,8 +320,12 @@ def main(args):
     # SFT: 加载预训练权重但不恢复训练状态
     if args.finetuning_model_ckpt is not None and args.finetuning_model_ckpt != "":
         print(f"[SFT] 加载预训练权重: {args.finetuning_model_ckpt}")
-        ckpt = torch.load(args.finetuning_model_ckpt, map_location='cpu', weights_only=False)
-        model_trainer.load_state_dict(ckpt['state_dict'], strict=False)
+        load_finetune_checkpoint_weights(
+            model_trainer,
+            args.finetuning_model_ckpt,
+            min_load_fraction=args.min_finetune_load_fraction,
+            allow_partial=args.allow_partial_finetune_load,
+        )
         print(f"[SFT] 权重加载完成，训练从 step 0 开始")
 
     # if args.debug_dataloader:
@@ -659,6 +796,8 @@ if __name__ == '__main__':
     parser.add_argument("--execution_mode", type=str, choices=["pretrain", "finetune", "inference"], default="pretrain")
     
     parser.add_argument("--finetuning_model_ckpt", help="model ckpt when finetuning", type=str, default=None)
+    parser.add_argument("--min_finetune_load_fraction", help="minimum trainable parameter coverage required when loading --finetuning_model_ckpt", type=float, default=0.95)
+    parser.add_argument("--allow_partial_finetune_load", help="allow partial finetune checkpoint initialization even when coverage is below --min_finetune_load_fraction", action="store_true", default=False)
 
     #METRICS#########################################################
     #NOTE reported metrics in wandb will be averages over the time span they are being computed, so the final one in an epoch will be the most accurate
