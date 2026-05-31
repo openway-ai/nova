@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 
-def compute_sequence_energy(model, input_ids, prompt_length):
+def compute_sequence_energy(model, input_ids, prompt_length, completion_mask=None):
     """Compute per-sequence energy for known completions (no MCMC iteration).
 
     Sets predicted_tokens to one-hot of actual targets, runs transformer once.
@@ -19,6 +19,10 @@ def compute_sequence_energy(model, input_ids, prompt_length):
         model: EBT_NLP model instance
         input_ids: (B, S) full sequence (prompt + completion)
         prompt_length: int, number of prompt tokens
+        completion_mask: optional (B, completion_length) binary mask. When
+            provided, only real generated completion tokens contribute to the
+            sequence mean. This prevents semantic-stop/padding tail tokens from
+            polluting GSPO ratios and the reference energy anchor.
 
     Returns:
         energies: (B,) mean energy per sequence (completion positions only)
@@ -90,8 +94,21 @@ def compute_sequence_energy(model, input_ids, prompt_length):
     comp_start = prompt_length - 1
     comp_energy = energy_preds[:, comp_start:]  # (B, comp_len)
 
-    # Mean energy over completion positions
-    return comp_energy.mean(dim=1)  # (B,)
+    if completion_mask is None:
+        return comp_energy.mean(dim=1)  # (B,)
+
+    mask = completion_mask.to(device=comp_energy.device, dtype=comp_energy.dtype)
+    if mask.shape[0] != comp_energy.shape[0]:
+        raise ValueError(
+            f"completion_mask batch mismatch: {tuple(mask.shape)} vs energy {tuple(comp_energy.shape)}"
+        )
+    if mask.shape[1] != comp_energy.shape[1]:
+        common_len = min(mask.shape[1], comp_energy.shape[1])
+        mask = mask[:, :common_len]
+        comp_energy = comp_energy[:, :common_len]
+
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    return (comp_energy * mask).sum(dim=1) / denom  # (B,)
 
 
 def get_per_token_logps(model, input_ids, prompt_length, learning=False):

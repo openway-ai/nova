@@ -24,6 +24,7 @@ def generate_completions(
     top_p: float = 0.95,
     generation_batch_size: int = 4,
     extra_stop_strings: Optional[List[str]] = None,
+    return_stats: bool = False,
 ):
     """Generate multiple completions per prompt.
 
@@ -42,6 +43,9 @@ def generate_completions(
         completion_ids: (num_prompts * num_generations, max_completion_length) token IDs
         completion_texts: list of str, decoded completions
         completion_masks: (num_prompts * num_generations, max_completion_length) binary mask
+        stats: optional dict when return_stats=True. Currently contains
+            entropy_mean, the mean sampling entropy over un-stopped generated
+            positions. Healthy runs should not collapse near 0 early.
     """
     num_prompts, prompt_len = prompt_ids.shape
     device = prompt_ids.device
@@ -87,6 +91,8 @@ def generate_completions(
     all_completion_masks = torch.zeros(
         (total_seqs, actual_comp_len), dtype=torch.long, device=device
     )
+    entropy_sum = 0.0
+    entropy_count = 0
 
     # Generate in sub-batches
     with torch.no_grad():
@@ -118,6 +124,11 @@ def generate_completions(
 
                 if temperature > 0:
                     probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                    active = ~eos_reached
+                    if return_stats and active.any():
+                        token_entropy = -(probs.clamp_min(1e-12) * probs.clamp_min(1e-12).log()).sum(dim=-1)
+                        entropy_sum += float(token_entropy[active].sum().detach().cpu().item())
+                        entropy_count += int(active.sum().detach().cpu().item())
                     next_token = sample_top_p(probs, top_p).reshape(-1)
                 else:
                     next_token = torch.argmax(logits[:, -1], dim=-1)
@@ -170,4 +181,8 @@ def generate_completions(
         text = tokenizer.decode(token_list)
         completion_texts.append(text)
 
+    if return_stats:
+        return all_completion_ids, completion_texts, all_completion_masks, {
+            "entropy_mean": entropy_sum / entropy_count if entropy_count else 0.0,
+        }
     return all_completion_ids, completion_texts, all_completion_masks

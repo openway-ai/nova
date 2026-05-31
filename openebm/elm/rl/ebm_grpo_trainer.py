@@ -396,6 +396,9 @@ class EBMGRPOTrainer(LightningModule):
         self.log("train/loss", loss_val, prog_bar=True)
         self.log("train/reward_mean", gen_data["reward_mean"], prog_bar=True)
         self.log("train/reward_std", gen_data["reward_std"])
+        self.log("train/reward_min", gen_data.get("reward_min", 0.0))
+        self.log("train/reward_max", gen_data.get("reward_max", 0.0))
+        self.log("train/reward_zero_frac", gen_data.get("reward_zero_frac", 0.0))
         self.log("train/reward_var", gen_data["reward_var"])
         self.log("train/advantage_var", gen_data["advantage_var"])
         self.log("train/policy_loss", total_metrics["policy_loss"])
@@ -403,6 +406,9 @@ class EBMGRPOTrainer(LightningModule):
         self.log("train/ref_energy_kl", ref_energy_kl)
         self.log("train/clip_ratio", total_metrics["clip_ratio"])
         self.log("train/completion_length", gen_data["avg_completion_length"])
+        self.log("train/response_len_mean", gen_data.get("response_len_mean", gen_data["avg_completion_length"]))
+        self.log("train/response_len_max", gen_data.get("response_len_max", 0.0))
+        self.log("train/entropy_mean", gen_data.get("entropy_mean", 0.0))
 
         # Log reward components
         for key, val in gen_data.get("reward_components", {}).items():
@@ -426,8 +432,10 @@ class EBMGRPOTrainer(LightningModule):
                     f"[GRPO] step={step} | "
                     f"loss={loss_val:.4f} | "
                     f"reward={gen_data['reward_mean']:.3f}±{gen_data['reward_std']:.3f} | "
+                    f"range=[{gen_data.get('reward_min', 0.0):.3f},{gen_data.get('reward_max', 0.0):.3f}] | "
                     f"{component_text} | "
                     f"comp_len={gen_data['avg_completion_length']:.0f} | "
+                    f"H={gen_data.get('entropy_mean', 0.0):.2f} | "
                     f"clip={total_metrics.get('clip_ratio', 0.0):.2f} "
                     f"degen={gen_data.get('degenerate_rate', 0):.2f} "
                     f"uniq={unique_ratio:.2f}",
@@ -437,6 +445,8 @@ class EBMGRPOTrainer(LightningModule):
                 "loss": {
                     "total": loss_val,
                     "policy": total_metrics.get("policy_loss", 0.0),
+                    "kl_raw": total_metrics.get("kl_raw", ref_energy_kl),
+                    "kl_term": total_metrics.get("kl_term"),
                     "ref_energy_kl": ref_energy_kl,
                     "clip_ratio": total_metrics.get("clip_ratio", 0.0),
                     "reinforce_surrogate": total_metrics.get("reinforce_surrogate"),
@@ -444,12 +454,18 @@ class EBMGRPOTrainer(LightningModule):
                 "reward": {
                     "mean": gen_data["reward_mean"],
                     "std": gen_data["reward_std"],
+                    "min": gen_data.get("reward_min"),
+                    "max": gen_data.get("reward_max"),
+                    "zero_frac": gen_data.get("reward_zero_frac"),
                     "var": gen_data["reward_var"],
                     "advantage_var": gen_data["advantage_var"],
                     "components": rc,
                 },
                 "rollout": {
                     "completion_len_mean": gen_data["avg_completion_length"],
+                    "response_len_mean": gen_data.get("response_len_mean"),
+                    "response_len_max": gen_data.get("response_len_max"),
+                    "entropy_mean": gen_data.get("entropy_mean"),
                     "unique_completion_ratio": unique_ratio,
                     "degenerate_group_rate": gen_data.get("degenerate_rate", 0.0),
                     "skipped_step": 0.0,
@@ -460,6 +476,14 @@ class EBMGRPOTrainer(LightningModule):
                     "ref_energy_drift": total_metrics.get("energy_drift"),
                     "ref_energy_kl": ref_energy_kl,
                     "ratio_mean": total_metrics.get("ratio_mean"),
+                    "ratio_std": total_metrics.get("ratio_std"),
+                    "ratio_min": total_metrics.get("ratio_min"),
+                    "ratio_max": total_metrics.get("ratio_max"),
+                    "log_ratio_mean": total_metrics.get("log_ratio_mean"),
+                    "log_ratio_std": total_metrics.get("log_ratio_std"),
+                    "clip_frac": total_metrics.get("clip_frac"),
+                    "approx_kl_k1": total_metrics.get("approx_kl_k1"),
+                    "approx_kl_k3": total_metrics.get("approx_kl_k3"),
                     "log_ratio_abs_max": total_metrics.get("log_ratio_abs_max"),
                     "log_ratio_clamp_rate": total_metrics.get("log_ratio_clamp_rate"),
                     "effective_clip_rate": total_metrics.get("effective_clip_rate"),
@@ -583,7 +607,7 @@ class EBMGRPOTrainer(LightningModule):
         # corrupt logits and multinomial crashes. fp32 rollout is safe — the
         # generation batch is small and sequential (no backward graph).
         with torch.amp.autocast('cuda', enabled=False):
-            completion_ids, completion_texts, completion_masks = generate_completions(
+            rollout_out = generate_completions(
                 model=self.model,
                 prompt_ids=prompt_ids,
                 tokenizer=self.tokenizer,
@@ -593,7 +617,9 @@ class EBMGRPOTrainer(LightningModule):
                 temperature=self.config.temperature,
                 top_p=self.config.top_p,
                 generation_batch_size=self.config.generation_batch_size,
+                return_stats=True,
             )
+            completion_ids, completion_texts, completion_masks, rollout_stats = rollout_out
         self.model.train()
         self._log_phase(
             "generate_done",
@@ -643,7 +669,9 @@ class EBMGRPOTrainer(LightningModule):
         energy_t0 = time.time()
         self._log_phase("old_energy_start", seqs=int(full_ids.shape[0]), seq_len=int(full_ids.shape[1]))
         with torch.amp.autocast('cuda', enabled=False):
-            old_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
+            old_energies = compute_sequence_energy(
+                self.model, full_ids, prompt_len, completion_masks
+            )
         self._log_phase(
             "old_energy_done",
             elapsed_s=round(time.time() - energy_t0, 3),
@@ -705,6 +733,9 @@ class EBMGRPOTrainer(LightningModule):
             reward_components[key] = sum(d[key] for d in reward_details) / len(reward_details)
         advantage_var = advantages.var(unbiased=False).item() if advantages.numel() > 1 else 0.0
         reward_var = float(rewards.var(unbiased=False).item()) if rewards.numel() > 1 else 0.0
+        reward_std = rewards.std().item()
+        reward_zero_frac = float((rewards == 0).float().mean().item())
+        response_lengths = completion_masks.sum(dim=1).float()
 
         return {
             "full_ids": full_ids,
@@ -715,10 +746,16 @@ class EBMGRPOTrainer(LightningModule):
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
             "reward_mean": rewards.mean().item(),
-            "reward_std": rewards.std().item(),
+            "reward_std": reward_std,
+            "reward_min": rewards.min().item(),
+            "reward_max": rewards.max().item(),
+            "reward_zero_frac": reward_zero_frac,
             "reward_var": reward_var,
             "advantage_var": advantage_var,
             "avg_completion_length": avg_comp_len,
+            "response_len_mean": response_lengths.mean().item(),
+            "response_len_max": response_lengths.max().item(),
+            "entropy_mean": float(rollout_stats.get("entropy_mean", 0.0)),
             "reward_components": reward_components,
             "degenerate_rate": degenerate_rate,
             # Raw arrays carried through for trajectory logging in training_step.
@@ -827,7 +864,7 @@ class EBMGRPOTrainer(LightningModule):
 
         return loss, metrics
 
-    def _energy_kl_anchor(self, full_ids, prompt_len, current_energies):
+    def _energy_kl_anchor(self, full_ids, prompt_len, current_energies, completion_masks=None):
         """Sequence-energy anchor against the frozen SFT reference.
 
         The earlier one-sided anchor only punished ``E_theta > E_ref`` and
@@ -839,7 +876,9 @@ class EBMGRPOTrainer(LightningModule):
         if self.ref_model is None or self.config.beta <= 0.0:
             return None, 0.0, 0.0
         with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
-            ref_energies = compute_sequence_energy(self.ref_model, full_ids, prompt_len)
+            ref_energies = compute_sequence_energy(
+                self.ref_model, full_ids, prompt_len, completion_masks
+            )
         energy_diff = current_energies - ref_energies.detach()
         mode = getattr(self.config, "energy_kl_mode", "symmetric_huber")
         if mode == "one_sided":
@@ -861,6 +900,22 @@ class EBMGRPOTrainer(LightningModule):
     def _loss_energy_gspo(self, gen_data):
         """Energy-GSPO: sequence-level energy ratio with PPO clipping.
 
+        Logged health metrics:
+        - train/gspo_policy_loss: unclipped surrogate after PPO max branch. Near
+          zero on the first update epoch is expected because group advantages
+          have mean zero; gradients still flow through the straight-through
+          ratio.
+        - train/gspo_kl_raw: unweighted E_theta-vs-reference energy anchor.
+          This is not token-probability KL; it is a sequence-energy drift
+          penalty. Keep beta*gspo_kl_raw below the policy-loss scale.
+        - train/gspo_approx_kl_k1/k3: old-policy drift estimates from the
+          sequence ratio. Sustained k3 above ~1e-3 with tight GSPO clips means
+          rollout reuse is drifting too far.
+        - train/gspo_ratio_* and train/gspo_clip_frac: sequence-level ratio
+          diagnostics. With clip low/high around 3e-4/4e-4, clip_frac should be
+          nonzero on reused update epochs and near zero only on exactly
+          on-policy first epochs.
+
         v3 fix: `compute_sequence_energy` already returns per-token MEAN
         energy (logprobs.py:94 does `comp_energy.mean(dim=1)`). Therefore
         `log_ratio = -(curr - old)` is already length-normalized; dividing
@@ -878,7 +933,9 @@ class EBMGRPOTrainer(LightningModule):
         # P0b: keep both energy computations under the same autocast context
         # (rollout-time `old_energies` runs under autocast(enabled=False)).
         with torch.amp.autocast('cuda', enabled=False):
-            current_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
+            current_energies = compute_sequence_energy(
+                self.model, full_ids, prompt_len, completion_masks
+            )
 
         # Sequence-level importance ratio, adapted from verl's GSPO loss.
         # Treat -E as a sequence log-prob surrogate. The forward ratio is the
@@ -889,7 +946,7 @@ class EBMGRPOTrainer(LightningModule):
         log_ratio_for_grad = (
             -current_energies + current_energies.detach() + raw_log_ratio.detach()
         )
-        log_ratio = torch.clamp(log_ratio_for_grad, max=10.0)
+        log_ratio = torch.clamp(log_ratio_for_grad, min=-20.0, max=10.0)
         ratio = torch.exp(log_ratio)
 
         clip_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else self.config.epsilon
@@ -902,20 +959,28 @@ class EBMGRPOTrainer(LightningModule):
         # KL anchor on top of PPO clip. PPO clip bounds per-step ratio drift,
         # the KL term bounds cumulative drift from SFT ref. They're orthogonal.
         kl_term, kl_value, energy_drift = self._energy_kl_anchor(
-            full_ids, prompt_len, current_energies)
+            full_ids, prompt_len, current_energies, completion_masks)
         if kl_term is not None:
-            loss = policy_loss + self.config.beta * kl_term
+            kl_weighted = self.config.beta * kl_term
+            loss = policy_loss + kl_weighted
             self.log("train/ref_energy_kl", kl_value)
             self.log("train/ref_energy_drift", energy_drift)
         else:
+            kl_weighted = torch.zeros_like(policy_loss)
             loss = policy_loss
 
         # P1a: log_ratio clamp visibility.
-        log_ratio_abs_max = raw_log_ratio.abs().max().item()
-        log_ratio_clamp_rate = (raw_log_ratio > 10.0).float().mean().item()
+        raw_log_ratio_det = raw_log_ratio.detach()
+        ratio_det = ratio.detach()
+        advantages_det = advantages.detach()
+        log_ratio_abs_max = raw_log_ratio_det.abs().max().item()
+        log_ratio_clamp_rate = ((raw_log_ratio_det < -20.0) | (raw_log_ratio_det > 10.0)).float().mean().item()
         # P1b: effective clip rate = how often clipped branch is selected.
         effective_clip_rate = (pg_losses2 > pg_losses1).float().mean().item()
+        clip_frac = ((ratio_det < (1.0 - clip_low)) | (ratio_det > (1.0 + clip_high))).float().mean().item()
         old_policy_energy_drift = (current_energies - old_energies).mean().item()
+        approx_kl_k1 = (-raw_log_ratio_det).mean().item()
+        approx_kl_k3 = ((ratio_det - 1.0) - raw_log_ratio_det).mean().item()
 
         # Diagnostic: equivalent REINFORCE loss surrogate.
         # When num_iterations=1 the on-policy ratio is ≡1 → policy_loss is
@@ -930,8 +995,29 @@ class EBMGRPOTrainer(LightningModule):
             advantages.detach() * current_energies.detach()
         ).mean().item()
 
+        total_loss_value = loss.detach().item()
+        policy_loss_value = policy_loss.detach().item()
+        kl_weighted_value = kl_weighted.detach().item()
+
         self.log("train/energy_mean", current_energies.mean().item())
-        self.log("train/ratio_mean", ratio.mean().item())
+        self.log("train/gspo_policy_loss", policy_loss_value)
+        self.log("train/gspo_kl_raw", kl_value)
+        self.log("train/gspo_kl_term", kl_weighted_value)
+        self.log("train/gspo_total_loss", total_loss_value)
+        self.log("train/gspo_ratio_mean", ratio_det.mean().item())
+        self.log("train/gspo_ratio_std", ratio_det.std(unbiased=False).item() if ratio_det.numel() > 1 else 0.0)
+        self.log("train/gspo_ratio_min", ratio_det.min().item())
+        self.log("train/gspo_ratio_max", ratio_det.max().item())
+        self.log("train/gspo_log_ratio_mean", raw_log_ratio_det.mean().item())
+        self.log("train/gspo_log_ratio_std", raw_log_ratio_det.std(unbiased=False).item() if raw_log_ratio_det.numel() > 1 else 0.0)
+        self.log("train/gspo_clip_frac", clip_frac)
+        self.log("train/gspo_effective_clip_frac", effective_clip_rate)
+        self.log("train/gspo_approx_kl_k1", approx_kl_k1)
+        self.log("train/gspo_approx_kl_k3", approx_kl_k3)
+        self.log("train/gspo_adv_mean", advantages_det.mean().item())
+        self.log("train/gspo_adv_std", advantages_det.std(unbiased=False).item() if advantages_det.numel() > 1 else 0.0)
+        self.log("train/gspo_adv_abs_mean", advantages_det.abs().mean().item())
+        self.log("train/ratio_mean", ratio_det.mean().item())
         self.log("train/reinforce_surrogate", reinforce_surrogate)
         self.log("stability/log_ratio_abs_max", log_ratio_abs_max)
         self.log("stability/log_ratio_clamp_rate", log_ratio_clamp_rate)
@@ -942,10 +1028,15 @@ class EBMGRPOTrainer(LightningModule):
             if _os.environ.get('LOCAL_RANK', '0') == '0':
                 print(
                     f"[GRPO-EXT] step={self.global_step} "
-                    f"ratio_mean={ratio.mean().item():.4f} "
+                    f"loss={total_loss_value:+.6f} "
+                    f"policy={policy_loss_value:+.6f} "
+                    f"kl_term={kl_weighted_value:.6f} "
+                    f"ratio_mean={ratio_det.mean().item():.4f} "
+                    f"ratio_std={ratio_det.std(unbiased=False).item() if ratio_det.numel() > 1 else 0.0:.4f} "
                     f"log_ratio_abs_max={log_ratio_abs_max:.4f} "
-                    f"clamp_rate={log_ratio_clamp_rate:.3f} "
+                    f"clip_frac={clip_frac:.3f} "
                     f"effective_clip={effective_clip_rate:.3f} "
+                    f"approx_kl_k3={approx_kl_k3:.6e} "
                     f"old_policy_energy_drift={old_policy_energy_drift:+.4f} "
                     f"ref_energy_kl={kl_value:.4f} "
                     f"reinforce_surrogate={reinforce_surrogate:+.6f}",
@@ -954,13 +1045,24 @@ class EBMGRPOTrainer(LightningModule):
 
         return loss, {
             "policy_loss": policy_loss.item(),
+            "kl_raw": kl_value,
+            "kl_term": kl_weighted_value,
+            "total_loss": total_loss_value,
             "ref_energy_kl": kl_value,
             "clip_ratio": effective_clip_rate,
             "effective_clip_rate": effective_clip_rate,
+            "clip_frac": clip_frac,
             "energy_mean": current_energies.mean().item(),
             "old_energy_mean": old_energies.mean().item(),
             "ref_energy_drift": energy_drift,
-            "ratio_mean": ratio.mean().item(),
+            "ratio_mean": ratio_det.mean().item(),
+            "ratio_std": ratio_det.std(unbiased=False).item() if ratio_det.numel() > 1 else 0.0,
+            "ratio_min": ratio_det.min().item(),
+            "ratio_max": ratio_det.max().item(),
+            "log_ratio_mean": raw_log_ratio_det.mean().item(),
+            "log_ratio_std": raw_log_ratio_det.std(unbiased=False).item() if raw_log_ratio_det.numel() > 1 else 0.0,
+            "approx_kl_k1": approx_kl_k1,
+            "approx_kl_k3": approx_kl_k3,
             "log_ratio_abs_max": log_ratio_abs_max,
             "log_ratio_clamp_rate": log_ratio_clamp_rate,
             "old_policy_energy_drift": old_policy_energy_drift,
@@ -985,10 +1087,13 @@ class EBMGRPOTrainer(LightningModule):
         """
         full_ids = gen_data["full_ids"]
         prompt_len = gen_data["prompt_len"]
+        completion_masks = gen_data["completion_masks"].float()
         advantages = gen_data["advantages"]
 
         with torch.amp.autocast('cuda', enabled=False):
-            current_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
+            current_energies = compute_sequence_energy(
+                self.model, full_ids, prompt_len, completion_masks
+            )
 
         # Energies are already per-token mean (logprobs.py:94), so no length
         # normalisation needed here.
@@ -996,7 +1101,7 @@ class EBMGRPOTrainer(LightningModule):
 
         # One-sided energy-KL anchor (shared with _loss_energy_gspo).
         kl_term, kl_value, energy_drift = self._energy_kl_anchor(
-            full_ids, prompt_len, current_energies)
+            full_ids, prompt_len, current_energies, completion_masks)
         if kl_term is not None:
             loss = policy_loss + self.config.beta * kl_term
             self.log("train/ref_energy_kl", kl_value)
