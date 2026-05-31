@@ -25,14 +25,29 @@ def sample_top_p(probs, p):
         exceeds the threshold p. The distribution is renormalized based on the selected tokens.
 
     """
+    probs = probs.float()
+    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     mask = probs_sum - probs_sort > p
-    probs_sort[mask] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    probs_sort = probs_sort.masked_fill(mask, 0.0)
+
+    probs_sort_sum = probs_sort.sum(dim=-1, keepdim=True)
+    bad = (probs_sort_sum <= 1e-9).squeeze(-1)
+    probs_sort = probs_sort / probs_sort_sum.clamp_min(1e-9)
+
+    # For degenerate rows, force deterministic selection of the top token.
+    # probs_idx[..., 0] IS the argmax (sorted descending), so multinomial
+    # on [1, 0, 0, ...] returns it directly — no second pass needed.
+    has_bad = bad.any().item()
+    if has_bad:
+        probs_sort[bad] = 0.0
+        probs_sort[bad, 0] = 1.0
+
     next_token = torch.multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
-    return next_token
+    return next_token.long()
 
 def call_model_forward_decode(hparams, model, input_tokens, start_pos, bsz):
     #TODO eventually add back kv caching, for now start_pos is not supported  in baseline transformer and EBT so start_pos can only be 0
