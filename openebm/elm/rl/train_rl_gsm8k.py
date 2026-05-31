@@ -123,7 +123,9 @@ class EBMGRPOTrainerGSM8K(EBMGRPOTrainer):
         # P0b: keep autocast disabled to match _loss_energy_*'s autocast(False)
         # block (avoids ratio drift between old/current energies).
         with torch.amp.autocast('cuda', enabled=False):
-            old_energies = compute_sequence_energy(self.model, full_ids, prompt_len)
+            old_energies = compute_sequence_energy(
+                self.model, full_ids, prompt_len, completion_masks
+            )
 
         old_per_token_logps = None
         if self.config.rl_loss_type == "token_logprobs":
