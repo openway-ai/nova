@@ -87,6 +87,8 @@ def flatten_components(components: Dict[str, Any]) -> Dict[str, float]:
         "clue_preservation": "clue",
         "blank_accuracy": "blank_acc",
         "blank_acc": "blank_acc",
+        "constraint_validity": "validity",
+        "validity": "validity",
         "answer_acc": "answer_acc",
         "exact_match": "exact_match",
         "partial_credit": "partial_credit",
@@ -104,10 +106,16 @@ def flatten_components(components: Dict[str, Any]) -> Dict[str, float]:
 
 def parse_component_text(text: str) -> Dict[str, float]:
     out: Dict[str, float] = {}
+    aliases = {
+        "fmt": "format",
+        "blank": "blank_acc",
+        "blank/answer": "blank_acc",
+        "validity": "validity",
+        "solve": "solve",
+        "clue": "clue",
+    }
     for key, val in re.findall(r"([A-Za-z_/-]+)=(-?[0-9.eE+-]+)", text):
-        key = key.replace("blank/answer", "blank_acc")
-        if key == "blank":
-            key = "blank_acc"
+        key = aliases.get(key, key.replace("blank/answer", "blank_acc"))
         fv = to_float(val)
         if fv is not None:
             out[key] = fv
@@ -171,10 +179,23 @@ def parse_log(log_path: Path, run_dir: Path) -> Analysis:
                     rollout = e.get("rollout") or {}
                     energy = e.get("energy") or loss
                     grad = e.get("grad") or {}
+                    ref_energy_kl = to_float(
+                        loss.get(
+                            "ref_energy_kl",
+                            energy.get("ref_energy_kl", loss.get("kl", energy.get("kl_proxy"))),
+                        )
+                    )
+                    ref_energy_drift = to_float(
+                        energy.get("ref_energy_drift", energy.get("drift", energy.get("energy_drift")))
+                    )
+                    old_policy_energy_drift = to_float(
+                        energy.get("old_policy_energy_drift", energy.get("energy_ppo_kl"))
+                    )
                     rec.update({
                         "loss": to_float(loss.get("total")),
                         "policy_loss": to_float(loss.get("policy", loss.get("policy_loss"))),
-                        "kl_proxy": to_float(loss.get("kl", energy.get("kl_proxy"))),
+                        "ref_energy_kl": ref_energy_kl,
+                        "kl_proxy": ref_energy_kl,
                         "reward_mean": to_float(reward.get("mean")),
                         "reward_std": to_float(reward.get("std")),
                         "reward_var": to_float(reward.get("var")),
@@ -185,7 +206,10 @@ def parse_log(log_path: Path, run_dir: Path) -> Analysis:
                         "skipped": to_float(rollout.get("skipped_step")),
                         "energy_mean": to_float(energy.get("current_mean", energy.get("energy_mean"))),
                         "old_energy_mean": to_float(energy.get("old_mean", energy.get("old_energy_mean"))),
-                        "energy_drift": to_float(energy.get("drift", energy.get("energy_drift"))),
+                        "ref_energy_drift": ref_energy_drift,
+                        "energy_drift": ref_energy_drift,
+                        "old_policy_energy_drift": old_policy_energy_drift,
+                        "energy_ppo_kl": old_policy_energy_drift,
                         "ratio_mean": to_float(energy.get("ratio_mean")),
                         "log_ratio_abs_max": to_float(energy.get("log_ratio_abs_max")),
                         "clamp_rate": to_float(energy.get("log_ratio_clamp_rate")),
@@ -228,6 +252,24 @@ def parse_log(log_path: Path, run_dir: Path) -> Analysis:
                             for k, v in m.groupdict().items():
                                 if k != "step":
                                     rec[k] = to_float(v)
+                            rec["old_policy_energy_drift"] = rec.get("energy_ppo_kl")
+                        elif "[GRPO-EXT]" in line:
+                            m_step = re.search(r"step=(\d+)", line)
+                            if m_step:
+                                rec = {
+                                    "line": lineno,
+                                    "event": "energy_ext",
+                                    "step": int(m_step.group(1)),
+                                }
+                                if ts is not None:
+                                    rec["ts"] = ts.isoformat(sep=" ")
+                                rec.update(parse_component_text(line))
+                                if "kl_proxy" in rec and "ref_energy_kl" not in rec:
+                                    rec["ref_energy_kl"] = rec["kl_proxy"]
+                                if "energy_drift" in rec and "ref_energy_drift" not in rec:
+                                    rec["ref_energy_drift"] = rec["energy_drift"]
+                                if "energy_ppo_kl" in rec and "old_policy_energy_drift" not in rec:
+                                    rec["old_policy_energy_drift"] = rec["energy_ppo_kl"]
             if rec is not None:
                 a.records.append({k: v for k, v in rec.items() if v is not None})
 
@@ -243,15 +285,105 @@ def parse_log(log_path: Path, run_dir: Path) -> Analysis:
     return a
 
 
+def _record_priority(record: Dict[str, Any], key: str) -> Tuple[int, int]:
+    """Prefer semantically complete per-step records over auxiliary log lines.
+
+    Logs may contain several records with the same global step: text summaries,
+    JSON rl_step summaries, per-GSPO-update JSON, and grad-only text lines. A
+    simple mean across all of them makes plots wrong because those records do
+    not describe the same quantity. Return (priority, update_epoch) so callers
+    can pick the best source for each metric.
+    """
+    event = str(record.get("event", ""))
+    update_epoch = int(record.get("update_epoch", 0) or 0)
+
+    reward_keys = {
+        "reward_mean", "reward_std", "reward_var", "advantage_var",
+        "comp_len", "degen", "unique_ratio", "skipped",
+        "format", "blank_acc", "answer_acc", "exact_match", "partial_credit",
+        "parse_rate", "clue", "validity", "solve", "length_penalty",
+    }
+    energy_loss_keys = {
+        "loss", "policy_loss", "ref_energy_kl", "kl_proxy",
+        "energy_mean", "old_energy_mean",
+        "ref_energy_drift", "energy_drift",
+        "old_policy_energy_drift", "energy_ppo_kl",
+        "ratio_mean", "log_ratio_abs_max", "clamp_rate",
+        "effective_clip", "reinforce_surrogate",
+    }
+    grad_keys = {"grad_norm", "max_param_grad", "nan_params"}
+
+    if key in reward_keys:
+        if event == "rl_step":
+            return (40, update_epoch)
+        if event == "rl_step_text":
+            return (30, update_epoch)
+        return (0, update_epoch)
+    if key in energy_loss_keys:
+        if event == "rl_step":
+            return (40, update_epoch)
+        if event == "gspo_update_epoch":
+            return (30, update_epoch)
+        if event == "energy_ext":
+            return (20, update_epoch)
+        if event == "rl_step_text":
+            return (10, update_epoch)
+        return (0, update_epoch)
+    if key in grad_keys:
+        if event == "gspo_update_epoch":
+            return (40, update_epoch)
+        if event == "grad":
+            return (20, update_epoch)
+        return (0, update_epoch)
+    if event == "rl_step":
+        return (30, update_epoch)
+    if event == "gspo_update_epoch":
+        return (20, update_epoch)
+    return (10, update_epoch)
+
+
 def aggregate(records: List[Dict[str, Any]]) -> Tuple[List[int], Dict[str, List[Optional[float]]]]:
-    numeric: Dict[int, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    by_step: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for r in records:
         step = int(r.get("step", 0))
-        for k, v in r.items():
-            if k in {"line", "event", "step", "ts"}:
+        by_step[step].append(r)
+
+    numeric: Dict[int, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    for step, step_records in by_step.items():
+        keys = sorted(
+            {
+                k
+                for r in step_records
+                for k, v in r.items()
+                if k not in {"line", "event", "step", "ts"}
+                and isinstance(v, (int, float))
+                and not isinstance(v, bool)
+            }
+        )
+        for k in keys:
+            candidates = [
+                r for r in step_records
+                if isinstance(r.get(k), (int, float)) and not isinstance(r.get(k), bool)
+            ]
+            if not candidates:
                 continue
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                numeric[step][k].append(float(v))
+            best_priority = max(_record_priority(r, k) for r in candidates)
+            best = [r for r in candidates if _record_priority(r, k) == best_priority]
+            numeric[step][k].extend(float(r[k]) for r in best)
+
+    # Keep only meaningful unified component aliases.
+    for step_values in numeric.values():
+        if "fmt" in step_values and "format" not in step_values:
+            step_values["format"] = step_values.pop("fmt")
+        else:
+            step_values.pop("fmt", None)
+        if "ref_energy_kl" in step_values:
+            step_values.pop("kl_proxy", None)
+        if "ref_energy_drift" in step_values:
+            step_values.pop("energy_drift", None)
+        if "old_policy_energy_drift" in step_values:
+            step_values.pop("energy_ppo_kl", None)
+
     steps = sorted(numeric)
     keys = sorted({k for by in numeric.values() for k in by})
     series = {k: [] for k in keys}
@@ -356,7 +488,7 @@ def plot_metrics(path: Path, title: str, steps: List[int], series: Dict[str, Lis
     ax.legend()
 
     ax = axes[0][1]
-    component_keys = [k for k in ["format", "blank_acc", "answer_acc", "exact_match", "partial_credit", "parse_rate", "clue", "solve"] if k in series]
+    component_keys = [k for k in ["format", "blank_acc", "answer_acc", "exact_match", "partial_credit", "parse_rate", "clue", "validity", "solve"] if k in series]
     for k in component_keys:
         label = "blank/answer acc" if k in {"blank_acc", "answer_acc"} else k
         plot_line(ax, steps, series, k, label)
@@ -403,8 +535,8 @@ def plot_stability(path: Path, title: str, steps: List[int], series: Dict[str, L
     fig, axes = plt.subplots(2, 2, figsize=(16, 9))
     fig.suptitle(title + " stability", fontsize=14)
     specs = [
-        ("Energy drift", ["energy_drift", "energy_mean", "old_energy_mean"]),
-        ("Ratio / clipping", ["ratio_mean", "log_ratio_abs_max", "clamp_rate", "effective_clip"]),
+        ("Reference energy drift", ["ref_energy_drift", "energy_mean", "old_energy_mean"]),
+        ("Old-policy ratio / clipping", ["ratio_mean", "log_ratio_abs_max", "clamp_rate", "effective_clip", "old_policy_energy_drift"]),
         ("Grad health", ["grad_norm", "max_param_grad", "nan_params"]),
         ("Rollout health", ["comp_len", "unique_ratio", "degen", "advantage_var"]),
     ]
@@ -434,7 +566,7 @@ def plot_overview(path: Path, title: str, steps: List[int], series: Dict[str, Li
     setup_axis(ax, "Reward")
 
     ax = axes[0][1]
-    for k in ["format", "blank_acc", "answer_acc", "exact_match", "partial_credit", "parse_rate", "clue", "solve"]:
+    for k in ["format", "blank_acc", "answer_acc", "exact_match", "partial_credit", "parse_rate", "clue", "validity", "solve"]:
         label = "blank/answer acc" if k in {"blank_acc", "answer_acc"} else k
         plot_line(ax, steps, series, k, label)
     setup_axis(ax, "Task components")
@@ -468,14 +600,14 @@ def plot_overview(path: Path, title: str, steps: List[int], series: Dict[str, Li
         ax.legend(h1 + h2, l1 + l2)
 
     ax = axes[2][0]
-    for k in ["energy_drift", "energy_mean", "old_energy_mean"]:
+    for k in ["ref_energy_drift", "energy_mean", "old_energy_mean"]:
         plot_line(ax, steps, series, k)
-    setup_axis(ax, "Energy drift")
+    setup_axis(ax, "Reference energy drift")
 
     ax = axes[2][1]
-    for k in ["ratio_mean", "log_ratio_abs_max", "clamp_rate", "effective_clip"]:
+    for k in ["ratio_mean", "log_ratio_abs_max", "clamp_rate", "effective_clip", "old_policy_energy_drift"]:
         plot_line(ax, steps, series, k)
-    setup_axis(ax, "Ratio / clipping")
+    setup_axis(ax, "Old-policy ratio / clipping")
 
     ax = axes[3][0]
     for k in ["grad_norm", "max_param_grad", "nan_params"]:
@@ -508,7 +640,7 @@ def status_and_assessment(a: Analysis, steps: List[int], series: Dict[str, List[
     collapse_step = first_collapse_step(steps, series)
     last_degen = last_value(series, "degen")
     last_grad = last_value(series, "grad_norm")
-    last_drift = last_value(series, "energy_drift")
+    last_drift = last_value(series, "ref_energy_drift")
     if collapse_step is not None:
         notes.append(f"collapse/degenerate signal starts around step {collapse_step}")
     if first_reward is not None and last_reward is not None:
@@ -556,6 +688,7 @@ def write_report(path: Path, a: Analysis, steps: List[int], series: Dict[str, Li
         ("last reward std", last_value(series, "reward_std")),
         ("last fmt", last_value(series, "format")),
         ("last blank/answer acc", last_value(series, "blank_acc") or last_value(series, "answer_acc")),
+        ("last validity", last_value(series, "validity")),
         ("last solve", last_value(series, "solve")),
         ("last degen", last_value(series, "degen")),
         ("last skipped", last_value(series, "skipped")),
@@ -563,7 +696,9 @@ def write_report(path: Path, a: Analysis, steps: List[int], series: Dict[str, Li
         ("last grad_norm", last_value(series, "grad_norm")),
         ("last ratio_mean", last_value(series, "ratio_mean")),
         ("last clamp_rate", last_value(series, "clamp_rate")),
-        ("last energy_drift", last_value(series, "energy_drift")),
+        ("last ref_energy_drift", last_value(series, "ref_energy_drift")),
+        ("last ref_energy_kl", last_value(series, "ref_energy_kl")),
+        ("last old_policy_energy_drift", last_value(series, "old_policy_energy_drift")),
     ]
     for k, v in metric_rows:
         if v is None:
@@ -593,8 +728,8 @@ def write_report(path: Path, a: Analysis, steps: List[int], series: Dict[str, Li
         lines.append("- The run should not be continued from late checkpoints after collapse; prefer the best early checkpoint or restart from SFT with safer hyperparameters.")
     if last_value(series, "effective_clip") == 0 or (last_value(series, "clamp_rate") == 0):
         lines.append("- GSPO/PPO clipping rarely activates; ratio-based trust region is not constraining this run.")
-    if (last_value(series, "energy_drift") or 0) < -0.5:
-        lines.append("- Energy drift is strongly negative, suggesting the policy can become over-confident relative to the reference without being penalized by one-sided KL.")
+    if (last_value(series, "ref_energy_drift") or 0) < -0.5:
+        lines.append("- Reference energy drift is strongly negative, suggesting the policy can become over-confident relative to the SFT reference without sufficient anchoring.")
     lines += ["", "## Recommended Next Actions", ""]
     if collapse_step is not None:
         lines += [

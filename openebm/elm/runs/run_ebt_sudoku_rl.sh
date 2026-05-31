@@ -55,7 +55,9 @@ export EXP_ID="d26-ctx2048-sudoku-rl-gspo-$(date +%Y%m%d)"
 # GRPO 超参数
 ################################################################################
 NUM_GENERATIONS="${NUM_GENERATIONS:-12}"            # keep enough group variance for Sudoku reward
-MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-165}"     # 9x9 board ≤162 chars; tail tokens add noise
+# MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-165}"     # 9x9 board ≤162 chars; tail tokens add noise
+MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-210}"     # 9x9 board ≤162 chars; tail tokens add noise
+
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-192}"
 TEMPERATURE="${TEMPERATURE:-0.70}"                  # slightly lower after late-run format/clue degradation
 TOP_P="${TOP_P:-0.80}"
@@ -69,7 +71,7 @@ CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-4e-4}"
 BETA="${BETA:-0.5}"                         # stronger anchor after clue-preservation drift in long run
 ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
 ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
-LEARNING_RATE="${LEARNING_RATE:-5e-7}"       # previous 1e-6 improved early but degraded over long horizon
+LEARNING_RATE="${LEARNING_RATE:-5e-7}"       # AdamW base/fallback LR; Muon matrices use MUON_LR
 # RL_LOSS_TYPE="energy_reinforce"  # removes 1/|y| dilution
 RL_LOSS_TYPE="${RL_LOSS_TYPE:-energy_gspo}"
 
@@ -81,20 +83,24 @@ WARMUP_STEPS="${WARMUP_STEPS:-20}"
 # ── Optimizer (v3 P0+P1+muon) ─────────────────────────────────────────────────
 # adamw      : v3 P0 multi-group AdamW (transformer/v2e/scalar/other split LR)
 # muon_adamw : Muon for transformer matrices + AdamW for the rest (matches SFT)
-RL_OPTIMIZER="${RL_OPTIMIZER:-adamw}"       # keep AdamW first; Muon can amplify collapse in short RL runs
-MUON_LR="${MUON_LR:-2e-4}"                  # default = SFT muon_lr (2e-3) / 10
+RL_OPTIMIZER="${RL_OPTIMIZER:-muon_adamw}"  # SFT-validated hybrid optimizer: Muon matrices + AdamW lanes
+MUON_LR="${MUON_LR:-2e-4}"                  # Muon peak LR for transformer matrices; scheduler scales it after warmup
+ADAMW_VOCAB_TO_EMBED_LR="${ADAMW_VOCAB_TO_EMBED_LR:--1}"  # <=0 => LEARNING_RATE * 0.5
+ADAMW_SCALAR_LR="${ADAMW_SCALAR_LR:--1}"                  # <=0 => LEARNING_RATE * 2.0
+ADAMW_OTHER_LR="${ADAMW_OTHER_LR:--1}"                    # <=0 => LEARNING_RATE
 ADVANTAGE_NORM="${ADVANTAGE_NORM:-group_mean_global_std}"  # batch-wide std prevents tiny intra-group std blow-ups
 GLOBAL_STD_MIN="${GLOBAL_STD_MIN:-0.2}"
 SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.5}"
 MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-0.01}"
 MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.3}"
-SKIP_CONSENSUS="${SKIP_CONSENSUS:-any}"      # conservative DDP stability mode
+SKIP_CONSENSUS="${SKIP_CONSENSUS:-all}"      # conservative DDP stability mode
 
-MAX_STEPS="${MAX_STEPS:-160}"                # analyzed run peaked at 60-120 and degraded around 150-190
+# MAX_STEPS="${MAX_STEPS:-160}"                # analyzed run peaked at 60-120 and degraded around 150-190
+MAX_STEPS="${MAX_STEPS:-1000}"                # analyzed run peaked at 60-120 and degraded around 150-190
            
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-50}"
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-100}"
 LOG_INTERVAL="${LOG_INTERVAL:-5}"
-SAVE_TOP_K="${SAVE_TOP_K:-3}"
+SAVE_TOP_K="${SAVE_TOP_K:-2}"
 SEED="${SEED:-42}"
 
 TRAJ_LOG_INTERVAL="${TRAJ_LOG_INTERVAL:-50}"
@@ -104,6 +110,9 @@ COLLAPSE_CHECK_WINDOW="${COLLAPSE_CHECK_WINDOW:-2}"
 # Current EBT forward debug is opt-in; keep train.log compact by default.
 export DBG_RL_FORWARD="${DBG_RL_FORWARD:-0}"
 export DBG_RL_FORWARD_INTERVAL="${DBG_RL_FORWARD_INTERVAL:-200}"
+export RL_PHASE_LOG="${RL_PHASE_LOG:-1}"       # concise rank-0 phase markers + heartbeat.json
+export TRAJ_PRINT_TEXT="${TRAJ_PRINT_TEXT:-1}" # JSONL keeps full text; stdout stays compact by default
+export TRAJ_TEXT_CHARS="${TRAJ_TEXT_CHARS:-180}"
 
 ################################################################################
 # GPU 配置
@@ -181,6 +190,11 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "energy_kl_mode=${ENERGY_KL_MODE}" \
     "energy_kl_huber_delta=${ENERGY_KL_HUBER_DELTA}" \
     "learning_rate=${LEARNING_RATE}" \
+    "rl_optimizer=${RL_OPTIMIZER}" \
+    "muon_lr=${MUON_LR}" \
+    "adamw_vocab_to_embed_lr=${ADAMW_VOCAB_TO_EMBED_LR}" \
+    "adamw_scalar_lr=${ADAMW_SCALAR_LR}" \
+    "adamw_other_lr=${ADAMW_OTHER_LR}" \
     "warmup_steps=${WARMUP_STEPS}" \
     "gradient_clip_val=${GRADIENT_CLIP_VAL}" \
     "max_grad_per_param=${MAX_GRAD_PER_PARAM}" \
@@ -196,6 +210,8 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "traj_output_dir=${TRAJ_OUTPUT_DIR}" \
     "traj_log_interval=${TRAJ_LOG_INTERVAL}" \
     "traj_num_samples=${TRAJ_NUM_SAMPLES}" \
+    "rl_phase_log=${RL_PHASE_LOG}" \
+    "traj_print_text=${TRAJ_PRINT_TEXT}" \
     "collapse_check_window=${COLLAPSE_CHECK_WINDOW}" \
     "max_steps=${MAX_STEPS}" \
     "num_gpus=${NUM_GPUS}" \
@@ -233,7 +249,9 @@ echo "Skip consensus:          ${SKIP_CONSENSUS}"
 echo "Max steps:               ${MAX_STEPS}"
 echo "Val interval:            ${VAL_CHECK_INTERVAL}"
 echo "Trajectory dir:          ${TRAJ_OUTPUT_DIR}/trajectories"
+echo "Heartbeat file:          ${TRAJ_OUTPUT_DIR}/logs/heartbeat.json"
 echo "Forward debug:           DBG_RL_FORWARD=${DBG_RL_FORWARD} interval=${DBG_RL_FORWARD_INTERVAL}"
+echo "Phase log:               RL_PHASE_LOG=${RL_PHASE_LOG}"
 echo "GPUs:                    ${NUM_GPUS}"
 echo "Log file:                ${LOG_FILE}"
 echo ""
@@ -265,10 +283,16 @@ cat << LOG_HEADER > "${LOG_FILE}"
 #   clip_ratio_high=${CLIP_RATIO_HIGH}
 #   beta=${BETA}
 #   energy_kl_mode=${ENERGY_KL_MODE}
-#   learning_rate=${LEARNING_RATE}
+#   optimizer=${RL_OPTIMIZER}
+#   adamw_base_lr=${LEARNING_RATE}
+#   muon_lr=${MUON_LR}
+#   adamw_vocab_to_embed_lr=${ADAMW_VOCAB_TO_EMBED_LR}
+#   adamw_scalar_lr=${ADAMW_SCALAR_LR}
+#   adamw_other_lr=${ADAMW_OTHER_LR}
 #   max_steps=${MAX_STEPS}
 #   traj_dir=${TRAJ_OUTPUT_DIR}/trajectories
 #   skip_consensus=${SKIP_CONSENSUS}
+#   heartbeat=${TRAJ_OUTPUT_DIR}/logs/heartbeat.json
 ################################################################################
 
 LOG_HEADER
@@ -316,6 +340,9 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --warmup_steps ${WARMUP_STEPS} \
     --rl_optimizer ${RL_OPTIMIZER} \
     --muon_lr ${MUON_LR} \
+    --adamw_vocab_to_embed_lr ${ADAMW_VOCAB_TO_EMBED_LR} \
+    --adamw_scalar_lr ${ADAMW_SCALAR_LR} \
+    --adamw_other_lr ${ADAMW_OTHER_LR} \
     --advantage_norm ${ADVANTAGE_NORM} \
     --global_std_min ${GLOBAL_STD_MIN} \
     --skip_degenerate_threshold ${SKIP_DEGENERATE_THRESHOLD} \

@@ -135,6 +135,12 @@ def parse_args():
                         help="adamw (default) or muon_adamw (Muon for transformer matrices).")
     parser.add_argument("--muon_lr", type=float, default=2e-4,
                         help="LR for Muon group (only used when rl_optimizer=muon_adamw).")
+    parser.add_argument("--adamw_vocab_to_embed_lr", type=float, default=-1.0,
+                        help="Absolute AdamW LR for vocab_to_embed in muon_adamw; <=0 uses learning_rate*0.5.")
+    parser.add_argument("--adamw_scalar_lr", type=float, default=-1.0,
+                        help="Absolute AdamW LR for scalar/norm-like params in muon_adamw; <=0 uses learning_rate*2.")
+    parser.add_argument("--adamw_other_lr", type=float, default=-1.0,
+                        help="Absolute AdamW LR for catch-all AdamW params in muon_adamw; <=0 uses learning_rate.")
     parser.add_argument("--muon_momentum", type=float, default=0.95)
     parser.add_argument("--muon_ns_steps", type=int, default=5)
     parser.add_argument("--muon_beta2", type=float, default=0.95)
@@ -289,6 +295,9 @@ def main():
         skip_consensus=args.skip_consensus,
         rl_optimizer=args.rl_optimizer,
         muon_lr=args.muon_lr,
+        adamw_vocab_to_embed_lr=args.adamw_vocab_to_embed_lr,
+        adamw_scalar_lr=args.adamw_scalar_lr,
+        adamw_other_lr=args.adamw_other_lr,
         muon_momentum=args.muon_momentum,
         muon_ns_steps=args.muon_ns_steps,
         muon_beta2=args.muon_beta2,
@@ -390,7 +399,13 @@ def main():
     print(f"  Epsilon (clip):     {config.epsilon}")
     print(f"  Beta (KL):          {config.beta}")
     print(f"  Energy KL mode:     {config.energy_kl_mode}")
-    print(f"  Learning rate:      {config.learning_rate}")
+    print(f"  Optimizer:          {config.rl_optimizer}")
+    print(f"  AdamW base LR:      {config.learning_rate}")
+    if config.rl_optimizer == "muon_adamw":
+        print(f"  Muon LR:            {config.muon_lr}")
+        print(f"  AdamW v2e LR:       {config.adamw_vocab_to_embed_lr if config.adamw_vocab_to_embed_lr > 0 else config.learning_rate * 0.5}")
+        print(f"  AdamW scalar LR:    {config.adamw_scalar_lr if config.adamw_scalar_lr > 0 else config.learning_rate * 2.0}")
+        print(f"  AdamW other LR:     {config.adamw_other_lr if config.adamw_other_lr > 0 else config.learning_rate}")
     print(f"  Skip consensus:     {config.skip_consensus}")
     print(f"  Max steps:          {config.max_steps}")
     print(f"  GPUs:               {gpus}")

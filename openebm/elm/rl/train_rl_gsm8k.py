@@ -306,6 +306,12 @@ def parse_args():
     parser.add_argument("--rl_optimizer", type=str, default="muon_adamw",
                         choices=["adamw", "muon_adamw"])
     parser.add_argument("--muon_lr", type=float, default=2e-4)
+    parser.add_argument("--adamw_vocab_to_embed_lr", type=float, default=-1.0,
+                        help="Absolute AdamW LR for vocab_to_embed in muon_adamw; <=0 uses learning_rate*0.5.")
+    parser.add_argument("--adamw_scalar_lr", type=float, default=-1.0,
+                        help="Absolute AdamW LR for scalar/norm-like params in muon_adamw; <=0 uses learning_rate*2.")
+    parser.add_argument("--adamw_other_lr", type=float, default=-1.0,
+                        help="Absolute AdamW LR for catch-all AdamW params in muon_adamw; <=0 uses learning_rate.")
     parser.add_argument("--muon_momentum", type=float, default=0.95)
     parser.add_argument("--muon_ns_steps", type=int, default=5)
     parser.add_argument("--muon_beta2", type=float, default=0.95)
@@ -451,6 +457,9 @@ def main():
         min_unique_completion_ratio_to_update=args.min_unique_completion_ratio_to_update,
         rl_optimizer=args.rl_optimizer,
         muon_lr=args.muon_lr,
+        adamw_vocab_to_embed_lr=args.adamw_vocab_to_embed_lr,
+        adamw_scalar_lr=args.adamw_scalar_lr,
+        adamw_other_lr=args.adamw_other_lr,
         muon_momentum=args.muon_momentum,
         muon_ns_steps=args.muon_ns_steps,
         muon_beta2=args.muon_beta2,
