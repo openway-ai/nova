@@ -12,10 +12,12 @@ Reward components:
      full preservation → +0.5; full corruption → −0.5.
      v3: changed from one-sided (0..0.5) after v2 showed clue dropping
      0.34 → 0.07 because corruption had no explicit cost.
-  3. Blank accuracy reward (0.0-1.5): blank fill quality. This is gated on
+  3. Blank accuracy reward (0.0-1.0): blank fill quality. This is gated on
      preserving every given clue; otherwise the model can get positive reward
      by corrupting clues and locally matching blank cells.
-  4. Full solve bonus (0.0-0.5): perfect solution (implies validity)
+  4. Constraint validity reward (0.0-0.4): row/column/box consistency, multiplied
+     by blank fill ratio to avoid rewarding conservative all-zero boards.
+  5. Full solve bonus (0.0-0.6): perfect solution (implies validity)
 
 Total reward range: [-0.5, 3.0]. If any clue is corrupted, total reward is
 capped at format + clue_preservation and blank/full-solve credit is disabled.
@@ -63,7 +65,8 @@ def compute_sudoku_rewards_detailed(
     """Like compute_sudoku_rewards but returns per-component breakdown.
 
     Returns:
-        list of dicts with keys: total, format, clue_preservation, blank_accuracy, full_solve
+        list of dicts with reward components plus diagnostic metrics such as
+        parse_ok, clue_accuracy, blank_accuracy_frac, valid_sudoku, and solved.
     """
     results = []
     for completion, puzzle, solution in zip(completions, puzzles, solutions):
@@ -86,7 +89,21 @@ def _score_single_detailed(
         "format": 0.0,
         "clue_preservation": 0.0,
         "blank_accuracy": 0.0,
+        "constraint_validity": 0.0,
         "full_solve": 0.0,
+        "parse_ok": False,
+        "valid_sudoku": False,
+        "solved": False,
+        "clue_count": 0,
+        "clue_correct": 0,
+        "clue_accuracy": 0.0,
+        "blank_count": 0,
+        "blank_correct": 0,
+        "blank_accuracy_frac": 0.0,
+        "filled_blank_count": 0,
+        "blank_fill_ratio": 0.0,
+        "constraint_validity_frac": 0.0,
+        "all_clues_preserved": False,
     }
 
     # 1. Format reward
@@ -99,9 +116,12 @@ def _score_single_detailed(
         if n_digits >= 40:
             result["format"] = min(0.1, 0.1 * n_digits / 81.0)
             result["total"] = result["format"]
+        result["digit_count"] = n_digits
         return result
 
+    result["parse_ok"] = True
     result["format"] = 0.5
+    result["valid_sudoku"] = bool(validate_sudoku_board(pred_board))
 
     # 2. Clue preservation: did the model keep all given clues unchanged?
     clue_count = 0
@@ -116,8 +136,12 @@ def _score_single_detailed(
                 if pred_board[r][c] == clue_value:
                     clue_preserved_count += 1
 
+    result["clue_count"] = clue_count
+    result["clue_correct"] = clue_preserved_count
+
     if clue_count > 0:
         clue_preservation_frac = clue_preserved_count / clue_count
+        result["clue_accuracy"] = clue_preservation_frac
         # SYMMETRIC: full preserve → +0.5, full corrupt → −0.5.
         # v3 fix: v2 had (frac * 0.5) which lets the model corrupt clues for
         # free if blank gain exceeds preservation cost. v3 makes corruption
@@ -127,7 +151,9 @@ def _score_single_detailed(
     else:
         # No clues (empty board) - give full credit
         result["clue_preservation"] = 0.5
+        result["clue_accuracy"] = 1.0
         all_clues_preserved = True
+    result["all_clues_preserved"] = all_clues_preserved
 
     # Stability guard: Sudoku givens are hard constraints, not soft hints.
     # The 20260529 GSPO run showed a reward-hacking path where the model kept
@@ -142,27 +168,39 @@ def _score_single_detailed(
     # Only count cells that were blank in the original puzzle.
     blank_count = 0
     correct_blank_count = 0
+    filled_blank_count = 0
 
     for r in range(9):
         for c in range(9):
             puzzle_idx = r * 9 + c
             if puzzle_idx < len(puzzle) and puzzle[puzzle_idx] == '0':
                 blank_count += 1
+                if pred_board[r][c] != 0:
+                    filled_blank_count += 1
                 if pred_board[r][c] == solution[r][c]:
                     correct_blank_count += 1
 
     if blank_count > 0:
         blank_accuracy_frac = correct_blank_count / blank_count
+        blank_fill_ratio = filled_blank_count / blank_count
     else:
         blank_accuracy_frac = 1.0  # no blanks = trivially correct
+        blank_fill_ratio = 1.0
+    result["blank_count"] = blank_count
+    result["blank_correct"] = correct_blank_count
+    result["filled_blank_count"] = filled_blank_count
+    result["blank_accuracy_frac"] = blank_accuracy_frac
+    result["blank_fill_ratio"] = blank_fill_ratio
 
-    # Effort floor 0.02 ONLY when ALL clues preserved. v3 fix: previously
-    # the floor was unconditional, giving the model a free 0.02 even after
-    # corrupting clues, which compounded the clue-corruption attractor.
-    floor = 0.02 if all_clues_preserved else 0.0
-    result["blank_accuracy"] = floor + blank_accuracy_frac * 1.48
+    result["blank_accuracy"] = blank_accuracy_frac * 1.0
 
-    # 4. Full solve bonus: perfect match with ground truth
+    # 4. Partial structural validity over 27 Sudoku constraints. Scale it by
+    # fill ratio so all-zero/under-filled boards cannot receive high reward.
+    constraint_validity_frac = _constraint_validity_fraction(pred_board)
+    result["constraint_validity_frac"] = constraint_validity_frac
+    result["constraint_validity"] = constraint_validity_frac * blank_fill_ratio * 0.4
+
+    # 5. Full solve bonus: perfect match with ground truth
     # This implicitly checks validity (correct solution must satisfy constraints)
     fully_correct = all(
         pred_board[r][c] == solution[r][c]
@@ -170,12 +208,44 @@ def _score_single_detailed(
         for c in range(9)
     )
     if fully_correct:
-        result["full_solve"] = 0.5
+        result["full_solve"] = 0.6
+    result["solved"] = bool(fully_correct)
 
     result["total"] = (
         result["format"]
         + result["clue_preservation"]
         + result["blank_accuracy"]
+        + result["constraint_validity"]
         + result["full_solve"]
     )
     return result
+
+
+def _constraint_validity_fraction(board: List[List[int]]) -> float:
+    """Fraction of row/column/box constraints with no duplicate non-zero digits."""
+    valid = 0
+    total = 0
+
+    def no_duplicate_nonzero(values: List[int]) -> bool:
+        digits = [v for v in values if v != 0]
+        return len(digits) == len(set(digits))
+
+    for r in range(9):
+        total += 1
+        valid += int(no_duplicate_nonzero(board[r]))
+
+    for c in range(9):
+        total += 1
+        valid += int(no_duplicate_nonzero([board[r][c] for r in range(9)]))
+
+    for br in range(0, 9, 3):
+        for bc in range(0, 9, 3):
+            total += 1
+            box = [
+                board[r][c]
+                for r in range(br, br + 3)
+                for c in range(bc, bc + 3)
+            ]
+            valid += int(no_duplicate_nonzero(box))
+
+    return valid / total if total else 0.0

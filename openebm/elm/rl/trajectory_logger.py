@@ -52,6 +52,8 @@ class TrajLoggerConfig:
     samples_per_dump: int = 3
     summary_every_n_steps: int = 500
     persist_jsonl: bool = True
+    print_text: bool = False
+    text_chars: int = 180
     # Collapse detection
     unique_ratio_threshold: float = 0.3
     reward_std_eps: float = 1e-3
@@ -78,6 +80,8 @@ class TrajLoggerConfig:
             samples_per_dump=_envi("TRAJ_SAMPLES_PER_DUMP", 3),
             summary_every_n_steps=_envi("TRAJ_SUMMARY_EVERY", 500),
             persist_jsonl=_envb("TRAJ_PERSIST_JSONL", True),
+            print_text=_envb("TRAJ_PRINT_TEXT", False),
+            text_chars=_envi("TRAJ_TEXT_CHARS", 180),
             unique_ratio_threshold=_envf("TRAJ_UNIQUE_RATIO_THRESH", 0.3),
             reward_std_eps=_envf("TRAJ_REWARD_STD_EPS", 1e-3),
             collapse_window=_envi("TRAJ_COLLAPSE_WINDOW", 3),
@@ -117,8 +121,9 @@ class TrajectoryLogger:
         *,
         energies: Optional[Sequence[float]] = None,
         advantages: Optional[Sequence[float]] = None,
-        kls: Optional[Sequence[float]] = None,
+        ref_energy_kls: Optional[Sequence[float]] = None,
         response_lens: Optional[Sequence[int]] = None,
+        per_sample_metrics: Optional[Sequence[Dict[str, Any]]] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Periodic stdout + JSONL dump. No-op for non-rank-0 ranks."""
@@ -129,8 +134,9 @@ class TrajectoryLogger:
 
         records = self._build_records(
             step, prompts, completions, rewards, ground_truths,
-            energies=energies, advantages=advantages, kls=kls,
-            response_lens=response_lens, extra=extra,
+            energies=energies, advantages=advantages, ref_energy_kls=ref_energy_kls,
+            response_lens=response_lens, per_sample_metrics=per_sample_metrics,
+            extra=extra,
         )
 
         # 1) stdout sample dump (3 samples by default)
@@ -192,13 +198,45 @@ class TrajectoryLogger:
 
     def _build_records(
         self, step, prompts, completions, rewards, ground_truths,
-        *, energies, advantages, kls, response_lens, extra,
+        *, energies, advantages, ref_energy_kls, response_lens, per_sample_metrics, extra,
     ) -> List[Dict[str, Any]]:
         n = len(completions)
         def _get(seq, i, default=None):
             return seq[i] if seq is not None and i < len(seq) else default
         recs = []
         for i in range(n):
+            metrics = _get(per_sample_metrics, i, {}) or {}
+            reward_components = {
+                k: metrics[k]
+                for k in (
+                    "format",
+                    "clue_preservation",
+                    "blank_accuracy",
+                    "constraint_validity",
+                    "full_solve",
+                )
+                if k in metrics
+            }
+            eval_metrics = {
+                k: metrics[k]
+                for k in (
+                    "parse_ok",
+                    "valid_sudoku",
+                    "solved",
+                    "all_clues_preserved",
+                    "clue_accuracy",
+                    "blank_accuracy_frac",
+                    "blank_fill_ratio",
+                    "constraint_validity_frac",
+                    "clue_count",
+                    "clue_correct",
+                    "blank_count",
+                    "blank_correct",
+                    "filled_blank_count",
+                    "digit_count",
+                )
+                if k in metrics
+            }
             rec = {
                 "step": int(step),
                 "sample_idx": i,
@@ -208,8 +246,10 @@ class TrajectoryLogger:
                 "ground_truth": _get(ground_truths, i, None),
                 "energy": _get(energies, i, None),
                 "advantage": _get(advantages, i, None),
-                "kl": _get(kls, i, None),
+                "ref_energy_kl": _get(ref_energy_kls, i, None),
                 "response_len": _get(response_lens, i, None),
+                "reward_components": reward_components,
+                "metrics": eval_metrics,
             }
             if extra:
                 rec.update(extra)
@@ -220,24 +260,31 @@ class TrajectoryLogger:
         if not records:
             return
         for i, rec in enumerate(records[:k]):
-            comp = (rec["completion"] or "").replace("\n", "\\n")
-            prompt = (rec["prompt"] or "").replace("\n", "\\n")
-            gt = rec.get("ground_truth")
+            metrics = rec.get("metrics", {}) or {}
             energy = rec.get("energy")
             energy_s = f"{energy:.4f}" if isinstance(energy, (int, float)) else str(energy)
             logp(
-                f"DBG-RL-PERIODIC step={step:>5} idx={i}",
+                f"TRAJ step={step:>5} idx={i}",
                 f"reward={rec['reward']:+.3f} energy={energy_s} "
-                f"len={rec.get('response_len')} | gt={gt}",
+                f"len={rec.get('response_len')} solved={int(bool(metrics.get('solved', False)))} "
+                f"valid={int(bool(metrics.get('valid_sudoku', False)))} "
+                f"clue_acc={metrics.get('clue_accuracy')} "
+                f"blank_acc={metrics.get('blank_accuracy_frac')}",
             )
-            logp(
-                f"DBG-RL-PERIODIC step={step:>5} idx={i}",
-                f"prompt={prompt[:160]}…" if len(prompt) > 160 else f"prompt={prompt}",
-            )
-            logp(
-                f"DBG-RL-PERIODIC step={step:>5} idx={i}",
-                f"compl ={comp[:300]}…" if len(comp) > 300 else f"compl ={comp}",
-            )
+            if self.cfg.print_text:
+                comp = (rec["completion"] or "").replace("\n", "\\n")
+                prompt = (rec["prompt"] or "").replace("\n", "\\n")
+                n = self.cfg.text_chars
+                logp(
+                    f"TRAJ-TEXT step={step:>5} idx={i}",
+                    f"prompt={prompt[:n]}…" if len(prompt) > n else f"prompt={prompt}",
+                    min_level=_LEVELS["DEBUG"],
+                )
+                logp(
+                    f"TRAJ-TEXT step={step:>5} idx={i}",
+                    f"completion={comp[:n]}…" if len(comp) > n else f"completion={comp}",
+                    min_level=_LEVELS["DEBUG"],
+                )
 
     def _write_jsonl(self, step: int, records: List[Dict[str, Any]]) -> None:
         sub = os.path.join(self.cfg.output_dir, "trajectories", f"step_{step:06d}")
@@ -270,6 +317,24 @@ class TrajectoryLogger:
             "len_max": max(lens) if lens else None,
             "unique_completion_ratio": unique_ratio,
         }
+        metric_rows = [r.get("metrics", {}) for r in records]
+        if metric_rows:
+            def _mean_bool(key):
+                vals = [1.0 if bool(m.get(key, False)) else 0.0 for m in metric_rows if key in m]
+                return (sum(vals) / len(vals)) if vals else None
+            def _mean_float(key):
+                vals = [float(m[key]) for m in metric_rows if key in m and m[key] is not None]
+                return (sum(vals) / len(vals)) if vals else None
+            summary.update({
+                "parse_rate": _mean_bool("parse_ok"),
+                "valid_sudoku_rate": _mean_bool("valid_sudoku"),
+                "solve_rate": _mean_bool("solved"),
+                "all_clues_preserved_rate": _mean_bool("all_clues_preserved"),
+                "clue_accuracy_mean": _mean_float("clue_accuracy"),
+                "blank_accuracy_frac_mean": _mean_float("blank_accuracy_frac"),
+                "blank_fill_ratio_mean": _mean_float("blank_fill_ratio"),
+                "constraint_validity_frac_mean": _mean_float("constraint_validity_frac"),
+            })
         path = os.path.join(
             self.cfg.output_dir, "trajectories", f"step_{step:06d}", "summary.json"
         )

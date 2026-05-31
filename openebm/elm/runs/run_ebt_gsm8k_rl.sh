@@ -101,6 +101,9 @@ WARMUP_STEPS="${WARMUP_STEPS:-100}"
 # muon_adamw : Muon for transformer matrices + AdamW for the rest (matches SFT)
 RL_OPTIMIZER="${RL_OPTIMIZER:-adamw}"       # keep AdamW first for sparse reward stability
 MUON_LR="${MUON_LR:-2e-4}"                  # default = SFT muon_lr (2e-3) / 10
+ADAMW_VOCAB_TO_EMBED_LR="${ADAMW_VOCAB_TO_EMBED_LR:--1}"  # <=0 => LEARNING_RATE * 0.5
+ADAMW_SCALAR_LR="${ADAMW_SCALAR_LR:--1}"                  # <=0 => LEARNING_RATE * 2.0
+ADAMW_OTHER_LR="${ADAMW_OTHER_LR:--1}"                    # <=0 => LEARNING_RATE
 ADVANTAGE_NORM="${ADVANTAGE_NORM:-group_mean_global_std}"
 GLOBAL_STD_MIN="${GLOBAL_STD_MIN:-0.2}"
 SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.85}"
@@ -327,6 +330,9 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --warmup_steps ${WARMUP_STEPS} \
     --rl_optimizer ${RL_OPTIMIZER} \
     --muon_lr ${MUON_LR} \
+    --adamw_vocab_to_embed_lr ${ADAMW_VOCAB_TO_EMBED_LR} \
+    --adamw_scalar_lr ${ADAMW_SCALAR_LR} \
+    --adamw_other_lr ${ADAMW_OTHER_LR} \
     --advantage_norm ${ADVANTAGE_NORM} \
     --global_std_min ${GLOBAL_STD_MIN} \
     --skip_degenerate_threshold ${SKIP_DEGENERATE_THRESHOLD} \

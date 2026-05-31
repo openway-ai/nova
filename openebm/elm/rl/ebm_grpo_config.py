@@ -111,8 +111,14 @@ class EBMGRPOConfig:
 
     # ── Optimization ──────────────────────────────────────────────────────────
     learning_rate: float = 1e-6
-    """Peak learning rate for RL fine-tuning. Lower than SFT due to second-order
-    gradients through the MCMC chain (Hessian-vector products amplified by alpha)."""
+    """AdamW base/fallback peak LR for RL fine-tuning.
+
+    With rl_optimizer='adamw', this is the transformer/other base peak LR and
+    the per-family LRs are derived from it. With rl_optimizer='muon_adamw',
+    this does NOT control transformer matrix parameters; Muon matrices use
+    muon_lr. It only controls AdamW lanes unless the adamw_* absolute LR fields
+    below are set. All optimizer groups are still scaled by the same warmup/cos
+    scheduler, so each group's configured LR is its own peak LR."""
 
     weight_decay: float = 0.01
     """AdamW weight decay."""
@@ -210,6 +216,18 @@ class EBMGRPOConfig:
     muon_lr: float = 2e-4
     """Learning rate for Muon group (transformer matrices). Only used when
     rl_optimizer='muon_adamw'. Default = SFT muon_lr (2e-3) / 10."""
+
+    adamw_vocab_to_embed_lr: float = -1.0
+    """Absolute AdamW LR for vocab_to_embed in muon_adamw mode. <=0 falls back
+    to learning_rate * 0.5."""
+
+    adamw_scalar_lr: float = -1.0
+    """Absolute AdamW LR for transformer scalar/norm-like params in
+    muon_adamw mode. <=0 falls back to learning_rate * 2.0."""
+
+    adamw_other_lr: float = -1.0
+    """Absolute AdamW LR for non-transformer catch-all params in muon_adamw
+    mode. <=0 falls back to learning_rate."""
 
     muon_momentum: float = 0.95
     """Muon momentum. Inherits SFT default."""
