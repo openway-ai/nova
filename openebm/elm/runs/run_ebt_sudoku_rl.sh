@@ -1,14 +1,21 @@
 #!/bin/bash
 
 ################################################################################
-# EBT Sudoku RL (GRPO) 训练脚本
+# EBT Sudoku RL (GRPO/GSPO) 训练脚本
 # ─────────────────────────────────────────────────────────────────────────────
 # 基于 SFT v3 最佳 checkpoint 进行 GRPO 强化学习后训练。
 #
-# 算法: Group Relative Policy Optimization (GRPO)
+# 2026-05-31 稳定性默认值来自 d26-ctx2048-sudoku-rl-gspo-20260529:
+#   - 有效信号集中在 step 60-120，step 190 后出现明显退化。
+#   - 默认使用短跑 160 steps，并保存 50/100/150 附近候选。
+#   - trajectory 固定写到当前 run 根目录，避免落到 repo 根目录 ./trajectories。
+#   - GSPO clip 对齐 verl tight sequence-ratio recipe，避免 clip 永远失效。
+#   - clue violation 在 reward 层 hard-gate blank/full-solve credit。
+#
+# 算法: Energy-GSPO / Group Relative Policy Optimization
 #   - 每个 prompt 生成 N 个 completion
 #   - 多组件奖励 (format + accuracy + validity + full_solve)
-#   - PPO-clipped policy gradient + KL penalty
+#   - energy-ratio clipped policy gradient + KL/energy anchor
 #
 # 参考: d1/diffu-grpo (adapted for EBT's energy-based paradigm)
 ################################################################################
@@ -47,29 +54,29 @@ export EXP_ID="d26-ctx2048-sudoku-rl-gspo-$(date +%Y%m%d)"
 ################################################################################
 # GRPO 超参数
 ################################################################################
-NUM_GENERATIONS="${NUM_GENERATIONS:-12}"            # 12 is a stable smoke default; use 16 after curves are healthy
+NUM_GENERATIONS="${NUM_GENERATIONS:-12}"            # keep enough group variance for Sudoku reward
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-165}"     # 9x9 board ≤162 chars; tail tokens add noise
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-192}"
-TEMPERATURE="${TEMPERATURE:-0.75}"                  # lower than 0.9: reduce invalid-format exploration
-TOP_P="${TOP_P:-0.85}"
+TEMPERATURE="${TEMPERATURE:-0.70}"                  # slightly lower after late-run format/clue degradation
+TOP_P="${TOP_P:-0.80}"
 GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-6}" # sub-batch for generation (VRAM management)
 
 NUM_ITERATIONS="${NUM_ITERATIONS:-1}"              # legacy loss recomputation; keep 1 when using GSPO_UPDATE_EPOCHS
-GSPO_UPDATE_EPOCHS="${GSPO_UPDATE_EPOCHS:-1}"  # true optimizer steps per rollout for energy_gspo
+GSPO_UPDATE_EPOCHS="${GSPO_UPDATE_EPOCHS:-1}"  # keep 1 by default; previous 2-epoch long run degraded after early gains
 EPSILON="${EPSILON:-0.2}"                   # PPO clip range (only used by energy_gspo)
-CLIP_RATIO_LOW="${CLIP_RATIO_LOW:-0.2}"     # verl/DAPO-style asymmetric GSPO clip
-CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-0.28}"
-BETA="${BETA:-0.3}"                         # stronger anchor after negative energy-drift collapse
+CLIP_RATIO_LOW="${CLIP_RATIO_LOW:-3e-4}"    # verl GSPO sequence-ratio clip
+CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-4e-4}"
+BETA="${BETA:-0.5}"                         # stronger anchor after clue-preservation drift in long run
 ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
 ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
-LEARNING_RATE="${LEARNING_RATE:-1e-6}"       # lower than collapsed v2/v3 runs
+LEARNING_RATE="${LEARNING_RATE:-5e-7}"       # previous 1e-6 improved early but degraded over long horizon
 # RL_LOSS_TYPE="energy_reinforce"  # removes 1/|y| dilution
 RL_LOSS_TYPE="${RL_LOSS_TYPE:-energy_gspo}"
 
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
-MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.03}"
-WARMUP_STEPS="${WARMUP_STEPS:-80}"
+MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.02}"
+WARMUP_STEPS="${WARMUP_STEPS:-20}"
 
 # ── Optimizer (v3 P0+P1+muon) ─────────────────────────────────────────────────
 # adamw      : v3 P0 multi-group AdamW (transformer/v2e/scalar/other split LR)
@@ -78,20 +85,25 @@ RL_OPTIMIZER="${RL_OPTIMIZER:-adamw}"       # keep AdamW first; Muon can amplify
 MUON_LR="${MUON_LR:-2e-4}"                  # default = SFT muon_lr (2e-3) / 10
 ADVANTAGE_NORM="${ADVANTAGE_NORM:-group_mean_global_std}"  # batch-wide std prevents tiny intra-group std blow-ups
 GLOBAL_STD_MIN="${GLOBAL_STD_MIN:-0.2}"
-SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.85}"
+SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.5}"
 MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-0.01}"
-MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.0}"
+MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.3}"
+SKIP_CONSENSUS="${SKIP_CONSENSUS:-any}"      # conservative DDP stability mode
 
-MAX_STEPS="${MAX_STEPS:-600}"                # smoke first; raise only after analysis_overview is healthy
+MAX_STEPS="${MAX_STEPS:-160}"                # analyzed run peaked at 60-120 and degraded around 150-190
            
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-25}"
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-50}"
 LOG_INTERVAL="${LOG_INTERVAL:-5}"
 SAVE_TOP_K="${SAVE_TOP_K:-3}"
 SEED="${SEED:-42}"
 
 TRAJ_LOG_INTERVAL="${TRAJ_LOG_INTERVAL:-50}"
-TRAJ_NUM_SAMPLES="${TRAJ_NUM_SAMPLES:-2}"
-COLLAPSE_CHECK_WINDOW="${COLLAPSE_CHECK_WINDOW:-5}"
+TRAJ_NUM_SAMPLES="${TRAJ_NUM_SAMPLES:-4}"
+COLLAPSE_CHECK_WINDOW="${COLLAPSE_CHECK_WINDOW:-2}"
+
+# Current EBT forward debug is opt-in; keep train.log compact by default.
+export DBG_RL_FORWARD="${DBG_RL_FORWARD:-0}"
+export DBG_RL_FORWARD_INTERVAL="${DBG_RL_FORWARD_INTERVAL:-200}"
 
 ################################################################################
 # GPU 配置
@@ -146,10 +158,12 @@ exp_init_sft "$0"
 export RUN_NAME="${EXP_ID}-sudoku-rl-grpo"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# 轨迹输出目录跟着实际 stage 目录走。TrajectoryLogger 会写入:
+# 轨迹输出目录跟着实验 run 根目录走。TrajectoryLogger 会写入:
 #   ${TRAJ_OUTPUT_DIR}/trajectories/step_*/rollout_samples.jsonl
 #   ${TRAJ_OUTPUT_DIR}/collapse_dump/step_*.jsonl
-TRAJ_OUTPUT_DIR="${EXP_SFT_DIR}"
+# 例如:
+#   /mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-gspo-20260529/trajectories
+TRAJ_OUTPUT_DIR="${TRAJ_OUTPUT_DIR:-${EXP_DIR}}"
 export TRAJ_OUTPUT_DIR
 
 exp_save_hparams "${EXP_SFT_DIR}" \
@@ -175,7 +189,10 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "skip_degenerate_threshold=${SKIP_DEGENERATE_THRESHOLD}" \
     "min_reward_std_to_update=${MIN_REWARD_STD_TO_UPDATE}" \
     "min_unique_completion_ratio_to_update=${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE}" \
+    "skip_consensus=${SKIP_CONSENSUS}" \
     "rl_loss_type=${RL_LOSS_TYPE}" \
+    "top_p=${TOP_P}" \
+    "generation_batch_size=${GENERATION_BATCH_SIZE}" \
     "traj_output_dir=${TRAJ_OUTPUT_DIR}" \
     "traj_log_interval=${TRAJ_LOG_INTERVAL}" \
     "traj_num_samples=${TRAJ_NUM_SAMPLES}" \
@@ -199,6 +216,7 @@ echo "GSPO update epochs:      ${GSPO_UPDATE_EPOCHS}"
 echo "Num generations:         ${NUM_GENERATIONS}"
 echo "Max completion length:   ${MAX_COMPLETION_LENGTH}"
 echo "Temperature:             ${TEMPERATURE}"
+echo "Top-p:                   ${TOP_P}"
 echo "Epsilon (clip):          ${EPSILON}"
 echo "Clip low/high:           ${CLIP_RATIO_LOW}/${CLIP_RATIO_HIGH}"
 echo "Beta (KL anchor):        ${BETA}"
@@ -210,9 +228,12 @@ echo "Max grad per param:      ${MAX_GRAD_PER_PARAM}"
 echo "Advantage norm:          ${ADVANTAGE_NORM}"
 echo "Skip degen threshold:    ${SKIP_DEGENERATE_THRESHOLD}"
 echo "Min reward std update:   ${MIN_REWARD_STD_TO_UPDATE}"
+echo "Min unique ratio update: ${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE}"
+echo "Skip consensus:          ${SKIP_CONSENSUS}"
 echo "Max steps:               ${MAX_STEPS}"
 echo "Val interval:            ${VAL_CHECK_INTERVAL}"
 echo "Trajectory dir:          ${TRAJ_OUTPUT_DIR}/trajectories"
+echo "Forward debug:           DBG_RL_FORWARD=${DBG_RL_FORWARD} interval=${DBG_RL_FORWARD_INTERVAL}"
 echo "GPUs:                    ${NUM_GPUS}"
 echo "Log file:                ${LOG_FILE}"
 echo ""
@@ -238,6 +259,7 @@ cat << LOG_HEADER > "${LOG_FILE}"
 #   num_generations=${NUM_GENERATIONS}
 #   max_completion_length=${MAX_COMPLETION_LENGTH}
 #   temperature=${TEMPERATURE}
+#   top_p=${TOP_P}
 #   epsilon=${EPSILON}
 #   clip_ratio_low=${CLIP_RATIO_LOW}
 #   clip_ratio_high=${CLIP_RATIO_HIGH}
@@ -245,6 +267,8 @@ cat << LOG_HEADER > "${LOG_FILE}"
 #   energy_kl_mode=${ENERGY_KL_MODE}
 #   learning_rate=${LEARNING_RATE}
 #   max_steps=${MAX_STEPS}
+#   traj_dir=${TRAJ_OUTPUT_DIR}/trajectories
+#   skip_consensus=${SKIP_CONSENSUS}
 ################################################################################
 
 LOG_HEADER
@@ -297,6 +321,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --skip_degenerate_threshold ${SKIP_DEGENERATE_THRESHOLD} \
     --min_reward_std_to_update ${MIN_REWARD_STD_TO_UPDATE} \
     --min_unique_completion_ratio_to_update ${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE} \
+    --skip_consensus ${SKIP_CONSENSUS} \
     --max_steps ${MAX_STEPS} \
     --val_check_interval ${VAL_CHECK_INTERVAL} \
     --log_interval ${LOG_INTERVAL} \

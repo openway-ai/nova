@@ -120,6 +120,14 @@ def parse_args():
                         help="Skip update when rollout reward std is below this value.")
     parser.add_argument("--min_unique_completion_ratio_to_update", type=float, default=0.0,
                         help="Optional diversity guard; 0 disables update skipping by unique ratio.")
+    parser.add_argument(
+        "--skip_consensus",
+        type=str,
+        default="all",
+        choices=["all", "any"],
+        help="'all': skip only if every DDP rank reports a bad rollout; "
+             "'any': skip if any rank reports a bad rollout.",
+    )
 
     # Optimizer
     parser.add_argument("--rl_optimizer", type=str, default="muon_adamw",
@@ -278,6 +286,7 @@ def main():
         skip_degenerate_threshold=args.skip_degenerate_threshold,
         min_reward_std_to_update=args.min_reward_std_to_update,
         min_unique_completion_ratio_to_update=args.min_unique_completion_ratio_to_update,
+        skip_consensus=args.skip_consensus,
         rl_optimizer=args.rl_optimizer,
         muon_lr=args.muon_lr,
         muon_momentum=args.muon_momentum,
@@ -382,6 +391,7 @@ def main():
     print(f"  Beta (KL):          {config.beta}")
     print(f"  Energy KL mode:     {config.energy_kl_mode}")
     print(f"  Learning rate:      {config.learning_rate}")
+    print(f"  Skip consensus:     {config.skip_consensus}")
     print(f"  Max steps:          {config.max_steps}")
     print(f"  GPUs:               {gpus}")
     print(f"  Precision:          {args.float_precision}")

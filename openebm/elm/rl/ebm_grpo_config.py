@@ -45,11 +45,16 @@ class EBMGRPOConfig:
     """Fallback symmetric PPO/GSPO clip range."""
 
     clip_ratio_low: Optional[float] = None
-    """Lower GSPO/PPO clip range. If None, uses epsilon."""
+    """Lower GSPO/PPO clip range. If None, uses epsilon.
+
+    For true GSPO mode, verl's validated recipes use much tighter sequence
+    ratio clipping (for example 3e-4) than PPO/GRPO token-ratio defaults."""
 
     clip_ratio_high: Optional[float] = None
-    """Upper GSPO/PPO clip range. If None, uses epsilon. verl recipes often
-    use a slightly larger high clip, e.g. 0.28, for GRPO/GSPO."""
+    """Upper GSPO/PPO clip range. If None, uses epsilon.
+
+    For true GSPO mode, verl's validated recipes often use 4e-4 paired with
+    clip_ratio_low=3e-4."""
 
     beta: float = 0.0
     """KL penalty coefficient. 0.0 disables KL (no reference model needed).
@@ -98,6 +103,12 @@ class EBMGRPOConfig:
     ratio is below this threshold. Keep 0.0 by default so low diversity is
     logged first and used as a manual diagnostic before enforcing the guard."""
 
+    skip_consensus: str = "all"
+    """DDP skip consensus mode:
+    - 'all': skip only when every rank reports a bad rollout.
+    - 'any': skip if any rank reports a bad rollout. More conservative and
+      preferred for stability-first Sudoku RL runs."""
+
     # ── Optimization ──────────────────────────────────────────────────────────
     learning_rate: float = 1e-6
     """Peak learning rate for RL fine-tuning. Lower than SFT due to second-order
@@ -141,7 +152,8 @@ class EBMGRPOConfig:
     rl_loss_type: str = "energy_gspo"
     """RL loss variant for EBT. Options:
     - 'energy_gspo' (default): Sequence-level energy ratio with PPO clipping.
-      ratio = exp(-(E_θ - E_θ_old) / |y|). First-order, no Hessian.
+      compute_sequence_energy returns completion-mean energy, so the ratio is
+      exp(-(E_θ - E_θ_old)). First-order, no Hessian.
     - 'energy_reinforce': Pure on-policy, loss = -advantage * (-E_θ).
       Simplest, no importance ratio needed. No PPO stability guarantees.
     - 'token_logprobs': Original token-level logprobs via MCMC chain.

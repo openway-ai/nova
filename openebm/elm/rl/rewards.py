@@ -12,12 +12,13 @@ Reward components:
      full preservation → +0.5; full corruption → −0.5.
      v3: changed from one-sided (0..0.5) after v2 showed clue dropping
      0.34 → 0.07 because corruption had no explicit cost.
-  3. Blank accuracy reward (0.0-1.5): blank fill quality. The 0.02 effort
-     floor only applies when ALL clues are preserved (prevents the model
-     from sacrificing clue fidelity for blank fill exploration).
+  3. Blank accuracy reward (0.0-1.5): blank fill quality. This is gated on
+     preserving every given clue; otherwise the model can get positive reward
+     by corrupting clues and locally matching blank cells.
   4. Full solve bonus (0.0-0.5): perfect solution (implies validity)
 
-Total reward range: [-0.5, 3.0]
+Total reward range: [-0.5, 3.0]. If any clue is corrupted, total reward is
+capped at format + clue_preservation and blank/full-solve credit is disabled.
 """
 
 from typing import List, Optional
@@ -127,6 +128,15 @@ def _score_single_detailed(
         # No clues (empty board) - give full credit
         result["clue_preservation"] = 0.5
         all_clues_preserved = True
+
+    # Stability guard: Sudoku givens are hard constraints, not soft hints.
+    # The 20260529 GSPO run showed a reward-hacking path where the model kept
+    # parseable format, corrupted clues, and still earned positive blank-cell
+    # reward. Do not award blank/full-solve credit unless every given clue is
+    # preserved.
+    if not all_clues_preserved:
+        result["total"] = result["format"] + result["clue_preservation"]
+        return result
 
     # 3. Blank accuracy reward: fraction of blank cells filled correctly
     # Only count cells that were blank in the original puzzle.
