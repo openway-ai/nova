@@ -223,14 +223,22 @@ class EBMGRPOTrainer(LightningModule):
         import torch.distributed as dist
         if dist.is_available() and dist.is_initialized():
             flag = torch.tensor([local_skip], device=self.device)
-            # MIN: skip only when every rank agrees the batch has no useful signal.
-            dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+            if getattr(self.config, "skip_consensus", "all") == "any":
+                # Stability-first mode: if any rank sees a bad rollout, skip the
+                # optimizer step on all ranks to avoid one poisoned shard moving
+                # the shared policy.
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            else:
+                # Throughput-first mode: skip only when every rank agrees the
+                # batch has no useful signal.
+                dist.all_reduce(flag, op=dist.ReduceOp.MIN)
             global_skip = flag.item() > 0.5
         else:
             global_skip = local_skip > 0.5
 
         self.log("stability/reward_std_too_low", float("low_reward_std" in skip_reasons))
         self.log("stability/unique_completion_ratio", unique_ratio_for_skip)
+        self.log("stability/local_skip", local_skip)
         self._skip_optim_step = global_skip
 
         if global_skip:
