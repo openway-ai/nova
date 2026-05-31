@@ -21,6 +21,9 @@ from typing import Dict, Iterable, List, Optional
 
 
 STEP_RE = re.compile(r"(?:s=)?step=(\d+)|periodic-s=(\d+)")
+DEFAULT_SUDOKU_EVAL_DIR = Path(
+    "/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/sudoku_eval"
+)
 
 
 @dataclass
@@ -75,6 +78,12 @@ def _discover_checkpoints(ckpt_dir: Path, max_ckpts: int) -> List[Candidate]:
         if len(deduped) >= max_ckpts:
             break
     return deduped
+
+
+def _safe_path_name(name: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "._=-+" else "-" for ch in name)
+    safe = safe.strip(".-")
+    return safe or "unknown"
 
 
 def _split_summary(summary: Dict, split: str) -> Dict:
@@ -218,7 +227,9 @@ def main() -> int:
     args = parse_args()
     run_dir = args.run_dir.resolve()
     ckpt_dir = args.ckpt_dir or (run_dir / "checkpoints")
-    out_root = args.out_dir or (run_dir / "eval_logs" / "sudoku_ckpt_sweep")
+    out_root = args.out_dir or (
+        DEFAULT_SUDOKU_EVAL_DIR / _safe_path_name(run_dir.name) / "ckpt_sweep"
+    )
     candidates = _discover_checkpoints(ckpt_dir, args.max_ckpts)
     if not candidates:
         print(f"[select_sudoku_sft_ckpt] no checkpoints found in {ckpt_dir}")

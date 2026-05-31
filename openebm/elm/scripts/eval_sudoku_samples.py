@@ -62,6 +62,8 @@ from openebm.elm.data.sudoku_dataset_v2 import PROMPT_TEMPLATES as SUDOKU_PROMPT
 DEFAULT_DATA_DIR = Path('/mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/data/sudoku_cache_v2')
 DEFAULT_TOKENIZER = '/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer'
 DEFAULT_RUN_DIR = Path('/mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/runs/d26-ctx2048-sudoku-mixed-0.6-20260508')
+DEFAULT_LOGS_DIR = Path('/mnt/shared-storage-user/puyuan/code/OpenEBM/logs')
+DEFAULT_SUDOKU_EVAL_DIR = DEFAULT_LOGS_DIR / 'sudoku_eval'
 
 LEGACY_ZH_PROMPT = (
     "请解决以下数独谜题。"
@@ -158,12 +160,27 @@ class _PrefixStream:
             pass
 
 
-def _resolve_log_path(checkpoint: str, run_dir: Path) -> Path:
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+def _safe_path_name(name: str) -> str:
+    safe = ''.join(ch if ch.isalnum() or ch in '._=-+' else '-' for ch in name)
+    safe = safe.strip('.-')
+    return safe or 'unknown'
+
+
+def _split_tag(splits) -> str:
+    return _safe_path_name('-'.join(splits or ['nosplit']))
+
+
+def _resolve_default_out_dir(checkpoint: str, run_dir: Path, splits, ts: str) -> Path:
     ckpt_stem = Path(checkpoint).stem if checkpoint else 'nockpt'
-    log_dir = run_dir / 'eval_logs'
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir / f'{ckpt_stem}_{ts}.log'
+    run_name = _safe_path_name(Path(run_dir).name)
+    return DEFAULT_SUDOKU_EVAL_DIR / run_name / _split_tag(splits) / f'{ckpt_stem}_{ts}'
+
+
+def _resolve_log_path(checkpoint: str, run_dir: Path, splits=None) -> Path:
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_dir = _resolve_default_out_dir(checkpoint, run_dir, splits or ['val', 'test'], ts)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / 'eval.log'
 
 
 def _resolve_output_layout(args) -> dict:
@@ -174,7 +191,7 @@ def _resolve_output_layout(args) -> dict:
       2. User passed --out_dir        -> structured; log_path = <out_dir>/eval.log
       3. Both passed                  -> structured + custom log_path = --log_file
       4. Neither                      -> structured under
-                                         <run_dir>/eval_logs/sudoku_samples/<ckpt_stem>_<ts>/
+                                         logs/sudoku_eval/<run_name>/<split_tag>/<ckpt_stem>_<ts>/
     """
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     ckpt_stem = Path(args.checkpoint).stem if args.checkpoint else 'nockpt'
@@ -194,7 +211,9 @@ def _resolve_output_layout(args) -> dict:
     if out_dir is not None:
         out_dir_p = Path(out_dir)
     else:
-        out_dir_p = Path(args.run_dir) / 'eval_logs' / 'sudoku_samples' / f'{ckpt_stem}_{ts}'
+        out_dir_p = _resolve_default_out_dir(
+            args.checkpoint, args.run_dir, getattr(args, 'splits', None), ts
+        )
 
     log_path = Path(log_file) if log_file is not None else (out_dir_p / 'eval.log')
     return {
@@ -835,7 +854,9 @@ def _setup_logging_if_needed(args, is_main: bool, rank: int):
         layout = getattr(args, '_layout', None)
         if layout is None:
             # Fallback path (shouldn't normally happen — main() precomputes it).
-            log_path = args.log_file or _resolve_log_path(args.checkpoint, args.run_dir)
+            log_path = args.log_file or _resolve_log_path(
+                args.checkpoint, args.run_dir, getattr(args, 'splits', None)
+            )
         else:
             log_path = layout['log_path']
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1204,11 +1225,13 @@ def _build_parser():
     parser.add_argument('--tokenizer', default=DEFAULT_TOKENIZER)
     parser.add_argument('--data_dir', type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument('--run_dir', type=Path, default=DEFAULT_RUN_DIR,
-                        help='Run directory; default structured out_dir lives under <run_dir>/eval_logs/sudoku_samples/.')
+                        help='Training run directory used for run naming/metadata; '
+                             'default structured out_dir lives under logs/sudoku_eval/.')
     parser.add_argument('--log_file', type=Path, default=None,
                         help='Override the log file path. Passing only --log_file triggers flat mode (legacy).')
     parser.add_argument('--out_dir', type=Path, default=None,
-                        help='Structured output root. None -> auto under <run_dir>/eval_logs/sudoku_samples/<ckpt_stem>_<ts>/.')
+                        help='Structured output root. None -> auto under '
+                             'logs/sudoku_eval/<run_name>/<split_tag>/<ckpt_stem>_<ts>/.')
     parser.add_argument('--splits', nargs='+', default=['val', 'test'],
                         choices=['train', 'val', 'test'],
                         help='Splits to evaluate; default opts out of the 180k rrn_train.')
