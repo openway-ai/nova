@@ -92,6 +92,10 @@ import sys
 from transformers import AutoTokenizer
 
 import ipdb
+import sys
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
@@ -605,6 +609,22 @@ class ModelTrainer(LightningModule):
                 gc.collect()
                 torch.cuda.empty_cache()
 
+        # --- Muon momentum 预热调度 (参考 NanoChat base_train.py:360-363) ---
+        # Muon momentum 从 0.85 线性预热到 0.95，前 300 步完成
+        # 通过 --muon_momentum_warmup_steps 控制（默认 300，设 0 禁用）
+        muon_warmup_steps = getattr(self.hparams, 'muon_momentum_warmup_steps', 300)
+        if muon_warmup_steps > 0 and self.global_step <= muon_warmup_steps:
+            if hasattr(self, 'trainer') and self.trainer.optimizers:
+                optimizer = self.trainer.optimizers[0]
+                if hasattr(optimizer, 'param_groups'):
+                    target_momentum = getattr(self.hparams, 'muon_momentum', 0.95)
+                    base_momentum = 0.85
+                    frac = min(self.global_step / muon_warmup_steps, 1.0)
+                    current_momentum = (1 - frac) * base_momentum + frac * target_momentum
+                    for group in optimizer.param_groups:
+                        if group.get('kind') == 'muon':
+                            group['momentum'] = current_momentum
+
         # Record step end time for dt calculation
         import time as _time
         now = _time.time()
@@ -722,6 +742,14 @@ class ModelTrainer(LightningModule):
         if self._rng_resume_state:
             print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
 
+    def on_validation_epoch_start(self):
+        """Reset validation accumulators at the start of each validation epoch."""
+        # 方案A: 重置每来源累计 buffer
+        self._val_source_buf = {}
+        self._val_source_bpb = {}
+        self._val_bpb_nats = 0.0
+        self._val_bpb_bytes = 0
+
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         # Move token_bytes to the same device as the model if needed
         token_bytes = self.token_bytes
@@ -733,13 +761,19 @@ class ModelTrainer(LightningModule):
         sources = getattr(self, '_val_loader_sources', None)
         if sources is not None and 0 <= dataloader_idx < len(sources):
             src = sources[dataloader_idx]
-            tagged = {f"{k}_{src}": v for k, v in eval_step_dict.items()}
+            tagged = {
+                f"{k}_{src}": v
+                for k, v in eval_step_dict.items()
+                if k not in ('bpb', 'bpb_nats', 'bpb_bytes')
+            }
             self.log_metrics(tagged, "valid")
             # 收集 scalar 用于 epoch 末加权 mixed 指标
             if not hasattr(self, '_val_source_buf'):
                 self._val_source_buf = {}
             buf = self._val_source_buf.setdefault(src, {})
             for k, v in eval_step_dict.items():
+                if k in ('bpb', 'bpb_nats', 'bpb_bytes'):
+                    continue
                 if isinstance(v, torch.Tensor) and v.dim() == 0:
                     val = v.detach().float()
                 elif isinstance(v, (int, float)):
@@ -753,72 +787,117 @@ class ModelTrainer(LightningModule):
         else:
             self.log_metrics(eval_step_dict, "valid")
 
+        # 累积 BPB 的 nats/bytes，用于 epoch-level 正确计算
+        # (BPB = sum(nats) / (log2 * sum(bytes)), 不能对 per-batch BPB 做算术平均)
+        bpb_nats = eval_step_dict.get('bpb_nats', 0)
+        bpb_bytes = eval_step_dict.get('bpb_bytes', 0)
+        if isinstance(bpb_nats, torch.Tensor):
+            bpb_nats = bpb_nats.item()
+        if isinstance(bpb_bytes, torch.Tensor):
+            bpb_bytes = bpb_bytes.item()
+        self._val_bpb_nats += bpb_nats
+        self._val_bpb_bytes += bpb_bytes
+        if sources is not None and 0 <= dataloader_idx < len(sources):
+            src = sources[dataloader_idx]
+            if not hasattr(self, '_val_source_bpb'):
+                self._val_source_bpb = {}
+            bpb_slot = self._val_source_bpb.setdefault(src, {'nats': 0.0, 'bytes': 0})
+            bpb_slot['nats'] += bpb_nats
+            bpb_slot['bytes'] += bpb_bytes
+
         # 缓存最新 valid 指标，供 train 进度条显示
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
         suffix = f"_{sources[dataloader_idx]}" if (sources is not None and 0 <= dataloader_idx < len(sources)) else ""
         for k, v in eval_step_dict.items():
+            # 跳过 BPB 累积中间量，它们不应作为独立指标显示
+            if k in ('bpb', 'bpb_nats', 'bpb_bytes'):
+                continue
             if isinstance(v, torch.Tensor) and v.dim() == 0:
                 self._last_valid_metrics[f"{k}{suffix}"] = v.detach().item()
             elif isinstance(v, (int, float)):
                 self._last_valid_metrics[f"{k}{suffix}"] = v
 
-    def on_validation_epoch_start(self):
-        # 方案A: 重置每来源累计 buffer
-        self._val_source_buf = {}
-
     def on_validation_epoch_end(self):
+        """Compute mixed validation metrics and epoch-level BPB."""
+        import math
+
         # 方案A: 当存在多 val dataloader (sudoku_mixed) 时, 按 sudoku_ratio 加权得到 mixed 指标,
         # 仍以 valid_loss / valid_bpb / valid_perplexity 等无后缀 key 暴露给 ModelCheckpoint
         sources = getattr(self, '_val_loader_sources', None)
         buf = getattr(self, '_val_source_buf', None)
-        if not sources or not buf:
-            return
-        ratio = float(getattr(self.hparams, 'sudoku_ratio', 0.6))
-        weights = {'sudoku': ratio, 'sft': 1.0 - ratio}
-        # 收集所有指标 key 的并集
-        all_keys = set()
-        for src in sources:
-            all_keys.update(buf.get(src, {}).keys())
-        mixed = {}
-        # v3: also compute a fixed 0.5/0.5 balanced version so cross-ratio runs are
-        # comparable. The ratio-weighted `mixed[k]` is intentionally biased toward the
-        # heavier source — use it for ratio-aware monitoring and `balanced[k]` for
-        # cross-run comparisons (e.g. ckpt selection).
-        balanced_weights = {'sudoku': 0.5, 'sft': 0.5}
-        balanced = {}
-        for k in all_keys:
-            total = 0.0
-            wsum = 0.0
-            btotal = 0.0
-            bwsum = 0.0
+        if sources and buf:
+            ratio = float(getattr(self.hparams, 'sudoku_ratio', 0.6))
+            weights = {'sudoku': ratio, 'sft': 1.0 - ratio}
+            # 收集所有指标 key 的并集
+            all_keys = set()
             for src in sources:
-                slot = buf.get(src, {}).get(k)
-                if slot is None or slot['count'].item() == 0:
-                    continue
-                mean = (slot['sum'] / slot['count']).item()
-                w = weights.get(src, 0.0)
-                bw = balanced_weights.get(src, 0.0)
-                total += w * mean
-                wsum += w
-                btotal += bw * mean
-                bwsum += bw
-            if wsum > 0:
-                mixed[k] = total / wsum  # 归一化以防某侧缺失
-            if bwsum > 0:
-                balanced[k + '_balanced'] = btotal / bwsum
-        if mixed:
-            self.log_metrics(mixed, "valid")
-            if not hasattr(self, '_last_valid_metrics'):
-                self._last_valid_metrics = {}
-            for k, v in mixed.items():
-                self._last_valid_metrics[k] = v
-        if balanced:
-            self.log_metrics(balanced, "valid")
-            if not hasattr(self, '_last_valid_metrics'):
-                self._last_valid_metrics = {}
-            for k, v in balanced.items():
-                self._last_valid_metrics[k] = v
+                all_keys.update(buf.get(src, {}).keys())
+            mixed = {}
+            # v3: also compute a fixed 0.5/0.5 balanced version so cross-ratio runs are
+            # comparable. The ratio-weighted `mixed[k]` is intentionally biased toward the
+            # heavier source — use it for ratio-aware monitoring and `balanced[k]` for
+            # cross-run comparisons (e.g. ckpt selection).
+            balanced_weights = {'sudoku': 0.5, 'sft': 0.5}
+            balanced = {}
+            for k in all_keys:
+                total = 0.0
+                wsum = 0.0
+                btotal = 0.0
+                bwsum = 0.0
+                for src in sources:
+                    slot = buf.get(src, {}).get(k)
+                    if slot is None or slot['count'].item() == 0:
+                        continue
+                    mean = (slot['sum'] / slot['count']).item()
+                    w = weights.get(src, 0.0)
+                    bw = balanced_weights.get(src, 0.0)
+                    total += w * mean
+                    wsum += w
+                    btotal += bw * mean
+                    bwsum += bw
+                if wsum > 0:
+                    mixed[k] = total / wsum  # 归一化以防某侧缺失
+                if bwsum > 0:
+                    balanced[k + '_balanced'] = btotal / bwsum
+
+            source_bpb = getattr(self, '_val_source_bpb', {})
+            for src, slot in source_bpb.items():
+                if slot['bytes'] > 0:
+                    bpb = slot['nats'] / (math.log(2) * slot['bytes'])
+                    mixed[f'bpb_{src}'] = bpb
+                    if not hasattr(self, '_last_valid_metrics'):
+                        self._last_valid_metrics = {}
+                    self._last_valid_metrics[f'bpb_{src}'] = bpb
+
+            if mixed:
+                self.log_metrics(mixed, "valid")
+                if not hasattr(self, '_last_valid_metrics'):
+                    self._last_valid_metrics = {}
+                for k, v in mixed.items():
+                    self._last_valid_metrics[k] = v
+            if balanced:
+                self.log_metrics(balanced, "valid")
+                if not hasattr(self, '_last_valid_metrics'):
+                    self._last_valid_metrics = {}
+                for k, v in balanced.items():
+                    self._last_valid_metrics[k] = v
+
+        if self._val_bpb_bytes > 0:
+            epoch_bpb = self._val_bpb_nats / (math.log(2) * self._val_bpb_bytes)
+        else:
+            epoch_bpb = float('inf')
+        # 用 epoch-level BPB 覆盖 _last_valid_metrics 中的 per-batch 值
+        if not hasattr(self, '_last_valid_metrics'):
+            self._last_valid_metrics = {}
+        self._last_valid_metrics['bpb'] = epoch_bpb
+
+        # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
+        if self.logger is not None:
+            try:
+                self.logger.experiment.log({'valid_bpb': epoch_bpb}, step=self.global_step)
+            except Exception:
+                pass
 
     def on_test_epoch_start(self):
         """Reset test metrics at the start of test epoch"""
@@ -1415,7 +1494,10 @@ class ModelTrainer(LightningModule):
         alpha_lr = self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate
 
         # --- 参数收集 ---
-        alpha_params = [self.model.alpha]
+        if isinstance(self.model.alpha, nn.ParameterList):
+            alpha_params = list(self.model.alpha.parameters())
+        else:
+            alpha_params = [self.model.alpha]
         embedding_params = list(self.model.embeddings.parameters())
 
         vocab_to_embed_params = []
@@ -2060,14 +2142,6 @@ class ModelTrainer(LightningModule):
             # Default: use val_dataloader for pretrain mode
             return self.val_dataloader()
         
-    # def train_dataloader(self):
-    #     return DataLoader(self.train_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = not self.hparams.no_shuffle, prefetch_factor=self.hparams.prefetch_factor)
-
-    # def val_dataloader(self):
-    #     return DataLoader(self.val_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
-
-    # def test_dataloader(self):
-    #     return DataLoader(self.test_ds, batch_size=self.hparams.batch_size_per_device, num_workers=self.hparams.num_workers, persistent_workers=True, collate_fn = self.get_collate_fn(), pin_memory = True, drop_last = False, shuffle = False, prefetch_factor=self.hparams.prefetch_factor)
 
     def log_metrics(self, metrics_dict, phase, log_torchmetrics = True):
         # first log torchmetrics if there are any
@@ -2079,6 +2153,16 @@ class ModelTrainer(LightningModule):
         scalar_metrics = {}
         keys = list(metrics_dict.keys()) # Iterate over a copy of the keys to avoid modification issues during iteration
         for key in keys:
+            # 跳过 BPB 相关指标，它们不应通过 Lightning log_dict 上报：
+            # - bpb_nats/bpb_bytes: BPB 累积中间量
+            # - bpb (非 train 阶段): BPB 是比率指标 (nats/bytes)，
+            #   Lightning 的 on_epoch=True 会对 per-batch bpb 做算术平均，这是数学错误的
+            #   正确做法是在 on_validation_epoch_end 中从累积 nats/bytes 重新计算
+            if key in ('bpb_nats', 'bpb_bytes'):
+                continue
+            if key == 'bpb' and phase != 'train':
+                continue
+
             value = metrics_dict[key]
             # if 'image' in key: # images
             #     image = self.to_pil(value)
@@ -2156,8 +2240,12 @@ class ModelTrainer(LightningModule):
 
         # Alpha (MCMC step size) 值 (仅 train 阶段，避免 validation 阶段 warning)
         if phase == "train" and self.hparams.mcmc_step_size_learnable:
-            self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach(),
-                     on_step=True, on_epoch=False)
+            if isinstance(self.model.alpha, nn.ParameterList):
+                for i, p in enumerate(self.model.alpha):
+                    self.log(f"Alpha_MCMC_Step_{i}", p.detach(), on_step=True, on_epoch=False, prog_bar=True)
+            else:
+                self.log("Alpha_MCMC_Step_Size", self.model.alpha.detach(),
+                         on_step=True, on_epoch=False, prog_bar=True)
 
         # Langevin dynamics noise (仅 train 阶段)
         if phase == "train" and self.hparams.langevin_dynamics_noise_learnable:
@@ -2269,6 +2357,11 @@ class ModelTrainer(LightningModule):
                         valid_str += f" | {src}_ppl: {sub_ppl:.2f}"
 
                 # --- 打印 ---
+                alpha_val_str = ""
+                if self.hparams.mcmc_step_size_learnable:
+                    alpha_val = self.model.alpha.detach()
+                    alpha_grad_str = f" grad={self.model.alpha.grad.item():.6f}" if self.model.alpha.grad is not None else " grad=None"
+                    alpha_val_str = f" | alpha: {alpha_val.item():.6f} ({alpha_val.dtype}){alpha_grad_str}"
                 print(
                     f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
                     f"loss: {loss_val:.6f}"
@@ -2279,6 +2372,7 @@ class ModelTrainer(LightningModule):
                     f"mfu: {mfu:.2f} | "
                     f"epoch: {epoch} | "
                     f"total time: {total_min:.2f}m"
-                    f"{eta_str}",
+                    f"{eta_str}"
+                    f"{alpha_val_str}",
                     flush=True,
                 )

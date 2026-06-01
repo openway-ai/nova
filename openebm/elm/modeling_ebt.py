@@ -32,7 +32,14 @@ class EBT_NLP(LightningModule):
         self.vocab_size = self.tokenizer.get_vocab_size() # len(self.tokenizer) # self.vocab_size = self.tokenizer.vocab_size caused errors since is smaller than len(self.tokenizer), is 50254 for neox-20b, len tokenizer is 50277 so decided to use that
         self.hparams.vocab_size = self.vocab_size
         
-        self.alpha = nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size)), requires_grad=self.hparams.mcmc_step_size_learnable)
+        if self.hparams.mcmc_step_size_learnable and getattr(self.hparams, 'mcmc_step_size_per_step', False):
+            self.alpha = nn.ParameterList([
+                nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size), dtype=torch.float32))
+                for _ in range(self.hparams.mcmc_num_steps)
+            ])
+        else:
+            self.alpha = nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size), dtype=torch.float32),
+                                      requires_grad=self.hparams.mcmc_step_size_learnable)
         self.langevin_dynamics_noise_std = nn.Parameter(torch.tensor(float(self.hparams.langevin_dynamics_noise)), requires_grad=False) # if using self.hparams.langevin_dynamics_noise_learnable this will be turned on in warm_up_finished func
 
         self.embeddings = nn.Embedding(self.vocab_size, self.hparams.embedding_dim)
@@ -63,13 +70,24 @@ class EBT_NLP(LightningModule):
             self.replay_buffer_samples = self.hparams.batch_size_per_device * self.hparams.mcmc_replay_buffer_sample_bs_percent
             self.replay_buffer = CausalReplayBuffer(max_size=replay_buffer_max_size, sample_size=self.replay_buffer_samples)
 
-        # DEBUGGING CODE ################################################################################################################################################
+        self._alpha_debug_step = 0  # counter for alpha diagnostic prints
         if self.hparams.debug_unused_parameters:
             self.used_parameters = set()
             self.parameters_not_to_check = set() # dont check these since may be frozen or dont want them to update
-        
+
+    def _apply(self, fn):
+        """Override to ensure alpha always stays in float32 regardless of model dtype.
+
+        _apply is the lowest-level method called by all dtype/device conversions
+        (to, cuda, float, etc.). Lightning's to() bypasses nn.Module.to() when a
+        trainer is present, so overriding to() is insufficient.
+        """
+        result = super()._apply(fn)
+        result.alpha.data = result.alpha.data.to(dtype=torch.float32)
+        return result
+
     @torch.compiler.disable
-    def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps, 
+    def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps,
                       langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
                       real_token_ids=None):
         batch_size = predicted_tokens.shape[0]
@@ -85,11 +103,18 @@ class EBT_NLP(LightningModule):
             predicted_tokens = predicted_tokens + ld_noise
 
         if self.hparams.normalize_initial_condition:
-            if self.hparams.normalize_initial_condition_only_first_step:
-                if mcmc_step == 0:
-                    predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
+            if getattr(self.hparams, 'float_precision', '') == "bf16-true":
+                if self.hparams.normalize_initial_condition_only_first_step:
+                    if mcmc_step == 0:
+                        predicted_tokens = self.softmax(predicted_tokens)
+                else:
+                    predicted_tokens = self.softmax(predicted_tokens)
             else:
-                predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
+                if self.hparams.normalize_initial_condition_only_first_step:
+                    if mcmc_step == 0:
+                        predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
+                else:
+                    predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
                 
             if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
                 predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
@@ -124,14 +149,15 @@ class EBT_NLP(LightningModule):
         # predicted_tokens_grad has shape B, S, V
         
         if self.hparams.clamp_futures_grad:
-            min_and_max = self.hparams.clamp_futures_grad_max_change / (self.alpha) # use self.alpha and not random alpha to clamp
+            _alpha_for_clamp = self.alpha[mcmc_step] if isinstance(self.alpha, nn.ParameterList) else self.alpha
+            min_and_max = self.hparams.clamp_futures_grad_max_change / torch.clamp(_alpha_for_clamp.float(), min=0.0001)
             # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
             predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
             
         if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
             raise ValueError("NaN or Inf gradients detected during MCMC.")
         
-        predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after  
+        predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after
         
         if self.hparams.absolute_clamp != 0.0:
             predicted_tokens = torch.clamp(predicted_tokens, min = -self.hparams.absolute_clamp, max = self.hparams.absolute_clamp)
@@ -154,14 +180,18 @@ class EBT_NLP(LightningModule):
         batch_size = x.shape[0]
         seq_length = x.shape[1]
         
-        alpha = torch.clamp(self.alpha, min=0.0001)
-        if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
-            expanded_alpha = alpha.expand(batch_size, seq_length, 1)
+        model_dtype = self.embeddings.weight.dtype
+        if not isinstance(self.alpha, nn.ParameterList):
+            alpha = torch.clamp(self.alpha, min=0.0001).float()
+            if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
+                expanded_alpha = alpha.expand(batch_size, seq_length, 1)
 
-            scale = self.hparams.randomize_mcmc_step_size_scale
-            low = alpha / scale
-            high = alpha * scale
-            alpha = low + torch.rand_like(expanded_alpha) * (high - low)
+                scale = self.hparams.randomize_mcmc_step_size_scale
+                low = alpha / scale
+                high = alpha * scale
+                alpha = low + torch.rand_like(expanded_alpha) * (high - low)
+        else:
+            alpha = None  # will be resolved per step below
 
         langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
 
@@ -194,10 +224,14 @@ class EBT_NLP(LightningModule):
 
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
-                
+                if isinstance(self.alpha, nn.ParameterList):
+                    step_alpha = torch.clamp(self.alpha[mcmc_step], min=0.0001)
+                else:
+                    step_alpha = alpha
+
                 predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
-                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
+                    langevin_dynamics_noise_std, step_alpha, start_pos, learning, return_raw_logits,
                     real_token_ids=x
                 )
                 predicted_energies.append(energy_preds)
@@ -309,9 +343,21 @@ class EBT_NLP(LightningModule):
             contrastive_loss = 0.0
         
         if token_bytes is not None:
-            bpb_loss = calculate_bpb_score(next_token_indices, cce_loss.detach(), token_bytes)
+            # Compute per-token loss (reduction='none') for accurate BPB.
+            # Passing scalar mean loss (cce_loss) is incorrect because
+            # calculate_bpb_score multiplies loss by (num_bytes > 0) mask and sums,
+            # yielding mean_loss × count rather than sum(per_token_loss[valid]).
+            # predicted_distribution from the last MCMC step is already (-1, vocab_size).
+            if self.hparams.soften_target_prob_dist != 0.0:
+                per_token_ce = F.cross_entropy(predicted_distribution, next_token_indices,
+                                                label_smoothing=label_smoothing, ignore_index=-1, reduction='none')
+            else:
+                per_token_ce = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1, reduction='none')
+            bpb_loss, bpb_nats, bpb_bytes = calculate_bpb_score(next_token_indices, per_token_ce.detach(), token_bytes)
         else:
             bpb_loss = 0
+            bpb_nats = 0
+            bpb_bytes = 0
 
         log_dict = {
             'loss': total_loss,
@@ -320,7 +366,9 @@ class EBT_NLP(LightningModule):
             'contrastive_loss' : contrastive_loss,
             'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
             'perplexity': ppl_loss,
-            'bpb': bpb_loss  # Renamed from 'bpb_loss' for cleaner logging
+            'bpb': bpb_loss,
+            'bpb_nats': bpb_nats,    # accumulated nats for epoch-level BPB
+            'bpb_bytes': bpb_bytes,  # accumulated bytes for epoch-level BPB
         }
         return log_dict
     
@@ -329,9 +377,9 @@ class EBT_NLP(LightningModule):
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=self.embeddings.weight.dtype, device = self.device) * self.hparams.gaussian_random_noise_scaling
+            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=torch.bfloat16, device=self.device) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
-            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=self.embeddings.weight.dtype, device = self.device)
+            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device)
         else:
             raise NotImplementedError(f"{self.hparams.denoising_initial_condition} denoising_initial_condition not yet supported")
         

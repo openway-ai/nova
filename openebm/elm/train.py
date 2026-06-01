@@ -1,62 +1,42 @@
-# Human-crafted
-# coding: utf-8
-import torch
+import json
 import os
+import random
+import shutil
+import sys
 from argparse import ArgumentParser
 
-import random
+import torch
+import wandb
 
 # 允许加载旧 checkpoint 中的自定义类
 try:
     from nanochat.tokenizer import RustBPETokenizer
     torch.serialization.add_safe_globals([RustBPETokenizer])
-except:
+except Exception:
     pass
 
 # 抑制 CUDA stream 不匹配警告（恢复训练时的已知问题）
-torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
-
-# from nanolightning.torchlightning_trainer import Trainer
-# from nanolightning.iteratabletrainer import IterableTrainer
-# from nanolightning.torchlightning_trainer import ModelSummary
-# from nanolightning.torchlightning_function import DDPStrategy
-# from nanolightning.torchlightning_function import seed_everything
-# from nanolightning.torchlightning_function import WandbLogger
-# from nanolightning.torchlightning_function import ModelCheckpoint
-# from nanolightning.torchlightning_function import rank_zero_only
+if hasattr(torch.autograd.graph, 'set_warn_on_accumulate_grad_stream_mismatch'):
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 try:
     from lightning.pytorch import Trainer, seed_everything
+    from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary
+    from lightning.pytorch.loggers import WandbLogger
     from lightning.pytorch.strategies import DDPStrategy
     from lightning.pytorch.utilities.rank_zero import rank_zero_only
-    from lightning.pytorch.loggers import WandbLogger
-    from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary
 except ImportError:
     from pytorch_lightning import Trainer, seed_everything
+    from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
+    from pytorch_lightning.loggers import WandbLogger
     from pytorch_lightning.strategies import DDPStrategy
     from pytorch_lightning.utilities.rank_zero import rank_zero_only
-    from pytorch_lightning.loggers import WandbLogger
-    from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
 
-from openebm.elm.disk_aware_checkpoint import DiskAwareCheckpoint
-
-import sys
-import wandb
-import ast
-import math
-from tqdm import tqdm
-import json
-import shutil
 from openebm.elm import logger as text_logger
-
-# from torch.utils.tensorboard import SummaryWriter # need to implement, which involves maybe changing the forward function
-
-# from utils.dataloader_debugger import debug_dataloader
-# from utils import load_trained_pl_model
-from openebm.elm.utils import model_sizes, init_wandb_watch, call_style_gan_fvd
-from openebm.elm import logger
-from openebm.elm.trainer import ModelTrainer
+from openebm.elm.disk_aware_checkpoint import DiskAwareCheckpoint
 from openebm.elm.eval import nlp_eval_acc
+from openebm.elm.trainer import ModelTrainer
+from openebm.elm.utils import init_wandb_watch, model_sizes
 
 @rank_zero_only # to ensure only one wandb run is created, if didnt do that then each GPU would create its own wandb run
 def setup_wandb(args): 
@@ -154,8 +134,25 @@ def main(args):
     #     assert args.random_num_mcmc_steps, "random_num_mcmc_steps needs to be True"
     #NOTE should uncomment if add above hparams back
     
-    args.num_nodes = int(os.getenv('SLURM_JOB_NUM_NODES', 1)) # may not exist if not using slurm so default to 1; multi node only supports slurm as of now
-    print(f"SLURM_JOB_NUM_NODES: {args.num_nodes}")
+    # 按优先级推导 num_nodes:
+    # 1. SLURM_JOB_NUM_NODES  —— Slurm 环境
+    # 2. NODE_COUNT            —— rjob/平台注入的环境变量（本集群使用）
+    # 3. WORLD_SIZE / LOCAL_WORLD_SIZE —— torchrun 自动注入
+    # 4. 默认为 1
+    if os.getenv('SLURM_JOB_NUM_NODES') is not None:
+        args.num_nodes = int(os.getenv('SLURM_JOB_NUM_NODES'))
+        print(f"num_nodes={args.num_nodes} (from SLURM_JOB_NUM_NODES)")
+    elif os.getenv('NODE_COUNT') is not None:
+        args.num_nodes = int(os.getenv('NODE_COUNT'))
+        print(f"num_nodes={args.num_nodes} (from NODE_COUNT)")
+    elif os.getenv('WORLD_SIZE') is not None and os.getenv('LOCAL_WORLD_SIZE') is not None:
+        world_size = int(os.getenv('WORLD_SIZE'))
+        local_world_size = int(os.getenv('LOCAL_WORLD_SIZE'))
+        args.num_nodes = max(1, world_size // local_world_size)
+        print(f"num_nodes={args.num_nodes} (inferred from WORLD_SIZE={world_size} / LOCAL_WORLD_SIZE={local_world_size})")
+    else:
+        args.num_nodes = 1
+        print("num_nodes=1 (default, no distributed env vars found)")
     print("torch.cuda.device_count()", torch.cuda.device_count())
     if args.gpus == "-1":
         num_gpus = args.num_nodes * torch.cuda.device_count()
@@ -166,8 +163,9 @@ def main(args):
         num_gpus = int(args.gpus)
     print("devices/args.gpus: ", args.gpus)
 
-    args.total_num_workers = args.num_workers * num_gpus
-    print("num_nodes", args.num_nodes, "total num_workers across all GPUs", args.total_num_workers, "num workers per GPU", args.num_workers, "num_GPUs", num_gpus)
+    # NOTE: num_workers is NOT configurable — nanochat DataLoader hardcodes num_workers=0
+    # because the generator holds GPU state (pre-allocated CUDA buffers) that cannot be
+    # pickled into worker processes. See dataset.py generate_dataloader() for details.
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     assert (device == torch.device('cuda') and num_gpus > 0), "using cpu instead of cuda. if you would like to proceed please remove this line and change code below to not use GPUs, otherwise check packages to ensure torch/others have cuda support"
@@ -285,31 +283,23 @@ def main(args):
         trainer = set_trainer(args, wandb_logger, checkpoint_callback, stage = "test")
         model_trainer.model.eval()
         trainer.test(model_trainer)
-
-        # DDP: only rank 0 merges shard files and computes metrics
-        if trainer.global_rank == 0:
-            # Merge per-rank JSONL shard files into a single results.jsonl
-            from openebm.elm.logger import JsonlLogger
-            JsonlLogger.merge_rank_files(args.save_generation_logs_dir, "results.jsonl")
-
-            if args.modality == "NLP": # can have modality specific logic here for inference
-                if args.execution_mode == "inference":
-                    # Only compute EM/F1 for generation tasks (GSM8K, etc), not PPL tasks (nanochat)
-                    if args.dataset_name in ["gsm8k", "arc", "humaneval", "mmlu", "smoltalk", "spellingbee"]:
-                        em_score, f1_score = nlp_eval_acc(os.path.join(args.save_generation_logs_dir, "results.jsonl"))
-                        if wandb_logger is not None:
-                            wandb_logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
-                    else:
-                        print(f"Skipping EM/F1 evaluation for PPL-only dataset: {args.dataset_name}")
-            # elif args.modality == "VID":
-            #     if args.infer_generate_video:
-            #         print("calling style gan FVD code on generated video dataset, NOTE THIS CODE MAY NOT WORK AS EXPECTED or get stuck")
-            #         fvd, fid = call_style_gan_fvd(args)
-            #         trainer.logger.experiment.log({"test_fvd": fvd, "test_fid": fid})
-            # elif args.modality == "IMG":
-            #     pass # no post test code for denoising, for t2i could call FID code here if desired
-            else:
-                raise NotImplementedError(f"no post test evaluation setup for this modality: {args.modality} yet")
+        if args.modality == "NLP": # can have modality specific logic here for inference
+            if args.execution_mode == "inference":
+                # Only compute EM/F1 for generation tasks (GSM8K, etc), not PPL tasks (nanochat)
+                if args.dataset_name in ["gsm8k", "arc", "humaneval", "mmlu", "smoltalk", "spellingbee"]:
+                    em_score, f1_score = nlp_eval_acc(os.path.join(args.save_generation_logs_dir, "results.jsonl"))
+                    trainer.logger.experiment.log({"em_score": em_score, "f1_score": f1_score})
+                else:
+                    print(f"Skipping EM/F1 evaluation for PPL-only dataset: {args.dataset_name}")
+        # elif args.modality == "VID":
+        #     if args.infer_generate_video:
+        #         print("calling style gan FVD code on generated video dataset, NOTE THIS CODE MAY NOT WORK AS EXPECTED or get stuck")
+        #         fvd, fid = call_style_gan_fvd(args)
+        #         trainer.logger.experiment.log({"test_fvd": fvd, "test_fid": fid})
+        # elif args.modality == "IMG":
+        #     pass # no post test code for denoising, for t2i could call FID code here if desired
+        else:
+            raise NotImplementedError(f"no post test evaluation setup for this modality: {args.modality} yet")
 
 def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", periodic_checkpoint=None):
     torch.autograd.set_detect_anomaly(args.detect_anomaly) #NOTE seems pl detect anomaly is not working so manually set it here
@@ -487,7 +477,11 @@ if __name__ == '__main__':
     parser.add_argument("--mcmc_step_size", help="is size of optimization step, or alpha in the paper, kinda like LR, can be learned param", type=float, default=60.0)
     
     parser.add_argument("--mcmc_step_size_learnable", help="makes mcmc_step_size a learnable param", action="store_true", default = False)
-    
+
+    parser.add_argument("--mcmc_step_size_per_step",
+        help="learn a separate mcmc_step_size (alpha) for each MCMC step index",
+        action="store_true", default=False)
+
     parser.add_argument("--mcmc_step_size_lr_multiplier", help="learning rate multiplier for mcmc step size, so to get lr of mcmc step size take lr multiply by this value", type=float, default=5000.0)
 
     parser.add_argument("--randomize_mcmc_step_size_scale", help="randomize the value of mcmc_step_size by a factor specified, i.e. if is 2 will mult by 2 and div by 2 and thats the range to sample from uniformly", type=float, default=1)
@@ -696,6 +690,7 @@ if __name__ == '__main__':
     parser.add_argument("--adamw_vocab_to_embed_lr", help="[Muon] vocab_to_embed 绝对 LR (EBT 特有, 建议保守 0.01)", type=float, default=-1)
     parser.add_argument("--adamw_scalar_lr", help="[Muon] transformer scalar 绝对 LR (NanoChat 默认 0.04)", type=float, default=-1)
     parser.add_argument("--adamw_dmodel_lr_scaling", help="[Muon] 是否对 AdamW LR 做 dmodel scaling: lr × (dim/768)^-0.5", action="store_true", default=False)
+    parser.add_argument("--muon_momentum_warmup_steps", help="[Muon] Momentum 从 0.85 线性预热到 muon_momentum 的步数 (NanoChat 默认 300, 设 0 禁用)", type=int, default=300)
 
     # Option 1: 分层学习率参数
     parser.add_argument("--layered_lr", help="[Option 1] 启用分层学习率，不同参数类型使用不同学习率", action="store_true", default=False)
@@ -714,9 +709,11 @@ if __name__ == '__main__':
 
     #DATASET AND DATALOADER #########################################################
 
-    parser.add_argument("--num_workers", help="num_workers per GPU. idea to do per GPU gotten from https://discuss.pytorch.org/t/guidelines-for-assigning-num-workers-to-dataloader/813/", type=int, default=4)
-
-    parser.add_argument("--prefetch_factor", help="prefetch factor for dataloader", type=int, default=None)
+    # NOTE: --num_workers and --prefetch_factor have been removed.
+    # The nanochat DataLoader hardcodes num_workers=0 because its generator holds
+    # GPU state (pre-allocated CUDA buffers) that cannot be pickled into worker
+    # processes. pin_memory=False because data is already on GPU.
+    # See dataset.py generate_dataloader() for details.
     
     parser.add_argument("--dataset_name", help="dataset name", default="ucf101")
 
