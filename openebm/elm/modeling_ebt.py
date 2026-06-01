@@ -16,6 +16,13 @@ from openebm.elm.metrics import calculate_bpb_score
 
 import ipdb
 
+PRECISION_TO_MCMC_DTYPE = {
+    "bf16-true": torch.bfloat16,
+    "bf16-mixed": torch.float32,
+    "16-mixed": torch.float32,
+    "32-true": torch.float32,
+}
+
 class EBT_NLP(LightningModule):
     def __init__(self, hparams):
         super().__init__()
@@ -346,13 +353,15 @@ class EBT_NLP(LightningModule):
     
 
     def corrupt_embeddings(self, embeddings):
+        float_precision = getattr(self.hparams, 'float_precision', '')
+        mcmc_dtype = PRECISION_TO_MCMC_DTYPE.get(float_precision, torch.float32)
+
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            mcmc_dtype = torch.bfloat16 if getattr(self.hparams, 'float_precision', '') == "bf16-true" else torch.float32
             predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=mcmc_dtype, device=self.device) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
-            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device)
+            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=mcmc_dtype, device = self.device)
         else:
             raise NotImplementedError(f"{self.hparams.denoising_initial_condition} denoising_initial_condition not yet supported")
         
