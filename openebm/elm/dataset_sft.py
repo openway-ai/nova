@@ -53,9 +53,32 @@ _SFT_DATASETS_CACHE = None
 _SFT_DATASET_LOGGING_CONFIGURED = False
 
 
+def _build_sft_inputs_and_targets(batch_tensor, mask_tensor, device, use_cuda):
+    inputs = batch_tensor[:, :-1].to(
+        device=device, dtype=torch.int64, non_blocking=use_cuda
+    )
+    targets = batch_tensor[:, 1:].to(
+        device=device, dtype=torch.int64, non_blocking=use_cuda
+    )
+    target_mask = mask_tensor[:, 1:].to(
+        device=device, dtype=torch.bool, non_blocking=use_cuda
+    )
+
+    # Use NanoChat's supervision mask directly: only assistant tokens
+    # should contribute to the loss.
+    targets = targets.masked_fill(~target_mask, -1)
+    return inputs, targets
+
+
 @contextmanager
 def _sft_dataset_load_lock():
-    """Serialize HF cached dataset construction across local DDP ranks."""
+    """Serialize HF cached dataset construction across local DDP ranks.
+
+    SFT currently runs on a single node, so the default /tmp lock is
+    intentionally node-local. If SFT is expanded to multi-node with a shared
+    writable dataset cache, set EBT_SFT_DATASET_LOAD_LOCK_PATH to a shared
+    filesystem path.
+    """
     if os.environ.get("EBT_SFT_DATASET_LOAD_LOCK", "1").lower() in ("0", "false", "no"):
         yield
         return
@@ -370,19 +393,9 @@ class SFTIterableDataset(_IterableDataset):
 
             batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
             mask_tensor = torch.tensor(row_masks, dtype=torch.bool, pin_memory=use_cuda)
-            inputs = batch_tensor[:, :-1].to(
-                device=self.device, dtype=torch.int64, non_blocking=use_cuda
+            inputs, targets = _build_sft_inputs_and_targets(
+                batch_tensor, mask_tensor, self.device, use_cuda
             )
-            targets = batch_tensor[:, 1:].to(
-                device=self.device, dtype=torch.int64, non_blocking=use_cuda
-            )
-            target_mask = mask_tensor[:, 1:].to(
-                device=self.device, dtype=torch.bool, non_blocking=use_cuda
-            )
-
-            # Use NanoChat's supervision mask directly: only assistant tokens
-            # should contribute to the loss.
-            targets = targets.masked_fill(~target_mask, -1)
 
             self.it += 1
             self.last_state_dict = self._build_state_dict(copy_buffer=False)

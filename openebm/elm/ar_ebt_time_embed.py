@@ -252,8 +252,17 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
         torch.Tensor: Reshaped frequency tensor for broadcast.
     """
     ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    # RoPE freqs are indexed by sequence position (x.shape[1]) and rotary
+    # complex pair dimension (x.shape[-1]), so x must expose both axes.
+    assert 0 <= 1 < ndim, (
+        "reshape_for_broadcast expects x to have at least two dimensions "
+        f"with a sequence axis at dim=1; got x.ndim={ndim}, shape={tuple(x.shape)}"
+    )
+    expected_freqs_shape = (x.shape[1], x.shape[-1])
+    assert freqs_cis.shape == expected_freqs_shape, (
+        "freqs_cis shape must match x sequence and rotary dimensions: "
+        f"expected {expected_freqs_shape}, got {tuple(freqs_cis.shape)}"
+    )
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
@@ -262,29 +271,36 @@ def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: Tuple[torch.Tensor, torch.Tensor],
-    use_fp32_rope: bool = True,
+    rope_use_complex_fp32: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Apply rotary embeddings to query and key tensors.
 
     Supports two paths:
-    - use_fp32_rope=True: complex-float32 arithmetic (for bf16-mixed / fp32 modes).
-    - use_fp32_rope=False: real-valued arithmetic in native dtype (for bf16-true mode).
+    - rope_use_complex_fp32=True: complex-float32 arithmetic (for bf16-mixed / fp32 modes).
+    - rope_use_complex_fp32=False: real-valued arithmetic in native dtype (for bf16-true mode).
+
+    The two paths implement the same rotary transform. The complex path treats
+    each even/odd hidden-dim pair as the real/imaginary part of a complex value
+    and multiplies by cos + i sin; the real path expands the same multiplication
+    into the equivalent 2D rotation formula. Numeric differences should only
+    come from dtype and rounding behavior.
 
     Args:
         xq (torch.Tensor): Query tensor, shape (..., seq, n_heads, head_dim).
         xk (torch.Tensor): Key tensor, shape (..., seq, n_kv_heads, head_dim).
         freqs_cis (Tuple[torch.Tensor, torch.Tensor]): (cos, sin) each of
             shape (seq, head_dim//2), precomputed by precompute_freqs_cis.
-        use_fp32_rope (bool): If True, use complex-float32 arithmetic.
+        rope_use_complex_fp32 (bool): If True, use complex-float32 arithmetic.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Rotated xq and xk in original dtype.
     """
     cos, sin = freqs_cis
 
-    if use_fp32_rope:
-        # Complex-float32 path: matches original 097d2d0 behavior for bf16-mixed
+    if rope_use_complex_fp32:
+        # Complex-float32 path: stable for bf16-mixed/fp32 while preserving the
+        # same rotary transform as the explicit real-valued branch below.
         freqs_cis_complex = cos + 1j * sin
         xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
         xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
@@ -293,7 +309,8 @@ def apply_rotary_emb(
         xk_out = torch.view_as_real(xk_ * freqs_cis_complex).flatten(3)
         return xq_out.type_as(xq), xk_out.type_as(xk)
     else:
-        # Real-bf16 path: avoids dtype casting for bf16-true
+        # Real-valued path: equivalent 2D rotation, kept in the input dtype for
+        # bf16-true runs that should avoid fp32 casts in the forward graph.
         cos = cos.to(dtype=xq.dtype)
         sin = sin.to(dtype=xq.dtype)
         xq_r = xq.reshape(*xq.shape[:-1], -1, 2)
@@ -372,7 +389,7 @@ class Attention(nn.Module):
         init_whole_model_weights(self.wo, args.weight_initialization, weight_initialization_gain=args.weight_initialization_gain)
         
         self.time_offset = 2 if args.use_mcmc_time_embed else 1
-        self.use_fp32_rope = getattr(args, 'float_precision', '') != "bf16-true"
+        self.rope_use_complex_fp32 = getattr(args, 'float_precision', '') != "bf16-true"
         self.use_sdpa_attention = args.use_sdpa_attention
         self.register_buffer('superdiag_rows', torch.arange(args.max_seq_len - 1))
         self.register_buffer('superdiag_cols', torch.arange(self.time_offset, args.max_seq_len + self.time_offset - 1))
@@ -468,9 +485,22 @@ class Attention(nn.Module):
         
         
         cos, sin = freqs_cis
-        xq_o, xk_o = apply_rotary_emb(xq_o, xk_o, freqs_cis=(cos[:original_seqlen], sin[:original_seqlen]), use_fp32_rope=self.use_fp32_rope)
+        xq_o, xk_o = apply_rotary_emb(
+            xq_o,
+            xk_o,
+            freqs_cis=(cos[:original_seqlen], sin[:original_seqlen]),
+            rope_use_complex_fp32=self.rope_use_complex_fp32,
+        )
 
-        xq_p, xk_p = apply_rotary_emb(xq_p, xk_p, freqs_cis=(cos[self.time_offset:original_seqlen+1], sin[self.time_offset:original_seqlen+1]), use_fp32_rope=self.use_fp32_rope)
+        xq_p, xk_p = apply_rotary_emb(
+            xq_p,
+            xk_p,
+            freqs_cis=(
+                cos[self.time_offset:original_seqlen+1],
+                sin[self.time_offset:original_seqlen+1],
+            ),
+            rope_use_complex_fp32=self.rope_use_complex_fp32,
+        )
         # I tested this compared to prepending row on S dimension and the tensors were the same
 
         # self.cache_k = self.cache_k.to(xq)
