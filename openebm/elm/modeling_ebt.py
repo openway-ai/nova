@@ -139,13 +139,14 @@ class EBT_NLP(LightningModule):
         
         with torch.amp.autocast(device_type='cuda', enabled=False):
             energy_f32 = energy_preds.float()
+            create_graph_for_mcmc = learning and not getattr(self.hparams, "fsdp_first_order_mcmc_debug", False)
             if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
                 if i == (num_mcmc_steps - 1):
-                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
+                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=create_graph_for_mcmc)[0]
                 else:
                     predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=False)[0]
             else:
-                predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
+                predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=create_graph_for_mcmc)[0]
         # predicted_tokens_grad has shape B, S, V
         
         if self.hparams.clamp_futures_grad:
@@ -242,16 +243,17 @@ class EBT_NLP(LightningModule):
 
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
         no_randomness = False if phase == "train" else True
+        learning = phase == "train"
         if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
             # all_tokens = x['input_ids'].squeeze(dim=1)
             all_tokens = x[0].squeeze(dim=0)
             input_ids, replay_buffer_logits, next_token_indices = self.replay_buffer.get_batch(all_tokens) # this automatically does indexing for input ids and next token indices while also passing back the logits
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness)
+            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness, learning = learning)
             self.replay_buffer.update(all_tokens.detach(), predicted_distributions[-1].detach()) # update using the final predicted distributions
         else:
             input_ids = x[0].squeeze(dim=0)
             next_token_indices = x[1].squeeze(dim=0)
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
+            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness, learning = learning)
 
             # input_ids = x['input_ids'].squeeze(dim=1)[:, :-1]
             # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
@@ -336,12 +338,18 @@ class EBT_NLP(LightningModule):
     
 
     def corrupt_embeddings(self, embeddings):
+        if self.hparams.vocab_to_embed_uses_prob_dist:
+            predicted_tokens_dtype = self.embeddings.weight.dtype
+        else:
+            predicted_tokens_dtype = self.vocab_to_embed.weight.dtype
+        predicted_tokens_device = embeddings.device
+
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=torch.bfloat16, device=self.device) * self.hparams.gaussian_random_noise_scaling
+            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=predicted_tokens_dtype, device=predicted_tokens_device) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
-            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device)
+            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=predicted_tokens_dtype, device=predicted_tokens_device)
         else:
             raise NotImplementedError(f"{self.hparams.denoising_initial_condition} denoising_initial_condition not yet supported")
         
