@@ -16,6 +16,13 @@ from openebm.elm.metrics import calculate_bpb_score
 
 import ipdb
 
+PRECISION_TO_MCMC_DTYPE = {
+    "bf16-true": torch.bfloat16,
+    "bf16-mixed": torch.float32,
+    "16-mixed": torch.float32,
+    "32-true": torch.float32,
+}
+
 class EBT_NLP(LightningModule):
     def __init__(self, hparams):
         super().__init__()
@@ -257,9 +264,16 @@ class EBT_NLP(LightningModule):
             # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
             # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
 
-        if self.hparams.execution_mode == "finetune": # Only tokens after "[[Answer]]: " will be calculated in finetune
+        dataset_name = getattr(self.hparams, 'dataset_name', '')
+        if self.hparams.execution_mode == "finetune" and dataset_name != "nanochat_sft":
+            # Legacy SFT datasets use the "[[Answer]]:" text marker.
             next_token_indices = mask_q_tokens(next_token_indices, self.tokenizer)
         next_token_indices = next_token_indices.reshape(-1) # BS * S; reshape since targets are supposed to be 1D
+        supervised_tokens = (next_token_indices != -1).sum()
+        # Empty SFT rows still continue through BPB/DDP reductions; early return
+        # can deadlock mixed empty/non-empty ranks.
+        supervised_tokens_denom = supervised_tokens.clamp_min(1)
+        empty_supervision_batch = (supervised_tokens == 0).to(dtype=torch.int64)
 
         reconstruction_loss = 0
         total_mcmc_steps = len(predicted_energies) # in general this equals self.hparams.mcmc_num_steps, isnt in case of rand number
@@ -270,10 +284,22 @@ class EBT_NLP(LightningModule):
                 else:
                     label_smoothing = ((total_mcmc_steps - 1) - mcmc_step) / (total_mcmc_steps - 1) * self.hparams.soften_target_prob_dist
                 predicted_distribution = predicted_distribution.reshape(-1, self.vocab_size)
-                cce_loss = F.cross_entropy(predicted_distribution, next_token_indices, label_smoothing=label_smoothing, ignore_index=-1)
+                per_token_step_loss = F.cross_entropy(
+                    predicted_distribution,
+                    next_token_indices,
+                    label_smoothing=label_smoothing,
+                    ignore_index=-1,
+                    reduction='none',
+                )
             else:
                 predicted_distribution = self.log_softmax(predicted_distribution).reshape(-1, self.vocab_size)
-                cce_loss = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1)
+                per_token_step_loss = F.nll_loss(
+                    predicted_distribution,
+                    next_token_indices,
+                    ignore_index=-1,
+                    reduction='none',
+                )
+            cce_loss = per_token_step_loss.sum() / supervised_tokens_denom
             
             if self.hparams.truncate_mcmc:
                 if mcmc_step == (total_mcmc_steps - 1):
@@ -331,17 +357,22 @@ class EBT_NLP(LightningModule):
             'bpb': bpb_loss,
             'bpb_nats': bpb_nats,    # accumulated nats for epoch-level BPB
             'bpb_bytes': bpb_bytes,  # accumulated bytes for epoch-level BPB
+            'supervised_tokens': supervised_tokens.detach(),
+            'empty_supervision_batch': empty_supervision_batch.detach(),
         }
         return log_dict
     
 
     def corrupt_embeddings(self, embeddings):
+        float_precision = getattr(self.hparams, 'float_precision', '')
+        mcmc_dtype = PRECISION_TO_MCMC_DTYPE.get(float_precision, torch.float32)
+
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=torch.bfloat16, device=self.device) * self.hparams.gaussian_random_noise_scaling
+            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=mcmc_dtype, device=self.device) * self.hparams.gaussian_random_noise_scaling
         elif self.hparams.denoising_initial_condition == "zeros":
-            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), device = self.device)
+            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=mcmc_dtype, device = self.device)
         else:
             raise NotImplementedError(f"{self.hparams.denoising_initial_condition} denoising_initial_condition not yet supported")
         

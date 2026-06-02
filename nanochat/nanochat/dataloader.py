@@ -16,6 +16,8 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+import warnings
+
 import torch
 import pyarrow.parquet as pq
 
@@ -96,21 +98,55 @@ class StatefulBestFitDataLoader:
             "doc_buffer": [list(doc) for doc in self.doc_buffer],  # deep copy
         }
 
+    def lightweight_state_dict(self):
+        """
+        Export streaming position without copying doc_buffer.
+
+        This is not sufficient for exact resume: it restores only the
+        streaming cursor and drops any prefetched, unconsumed doc_buffer.
+        """
+        return {
+            "state_version": EXACT_RESUME_STATE_VERSION,
+            "pq_idx": self.next_pq_idx,
+            "rg_idx": self.next_rg_idx,
+            "epoch": self.next_epoch,
+            "doc_batch_index": self.next_doc_batch_index,
+        }
+
     def _apply_resume_state(self, state):
         """Restore internal state from a checkpoint dict."""
-        if state.get("state_version") == EXACT_RESUME_STATE_VERSION:
+        if state.get("state_version") == EXACT_RESUME_STATE_VERSION and "doc_buffer" in state:
             # --- Exact resume (new checkpoint) ---
             self.next_pq_idx = state["pq_idx"]
             self.next_rg_idx = state["rg_idx"]
             self.next_epoch = state["epoch"]
             self.next_doc_batch_index = state.get("doc_batch_index", 0)
-            raw_buffer = state.get("doc_buffer", [])
+            raw_buffer = state["doc_buffer"]
             self.doc_buffer = [list(doc) for doc in raw_buffer]
             self._legacy_resume = False
             print(f"[Exact Resume] rank={self._ddp_rank}: pq_idx={self.next_pq_idx}, "
                   f"rg_idx={self.next_rg_idx}, epoch={self.next_epoch}, "
                   f"doc_batch_index={self.next_doc_batch_index}, "
                   f"doc_buffer_len={len(self.doc_buffer)}")
+        elif state.get("state_version") == EXACT_RESUME_STATE_VERSION:
+            # --- Cursor-only resume (new lightweight checkpoint without doc_buffer) ---
+            self.next_pq_idx = state["pq_idx"]
+            self.next_rg_idx = state["rg_idx"]
+            self.next_epoch = state["epoch"]
+            self.next_doc_batch_index = state.get("doc_batch_index", 0)
+            self.doc_buffer = []
+            self._legacy_resume = False
+            warnings.warn(
+                "Dataloader resume state is missing doc_buffer; this is a "
+                "cursor-only resume, not an exact resume. Any prefetched, "
+                "unconsumed documents from the checkpoint cannot be restored.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            print(f"[Cursor-only Resume] rank={self._ddp_rank}: pq_idx={self.next_pq_idx}, "
+                  f"rg_idx={self.next_rg_idx}, epoch={self.next_epoch}, "
+                  f"doc_batch_index={self.next_doc_batch_index}, "
+                  f"doc_buffer_len=0")
         else:
             # --- Legacy resume (old checkpoint without state_version) ---
             self.next_pq_idx = state.get("pq_idx", 0)
@@ -263,7 +299,7 @@ class StatefulBestFitDataLoader:
             cpu_inputs.copy_(row_buffer[:, :-1])
             cpu_targets.copy_(row_buffer[:, 1:])
 
-            sd = self.state_dict()
+            sd = self.lightweight_state_dict()
 
             gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
             yield inputs, targets, sd
