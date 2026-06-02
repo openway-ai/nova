@@ -269,6 +269,7 @@ COMPILE_FLAGS="--compile_model --compile_mode full"
 # 默认不传任何 engine flags，保持当前 Lightning/DDP 行为。
 # 启用示例:
 #   TRAIN_ENGINE=fsdp2 bash openebm/elm/runs/run_ebt_muon_adamw_c2048.sh
+#   TRAIN_ENGINE=zero-2 bash openebm/elm/runs/run_ebt_muon_adamw_c2048.sh
 TRAIN_ENGINE="${TRAIN_ENGINE:-lightning_ddp}"
 ENGINE_FLAGS=""
 if [ "${TRAIN_ENGINE}" = "fsdp2" ]; then
@@ -290,6 +291,46 @@ if [ "${TRAIN_ENGINE}" = "fsdp2" ]; then
     fi
     if [ "${FSDP_FIRST_ORDER_MCMC_DEBUG:-0}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_first_order_mcmc_debug"
+    fi
+elif [ "${TRAIN_ENGINE}" = "zero-1" ] || [ "${TRAIN_ENGINE}" = "zero-2" ] || [ "${TRAIN_ENGINE}" = "zero-3" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero1" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero2" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero3" ]; then
+    # ZeRO-1/2 reduce optimizer/gradient memory but do not shard activations or
+    # the retained create_graph=True MCMC graph. Keep the default ZeRO test path
+    # conservative; override with ZERO_COMPILE_FLAGS or ZERO_FORCE_TRUNCATE_MCMC=0
+    # only for explicit memory experiments.
+    COMPILE_FLAGS="${ZERO_COMPILE_FLAGS:-}"
+    ENGINE_FLAGS="--train_engine ${TRAIN_ENGINE}"
+    if [ -n "${DEEPSPEED_REPO_PATH:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --deepspeed_repo_path ${DEEPSPEED_REPO_PATH}"
+    fi
+    if [ -n "${ZERO_CONFIG:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_config ${ZERO_CONFIG}"
+    fi
+    if [ "${ZERO_CPU_OFFLOAD_OPTIMIZER:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_cpu_offload_optimizer"
+    fi
+    if [ "${ZERO_CPU_OFFLOAD_PARAMETERS:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_cpu_offload_parameters"
+    fi
+    if [ "${ZERO_CONTIGUOUS_GRADIENTS:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_contiguous_gradients"
+    fi
+    if [ "${ZERO_FORCE_TRUNCATE_MCMC:-1}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_force_truncate_mcmc"
+    fi
+    if [ "${ZERO_DISABLE_COMPILE:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_disable_compile"
+    fi
+    if [ "${ZERO_ALLOW_COMPILE:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allow_compile"
+    fi
+    if [ "${ZERO_ALLOW_MUON_ADAMW:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allow_muon_adamw"
+    fi
+    if [ "${ZERO_ALLGATHER_BUCKET_SIZE:-0}" != "0" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allgather_bucket_size ${ZERO_ALLGATHER_BUCKET_SIZE}"
+    fi
+    if [ "${ZERO_REDUCE_BUCKET_SIZE:-0}" != "0" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_reduce_bucket_size ${ZERO_REDUCE_BUCKET_SIZE}"
     fi
 elif [ "${TRAIN_ENGINE}" != "lightning_ddp" ]; then
     ENGINE_FLAGS="--train_engine ${TRAIN_ENGINE}"

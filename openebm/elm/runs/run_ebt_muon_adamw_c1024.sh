@@ -33,8 +33,16 @@ export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
 
 ### 环境变量 ###
-HOME="/mnt/shared-storage-user/puyuan/nanochat"
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+# Keep nanochat cache aligned with the prepared tokenizer/base_data location.
+# The previous /mnt/shared-storage-user/puyuan/nanochat path does not contain
+# tokenizer/tokenizer.pkl on the worker nodes.
+NANOCHAT_HOME="${NANOCHAT_HOME:-/mnt/shared-storage-user/puyuan/code/nanochat}"
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-${NANOCHAT_HOME}/.cache/nanochat}"
+if [ ! -f "${NANOCHAT_BASE_DIR}/tokenizer/tokenizer.pkl" ] || [ ! -f "${NANOCHAT_BASE_DIR}/tokenizer/token_bytes.pt" ]; then
+    echo "ERROR: nanochat tokenizer cache is missing under ${NANOCHAT_BASE_DIR}/tokenizer" >&2
+    echo "Expected tokenizer.pkl and token_bytes.pt. Set NANOCHAT_BASE_DIR to a prepared nanochat cache." >&2
+    exit 1
+fi
 
 # PyTorch 内存优化
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
@@ -169,6 +177,7 @@ COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
 # 默认不传任何 engine flags，保持当前 Lightning/DDP 行为。
 # 启用示例:
 #   TRAIN_ENGINE=fsdp2 bash openebm/elm/runs/run_ebt_muon_adamw_c1024.sh
+#   TRAIN_ENGINE=zero-2 bash openebm/elm/runs/run_ebt_muon_adamw_c1024.sh
 TRAIN_ENGINE="${TRAIN_ENGINE:-lightning_ddp}"
 ENGINE_FLAGS=""
 if [ "${TRAIN_ENGINE}" = "fsdp2" ]; then
@@ -190,6 +199,46 @@ if [ "${TRAIN_ENGINE}" = "fsdp2" ]; then
     fi
     if [ "${FSDP_FIRST_ORDER_MCMC_DEBUG:-0}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_first_order_mcmc_debug"
+    fi
+elif [ "${TRAIN_ENGINE}" = "zero-1" ] || [ "${TRAIN_ENGINE}" = "zero-2" ] || [ "${TRAIN_ENGINE}" = "zero-3" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero1" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero2" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero3" ]; then
+    # ZeRO-1/2 reduce optimizer/gradient memory but do not shard activations or
+    # the retained create_graph=True MCMC graph. Keep the default ZeRO test path
+    # conservative; override with ZERO_COMPILE_FLAGS or ZERO_FORCE_TRUNCATE_MCMC=0
+    # only for explicit memory experiments.
+    COMPILE_FLAGS="${ZERO_COMPILE_FLAGS:-}"
+    ENGINE_FLAGS="--train_engine ${TRAIN_ENGINE}"
+    if [ -n "${DEEPSPEED_REPO_PATH:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --deepspeed_repo_path ${DEEPSPEED_REPO_PATH}"
+    fi
+    if [ -n "${ZERO_CONFIG:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_config ${ZERO_CONFIG}"
+    fi
+    if [ "${ZERO_CPU_OFFLOAD_OPTIMIZER:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_cpu_offload_optimizer"
+    fi
+    if [ "${ZERO_CPU_OFFLOAD_PARAMETERS:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_cpu_offload_parameters"
+    fi
+    if [ "${ZERO_CONTIGUOUS_GRADIENTS:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_contiguous_gradients"
+    fi
+    if [ "${ZERO_FORCE_TRUNCATE_MCMC:-1}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_force_truncate_mcmc"
+    fi
+    if [ "${ZERO_DISABLE_COMPILE:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_disable_compile"
+    fi
+    if [ "${ZERO_ALLOW_COMPILE:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allow_compile"
+    fi
+    if [ "${ZERO_ALLOW_MUON_ADAMW:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allow_muon_adamw"
+    fi
+    if [ "${ZERO_ALLGATHER_BUCKET_SIZE:-0}" != "0" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allgather_bucket_size ${ZERO_ALLGATHER_BUCKET_SIZE}"
+    fi
+    if [ "${ZERO_REDUCE_BUCKET_SIZE:-0}" != "0" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_reduce_bucket_size ${ZERO_REDUCE_BUCKET_SIZE}"
     fi
 elif [ "${TRAIN_ENGINE}" != "lightning_ddp" ]; then
     ENGINE_FLAGS="--train_engine ${TRAIN_ENGINE}"
@@ -484,7 +533,6 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --warm_up_base_lr_divider ${WARM_UP_BASE_LR_DIVIDER} \
 \
 --dataset_name "nanochat" \
---num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
 --limit_val_batches ${LIMIT_VAL_BATCHES} \
 --val_sanity 1 \
