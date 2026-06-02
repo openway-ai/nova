@@ -139,7 +139,8 @@ class EBT_NLP(LightningModule):
         
         with torch.amp.autocast(device_type='cuda', enabled=False):
             energy_f32 = energy_preds.float()
-            create_graph_for_mcmc = learning and not getattr(self.hparams, "fsdp_first_order_mcmc_debug", False)
+            mcmc_gradient_mode = getattr(self.hparams, "mcmc_gradient_mode", "second_order")
+            create_graph_for_mcmc = learning and mcmc_gradient_mode == "second_order" and not getattr(self.hparams, "fsdp_first_order_mcmc_debug", False)
             if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
                 if i == (num_mcmc_steps - 1):
                     predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=create_graph_for_mcmc)[0]
@@ -298,7 +299,25 @@ class EBT_NLP(LightningModule):
         
         initial_final_pred_energies_gap = initial_pred_energies - final_pred_energies
 
-        if self.hparams.contrastive_loss: # works by pushing up on energies model predicted and pushing down on energy of true samples
+        mcmc_gradient_mode = getattr(self.hparams, "mcmc_gradient_mode", "second_order")
+        use_first_order_cd = learning and mcmc_gradient_mode == "first_order_cd"
+        if use_first_order_cd:
+            # In first-order CD mode, the MCMC sampler is detached from model
+            # parameters. Recompute positive/negative energies at detached token
+            # states so the trainable signal is a normal first-order EBM loss.
+            contrastive_loss = self.calculate_contrastive_loss(
+                predicted_energies,
+                input_ids,
+                next_token_indices,
+                fake_pred_tokens=predicted_distributions[-1].detach(),
+                recompute_fake_energy=True,
+            )
+            total_loss = getattr(self.hparams, "first_order_cd_loss_coeff", 1.0) * contrastive_loss
+            alpha_ce_coeff = getattr(self.hparams, "first_order_cd_alpha_ce_coeff", 0.0)
+            if alpha_ce_coeff != 0.0:
+                total_loss = total_loss + alpha_ce_coeff * reconstruction_loss
+            contrastive_loss = contrastive_loss.detach()
+        elif self.hparams.contrastive_loss: # works by pushing up on energies model predicted and pushing down on energy of true samples
             contrastive_loss = self.calculate_contrastive_loss(predicted_energies, input_ids, next_token_indices)
             total_loss = self.hparams.reconstruction_coeff * reconstruction_loss + self.hparams.contrastive_loss_coeff * contrastive_loss
             contrastive_loss = contrastive_loss.detach()
@@ -355,12 +374,15 @@ class EBT_NLP(LightningModule):
         
         return predicted_tokens
     
-    def calculate_contrastive_loss(self, predicted_energies, input_ids, next_token_indices):
+    def calculate_contrastive_loss(self, predicted_energies, input_ids, next_token_indices,
+                                   fake_pred_tokens=None, recompute_fake_energy=False):
         batch_size = input_ids.shape[0]
         seq_length = input_ids.shape[1]
         real_embeddings_input = self.embeddings(input_ids)
         
         next_token_indices_2d = next_token_indices.reshape(batch_size, seq_length)
+        valid_positions = next_token_indices_2d != -1
+        safe_next_token_indices_2d = next_token_indices_2d.clamp(min=0)
         
         if self.hparams.discrete_contrastive_loss_true_logit_val != 0: # NOTE from experience this doesnt work very well and it not recommended compared to just one hot encoding
             true_logit_value = self.hparams.discrete_contrastive_loss_true_logit_val
@@ -369,7 +391,8 @@ class EBT_NLP(LightningModule):
             
             batch_idx = torch.arange(batch_size, device=next_token_indices.device).view(-1, 1).expand(-1, seq_length)
             seq_idx = torch.arange(seq_length, device=next_token_indices.device).view(1, -1).expand(batch_size, -1)
-            true_token_logits[batch_idx, seq_idx, next_token_indices_2d] = true_logit_value
+            true_token_logits[batch_idx, seq_idx, safe_next_token_indices_2d] = true_logit_value
+            true_token_logits = true_token_logits.masked_fill(~valid_positions.unsqueeze(-1), 0.0)
             
             if self.hparams.normalize_initial_condition:
                 true_token_logits = self.softmax(true_token_logits)
@@ -385,7 +408,8 @@ class EBT_NLP(LightningModule):
             true_token_one_hot = torch.zeros((batch_size, seq_length, self.vocab_size), device=next_token_indices.device)
             batch_idx = torch.arange(batch_size, device=next_token_indices.device).view(-1, 1).expand(-1, seq_length)
             seq_idx = torch.arange(seq_length, device=next_token_indices.device).view(1, -1).expand(batch_size, -1)
-            true_token_one_hot[batch_idx, seq_idx, next_token_indices_2d] = 1.0
+            true_token_one_hot[batch_idx, seq_idx, safe_next_token_indices_2d] = 1.0
+            true_token_one_hot = true_token_one_hot.masked_fill(~valid_positions.unsqueeze(-1), 0.0)
             
             if self.hparams.vocab_to_embed_uses_prob_dist:
                 true_embeddings = torch.matmul(true_token_one_hot, self.embeddings.weight)
@@ -403,12 +427,48 @@ class EBT_NLP(LightningModule):
             predicted_tokens=true_pred_tokens,
         ) # NOTE if want to use this maybe check in better detail what ired does
         real_energies = real_energies.reshape(-1, 1) # BS, 1
-        fake_energies = predicted_energies[-1] # B*S, 1
+        if recompute_fake_energy:
+            if fake_pred_tokens is None:
+                raise ValueError("recompute_fake_energy=True requires fake_pred_tokens.")
+            fake_pred_tokens = fake_pred_tokens.detach()
+            if self.hparams.normalize_initial_condition:
+                if getattr(self.hparams, 'float_precision', '') == "bf16-true":
+                    fake_model_tokens = self.softmax(fake_pred_tokens)
+                else:
+                    fake_model_tokens = self.softmax(fake_pred_tokens.float()).to(fake_pred_tokens.dtype)
+                if self.hparams.vocab_to_embed_uses_prob_dist:
+                    fake_embeddings = torch.matmul(fake_model_tokens, self.embeddings.weight)
+                else:
+                    fake_embeddings = self.vocab_to_embed(fake_model_tokens)
+            else:
+                fake_model_tokens = fake_pred_tokens
+                fake_embeddings = self.vocab_to_embed(fake_pred_tokens)
+
+            all_fake_embeddings = torch.cat((real_embeddings_input, fake_embeddings), dim=1)
+            fake_energies = self.transformer(
+                all_fake_embeddings,
+                start_pos=0,
+                mcmc_step=self.hparams.mcmc_num_steps - 1,
+                real_token_ids=input_ids,
+                predicted_tokens=fake_model_tokens,
+            )
+            fake_energies = fake_energies.reshape(-1, 1)
+        else:
+            fake_energies = predicted_energies[-1] # B*S, 1
         energy_stack = torch.cat([real_energies, fake_energies], dim=1)
         energy_targets = torch.zeros(real_energies.shape[0], dtype=torch.long, device=fake_energies.device)
-        padding_positions = None # (next_token_indices == self.tokenizer_pad_token_id).reshape(-1)
+        padding_positions = ~valid_positions.reshape(-1)
         energy_targets[padding_positions] = -100 # prevents nans instead of using self.tokenizer_pad_token_id, as setting this to 0 leads to issues
-        contrastive_loss = F.cross_entropy(-1 * energy_stack, energy_targets, ignore_index=-100)
+        if getattr(self.hparams, "first_order_cd_loss_type", "ce") == "margin":
+            margin = getattr(self.hparams, "first_order_cd_margin", 1.0)
+            per_token_loss = F.relu(margin + real_energies.squeeze(-1) - fake_energies.squeeze(-1))
+            valid_flat = valid_positions.reshape(-1)
+            if valid_flat.any():
+                contrastive_loss = per_token_loss[valid_flat].mean()
+            else:
+                contrastive_loss = per_token_loss.sum() * 0.0
+        else:
+            contrastive_loss = F.cross_entropy(-1 * energy_stack, energy_targets, ignore_index=-100)
         return contrastive_loss
     
     def warm_up_finished(self):

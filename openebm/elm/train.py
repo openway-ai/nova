@@ -518,6 +518,32 @@ if __name__ == '__main__':
 
     parser.add_argument("--no_mcmc_detach", help="dont detach between mcmc steps, probably need to use for S2 models but can increase instability due to longer gradient computation graphs", action="store_true", default=False)
 
+    parser.add_argument("--mcmc_gradient_mode", type=str, default="second_order",
+        choices=["second_order", "first_order_debug", "first_order_cd"],
+        help=(
+            "Controls whether MCMC refinement participates in higher-order autograd. "
+            "second_order preserves the current EBT objective. first_order_debug forces "
+            "autograd.grad(create_graph=False) for isolation only. first_order_cd uses "
+            "detached MCMC samples with a first-order contrastive energy surrogate."
+        ))
+
+    parser.add_argument("--first_order_cd_loss_coeff", type=float, default=1.0,
+        help="Loss coefficient for mcmc_gradient_mode=first_order_cd.")
+
+    parser.add_argument("--first_order_cd_loss_type", type=str, default="ce",
+        choices=["ce", "margin"],
+        help="First-order CD surrogate loss: CE over positive/negative energies or margin ranking.")
+
+    parser.add_argument("--first_order_cd_margin", type=float, default=1.0,
+        help="Margin used when --first_order_cd_loss_type margin.")
+
+    parser.add_argument("--first_order_cd_alpha_ce_coeff", type=float, default=0.0,
+        help=(
+            "Optional alpha-only CE coefficient for first_order_cd. The default keeps "
+            "the surrogate purely first-order in model parameters; set >0 only if you "
+            "want the detached MCMC CE term to tune alpha."
+        ))
+
     parser.add_argument("--contrastive_loss", help="uses a contrastive loss to shape the landscape of EBM, idea from IRED paper https://arxiv.org/abs/2406.11179", action="store_true", default=False)
 
     parser.add_argument("--contrastive_loss_coeff", help="coefficient for contrastive loss, didnt work well not used", type=float, default=0.0005)

@@ -34,10 +34,25 @@ def prepare_fsdp2_args(args) -> None:
     """
     _set_local_cuda_device()
 
+    mcmc_gradient_mode = getattr(args, "mcmc_gradient_mode", "second_order")
+
     if getattr(args, "compile_model", False) and getattr(args, "fsdp_disable_compile", True):
-        _warn("Disabling torch.compile for FSDP2 MVP; EBT MCMC uses create_graph=True.")
+        _warn("Disabling torch.compile for FSDP2 MVP; EBT MCMC can use high-order or detached sampler autograd.")
         args.compile_model = False
         args.compile_mode = "disabled"
+
+    if mcmc_gradient_mode == "second_order":
+        _warn(
+            "mcmc_gradient_mode=second_order keeps the current EBT double-backward path and is known "
+            "to be fragile with wrapped FSDP2 transformer blocks. Use first_order_cd for the FSDP-safe "
+            "surrogate path, or fsdp_wrap_policy=none for diagnosis."
+        )
+    elif mcmc_gradient_mode == "first_order_debug":
+        _warn(
+            "mcmc_gradient_mode=first_order_debug only disables create_graph in the sampler. "
+            "It is useful for isolating FSDP2 failures but does not provide a full model-training "
+            "signal from the CE objective. Use first_order_cd for training."
+        )
 
     if getattr(args, "fsdp_force_truncate_mcmc", False) and not getattr(args, "truncate_mcmc", False):
         _warn("Forcing truncate_mcmc=True to keep only the final MCMC step on the high-order path.")
@@ -60,6 +75,8 @@ def prepare_fsdp2_args(args) -> None:
         _warn("mcmc_num_steps>2 may cause repeated FSDP all-gather and large retained graphs.")
 
     if getattr(args, "fsdp_first_order_mcmc_debug", False):
+        if mcmc_gradient_mode == "second_order":
+            args.mcmc_gradient_mode = "first_order_debug"
         _warn(
             "fsdp_first_order_mcmc_debug=True will force MCMC autograd.grad(create_graph=False). "
             "This is only for isolating FSDP2 second-order autograd failures and is not equivalent "
