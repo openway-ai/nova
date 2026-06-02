@@ -34,16 +34,33 @@ class DiskAwareCheckpoint(ModelCheckpoint):
         if not ckpt_dir.exists():
             return
 
-        # 找到所有 checkpoint 文件（排除 last.ckpt）
+        # 找到所有 checkpoint 文件/目录（DeepSpeed 会把 .ckpt 保存成目录）
         ckpts = [f for f in ckpt_dir.glob("*.ckpt") if f.name != "last.ckpt"]
 
         # 删除所有非 last.ckpt 的文件
         for ckpt in ckpts:
             try:
-                ckpt.unlink()
+                if ckpt.is_dir():
+                    shutil.rmtree(ckpt)
+                else:
+                    ckpt.unlink()
                 print(f"[DiskAware] 已删除旧 checkpoint: {ckpt.name}")
             except Exception as e:
                 print(f"[DiskAware] 删除失败 {ckpt.name}: {e}")
+
+    def _cleanup_failed_checkpoint(self, filepath):
+        """Remove a partially written checkpoint target after save failure."""
+        path = Path(filepath)
+        if not path.exists():
+            return
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            print(f"[DiskAware] 已清理失败的 checkpoint: {path}")
+        except Exception as exc:
+            print(f"[DiskAware] 清理失败的 checkpoint 失败 {path}: {exc}")
 
     def _save_checkpoint(self, trainer, filepath):
         """保存前检查磁盘空间"""
@@ -58,8 +75,13 @@ class DiskAwareCheckpoint(ModelCheckpoint):
             free_gb = self._check_disk_space()
             print(f"[DiskAware] 清理后剩余空间: {free_gb:.1f}GB")
 
-        # 调用父类保存方法
-        super()._save_checkpoint(trainer, filepath)
+        # 调用父类保存方法；DeepSpeed checkpoint 是目录，失败时可能留下
+        # 缺 rank shard 的半成品，必须移除避免后续误恢复。
+        try:
+            super()._save_checkpoint(trainer, filepath)
+        except Exception:
+            self._cleanup_failed_checkpoint(filepath)
+            raise
 
     def _temporarily_align_completed_for_save(self, trainer):
         """让 checkpoint 看到 completed 已更新后的边界，避免 resume 错一批。"""

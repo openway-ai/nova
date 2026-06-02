@@ -65,13 +65,23 @@ if _PROJECT_ROOT not in sys.path:
 
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
+
+def _sanitize_hparams_for_checkpoint(hparams_dict):
+    """Avoid storing runtime strategy objects in Lightning hyperparameters."""
+    sanitized = dict(hparams_dict)
+    strategy = sanitized.get("distributed_strategy")
+    if strategy is not None and not isinstance(strategy, str):
+        sanitized["distributed_strategy"] = strategy.__class__.__name__
+    return sanitized
+
+
 class ModelTrainer(LightningModule):
     def __init__(self, hparams, trained_model = None):
         super().__init__()
         if isinstance(hparams, dict):#passed in from model ckpt
-            self.hparams.update(hparams)
+            self.hparams.update(_sanitize_hparams_for_checkpoint(hparams))
         else:
-            self.hparams.update(vars(hparams))
+            self.hparams.update(_sanitize_hparams_for_checkpoint(vars(hparams)))
         # self.txt_logger = hparams.txt_logger if txt_logger == None else txt_logger # txt_logger is no longer supported
 
         # Initialize tracking for test metrics
@@ -84,6 +94,7 @@ class ModelTrainer(LightningModule):
 
         # Dataloader resume state: 用于从 checkpoint 恢复 dataloader 位置
         self._dataloader_resume_state = None
+        self._fsdp2_gradient_clip_warned = False
 
         if self.hparams.modality == "NLP":
             if "execution_mode" in self.hparams and "save_generation_logs_dir" in self.hparams and self.hparams.execution_mode == "inference": # two of these are sanity check for loading pretrained ckpt that may not have newer params
@@ -510,6 +521,64 @@ class ModelTrainer(LightningModule):
         checkpoint['rng_states_by_rank'] = all_rng_states
 
         print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
+
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
+        """Clip FSDP2 DTensor and regular Tensor gradients in separate groups.
+
+        Lightning's default norm clipping passes all gradients to
+        ``torch.nn.utils.clip_grad_norm_`` at once. With composable FSDP2, wrapped
+        transformer block gradients are DTensors while replicated EBT root
+        parameters such as embeddings/vocab_to_embed/alpha remain regular
+        tensors. PyTorch foreach norm rejects that mixed list, so split by grad
+        type before clipping.
+        """
+        if getattr(self.hparams, "train_engine", "lightning_ddp") != "fsdp2":
+            return super().configure_gradient_clipping(
+                optimizer,
+                gradient_clip_val=gradient_clip_val,
+                gradient_clip_algorithm=gradient_clip_algorithm,
+            )
+
+        if gradient_clip_val is None or gradient_clip_val <= 0:
+            return
+
+        algorithm = str(gradient_clip_algorithm or "norm").lower()
+        if "norm" not in algorithm:
+            return super().configure_gradient_clipping(
+                optimizer,
+                gradient_clip_val=gradient_clip_val,
+                gradient_clip_algorithm=gradient_clip_algorithm,
+            )
+
+        regular_params = []
+        dtensor_params = []
+        for group in optimizer.param_groups:
+            for param in group.get("params", []):
+                grad = getattr(param, "grad", None)
+                if grad is None:
+                    continue
+                if self._is_dtensor(grad):
+                    dtensor_params.append(param)
+                else:
+                    regular_params.append(param)
+
+        if not self._fsdp2_gradient_clip_warned:
+            print(
+                "[train_engine=fsdp2] Using split gradient clipping for "
+                f"{len(dtensor_params)} DTensor params and {len(regular_params)} regular Tensor params.",
+                flush=True,
+            )
+            self._fsdp2_gradient_clip_warned = True
+
+        if dtensor_params:
+            torch.nn.utils.clip_grad_norm_(dtensor_params, gradient_clip_val, foreach=False)
+        if regular_params:
+            torch.nn.utils.clip_grad_norm_(regular_params, gradient_clip_val, foreach=False)
+
+    @staticmethod
+    def _is_dtensor(tensor):
+        tensor_type = type(tensor)
+        return tensor_type.__name__ == "DTensor" or tensor_type.__module__.startswith("torch.distributed.tensor")
 
     def on_load_checkpoint(self, checkpoint):
         # --- 修复 torch.compile _orig_mod 前缀不匹配 ---
