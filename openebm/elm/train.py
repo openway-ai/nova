@@ -16,7 +16,9 @@ except Exception:
     pass
 
 # 抑制 CUDA stream 不匹配警告（恢复训练时的已知问题）
-torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+# 仅 torch >= 2.6 提供该 API；旧版本静默跳过。
+if hasattr(torch.autograd.graph, "set_warn_on_accumulate_grad_stream_mismatch"):
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 try:
     from lightning.pytorch import Trainer, seed_everything
@@ -495,6 +497,20 @@ if __name__ == '__main__':
     parser.add_argument("--clamp_max_after_warm_up", help="clamps the absolute value of predicted_tokens to be within range [-val, val], after warming up. not used anymore", type=float, default=0.0)
 
     parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
+
+    # TF (teacher-forced, Gemma-drafter-style) head — sits AFTER MCMC, consumes trunk
+    # pred_hidden + embed(input_ids[t]) -> logits used for CE. K=1 (single-token NTP).
+    # See TF_HEAD_ARCHITECTURE.md §9 and openebm/elm/tf_head.py.
+    parser.add_argument("--use_tf_head", action="store_true", default=False,
+        help="Replace MCMC-derived CE with TF head on top of trunk pred_hidden. Default off.")
+    parser.add_argument("--tf_head_type", choices=["linear", "transformer"], type=str, default="transformer",
+        help="TF head variant. 'transformer' = L-block causal head (Gemma drafter). 'linear' = concat+project.")
+    parser.add_argument("--tf_head_layers", type=int, default=1,
+        help="Number of causal AR blocks in the transformer head (L=1 is empirical sweet spot).")
+    parser.add_argument("--tf_head_n_heads", type=int, default=0,
+        help="Attention heads inside TF head block; 0 inherits trunk's multiheaded_attention_heads.")
+    parser.add_argument("--tf_head_ffn_mult", type=float, default=4.0,
+        help="FFN expansion factor inside TF head transformer block.")
 
     parser.add_argument("--use_ve", help="启用 Value Embedding (VE)，为交替层添加可学习的值嵌入", action="store_true", default=False)
 

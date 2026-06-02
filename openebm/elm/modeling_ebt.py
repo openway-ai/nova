@@ -13,6 +13,7 @@ from openebm.elm.utils import setup_ebt, init_whole_model_weights
 from openebm.elm.utils import MLP, Memory_Augmented_MLP, Memory_Gating_MLP, mask_q_tokens
 from openebm.elm.replay_buffer import CausalReplayBuffer
 from openebm.elm.metrics import calculate_bpb_score
+from openebm.elm.tf_head import build_tf_head
 
 import ipdb
 
@@ -61,7 +62,19 @@ class EBT_NLP(LightningModule):
             init_whole_model_weights(self.vocab_to_embed, self.hparams.weight_initialization_method, weight_initialization_gain=self.hparams.weight_initialization_gain)
 
         self.transformer = setup_ebt(self.hparams)
-        
+
+        # TF head (Gemma-drafter style) sits AFTER MCMC, consumes trunk pred_hidden
+        # + embed(input_ids[t]) -> final logits used for CE. Default off; toggled by
+        # --use_tf_head. Keeps original EBT CE path intact when off.
+        self.use_tf_head = bool(getattr(self.hparams, "use_tf_head", False))
+        if self.use_tf_head:
+            self.tf_head = build_tf_head(self.hparams)
+            init_whole_model_weights(
+                self.tf_head,
+                self.hparams.weight_initialization_method,
+                weight_initialization_gain=self.hparams.weight_initialization_gain,
+            )
+
         self.finished_warming_up = False
 
         self.mcmc_replay_buffer = 'mcmc_replay_buffer' in self.hparams and self.hparams.mcmc_replay_buffer and self.hparams.execution_mode != "inference"
@@ -86,10 +99,26 @@ class EBT_NLP(LightningModule):
         result.alpha.data = result.alpha.data.to(dtype=torch.float32)
         return result
 
+    def _logits_to_pred_embeddings(self, predicted_tokens):
+        """Convert V-dim predicted_tokens (post-update) to D-dim embeddings for a
+        second trunk forward. Always softmaxes when normalize_initial_condition=True
+        because post-update logits are not a clean prob dist any more. No Langevin noise.
+        Used ONLY by the TF-head pred_hidden extraction path.
+        """
+        if self.hparams.normalize_initial_condition:
+            if getattr(self.hparams, 'float_precision', '') == "bf16-true":
+                predicted_tokens = self.softmax(predicted_tokens)
+            else:
+                predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
+            if self.hparams.vocab_to_embed_uses_prob_dist:
+                return torch.matmul(predicted_tokens, self.embeddings.weight)
+            return self.vocab_to_embed(predicted_tokens)
+        return self.vocab_to_embed(predicted_tokens)
+
     @torch.compiler.disable
     def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps,
                       langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
-                      real_token_ids=None):
+                      real_token_ids=None, compute_pred_hidden=False):
         batch_size = predicted_tokens.shape[0]
         seq_length = predicted_tokens.shape[1]
         
@@ -128,6 +157,10 @@ class EBT_NLP(LightningModule):
         # create_graph=True 的 autograd.grad 与 compiled graph 不兼容
         # 所以若 transformer 已被 torch.compile 编译，MCMC 中需要用 eager 版本
         transformer = getattr(self, 'transformer_eager', self.transformer)
+        # First trunk forward — energy only. pred_hidden is intentionally NOT taken from here:
+        # at this point predicted_tokens is the pre-update leaf (detach()'d under default
+        # no_mcmc_detach=False), so any hidden state from this forward has no alpha gradient.
+        # The TF-head pred_hidden comes from a second forward AFTER the alpha-bearing update.
         energy_preds = transformer(
             all_embeddings,
             start_pos=start_pos,
@@ -167,16 +200,36 @@ class EBT_NLP(LightningModule):
         if self.hparams.sharpen_predicted_distribution != 0.0:
             predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
 
+        # Second trunk forward — POST-update — to extract pred_hidden for TF head.
+        # Why a second forward: post-update predicted_tokens depends on alpha (via
+        # `pt - alpha * grad`), so a trunk forward consuming it produces pred_hidden
+        # that carries alpha in its autograd graph. The first (energy) forward used
+        # the pre-update detached leaf, so it carries no alpha. Without this second
+        # forward, alpha would be frozen under TF-head training.
+        pred_hidden_step = None
+        if compute_pred_hidden:
+            post_pred_embeddings = self._logits_to_pred_embeddings(predicted_tokens)
+            post_all_embeddings = torch.cat((real_embeddings_input.detach(), post_pred_embeddings), dim=1)
+            _, pred_hidden_step = transformer(
+                post_all_embeddings,
+                start_pos=start_pos,
+                mcmc_step=mcmc_step,
+                real_token_ids=real_token_ids,
+                predicted_tokens=predicted_tokens,
+                return_pred_hidden=True,
+            )
+
         if return_raw_logits:
             predicted_tokens_for_loss = predicted_tokens # BS, S, V
         else:
             predicted_tokens_for_loss = self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size) # BS*S, V
-            
-        return predicted_tokens, energy_preds, predicted_tokens_for_loss
 
-    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
+        return predicted_tokens, energy_preds, predicted_tokens_for_loss, pred_hidden_step
+
+    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True, return_pred_hiddens = False): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
         predicted_distributions = []
         predicted_energies = []
+        predicted_pred_hiddens = []  # populated only if return_pred_hiddens=True (TF head path)
 
         real_embeddings_input = self.embeddings(x)
         batch_size = x.shape[0]
@@ -224,34 +277,62 @@ class EBT_NLP(LightningModule):
 
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
-                
-                predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
+
+                predicted_tokens, energy_preds, predicted_tokens_for_loss, pred_hidden_step = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
                     langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
-                    real_token_ids=x
+                    real_token_ids=x, compute_pred_hidden=return_pred_hiddens,
                 )
                 predicted_energies.append(energy_preds)
                 predicted_distributions.append(predicted_tokens_for_loss)
-                del energy_preds, predicted_tokens_for_loss  # release references to help GC
+                if return_pred_hiddens:
+                    predicted_pred_hiddens.append(pred_hidden_step)
+                del energy_preds, predicted_tokens_for_loss, pred_hidden_step  # release references to help GC
 
+        if return_pred_hiddens:
+            return predicted_distributions, predicted_energies, predicted_pred_hiddens
         return predicted_distributions, predicted_energies
 
-    def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
+    def forward_loss_wrapper(self, x, phase="train", token_bytes=None, global_step=None):
         no_randomness = False if phase == "train" else True
+        predicted_pred_hiddens = None  # set only on TF-head path
         if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
             # all_tokens = x['input_ids'].squeeze(dim=1)
             all_tokens = x[0].squeeze(dim=0)
             input_ids, replay_buffer_logits, next_token_indices = self.replay_buffer.get_batch(all_tokens) # this automatically does indexing for input ids and next token indices while also passing back the logits
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness)
+            if self.use_tf_head:
+                predicted_distributions, predicted_energies, predicted_pred_hiddens = self(
+                    input_ids, return_raw_logits=True, replay_buffer_logits=replay_buffer_logits,
+                    no_randomness=no_randomness, return_pred_hiddens=True,
+                )
+            else:
+                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness)
+            # Replay buffer is seeded with MCMC's raw distribution (NOT the TF-head logits) so
+            # buffer semantics stay consistent across baseline/TF runs.
             self.replay_buffer.update(all_tokens.detach(), predicted_distributions[-1].detach()) # update using the final predicted distributions
         else:
             input_ids = x[0].squeeze(dim=0)
             next_token_indices = x[1].squeeze(dim=0)
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
+            if self.use_tf_head:
+                predicted_distributions, predicted_energies, predicted_pred_hiddens = self(
+                    input_ids, return_raw_logits=True, no_randomness=no_randomness, return_pred_hiddens=True,
+                )
+            else:
+                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
 
             # input_ids = x['input_ids'].squeeze(dim=1)[:, :-1]
             # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
             # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
+
+        if self.use_tf_head:
+            # Replace per-step distributions with TF-head outputs:
+            # logits_step = tf_head(pred_hidden_step, prev_embed=embed(input_ids[t])).
+            # Anchor on input_ids[t] (= doc §9c plain-NTP "redundant but legitimate" anchor).
+            prev_embed = self.embeddings(input_ids)  # [B, S, D]
+            predicted_distributions = [
+                self.tf_head(pred_hidden_step, prev_embed)  # [B, S, V]
+                for pred_hidden_step in predicted_pred_hiddens
+            ]
 
         dataset_name = getattr(self.hparams, 'dataset_name', '')
         if self.hparams.execution_mode == "finetune" and dataset_name != "nanochat_sft":
