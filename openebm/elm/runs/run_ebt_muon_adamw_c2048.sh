@@ -264,6 +264,38 @@ COMPILE_FLAGS="--compile_model --compile_mode full"
 # COMPILE_FLAGS="--compile_model --compile_mode disabled"
 
 ################################################################################
+# 可选训练引擎配置
+################################################################################
+# 默认不传任何 engine flags，保持当前 Lightning/DDP 行为。
+# 启用示例:
+#   TRAIN_ENGINE=fsdp2 bash openebm/elm/runs/run_ebt_muon_adamw_c2048.sh
+TRAIN_ENGINE="${TRAIN_ENGINE:-lightning_ddp}"
+ENGINE_FLAGS=""
+if [ "${TRAIN_ENGINE}" = "fsdp2" ]; then
+    # FSDP2 MVP: 避免 torch.compile + create_graph=True 的高阶 autograd 风险。
+    COMPILE_FLAGS="${FSDP_COMPILE_FLAGS:-}"
+    ENGINE_FLAGS="--train_engine fsdp2 \
+--fsdp_sharding_strategy ${FSDP_SHARDING_STRATEGY:-full_shard} \
+--fsdp_activation_checkpointing ${FSDP_ACTIVATION_CHECKPOINTING:-off} \
+--fsdp_mixed_precision ${FSDP_MIXED_PRECISION:-bf16} \
+--fsdp_state_dict_type ${FSDP_STATE_DICT_TYPE:-sharded} \
+--fsdp_wrap_policy ${FSDP_WRAP_POLICY:-transformer_block} \
+--fsdp_reshard_after_forward ${FSDP_RESHARD_AFTER_FORWARD:-false} \
+--fsdp_force_truncate_mcmc"
+    if [ "${FSDP_CPU_OFFLOAD:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_cpu_offload"
+    fi
+    if [ "${FSDP_ALLOW_MUON_ADAMW:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_allow_muon_adamw"
+    fi
+    if [ "${FSDP_FIRST_ORDER_MCMC_DEBUG:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_first_order_mcmc_debug"
+    fi
+elif [ "${TRAIN_ENGINE}" != "lightning_ddp" ]; then
+    ENGINE_FLAGS="--train_engine ${TRAIN_ENGINE}"
+fi
+
+################################################################################
 # WandB 配置 (训练参数)
 ################################################################################
 # 默认: 只记录 loss 等基础 metric, 不记录 gradients/activations
@@ -493,6 +525,7 @@ Total Tokens:             ${total_tokens_b}
 
 Option Flags:             ${OPTION_FLAGS:-"None (Baseline)"}
 Compile Flags:            ${COMPILE_FLAGS:-"None"}
+Engine Flags:             ${ENGINE_FLAGS:-"None (Lightning/DDP default)"}
 
 ================================================================================
 [训练输出]
@@ -552,7 +585,6 @@ $([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 --warm_up_base_lr_divider ${WARM_UP_BASE_LR_DIVIDER} \
 \
 --dataset_name "nanochat" \
---num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
 --limit_val_batches ${LIMIT_VAL_BATCHES} \
 --val_sanity 1 \
@@ -560,17 +592,18 @@ $([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 \
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
---use_ve \
 --set_matmul_precision "medium" \
---float_precision "bf16-mixed" \
+--float_precision "32-true" \
 --manual_gc_collect_every_n_steps -1 \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --save_periodic_steps 1000 \
 ${WANDB_FLAGS} \
+${ENGINE_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}
 
 # --use_ve \
+# --float_precision "bf16-mixed" \
 
 # --manual_gc_collect_every_n_steps -1 \
 
@@ -578,6 +611,7 @@ ${COMPILE_FLAGS}
 # --cpu_offload_optimizer \
 # --gradient_checkpointing \
 # --manual_gc_collect_every_n_steps 50 \
+# --num_workers ${NUM_WORKERS} \
 
 
 TRAIN_EXIT_CODE=$?

@@ -2,48 +2,14 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-# from torch.utils.data import random_split, Dataset
-# from torchvision import transforms
-# from torchvision.transforms import ToPILImage
 from torch.distributed import all_reduce
 import wandb
 import gc
 
-# from data.vid.ucf_dataloader import *
-# from data.vid.kinetics_dataloader import *
-# from data.img.imagenet_dataloader import *
-# from data.img.coco_tiny_dataset import COCOTinyDataset
-# from data.img.coco_medium_dataset import COCOMediumDataset
-# from data.vid.aggregate_dataloader import *
-# from data.vid.vid_synthetic_dataset import VIDSyntheticDataset
-# from data.nlp.pajama_dataloader import RedPajamaDataset
-# from data.nlp.fineweb_dataloader import FineWebDataset
-# from data.nlp.collator import NLP_HF_Collator
-# from data.nlp.bigbench_dataloader import BigBenchDataset
-# from data.nlp.gsm8k_dataloader import GSM8KDataset
-# from data.nlp.lambada_dataset import LambadaDataset
-# from data.nlp.squad_dataloader import SQuADDataset
-# from data.nlp.ai2arc_dataloader import AI2ArcDataset
-# from data.nlp.planbench_dataloader import PlanBenchDataset
-# from data.nlp.synthetic_dataset import NLPSyntheticDataset
-
 from openebm.elm.collector import NLP_HF_Collator
 from datasets import load_dataset, load_from_disk
 import os
-# from model.vid.ebt import EBT_VID
 from openebm.elm.modeling_ebt import EBT_NLP
-# from model.img.ebt_t2i import EBT_IMG_T2I
-# from model.img.ebt_denoise import EBT_IMG_Denoise
-
-# from model.vid.baseline_transformer import Baseline_Transformer_VID
-# from model.nlp.baseline_transformer import Baseline_Transformer_NLP
-
-# from model.img.dit_t2i import Diffusion_Transformer_IMG_T2I
-# from model.img.dit_denoise import Diffusion_Transformer_IMG_Denoise
-
-
-# from nanolightning.torchlightning_module import LightningModule
-# from nanolightning.iteratabledataset import generate_dataloader, IterableDataset
 
 try:
     from lightning.pytorch import LightningModule
@@ -392,6 +358,8 @@ class ModelTrainer(LightningModule):
         return eval_step_dict['loss']   
     
     def on_after_backward(self):
+        self._sync_fsdp2_replicated_grads()
+
         if self.hparams.log_gradients:
             total_norm = 0.0
             num_parameters = 0
@@ -414,6 +382,43 @@ class ModelTrainer(LightningModule):
             things_to_log['avg_gradient_norms'] = average_norm
             things_to_log['pct_gradient_clipped'] = percentage_clipped
             self.log_metrics(things_to_log, "train", log_torchmetrics = False)
+
+    def _sync_fsdp2_replicated_grads(self):
+        """Synchronize non-FSDP replicated parameter grads under native FSDP2.
+
+        The FSDP2 MVP uses native composable FSDP while Lightning runs one
+        single-device Trainer per torchrun rank. FSDP-managed DTensor
+        parameters reduce their gradients internally, but intentionally
+        replicated parameters (alpha, embeddings, vocab_to_embed, transformer
+        root leftovers such as VE/norm/final_layer) would otherwise update
+        independently on each rank. We all-reduce only plain Tensor grads and
+        skip DTensor grads managed by FSDP2.
+        """
+        if getattr(self.hparams, "train_engine", "lightning_ddp") != "fsdp2":
+            return
+        try:
+            import torch.distributed as dist
+        except Exception:
+            return
+        if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+            return
+
+        try:
+            from torch.distributed.tensor import DTensor
+        except Exception:
+            DTensor = ()
+
+        world_size = dist.get_world_size()
+        for name, param in self.named_parameters():
+            if "model.transformer.layers." in name:
+                continue
+            grad = param.grad
+            if grad is None:
+                continue
+            if DTensor and (isinstance(param, DTensor) or isinstance(grad, DTensor)):
+                continue
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+            grad.div_(world_size)
         
     def on_train_batch_end(self, outputs, batch, batch_idx):
         #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
