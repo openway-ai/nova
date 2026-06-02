@@ -2,6 +2,10 @@ import torch
 
 from openebm.elm.ar_ebt_time_embed import apply_rotary_emb, precompute_freqs_cis
 
+# Validation on 2026-06-02: this RoPE dtype-path test passed via direct
+# function invocation in /mnt/shared-storage-user/luyudong/conda_envs/ebt/bin/python
+# and printed targeted_tests_ok.
+
 
 def test_rotary_complex_fp32_and_real_paths_match_for_bf16_inputs():
     torch.manual_seed(1234)
