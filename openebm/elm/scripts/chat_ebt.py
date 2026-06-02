@@ -24,6 +24,7 @@ import numpy as np
 
 # 从 generate.py 导入核心逻辑，保证行为 100% 一致
 from openebm.elm.generate import call_model_forward_decode, _get_tokenizer, sample_top_p
+from openebm.elm.nanochat_tokenizer_adapter import NanoChatTokenizerWrapper
 
 # 清除分布式训练环境变量
 for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT']:
@@ -139,8 +140,17 @@ class EBTChatEngine:
         if isinstance(self.hparams, dict):
             self.hparams = HParamsNamespace(self.hparams)
 
-        # 【修复点 1】: 使用 generate.py 的 _get_tokenizer
-        self.tokenizer = _get_tokenizer(self.hparams)
+        resolved_tokenizer_path = os.path.abspath(tokenizer_path) if tokenizer_path else None
+        if resolved_tokenizer_path and os.path.isdir(resolved_tokenizer_path):
+            os.environ['NANOCHAT_BASE_DIR'] = os.path.dirname(resolved_tokenizer_path.rstrip('/'))
+            self.hparams.tokenizer_path = resolved_tokenizer_path
+            self.hparams.tokenizer = resolved_tokenizer_path
+            self.tokenizer = NanoChatTokenizerWrapper(tokenizer_dir=resolved_tokenizer_path)
+            print(f"  Using NanoChat tokenizer from CLI path: {resolved_tokenizer_path}")
+        else:
+            if resolved_tokenizer_path:
+                print(f"  Tokenizer path not found, falling back to checkpoint hparams: {resolved_tokenizer_path}")
+            self.tokenizer = _get_tokenizer(self.hparams)
         
         # 兼容性：如果 tokenizer 有 get_vocab_size 方法则调用，否则使用 len
         vocab_size = self.tokenizer.get_vocab_size() if hasattr(self.tokenizer, 'get_vocab_size') else len(self.tokenizer)
@@ -154,6 +164,11 @@ class EBTChatEngine:
                 self.tokenizer.get_vocab_size = lambda: len(self.tokenizer)
 
         self.hparams.tokenizer_obj = self.tokenizer
+
+        # setup_ebt() requires use_ve; older Lightning ckpts may omit it in hyper_parameters.
+        if not hasattr(self.hparams, "use_ve"):
+            raw_sd = checkpoint.get("state_dict", checkpoint)
+            self.hparams.use_ve = any("value_embeds" in k for k in raw_sd.keys())
 
         # 创建模型
         from openebm.elm.modeling_ebt import EBT_NLP
@@ -170,6 +185,10 @@ class EBTChatEngine:
             # 2. 剥离 torch.compile 带来的 '_orig_mod.' 前缀
             if new_key.startswith('_orig_mod.'):
                 new_key = new_key[10:]
+            if '._orig_mod.' in new_key:
+                new_key = new_key.replace('._orig_mod.', '.')
+            if new_key.startswith('transformer_eager.'):
+                new_key = 'transformer.' + new_key[len('transformer_eager.'):]
             
             new_state_dict[new_key] = v
 
@@ -278,7 +297,15 @@ class EBTChatEngine:
         # 格式: <|bos|> <|user_start|> {text} <|user_end|> <|assistant_start|>
         # 这与 SFT 训练时 dataset_sft.py -> render_conversation() 的格式完全一致
         inner_tok = getattr(self.tokenizer, 'tokenizer', None)  # NanoChatTokenizerWrapper.tokenizer = RustBPETokenizer
-        if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
+        if inner_tok is not None and hasattr(inner_tok, 'render_for_completion'):
+            conversation = {
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": ""},
+                ]
+            }
+            prompt_tokens_list = inner_tok.render_for_completion(conversation)
+        elif inner_tok is not None and hasattr(inner_tok, 'encode_special'):
             bos_id       = inner_tok.get_bos_token_id()
             user_start   = inner_tok.encode_special("<|user_start|>")
             user_end     = inner_tok.encode_special("<|user_end|>")
@@ -325,13 +352,15 @@ class EBTChatEngine:
 
         # 【修复】stop_token_ids 只包含 <|assistant_end|>，不包含 bos_id/pad_id
         # 原因：bos_id == pad_id，若加入 stop_token_ids，SFT 模型生成 bos 时会立即停止输出为空
+        # Stop when the assistant ends, or when the model tries to start a fake next user turn.
+        # Do not add bos/pad here: bos_id == pad_id for NanoChat, which can cause empty answers.
         stop_token_ids = set()
         inner_tok = getattr(self.tokenizer, 'tokenizer', None)
         if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
-            asst_end_id = inner_tok.encode_special("<|assistant_end|>")
-            if asst_end_id is not None:
-                stop_token_ids.add(asst_end_id)
-        # fallback：若无 <|assistant_end|>，用 pad_id 兜底
+            for special in ("<|assistant_end|>", "<|user_start|>"):
+                sid = inner_tok.encode_special(special)
+                if sid is not None:
+                    stop_token_ids.add(sid)
         if not stop_token_ids:
             stop_token_ids.add(pad_id)
 
