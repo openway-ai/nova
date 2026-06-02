@@ -24,7 +24,7 @@ module purge
 lr=(0.0002)
 alpha=(500)
 alpha_lr=(1500)
-MAX_STEP=10000
+MAX_STEP=50000
 WARMUP_STEP=1000
 
 python train.py \

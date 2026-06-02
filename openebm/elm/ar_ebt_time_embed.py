@@ -840,6 +840,7 @@ class EBTTimeConcat(nn.Module):
         mcmc_step=0,
         real_token_ids: Optional[torch.Tensor] = None,
         predicted_tokens: Optional[torch.Tensor] = None,
+        return_pred_hidden: bool = False,
     ):
         """
         Perform a forward pass through the Transformer model.
@@ -848,9 +849,12 @@ class EBTTimeConcat(nn.Module):
             embeds (torch.Tensor): Embeddings (instead of tokens since is for vision).
             start_pos (int): Starting position for attention caching.
             mcmc_step (int): Current MCMC step index, used for time embeddings.
+            return_pred_hidden (bool): When True, also return the post-norm hidden
+                state at candidate positions ([B, S, D]) used by the TF head.
 
         Returns:
             torch.Tensor: Output energies after applying the Transformer model.
+            (energies, pred_hidden) tuple when return_pred_hidden=True.
 
         """
         _bsz = embeddings.shape[0]
@@ -917,4 +921,8 @@ class EBTTimeConcat(nn.Module):
             energies = self.final_layer(embeddings)
 
             energies = energies[:, embeddings.shape[1] // 2:]
+            if return_pred_hidden:
+                # Candidate-position hidden state, post-norm, [B, S, D] — for TF head.
+                pred_hidden = embeddings[:, embeddings.shape[1] // 2:]
+                return energies, pred_hidden
             return energies
