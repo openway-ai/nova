@@ -35,6 +35,7 @@ except ImportError:
 from openebm.elm import logger as text_logger
 from openebm.elm.disk_aware_checkpoint import DiskAwareCheckpoint
 from openebm.elm.eval import nlp_eval_acc
+from openebm.elm.train_engines import apply_train_engine, prepare_train_engine
 from openebm.elm.trainer import ModelTrainer
 from openebm.elm.utils import init_wandb_watch, model_sizes
 
@@ -180,6 +181,7 @@ def main(args):
     if args.max_scheduling_steps == -1:
         args.max_scheduling_steps = args.max_steps
 
+    prepare_train_engine(args)
     model_trainer = ModelTrainer(args)
 
     # SFT: 加载预训练权重但不恢复训练状态
@@ -188,6 +190,8 @@ def main(args):
         ckpt = torch.load(args.finetuning_model_ckpt, map_location='cpu', weights_only=False)
         model_trainer.load_state_dict(ckpt['state_dict'], strict=False)
         print(f"[SFT] 权重加载完成，训练从 step 0 开始")
+
+    apply_train_engine(model_trainer, args)
 
     # if args.debug_dataloader:
     #     debug_dataloader(args, model_trainer)
@@ -304,7 +308,12 @@ def main(args):
 def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", periodic_checkpoint=None):
     torch.autograd.set_detect_anomaly(args.detect_anomaly) #NOTE seems pl detect anomaly is not working so manually set it here
 
-    if args.find_unused_parameters or args.distributed_strategy == "ddp":
+    if args.distributed_strategy in (None, "None", "none", "null", ""):
+        args.distributed_strategy = "auto"
+
+    if getattr(args, "train_engine", "lightning_ddp") != "fsdp2" and (
+        args.find_unused_parameters or args.distributed_strategy == "ddp"
+    ):
             args.distributed_strategy = DDPStrategy(
                 find_unused_parameters=True,
                 gradient_as_bucket_view=True,
@@ -601,6 +610,39 @@ if __name__ == '__main__':
     parser.add_argument("--gpus", help="number of gpus or gpus list, -1 uses all GPUs. use -1 for multinode, if want to specify which GPUs to use specify as comma seperated str with brackets e.g. [0, 1]", default="-1")
     
     parser.add_argument("--distributed_strategy", help="distributed strategy - ddp_spawn, ddp, fsdp_native, or None", default='ddp')
+
+    # Train engine selection. Defaults preserve the current Lightning/DDP path.
+    parser.add_argument("--train_engine", type=str, default="lightning_ddp",
+        choices=["lightning_ddp", "fsdp2", "megatron", "deepspeed-zero3"],
+        help="Optional training engine. Only fsdp2 is implemented beyond the default Lightning/DDP path.")
+    parser.add_argument("--fsdp_sharding_strategy", type=str, default="full_shard",
+        choices=["full_shard", "hybrid_shard", "no_shard"],
+        help="[FSDP2 MVP] Parsed for future policy selection; current implementation uses full-shard style wrapping.")
+    parser.add_argument("--fsdp_cpu_offload", action="store_true", default=False,
+        help="[FSDP2 MVP] Parsed but not enabled yet; kept explicit to avoid silent CPU-offload behavior.")
+    parser.add_argument("--fsdp_activation_checkpointing", type=str, default="off",
+        choices=["off", "non_create_graph_steps", "all_blocks"],
+        help="[FSDP2 MVP] Kept off by default because EBT MCMC uses create_graph=True.")
+    parser.add_argument("--fsdp_mixed_precision", type=str, default="bf16",
+        choices=["bf16", "fp32"],
+        help="[FSDP2 MVP] Parsed for future FSDP policy; current dtype still follows --float_precision.")
+    parser.add_argument("--fsdp_state_dict_type", type=str, default="sharded",
+        choices=["sharded", "full", "both"],
+        help="[FSDP2 MVP] Only sharded training checkpoints are supported initially.")
+    parser.add_argument("--fsdp_force_truncate_mcmc", action="store_true", default=False,
+        help="[FSDP2 MVP] Force truncate_mcmc=True to reduce high-order MCMC graph retention.")
+    parser.add_argument("--fsdp_wrap_policy", type=str, default="transformer_block",
+        choices=["transformer_block", "transformer_root", "none"],
+        help="[FSDP2 MVP] Wrap transformer blocks first, keeping EBT-specific MCMC modules replicated.")
+    parser.add_argument("--fsdp_reshard_after_forward", type=str, default="false",
+        choices=["true", "false"],
+        help="[FSDP2 MVP] Defaults false because EBT MCMC uses create_graph=True.")
+    parser.add_argument("--fsdp_disable_compile", action="store_true", default=True,
+        help="[FSDP2 MVP] Disable torch.compile because EBT MCMC uses create_graph=True.")
+    parser.add_argument("--fsdp_allow_muon_adamw", action="store_true", default=False,
+        help="[FSDP2 MVP] Opt in to experimental MuonAdamW under FSDP2; default falls back to layered AdamW.")
+    parser.add_argument("--fsdp_first_order_mcmc_debug", action="store_true", default=False,
+        help="[FSDP2 DEBUG] Force MCMC autograd.grad(create_graph=False) under FSDP2 to isolate second-order/FSDP interactions. Not equivalent EBT training.")
 
 
     #TRAINING#########################################################
