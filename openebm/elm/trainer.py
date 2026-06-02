@@ -1152,14 +1152,79 @@ class ModelTrainer(LightningModule):
         # else:
         #     raise NotImplementedError(f"Modality {self.hparams.modality} does not have configure optimizers supported yet")
         
+    def _fsdp2_optimizer_compat_enabled(self):
+        return getattr(self.hparams, "train_engine", "lightning_ddp") == "fsdp2"
+
+    @staticmethod
+    def _is_dtensor_parameter(param):
+        return param.__class__.__name__ == "DTensor" or param.__class__.__module__.startswith("torch.distributed.tensor")
+
+    def _split_optimizer_groups_for_fsdp2(self, optimizer_parameters):
+        """
+        Composable FSDP2 replaces wrapped module parameters with DTensor while
+        replicated root parameters remain regular Tensor/Parameter objects.
+        PyTorch foreach optimizer kernels cannot operate on mixed Tensor and
+        DTensor lists, so keep them in separate param groups.
+        """
+        if not self._fsdp2_optimizer_compat_enabled():
+            return optimizer_parameters
+
+        split_groups = []
+        num_split_groups = 0
+        for group in optimizer_parameters:
+            params = group.get("params", [])
+            if isinstance(params, torch.Tensor):
+                params = [params]
+            else:
+                params = list(params)
+
+            regular_params = []
+            dtensor_params = []
+            for param in params:
+                if self._is_dtensor_parameter(param):
+                    dtensor_params.append(param)
+                else:
+                    regular_params.append(param)
+
+            for tensor_kind, kind_params in (("tensor", regular_params), ("dtensor", dtensor_params)):
+                if not kind_params:
+                    continue
+                new_group = dict(group)
+                new_group["params"] = kind_params
+                new_group["fsdp2_tensor_kind"] = tensor_kind
+                split_groups.append(new_group)
+
+            if regular_params and dtensor_params:
+                num_split_groups += 1
+
+        if num_split_groups:
+            print(
+                "[train_engine=fsdp2] Split "
+                f"{num_split_groups} optimizer param group(s) by Tensor/DTensor kind "
+                "to avoid mixed distributed optimizer foreach kernels."
+            )
+        return split_groups
+
+    def _adamw_optimizer_kwargs(self):
+        kwargs = {"betas": [self.hparams.beta1, self.hparams.beta2]}
+        if self._fsdp2_optimizer_compat_enabled():
+            # AdamW's foreach/fused implementations bucket tensors by device and
+            # dtype and currently reject mixed Tensor/DTensor lists. The single
+            # tensor path is slower but avoids that kernel-level incompatibility.
+            kwargs["foreach"] = False
+            kwargs["fused"] = False
+            print("[train_engine=fsdp2] AdamW foreach/fused disabled for DTensor compatibility.")
+        return kwargs
+
     def get_optimizer(self, optimizer_parameters): # function for once gotten optimizer_parameters to get optimizer, i.e. adamw, lars, etc
+        optimizer_parameters = self._split_optimizer_groups_for_fsdp2(optimizer_parameters)
         if self.hparams.optimizer == "lars":
             lars_exclude_bias_and_norm = None if not self.hparams.lars_exclude_bias_bn_wd else exclude_bias_and_norm
             optimizer = LARS(optimizer_parameters, lr=self.hparams.peak_learning_rate, weight_decay=self.hparams.weight_decay, momentum=self.hparams.beta1, eta=self.hparams.lars_trust_coeff, weight_decay_filter=lars_exclude_bias_and_norm, lars_adaptation_filter=lars_exclude_bias_and_norm)
         elif self.hparams.optimizer == "stableadamw":
             optimizer = StableAdamWUnfused(optimizer_parameters, betas=[self.hparams.beta1, self.hparams.beta2])
         else:
-            optimizer = torch.optim.AdamW(optimizer_parameters, betas=[self.hparams.beta1, self.hparams.beta2])
+            optimizer = torch.optim.AdamW(optimizer_parameters, **self._adamw_optimizer_kwargs())
         return optimizer
     
     def on_warm_up_finished(self):
