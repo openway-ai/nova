@@ -125,7 +125,8 @@ echo "  - 计算得出总 Steps:  ${MAX_STEPS}"
 # 学习率配置
 ################################################################################
 
-PEAK_LR=0.00025
+# PEAK_LR=0.00025
+PEAK_LR=0.0012
 WARM_UP_STEPS=0
 WARM_UP_BASE_LR_DIVIDER=10
 MIN_LR_SCALE=50
@@ -151,10 +152,10 @@ SAVE_TOP_K=2
 # 优化选项
 ################################################################################
 
-OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.05 \
+OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0057 --warmdown_ratio 0.65 --final_lr_frac 0.05 \
 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 \
 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling \
---muon_momentum_warmup_steps 0"
+--muon_momentum_warmup_steps 300"
 
 ################################################################################
 # torch.compile 配置
@@ -253,7 +254,7 @@ torchrun \
   --wandb_project 'nlp_pretrain' \
   --log_model_archi \
   --set_matmul_precision "medium" \
-  --float_precision "bf16-true" \
+  --float_precision "bf16-mixed" \
   --manual_gc_collect_every_n_steps -1 \
   --save_top_k_ckpts "${SAVE_TOP_K}" \
   --save_periodic_steps 1000 \
