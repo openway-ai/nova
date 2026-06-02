@@ -265,7 +265,7 @@ def _build_deepspeed_strategy(args, stage: int):
         kwargs = {
             "stage": stage,
             "offload_optimizer": getattr(args, "zero_cpu_offload_optimizer", False),
-            "offload_parameters": False,
+            "offload_parameters": getattr(args, "zero_cpu_offload_parameters", False) if stage == 3 else False,
         }
         if int(getattr(args, "zero_allgather_bucket_size", 0) or 0) > 0:
             kwargs["allgather_bucket_size"] = int(args.zero_allgather_bucket_size)
@@ -279,15 +279,21 @@ def _build_deepspeed_strategy(args, stage: int):
 
 
 def prepare_deepspeed_zero_args(args, engine: str) -> None:
-    """Mutate args before ``ModelTrainer`` construction for ZeRO-1/2."""
+    """Mutate args before ``ModelTrainer`` construction for ZeRO engines."""
     stage = _zero_stage(engine)
     args.train_engine = engine
 
-    if stage == 3:
+    mcmc_gradient_mode = getattr(args, "mcmc_gradient_mode", "second_order")
+    if stage == 3 and mcmc_gradient_mode != "first_order_cd":
         raise NotImplementedError(
-            "train_engine=zero-3 is only a reserved interface in this phase. "
-            "Use zero-1/zero-2 for exact second-order EBT training, or revisit "
-            "zero-3 together with a first-order/surrogate MCMC objective."
+            "train_engine=zero-3 shards model parameters and is only enabled with "
+            "--mcmc_gradient_mode first_order_cd in this phase. Use zero-1/zero-2 "
+            "for exact second-order EBT training."
+        )
+    if stage == 3:
+        _warn(
+            "Enabling experimental ZeRO-3 with first_order_cd. Parameters are sharded, "
+            "so exact second-order MCMC remains unsupported on this path."
         )
 
     _import_deepspeed_strategy._local_repo = getattr(args, "deepspeed_repo_path", "")
@@ -316,7 +322,7 @@ def prepare_deepspeed_zero_args(args, engine: str) -> None:
         args.optimizer = "adamw"
         args.layered_lr = True
 
-    if getattr(args, "zero_cpu_offload_parameters", False):
+    if stage in {1, 2} and getattr(args, "zero_cpu_offload_parameters", False):
         _warn("zero_cpu_offload_parameters is parsed for the reserved ZeRO-3 path and ignored for ZeRO-1/2.")
         args.zero_cpu_offload_parameters = False
 

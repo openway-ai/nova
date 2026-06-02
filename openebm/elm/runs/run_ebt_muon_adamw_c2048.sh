@@ -246,6 +246,29 @@ SAVE_TOP_K=2
 #   实际 scalar LR = 0.04 × 0.679 = 0.027
 OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
 
+################################################################################
+# MCMC 梯度模式
+################################################################################
+# 默认不传，保持当前 second_order EBT 训练目标。
+# 启用 FSDP/ZeRO-3 友好的一阶 surrogate:
+#   MCMC_GRADIENT_MODE=first_order_cd TRAIN_ENGINE=fsdp2 bash ...
+MCMC_GRADIENT_FLAGS=""
+if [ -n "${MCMC_GRADIENT_MODE:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --mcmc_gradient_mode ${MCMC_GRADIENT_MODE}"
+fi
+if [ -n "${FIRST_ORDER_CD_LOSS_COEFF:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_loss_coeff ${FIRST_ORDER_CD_LOSS_COEFF}"
+fi
+if [ -n "${FIRST_ORDER_CD_LOSS_TYPE:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_loss_type ${FIRST_ORDER_CD_LOSS_TYPE}"
+fi
+if [ -n "${FIRST_ORDER_CD_MARGIN:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_margin ${FIRST_ORDER_CD_MARGIN}"
+fi
+if [ -n "${FIRST_ORDER_CD_ALPHA_CE_COEFF:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_alpha_ce_coeff ${FIRST_ORDER_CD_ALPHA_CE_COEFF}"
+fi
+
 
 ################################################################################
 # torch.compile 配置
@@ -565,6 +588,7 @@ Max Steps:                ${MAX_STEPS}
 Total Tokens:             ${total_tokens_b}
 
 Option Flags:             ${OPTION_FLAGS:-"None (Baseline)"}
+MCMC Gradient Flags:      ${MCMC_GRADIENT_FLAGS:-"None (second_order default)"}
 Compile Flags:            ${COMPILE_FLAGS:-"None"}
 Engine Flags:             ${ENGINE_FLAGS:-"None (Lightning/DDP default)"}
 
@@ -640,6 +664,7 @@ $([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 --save_periodic_steps 1000 \
 ${WANDB_FLAGS} \
 ${ENGINE_FLAGS} \
+${MCMC_GRADIENT_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}
 

@@ -65,15 +65,9 @@ def apply_train_engine(model_trainer, args) -> None:
 
         apply_fsdp2_wrapping(model_trainer, args)
         return
-    if engine in {"zero-1", "zero-2"}:
+    if engine in {"zero-1", "zero-2", "zero-3"}:
         model_trainer._openebm_train_engine = engine
         return
-    if engine == "zero-3":
-        raise NotImplementedError(
-            "train_engine=zero-3 is reserved for future surrogate-MCMC work. "
-            "ZeRO-3 shards parameters and has the same high-order autograd risk class "
-            "as FSDP2 for the current exact second-order EBT objective."
-        )
     raise NotImplementedError(
         f"train_engine={engine!r} is reserved for future work. "
         "Implemented engines: lightning_ddp, fsdp2, zero-1, zero-2."
