@@ -254,7 +254,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     # RoPE freqs are indexed by sequence position (x.shape[1]) and rotary
     # complex pair dimension (x.shape[-1]), so x must expose both axes.
-    assert 0 <= 1 < ndim, (
+    assert ndim >= 2, (
         "reshape_for_broadcast expects x to have at least two dimensions "
         f"with a sequence axis at dim=1; got x.ndim={ndim}, shape={tuple(x.shape)}"
     )
