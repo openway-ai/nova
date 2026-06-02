@@ -311,7 +311,7 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
     if args.distributed_strategy in (None, "None", "none", "null", ""):
         args.distributed_strategy = "auto"
 
-    if getattr(args, "train_engine", "lightning_ddp") != "fsdp2" and (
+    if getattr(args, "train_engine", "lightning_ddp") == "lightning_ddp" and (
         args.find_unused_parameters or args.distributed_strategy == "ddp"
     ):
             args.distributed_strategy = DDPStrategy(
@@ -613,8 +613,18 @@ if __name__ == '__main__':
 
     # Train engine selection. Defaults preserve the current Lightning/DDP path.
     parser.add_argument("--train_engine", type=str, default="lightning_ddp",
-        choices=["lightning_ddp", "fsdp2", "megatron", "deepspeed-zero3"],
-        help="Optional training engine. Only fsdp2 is implemented beyond the default Lightning/DDP path.")
+        choices=[
+            "lightning_ddp",
+            "fsdp2",
+            "zero-1",
+            "zero-2",
+            "zero-3",
+            "deepspeed-zero1",
+            "deepspeed-zero2",
+            "deepspeed-zero3",
+            "megatron",
+        ],
+        help="Optional training engine. Implemented: lightning_ddp, fsdp2, zero-1, zero-2. zero-3 is reserved.")
     parser.add_argument("--fsdp_sharding_strategy", type=str, default="full_shard",
         choices=["full_shard", "hybrid_shard", "no_shard"],
         help="[FSDP2 MVP] Parsed for future policy selection; current implementation uses full-shard style wrapping.")
@@ -643,6 +653,29 @@ if __name__ == '__main__':
         help="[FSDP2 MVP] Opt in to experimental MuonAdamW under FSDP2; default falls back to layered AdamW.")
     parser.add_argument("--fsdp_first_order_mcmc_debug", action="store_true", default=False,
         help="[FSDP2 DEBUG] Force MCMC autograd.grad(create_graph=False) under FSDP2 to isolate second-order/FSDP interactions. Not equivalent EBT training.")
+
+    parser.add_argument("--zero_config", type=str, default="",
+        help="[DeepSpeed ZeRO] Optional config JSON for zero-1/zero-2. If set, zero_optimization.stage must match --train_engine.")
+    parser.add_argument("--deepspeed_repo_path", type=str, default="/mnt/shared-storage-user/puyuan/code/DeepSpeed",
+        help="[DeepSpeed ZeRO] Optional local DeepSpeed source checkout used as an import fallback before requiring installed deepspeed.")
+    parser.add_argument("--zero_cpu_offload_optimizer", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Enable optimizer-state CPU offload for ZeRO-1/2.")
+    parser.add_argument("--zero_cpu_offload_parameters", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Reserved for ZeRO-3. Ignored for ZeRO-1/2.")
+    parser.add_argument("--zero_allgather_bucket_size", type=int, default=0,
+        help="[DeepSpeed ZeRO] Optional allgather_bucket_size. 0 lets Lightning/DeepSpeed choose.")
+    parser.add_argument("--zero_reduce_bucket_size", type=int, default=0,
+        help="[DeepSpeed ZeRO] Optional reduce_bucket_size. 0 lets Lightning/DeepSpeed choose.")
+    parser.add_argument("--zero_contiguous_gradients", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Request contiguous gradients when supported by the installed Lightning version.")
+    parser.add_argument("--zero_force_truncate_mcmc", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Force truncate_mcmc=True to reduce retained second-order graph memory.")
+    parser.add_argument("--zero_disable_compile", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Disable torch.compile for ZeRO runs.")
+    parser.add_argument("--zero_allow_compile", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Opt in to torch.compile under ZeRO. Default disables compile because EBT MCMC uses create_graph=True.")
+    parser.add_argument("--zero_allow_muon_adamw", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Opt in to experimental MuonAdamW under ZeRO; default falls back to layered AdamW.")
 
 
     #TRAINING#########################################################
