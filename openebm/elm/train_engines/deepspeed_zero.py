@@ -18,6 +18,7 @@ import inspect
 import importlib.util
 import json
 import os
+import pickle
 import platform
 import sys
 import types
@@ -79,18 +80,113 @@ def _import_deepspeed_strategy():
     try:
         from lightning.pytorch.strategies import DeepSpeedStrategy
 
-        return DeepSpeedStrategy
+        return _make_openebm_deepspeed_strategy(DeepSpeedStrategy)
     except Exception:
         try:
             from pytorch_lightning.strategies import DeepSpeedStrategy
 
-            return DeepSpeedStrategy
+            return _make_openebm_deepspeed_strategy(DeepSpeedStrategy)
         except Exception as exc:
             raise RuntimeError(
                 "train_engine=zero-1/zero-2 requires Lightning with DeepSpeedStrategy. "
                 "Install lightning[pytorch] and deepspeed in the training environment, "
                 "or use train_engine=lightning_ddp."
             ) from exc
+
+
+def _make_openebm_deepspeed_strategy(base_cls):
+    class OpenEBMDeepSpeedStrategy(base_cls):
+        """DeepSpeedStrategy with pickle-safe Lightning client_state.
+
+        Lightning forwards the whole checkpoint dict, minus model/optimizer
+        states, as DeepSpeed ``client_state``. In the local DeepSpeed checkout,
+        that client state can contain a module object with DeepSpeed's local
+        forward hook closure attached, which fails ``torch.save`` with:
+        ``Can't pickle local object ... _module_forward_post_hook``. Keep the
+        actual DeepSpeed module/optimizer checkpoint path intact, but drop or
+        simplify non-pickleable metadata entries from client_state before
+        handing it to DeepSpeed.
+        """
+
+        def save_checkpoint(self, checkpoint: dict, filepath, storage_options: Any = None) -> None:
+            filepath = self.broadcast(filepath)
+            if storage_options is not None:
+                raise TypeError(
+                    "`Trainer.save_checkpoint(..., storage_options=...)` with `storage_options` arg "
+                    f"is not supported for `{self.__class__.__name__}` as `CheckpointIO` is not used."
+                )
+
+            client_state = {k: v for k, v in checkpoint.items() if k not in {"state_dict", "optimizer_states"}}
+            client_state = _sanitize_deepspeed_client_state(client_state)
+            self.deepspeed_engine.save_checkpoint(
+                filepath,
+                client_state=client_state,
+                tag="checkpoint",
+                exclude_frozen_parameters=self.exclude_frozen_parameters,
+            )
+
+    OpenEBMDeepSpeedStrategy.__name__ = "OpenEBMDeepSpeedStrategy"
+    OpenEBMDeepSpeedStrategy.__qualname__ = "OpenEBMDeepSpeedStrategy"
+    return OpenEBMDeepSpeedStrategy
+
+
+def _is_pickleable(value: Any) -> bool:
+    try:
+        pickle.dumps(value)
+        return True
+    except Exception:
+        return False
+
+
+def _sanitize_deepspeed_client_state(value: Any, path: str = "client_state", removed: list[str] | None = None):
+    """Recursively remove checkpoint metadata objects that DeepSpeed cannot pickle."""
+    root_call = removed is None
+    if removed is None:
+        removed = []
+
+    if isinstance(value, dict):
+        clean = {}
+        for key, item in value.items():
+            key_path = f"{path}.{key}"
+            sanitized = _sanitize_deepspeed_client_state(item, key_path, removed)
+            if sanitized is not _UNPICKLEABLE:
+                clean[key] = sanitized
+        result = clean
+    elif isinstance(value, list):
+        clean = []
+        for idx, item in enumerate(value):
+            item_path = f"{path}[{idx}]"
+            sanitized = _sanitize_deepspeed_client_state(item, item_path, removed)
+            if sanitized is not _UNPICKLEABLE:
+                clean.append(sanitized)
+        result = clean
+    elif isinstance(value, tuple):
+        clean = []
+        for idx, item in enumerate(value):
+            item_path = f"{path}[{idx}]"
+            sanitized = _sanitize_deepspeed_client_state(item, item_path, removed)
+            if sanitized is not _UNPICKLEABLE:
+                clean.append(sanitized)
+        result = tuple(clean)
+    else:
+        if _is_pickleable(value):
+            result = value
+        else:
+            removed.append(path)
+            result = _UNPICKLEABLE
+
+    if result is not _UNPICKLEABLE and not _is_pickleable(result):
+        removed.append(path)
+        result = _UNPICKLEABLE
+
+    if root_call and removed:
+        preview = ", ".join(removed[:12])
+        suffix = "" if len(removed) <= 12 else f", ... (+{len(removed) - 12} more)"
+        _warn(f"Removed non-pickleable DeepSpeed checkpoint client_state entries: {preview}{suffix}")
+    return result
+
+
+_UNPICKLEABLE = object()
 
 
 def _patch_lightning_deepspeed_requirement_cache() -> None:
