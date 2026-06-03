@@ -1,5 +1,5 @@
 [project]
-name = "openebm"
+name = "openebm-elm"
 version = "0.1.0"
 description = "the minimal full-stack ChatGPT clone"
 readme = "README.md"
@@ -24,6 +24,9 @@ dependencies = [
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
     "zstandard>=0.25.0",
+    "torchmetrics==1.8.2",
+    "ipdb==0.13.13",
+    "pytorch-lightning==2.4.0",
 ]
 
 [dependency-groups]
@@ -35,7 +38,7 @@ dev = [
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
-testpaths = ["nanochat/tests"]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
@@ -72,6 +75,3 @@ conflicts = [
         { extra = "gpu" },
     ],
 ]
-
-[tool.setuptools.packages.find]
-where = [".", "nanochat"]
