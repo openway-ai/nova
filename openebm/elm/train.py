@@ -503,8 +503,9 @@ if __name__ == '__main__':
     # See TF_HEAD_ARCHITECTURE.md §9 and openebm/elm/tf_head.py.
     parser.add_argument("--use_tf_head", action="store_true", default=False,
         help="Replace MCMC-derived CE with TF head on top of trunk pred_hidden. Default off.")
-    parser.add_argument("--tf_head_type", choices=["linear", "transformer"], type=str, default="transformer",
-        help="TF head variant. 'transformer' = L-block causal head (Gemma drafter). 'linear' = concat+project.")
+    parser.add_argument("--tf_head_type", choices=["linear", "transformer", "direct_unembed"], type=str, default="transformer",
+        help="TF head variant. 'transformer' = L-block causal head (Gemma drafter). "
+             "'linear' = concat+project. 'direct_unembed' = explicit test2 concat+project ablation.")
     parser.add_argument("--tf_head_layers", type=int, default=1,
         help="Number of causal AR blocks in the transformer head (L=1 is empirical sweet spot).")
     parser.add_argument("--tf_head_n_heads", type=int, default=0,

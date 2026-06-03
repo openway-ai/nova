@@ -4,9 +4,10 @@ Decoupled from the blockwise/MTP machinery in `nova/ebt/`. Each head takes
 `(pred_hidden, prev_token_embed) -> logits` and is used in plain (K=1) NTP
 on top of EBT's MCMC pred_hidden output. See `TF_HEAD_ARCHITECTURE.md` §9.
 
-Two variants exposed via `build_tf_head(hparams)`:
-  - "linear":      Linear(2D, D) -> Linear(D, V)
-  - "transformer": Linear(2D, D) -> L x causal AR block -> RMSNorm -> Linear(D, V)
+Three variants exposed via `build_tf_head(hparams)`:
+  - "linear":         Linear(2D, D) -> Linear(D, V)
+  - "direct_unembed": Linear(2D, D) -> Linear(D, V) as an explicit test2 ablation
+  - "transformer":    Linear(2D, D) -> L x causal AR block -> RMSNorm -> Linear(D, V)
 
 The transformer variant matches Gemma-drafter's "concat-then-project + L tiny
 attention blocks" pattern. L=1 is the empirical sweet spot in xxs experiments.
@@ -84,6 +85,20 @@ class TFLinearHead(nn.Module):
         return self.out_proj(self.down_proj(x))
 
 
+class TFDirectUnembedHead(nn.Module):
+    """Test2 head: project the last-layer t1 embedding directly to vocab logits."""
+
+    def __init__(self, dim: int, vocab_size: int):
+        super().__init__()
+        self.down_proj = nn.Linear(2 * dim, dim, bias=False)
+        self.proj = nn.Linear(dim, vocab_size, bias=False)
+
+    def forward(self, pred_hidden: torch.Tensor, prev_token_embed: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([pred_hidden, prev_token_embed], dim=-1)
+        t1_embedding = self.down_proj(x)
+        return self.proj(t1_embedding)
+
+
 class TFTransformerHead(nn.Module):
     """forward(pred_hidden[B,S,D], prev_embed[B,S,D]) -> logits[B,S,V].
 
@@ -120,7 +135,7 @@ def build_tf_head(hparams) -> nn.Module:
     """Factory that consumes hparams namespace from train.py CLI flags.
 
     Reads:
-      hparams.tf_head_type       in {"linear", "transformer"}
+      hparams.tf_head_type       in {"linear", "direct_unembed", "transformer"}
       hparams.tf_head_layers     int (transformer only)
       hparams.tf_head_n_heads    int, 0 -> inherit hparams.multiheaded_attention_heads
       hparams.tf_head_ffn_mult   float
@@ -132,6 +147,9 @@ def build_tf_head(hparams) -> nn.Module:
 
     if head_type == "linear":
         return TFLinearHead(dim=dim, vocab_size=vocab_size)
+
+    if head_type == "direct_unembed":
+        return TFDirectUnembedHead(dim=dim, vocab_size=vocab_size)
 
     if head_type == "transformer":
         n_heads_override = int(getattr(hparams, "tf_head_n_heads", 0))
