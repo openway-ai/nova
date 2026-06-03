@@ -6,7 +6,7 @@ on top of EBT's MCMC pred_hidden output. See `TF_HEAD_ARCHITECTURE.md` §9.
 
 Three variants exposed via `build_tf_head(hparams)`:
   - "linear":         Linear(2D, D) -> Linear(D, V)
-  - "direct_unembed": Linear(2D, D) -> Linear(D, V) as an explicit test2 ablation
+  - "direct_unembed": Linear(D, V) over trunk pred_hidden as an explicit test2 ablation
   - "transformer":    Linear(2D, D) -> L x causal AR block -> RMSNorm -> Linear(D, V)
 
 The transformer variant matches Gemma-drafter's "concat-then-project + L tiny
@@ -86,17 +86,20 @@ class TFLinearHead(nn.Module):
 
 
 class TFDirectUnembedHead(nn.Module):
-    """Test2 head: project the last-layer t1 embedding directly to vocab logits."""
+    """Test2 head: project the trunk last-layer candidate hidden to vocab logits.
+
+    `prev_token_embed` is the first-layer embedding from self.embeddings(input_ids)
+    and is intentionally ignored here. It stays in the signature only to match the
+    shared TF-head interface used by the linear/transformer heads.
+    """
 
     def __init__(self, dim: int, vocab_size: int):
         super().__init__()
-        self.down_proj = nn.Linear(2 * dim, dim, bias=False)
         self.proj = nn.Linear(dim, vocab_size, bias=False)
 
     def forward(self, pred_hidden: torch.Tensor, prev_token_embed: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([pred_hidden, prev_token_embed], dim=-1)
-        t1_embedding = self.down_proj(x)
-        return self.proj(t1_embedding)
+        del prev_token_embed
+        return self.proj(pred_hidden)
 
 
 class TFTransformerHead(nn.Module):

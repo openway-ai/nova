@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Local launcher for the direct-unembed TF-head + free-embedding-MCMC xxs run.
 # Mirrors launch_xxs_local_free_embed.sh, but sets --tf_head_type direct_unembed
-# so the t1 embedding is projected directly to vocab logits without TF-head blocks.
+# so the trunk post-norm candidate hidden is projected directly to vocab logits
+# without using first-layer prev_embed or extra TF-head blocks.
 
 set -euo pipefail
 
@@ -53,8 +54,11 @@ ALPHA_LR=1500
 # 2-GPU, 50k-step xxs launcher:
 #   2 * 2 batch/device * 2 grad_accum * 256 ctx * 50000 = 102.4M tokens
 #   4 * 2 batch/device * 2 grad_accum * 256 ctx * 25000 = 102.4M tokens
+# Keep the warmup token budget aligned too:
+#   old 2-GPU warmup = 1000 optimizer steps * 2048 tokens/step = 2.048M tokens
+#   new 4-GPU warmup = 500 optimizer steps * 4096 tokens/step = 2.048M tokens
 MAX_STEP=25000
-WARMUP_STEP=1000
+WARMUP_STEP=500
 
 cd "$ELM_DIR"
 

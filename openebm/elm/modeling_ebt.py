@@ -70,9 +70,12 @@ class EBT_NLP(LightningModule):
 
         self.transformer = setup_ebt(self.hparams)
 
-        # TF head (Gemma-drafter style) sits AFTER MCMC, consumes trunk pred_hidden
-        # + embed(input_ids[t]) -> final logits used for CE. Default off; toggled by
-        # --use_tf_head. Keeps original EBT CE path intact when off.
+        # TF head sits AFTER MCMC and consumes the trunk's candidate-position
+        # pred_hidden (post-norm / last-layer hidden) to produce final CE logits.
+        # Some head variants also use embed(input_ids[t]) as a first-layer
+        # teacher-forced anchor; direct_unembed intentionally ignores that anchor.
+        # Default off; toggled by --use_tf_head. Keeps original EBT CE path intact
+        # when off.
         self.use_tf_head = bool(getattr(self.hparams, "use_tf_head", False))
         if self.use_tf_head:
             self.tf_head = build_tf_head(self.hparams)
@@ -363,10 +366,11 @@ class EBT_NLP(LightningModule):
             # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
 
         if self.use_tf_head:
-            # Replace per-step distributions with TF-head outputs:
-            # logits_step = tf_head(pred_hidden_step, prev_embed=embed(input_ids[t])).
-            # Anchor on input_ids[t] (= doc §9c plain-NTP "redundant but legitimate" anchor).
-            prev_embed = self.embeddings(input_ids)  # [B, S, D]
+            # Replace per-step distributions with TF-head outputs. pred_hidden_step
+            # is the trunk post-norm candidate hidden from return_pred_hidden=True.
+            # prev_embed is only the first-layer token embedding; direct_unembed
+            # keeps the shared call signature but does not unembed this tensor.
+            prev_embed = self.embeddings(input_ids)  # first-layer anchor, [B, S, D]
             predicted_distributions = [
                 self.tf_head(pred_hidden_step, prev_embed)  # [B, S, V]
                 for pred_hidden_step in predicted_pred_hiddens

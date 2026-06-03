@@ -502,14 +502,16 @@ if __name__ == '__main__':
 
     parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
 
-    # TF (teacher-forced, Gemma-drafter-style) head — sits AFTER MCMC, consumes trunk
-    # pred_hidden + embed(input_ids[t]) -> logits used for CE. K=1 (single-token NTP).
+    # TF (teacher-forced, Gemma-drafter-style) head — sits AFTER MCMC and consumes
+    # trunk pred_hidden for CE logits. Some variants also use embed(input_ids[t])
+    # as a first-layer anchor; direct_unembed projects pred_hidden directly.
     # See TF_HEAD_ARCHITECTURE.md §9 and openebm/elm/tf_head.py.
     parser.add_argument("--use_tf_head", action="store_true", default=False,
         help="Replace MCMC-derived CE with TF head on top of trunk pred_hidden. Default off.")
     parser.add_argument("--tf_head_type", choices=["linear", "transformer", "direct_unembed"], type=str, default="transformer",
         help="TF head variant. 'transformer' = L-block causal head (Gemma drafter). "
-             "'linear' = concat+project. 'direct_unembed' = explicit test2 concat+project ablation.")
+             "'linear' = concat+project. "
+             "'direct_unembed' = explicit test2 ablation: project trunk pred_hidden directly.")
     parser.add_argument("--tf_head_layers", type=int, default=1,
         help="Number of causal AR blocks in the transformer head (L=1 is empirical sweet spot).")
     parser.add_argument("--tf_head_n_heads", type=int, default=0,
