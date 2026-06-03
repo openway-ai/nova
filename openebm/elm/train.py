@@ -512,6 +512,16 @@ if __name__ == '__main__':
     parser.add_argument("--tf_head_ffn_mult", type=float, default=4.0,
         help="FFN expansion factor inside TF head transformer block.")
 
+    # Free embedding MCMC: iterate in D-dim embedding space directly (instead of V-dim logit).
+    # Skips the softmax + matmul(embeddings.weight) conversion at trunk input. Requires
+    # --use_tf_head (TF head provides the discrete CE supervision; without it the D-dim iterate
+    # has no decode path). See blockwise_free_embedding_optimizations_2026-06-01.md.
+    parser.add_argument("--free_embedding_mcmc", action="store_true", default=False,
+        help="Run MCMC in D-dim free embedding space instead of V-dim logit space. Requires --use_tf_head.")
+    parser.add_argument("--free_embed_noise_scale", type=float, default=1.0,
+        help="Multiplier on initial corruption noise when free_embedding_mcmc=True (doc §4 noise rescaling). "
+             "Higher = harder denoising = forces model to use context.")
+
     parser.add_argument("--use_ve", help="启用 Value Embedding (VE)，为交替层添加可学习的值嵌入", action="store_true", default=False)
 
     parser.add_argument("--use_mcmc_time_embed", action="store_true", default=False,

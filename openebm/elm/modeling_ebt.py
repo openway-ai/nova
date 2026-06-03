@@ -83,6 +83,22 @@ class EBT_NLP(LightningModule):
             self.replay_buffer_samples = self.hparams.batch_size_per_device * self.hparams.mcmc_replay_buffer_sample_bs_percent
             self.replay_buffer = CausalReplayBuffer(max_size=replay_buffer_max_size, sample_size=self.replay_buffer_samples)
 
+        # Free embedding MCMC: iterate in D-dim instead of V-dim. Skips softmax/vocab_to_embed
+        # at trunk input. TF head is mandatory in this mode (provides discrete supervision).
+        # Must come AFTER self.mcmc_replay_buffer is assigned, since the assertion reads it.
+        self.use_free_embedding_mcmc = bool(getattr(self.hparams, "free_embedding_mcmc", False))
+        if self.use_free_embedding_mcmc:
+            if not self.use_tf_head:
+                raise ValueError(
+                    "--free_embedding_mcmc requires --use_tf_head: D-dim MCMC iterate has no "
+                    "intrinsic V-dim decode path; TF head supplies the discrete CE supervision."
+                )
+            if self.mcmc_replay_buffer:
+                raise ValueError(
+                    "--free_embedding_mcmc is incompatible with mcmc_replay_buffer "
+                    "(buffer stores V-dim logits)."
+                )
+
         self._alpha_debug_step = 0  # counter for alpha diagnostic prints
         if self.hparams.debug_unused_parameters:
             self.used_parameters = set()
@@ -122,16 +138,22 @@ class EBT_NLP(LightningModule):
         batch_size = predicted_tokens.shape[0]
         seq_length = predicted_tokens.shape[1]
         
+        # predicted_tokens state-dim: V (logit mode) or D (free embedding mode). Use -1
+        # so the reshape doesn't break in free mode where state_dim == embedding_dim != vocab_size.
         if self.hparams.no_mcmc_detach:
-            predicted_tokens.requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
+            predicted_tokens.requires_grad_().reshape(batch_size, seq_length, -1)
         else: # default, do detach
-            predicted_tokens = predicted_tokens.detach().requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
+            predicted_tokens = predicted_tokens.detach().requires_grad_().reshape(batch_size, seq_length, -1)
 
         if self.hparams.langevin_dynamics_noise != 0:
             ld_noise = torch.randn_like(predicted_tokens.detach()) * langevin_dynamics_noise_std # langevin dynamics
             predicted_tokens = predicted_tokens + ld_noise
 
-        if self.hparams.normalize_initial_condition:
+        if self.use_free_embedding_mcmc:
+            # Free embedding mode: predicted_tokens is already [B, S, D]; no softmax/vocab_to_embed
+            # conversion. The MCMC state IS the trunk's input embedding.
+            predicted_embeddings = predicted_tokens
+        elif self.hparams.normalize_initial_condition:
             if getattr(self.hparams, 'float_precision', '') == "bf16-true":
                 if self.hparams.normalize_initial_condition_only_first_step:
                     if mcmc_step == 0:
@@ -144,14 +166,14 @@ class EBT_NLP(LightningModule):
                         predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
                 else:
                     predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
-                
+
             if self.hparams.vocab_to_embed_uses_prob_dist: # predicted_embeds is B, S, V; embed is V, D
                 predicted_embeddings = torch.matmul(predicted_tokens, self.embeddings.weight) #BS, S, D
             else:
                 predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
         else:
             predicted_embeddings = self.vocab_to_embed(predicted_tokens) #BS, S, D
-        
+
         all_embeddings = torch.cat((real_embeddings_input.detach(), predicted_embeddings), dim = 1) # B, 2*S, D
         
         # create_graph=True 的 autograd.grad 与 compiled graph 不兼容
@@ -208,7 +230,11 @@ class EBT_NLP(LightningModule):
         # forward, alpha would be frozen under TF-head training.
         pred_hidden_step = None
         if compute_pred_hidden:
-            post_pred_embeddings = self._logits_to_pred_embeddings(predicted_tokens)
+            if self.use_free_embedding_mcmc:
+                # post-update predicted_tokens IS already D-dim — feed straight to trunk.
+                post_pred_embeddings = predicted_tokens
+            else:
+                post_pred_embeddings = self._logits_to_pred_embeddings(predicted_tokens)
             post_all_embeddings = torch.cat((real_embeddings_input.detach(), post_pred_embeddings), dim=1)
             _, pred_hidden_step = transformer(
                 post_all_embeddings,
@@ -219,7 +245,12 @@ class EBT_NLP(LightningModule):
                 return_pred_hidden=True,
             )
 
-        if return_raw_logits:
+        if self.use_free_embedding_mcmc:
+            # No V-dim baseline CE in free mode; TF head supplies the supervised logits
+            # in forward_loss_wrapper. Returning None here is fine — the list slot gets
+            # replaced wholesale before the CE loop.
+            predicted_tokens_for_loss = None
+        elif return_raw_logits:
             predicted_tokens_for_loss = predicted_tokens # BS, S, V
         else:
             predicted_tokens_for_loss = self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size) # BS*S, V
@@ -437,15 +468,26 @@ class EBT_NLP(LightningModule):
         float_precision = getattr(self.hparams, 'float_precision', '')
         mcmc_dtype = PRECISION_TO_MCMC_DTYPE.get(float_precision, torch.float32)
 
+        # State dim depends on MCMC space: V-dim (logit) or D-dim (free embedding).
+        if self.use_free_embedding_mcmc:
+            state_dim = self.hparams.embedding_dim
+            # Doc §4 noise rescaling — extra multiplier for free embedding training noise.
+            noise_scale = self.hparams.gaussian_random_noise_scaling * float(
+                getattr(self.hparams, "free_embed_noise_scale", 1.0)
+            )
+        else:
+            state_dim = self.vocab_size
+            noise_scale = self.hparams.gaussian_random_noise_scaling
+
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=mcmc_dtype, device=self.device) * self.hparams.gaussian_random_noise_scaling
+            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], state_dim), dtype=mcmc_dtype, device=self.device) * noise_scale
         elif self.hparams.denoising_initial_condition == "zeros":
-            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=mcmc_dtype, device = self.device)
+            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], state_dim), dtype=mcmc_dtype, device = self.device)
         else:
             raise NotImplementedError(f"{self.hparams.denoising_initial_condition} denoising_initial_condition not yet supported")
-        
+
         return predicted_tokens
     
     def calculate_contrastive_loss(self, predicted_energies, input_ids, next_token_indices):
