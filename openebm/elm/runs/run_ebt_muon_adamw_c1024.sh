@@ -52,7 +52,9 @@ export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"
 
 mkdir -p logs/slurm/nlp/
-module purge
+if command -v module >/dev/null 2>&1; then
+    module purge
+fi
 
 # EBT 特定参数
 MCMC_STEP_SIZE=500.0
@@ -212,11 +214,12 @@ if [ "${TRAIN_ENGINE}" = "fsdp2" ]; then
 --fsdp_state_dict_type ${FSDP_STATE_DICT_TYPE:-sharded} \
 --fsdp_wrap_policy ${FSDP_WRAP_POLICY:-transformer_block} \
 --fsdp_reshard_after_forward ${FSDP_RESHARD_AFTER_FORWARD:-false} \
+--fsdp_muon_dtensor_policy ${FSDP_MUON_DTENSOR_POLICY:-adamw} \
 --fsdp_force_truncate_mcmc"
     if [ "${FSDP_CPU_OFFLOAD:-0}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_cpu_offload"
     fi
-    if [ "${FSDP_ALLOW_MUON_ADAMW:-0}" = "1" ]; then
+    if [ "${FSDP_ALLOW_MUON_ADAMW:-1}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_allow_muon_adamw"
     fi
     if [ "${FSDP_FIRST_ORDER_MCMC_DEBUG:-0}" = "1" ]; then
@@ -241,6 +244,9 @@ elif [ "${TRAIN_ENGINE}" = "zero-1" ] || [ "${TRAIN_ENGINE}" = "zero-2" ] || [ "
     if [ "${ZERO_CPU_OFFLOAD_PARAMETERS:-0}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --zero_cpu_offload_parameters"
     fi
+    if [ "${TRAIN_ENGINE}" = "zero-3" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero3" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero3_param_dtype ${ZERO3_PARAM_DTYPE:-fp32}"
+    fi
     if [ "${ZERO_CONTIGUOUS_GRADIENTS:-0}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --zero_contiguous_gradients"
     fi
@@ -253,8 +259,11 @@ elif [ "${TRAIN_ENGINE}" = "zero-1" ] || [ "${TRAIN_ENGINE}" = "zero-2" ] || [ "
     if [ "${ZERO_ALLOW_COMPILE:-0}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allow_compile"
     fi
-    if [ "${ZERO_ALLOW_MUON_ADAMW:-0}" = "1" ]; then
-        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allow_muon_adamw"
+    if [ -n "${ZERO_MUON_POLICY:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_muon_policy ${ZERO_MUON_POLICY}"
+    fi
+    if [ -n "${ZERO3_MUON_POLICY:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero3_muon_policy ${ZERO3_MUON_POLICY}"
     fi
     if [ "${ZERO_ALLGATHER_BUCKET_SIZE:-0}" != "0" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allgather_bucket_size ${ZERO_ALLGATHER_BUCKET_SIZE}"
@@ -393,11 +402,11 @@ echo ""
 echo -e "${CYAN}▶ 学习率配置${NC}"
 print_separator "─" 60
 print_kv "Peak LR (Base)" "${PEAK_LR}"
-local alpha_lr=$(awk "BEGIN {printf \"%.4f\", ${PEAK_LR} * ${MCMC_STEP_SIZE_LR_MULTIPLIER}}")
+alpha_lr=$(awk "BEGIN {printf \"%.4f\", ${PEAK_LR} * ${MCMC_STEP_SIZE_LR_MULTIPLIER}}")
 print_kv "Alpha Effective LR" "${BOLD}${alpha_lr}${NC} (=${PEAK_LR}×${MCMC_STEP_SIZE_LR_MULTIPLIER})"
 print_kv "Warmup Steps" "${WARM_UP_STEPS} (5%)"
 print_kv "Min LR Scale" "${MIN_LR_SCALE}"
-local final_lr=$(awk "BEGIN {printf \"%.8f\", ${PEAK_LR}/${MIN_LR_SCALE}}")
+final_lr=$(awk "BEGIN {printf \"%.8f\", ${PEAK_LR}/${MIN_LR_SCALE}}")
 print_kv "Final LR" "${final_lr}"
 
 echo ""
@@ -434,7 +443,9 @@ echo "  3. Alpha LR 仍由 MCMC_STEP_SIZE_LR_MULTIPLIER × PEAK_LR 控制 (EBT �
 echo "  4. 监控关键指标: train_loss, Alpha_MCMC, Global_LR"
 
 echo ""
-read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
+if [ "${DRY_RUN:-0}" != "1" ]; then
+    read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
+fi
 
 ################################################################################
 # 写入日志头
@@ -518,6 +529,15 @@ echo ""
 print_header "开始训练"
 echo ""
 
+if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo "[DRY_RUN] Skipping torchrun launch."
+    echo "[DRY_RUN] Engine Flags: ${ENGINE_FLAGS:-None}"
+    echo "[DRY_RUN] MCMC Gradient Flags: ${MCMC_GRADIENT_FLAGS:-None}"
+    echo "[DRY_RUN] Float Precision: ${FLOAT_PRECISION}"
+    echo "[DRY_RUN] Effective Optimizer: $(short_optimizer_tag)"
+    exit 0
+fi
+
 set +e
 torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/train.py \
 --run_name ${RUN_NAME}_${current_time} \
@@ -595,8 +615,8 @@ else
         echo -e "${YELLOW}⚠ 检测到 OOM - 建议减小 DEVICE_BATCH_SIZE${NC}"
     fi
 
-    if grep -q "nan\|NaN\|inf\|Inf" "${LOG_FILE}" 2>/dev/null | head -5; then
-        echo -e "${YELLOW}⚠ 检测到 NaN/Inf - 可能需要进一步降低学习率${NC}"
+    if grep -Eiq "(^|[^[:alnum:]_])nan([^[:alnum:]_]|$)|(train_)?loss:[[:space:]]*(nan|inf)|valid_loss:[[:space:]]*(nan|inf)" "${LOG_FILE}" 2>/dev/null; then
+        echo -e "${YELLOW}⚠ 检测到 loss NaN/Inf - 可能需要进一步降低学习率${NC}"
     fi
 fi
 

@@ -236,8 +236,15 @@ class EBT_NLP(LightningModule):
                     langevin_dynamics_noise_std, step_alpha, start_pos, learning, return_raw_logits,
                     real_token_ids=x
                 )
-                predicted_energies.append(energy_preds)
-                predicted_distributions.append(predicted_tokens_for_loss)
+                if getattr(self.hparams, "mcmc_gradient_mode", "second_order") == "first_order_cd_v2":
+                    # The v2 first-order CD objective recomputes positive and
+                    # negative energies below. Keep only detached sampler
+                    # outputs here so MCMC does not retain transformer graphs.
+                    predicted_energies.append(energy_preds.detach())
+                    predicted_distributions.append(predicted_tokens_for_loss.detach())
+                else:
+                    predicted_energies.append(energy_preds)
+                    predicted_distributions.append(predicted_tokens_for_loss)
                 del energy_preds, predicted_tokens_for_loss  # release references to help GC
 
         return predicted_distributions, predicted_energies
@@ -300,20 +307,27 @@ class EBT_NLP(LightningModule):
         initial_final_pred_energies_gap = initial_pred_energies - final_pred_energies
 
         mcmc_gradient_mode = getattr(self.hparams, "mcmc_gradient_mode", "second_order")
-        use_first_order_cd = learning and mcmc_gradient_mode == "first_order_cd"
+        use_first_order_cd = mcmc_gradient_mode in {"first_order_cd", "first_order_cd_v2"}
         if use_first_order_cd:
             # In first-order CD mode, the MCMC sampler is detached from model
             # parameters. Recompute positive/negative energies at detached token
-            # states so the trainable signal is a normal first-order EBM loss.
+            # states so the optimization and validation losses use the same
+            # first-order EBM objective. CE is still logged separately below.
             contrastive_loss = self.calculate_contrastive_loss(
                 predicted_energies,
                 input_ids,
                 next_token_indices,
                 fake_pred_tokens=predicted_distributions[-1].detach(),
                 recompute_fake_energy=True,
+                combine_recomputed_energies=mcmc_gradient_mode == "first_order_cd_v2",
             )
             total_loss = getattr(self.hparams, "first_order_cd_loss_coeff", 1.0) * contrastive_loss
             alpha_ce_coeff = getattr(self.hparams, "first_order_cd_alpha_ce_coeff", 0.0)
+            if mcmc_gradient_mode == "first_order_cd_v2" and alpha_ce_coeff != 0.0:
+                raise ValueError(
+                    "first_order_cd_v2 drops sampler graph references and does not support "
+                    "--first_order_cd_alpha_ce_coeff. Use first_order_cd for that diagnostic path."
+                )
             if alpha_ce_coeff != 0.0:
                 total_loss = total_loss + alpha_ce_coeff * reconstruction_loss
             contrastive_loss = contrastive_loss.detach()
@@ -345,6 +359,7 @@ class EBT_NLP(LightningModule):
         log_dict = {
             'loss': total_loss,
             'initial_loss' : initial_loss,
+            'reconstruction_loss': reconstruction_loss.detach(),
             'final_step_loss': final_reconstruction_loss,
             'contrastive_loss' : contrastive_loss,
             'initial_final_pred_energies_gap': initial_final_pred_energies_gap,
@@ -375,7 +390,8 @@ class EBT_NLP(LightningModule):
         return predicted_tokens
     
     def calculate_contrastive_loss(self, predicted_energies, input_ids, next_token_indices,
-                                   fake_pred_tokens=None, recompute_fake_energy=False):
+                                   fake_pred_tokens=None, recompute_fake_energy=False,
+                                   combine_recomputed_energies=False):
         batch_size = input_ids.shape[0]
         seq_length = input_ids.shape[1]
         real_embeddings_input = self.embeddings(input_ids)
@@ -416,17 +432,7 @@ class EBT_NLP(LightningModule):
             else:
                 true_embeddings = self.vocab_to_embed(true_token_one_hot)
 
-        all_true_embeddings = torch.cat((real_embeddings_input, true_embeddings), dim=1)
-
         true_pred_tokens = true_token_logits if self.hparams.discrete_contrastive_loss_true_logit_val != 0 else true_token_one_hot
-        real_energies = self.transformer(
-            all_true_embeddings,
-            start_pos=0,
-            mcmc_step=self.hparams.mcmc_num_steps - 1,
-            real_token_ids=input_ids,
-            predicted_tokens=true_pred_tokens,
-        ) # NOTE if want to use this maybe check in better detail what ired does
-        real_energies = real_energies.reshape(-1, 1) # BS, 1
         if recompute_fake_energy:
             if fake_pred_tokens is None:
                 raise ValueError("recompute_fake_energy=True requires fake_pred_tokens.")
@@ -444,16 +450,52 @@ class EBT_NLP(LightningModule):
                 fake_model_tokens = fake_pred_tokens
                 fake_embeddings = self.vocab_to_embed(fake_pred_tokens)
 
-            all_fake_embeddings = torch.cat((real_embeddings_input, fake_embeddings), dim=1)
-            fake_energies = self.transformer(
-                all_fake_embeddings,
+            if combine_recomputed_energies:
+                # Used by first_order_cd_v2: one larger transformer call avoids
+                # two separate ZeRO-3/FSDP parameter materialization cycles.
+                all_true_embeddings = torch.cat((real_embeddings_input, true_embeddings), dim=1)
+                all_fake_embeddings = torch.cat((real_embeddings_input, fake_embeddings), dim=1)
+                combined_embeddings = torch.cat((all_true_embeddings, all_fake_embeddings), dim=0)
+                combined_input_ids = torch.cat((input_ids, input_ids), dim=0)
+                combined_pred_tokens = torch.cat((true_pred_tokens, fake_model_tokens), dim=0)
+                combined_energies = self.transformer(
+                    combined_embeddings,
+                    start_pos=0,
+                    mcmc_step=self.hparams.mcmc_num_steps - 1,
+                    real_token_ids=combined_input_ids,
+                    predicted_tokens=combined_pred_tokens,
+                ).reshape(2, batch_size * seq_length, 1)
+                real_energies = combined_energies[0]
+                fake_energies = combined_energies[1]
+            else:
+                all_true_embeddings = torch.cat((real_embeddings_input, true_embeddings), dim=1)
+                real_energies = self.transformer(
+                    all_true_embeddings,
+                    start_pos=0,
+                    mcmc_step=self.hparams.mcmc_num_steps - 1,
+                    real_token_ids=input_ids,
+                    predicted_tokens=true_pred_tokens,
+                ) # NOTE if want to use this maybe check in better detail what ired does
+                real_energies = real_energies.reshape(-1, 1) # BS, 1
+                all_fake_embeddings = torch.cat((real_embeddings_input, fake_embeddings), dim=1)
+                fake_energies = self.transformer(
+                    all_fake_embeddings,
+                    start_pos=0,
+                    mcmc_step=self.hparams.mcmc_num_steps - 1,
+                    real_token_ids=input_ids,
+                    predicted_tokens=fake_model_tokens,
+                )
+                fake_energies = fake_energies.reshape(-1, 1)
+        else:
+            all_true_embeddings = torch.cat((real_embeddings_input, true_embeddings), dim=1)
+            real_energies = self.transformer(
+                all_true_embeddings,
                 start_pos=0,
                 mcmc_step=self.hparams.mcmc_num_steps - 1,
                 real_token_ids=input_ids,
-                predicted_tokens=fake_model_tokens,
-            )
-            fake_energies = fake_energies.reshape(-1, 1)
-        else:
+                predicted_tokens=true_pred_tokens,
+            ) # NOTE if want to use this maybe check in better detail what ired does
+            real_energies = real_energies.reshape(-1, 1) # BS, 1
             fake_energies = predicted_energies[-1] # B*S, 1
         energy_stack = torch.cat([real_energies, fake_energies], dim=1)
         energy_targets = torch.zeros(real_energies.shape[0], dtype=torch.long, device=fake_energies.device)

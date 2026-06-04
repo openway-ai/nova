@@ -519,12 +519,14 @@ if __name__ == '__main__':
     parser.add_argument("--no_mcmc_detach", help="dont detach between mcmc steps, probably need to use for S2 models but can increase instability due to longer gradient computation graphs", action="store_true", default=False)
 
     parser.add_argument("--mcmc_gradient_mode", type=str, default="second_order",
-        choices=["second_order", "first_order_debug", "first_order_cd"],
+        choices=["second_order", "first_order_debug", "first_order_cd", "first_order_cd_v2"],
         help=(
             "Controls whether MCMC refinement participates in higher-order autograd. "
             "second_order preserves the current EBT objective. first_order_debug forces "
             "autograd.grad(create_graph=False) for isolation only. first_order_cd uses "
-            "detached MCMC samples with a first-order contrastive energy surrogate."
+            "detached MCMC samples with a first-order contrastive energy surrogate. "
+            "first_order_cd_v2 keeps the same surrogate but drops sampler graph refs and "
+            "recomputes positive/negative energies in one transformer pass."
         ))
 
     parser.add_argument("--first_order_cd_loss_coeff", type=float, default=1.0,
@@ -677,6 +679,10 @@ if __name__ == '__main__':
         help="[FSDP2 MVP] Disable torch.compile because EBT MCMC uses create_graph=True.")
     parser.add_argument("--fsdp_allow_muon_adamw", action="store_true", default=False,
         help="[FSDP2 MVP] Opt in to experimental MuonAdamW under FSDP2; default falls back to layered AdamW.")
+    parser.add_argument("--fsdp_muon_dtensor_policy", type=str, default="adamw",
+        choices=["adamw", "error"],
+        help="[FSDP2 MuonAdamW] DTensor matrix params cannot use Muon's shape-stacked update. "
+             "'adamw' routes them through a DTensor-safe AdamW branch; 'error' fails fast.")
     parser.add_argument("--fsdp_first_order_mcmc_debug", action="store_true", default=False,
         help="[FSDP2 DEBUG] Force MCMC autograd.grad(create_graph=False) under FSDP2 to isolate second-order/FSDP interactions. Not equivalent EBT training.")
 
@@ -688,6 +694,13 @@ if __name__ == '__main__':
         help="[DeepSpeed ZeRO] Enable optimizer-state CPU offload for ZeRO-1/2.")
     parser.add_argument("--zero_cpu_offload_parameters", action="store_true", default=False,
         help="[DeepSpeed ZeRO] Reserved for ZeRO-3. Ignored for ZeRO-1/2.")
+    parser.add_argument("--zero3_param_dtype", type=str, default="fp32",
+        choices=["fp32", "bf16"],
+        help=(
+            "[DeepSpeed ZeRO-3] Force a uniform floating parameter dtype before "
+            "DeepSpeed initialization. ZeRO-3 defragmentation requires uniform "
+            "trainable parameter partitions; default fp32 matches bf16-mixed training."
+        ))
     parser.add_argument("--zero_allgather_bucket_size", type=int, default=0,
         help="[DeepSpeed ZeRO] Optional allgather_bucket_size. 0 lets Lightning/DeepSpeed choose.")
     parser.add_argument("--zero_reduce_bucket_size", type=int, default=0,
@@ -701,7 +714,21 @@ if __name__ == '__main__':
     parser.add_argument("--zero_allow_compile", action="store_true", default=False,
         help="[DeepSpeed ZeRO] Opt in to torch.compile under ZeRO. Default disables compile because EBT MCMC uses create_graph=True.")
     parser.add_argument("--zero_allow_muon_adamw", action="store_true", default=False,
-        help="[DeepSpeed ZeRO] Opt in to experimental MuonAdamW under ZeRO; default falls back to layered AdamW.")
+        help="[DeepSpeed ZeRO] Deprecated compatibility flag. MuonAdamW is not supported under ZeRO-1/2/3 because DeepSpeed flattens/partitions optimizer params; use --zero_muon_policy instead.")
+    parser.add_argument("--zero_muon_policy", type=str, default="adamw",
+        choices=["adamw", "error"],
+        help=(
+            "[DeepSpeed ZeRO] What to do if --optimizer muon_adamw is requested. "
+            "Default 'adamw' falls back to layered AdamW because ZeRO passes flattened/"
+            "partitioned tensors to the base optimizer, while Muon requires full 2D matrices. "
+            "'error' fails fast."
+        ))
+    parser.add_argument("--zero3_muon_policy", type=str, default="adamw",
+        choices=["adamw", "error"],
+        help=(
+            "[DeepSpeed ZeRO-3] Deprecated alias for --zero_muon_policy. "
+            "Kept for older scripts."
+        ))
 
 
     #TRAINING#########################################################
