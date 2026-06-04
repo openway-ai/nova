@@ -109,10 +109,18 @@ def prepare_fsdp2_args(args) -> None:
     if getattr(args, "optimizer", "adamw") == "muon_adamw" and not getattr(args, "fsdp_allow_muon_adamw", False):
         _warn(
             "MuonAdamW is not enabled for FSDP2 MVP because its shape-stacked parameter groups "
-            "need DTensor validation. Falling back to layered AdamW param groups."
+            "cannot update DTensor parameters directly. Falling back to layered AdamW param groups. "
+            "Set --fsdp_allow_muon_adamw to enable the guarded partial-Muon path: regular Tensor "
+            "matrix params use Muon, DTensor matrix params follow --fsdp_muon_dtensor_policy."
         )
         args.optimizer = "adamw"
         args.layered_lr = True
+    elif getattr(args, "optimizer", "adamw") == "muon_adamw":
+        _warn(
+            "MuonAdamW enabled under FSDP2. DTensor matrix parameters are not sent through Muon's "
+            "shape-stacked update; they follow fsdp_muon_dtensor_policy. Use fsdp_wrap_policy=none "
+            "only for diagnosis if you need every transformer matrix to use Muon."
+        )
 
     # Native composable FSDP2 is already distributed. In torchrun mode, each
     # process should run a single-device Lightning trainer instead of being

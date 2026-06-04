@@ -24,6 +24,8 @@ import sys
 import types
 from typing import Any
 
+import torch
+
 
 def _warn(message: str) -> None:
     print(f"[train_engine=deepspeed_zero] WARNING: {message}", flush=True)
@@ -116,7 +118,7 @@ def _make_openebm_deepspeed_strategy(base_cls):
                     f"is not supported for `{self.__class__.__name__}` as `CheckpointIO` is not used."
                 )
 
-            client_state = {k: v for k, v in checkpoint.items() if k not in {"state_dict", "optimizer_states"}}
+            client_state = _select_deepspeed_client_state(checkpoint)
             client_state = _sanitize_deepspeed_client_state(client_state)
             self.deepspeed_engine.save_checkpoint(
                 filepath,
@@ -128,6 +130,35 @@ def _make_openebm_deepspeed_strategy(base_cls):
     OpenEBMDeepSpeedStrategy.__name__ = "OpenEBMDeepSpeedStrategy"
     OpenEBMDeepSpeedStrategy.__qualname__ = "OpenEBMDeepSpeedStrategy"
     return OpenEBMDeepSpeedStrategy
+
+
+def _select_deepspeed_client_state(checkpoint: dict) -> dict:
+    """Keep DeepSpeed client_state focused on serializable resume metadata.
+
+    Lightning's full checkpoint dict can contain callback/loop objects that point
+    back to the DeepSpeed engine or module. The local DeepSpeed checkout attaches
+    a nested forward hook closure to modules, and that closure cannot be pickled
+    by ``torch.save`` during ``DeepSpeedEngine.save_checkpoint``. DeepSpeed
+    already saves model and optimizer shards separately, so the client_state only
+    needs lightweight trainer metadata plus OpenEBM's dataloader/RNG resume
+    payloads.
+    """
+    allowed_keys = {
+        "epoch",
+        "global_step",
+        "pytorch-lightning_version",
+        "loops",
+        "callbacks",
+        "lr_schedulers",
+        "hparams_name",
+        "hyper_parameters",
+        "datamodule_hparams_name",
+        "datamodule_hyper_parameters",
+        "dataloader_state_dict",
+        "dataloader_state_dict_by_rank",
+        "rng_states_by_rank",
+    }
+    return {key: checkpoint[key] for key in allowed_keys if key in checkpoint}
 
 
 def _is_pickleable(value: Any) -> bool:
@@ -319,7 +350,7 @@ def _load_zero_config(path: str) -> dict[str, Any]:
 def _filter_strategy_kwargs(strategy_cls, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Drop kwargs not accepted by the installed Lightning version."""
     try:
-        signature = inspect.signature(strategy_cls)
+        signature = inspect.signature(getattr(strategy_cls, "__init__", strategy_cls))
     except (TypeError, ValueError):
         return kwargs
 
@@ -335,6 +366,37 @@ def _filter_strategy_kwargs(strategy_cls, kwargs: dict[str, Any]) -> dict[str, A
             f"{dropped}; dropping them. Check the runtime Lightning version if this is unexpected."
         )
     return {key: value for key, value in kwargs.items() if key in accepted}
+
+
+def _build_zero_config(args, stage: int) -> dict[str, Any]:
+    """Build an explicit DeepSpeed config so Lightning cannot infer the wrong ZeRO stage."""
+    zero_config: dict[str, Any] = {
+        "stage": stage,
+        "contiguous_gradients": bool(getattr(args, "zero_contiguous_gradients", False)),
+        "overlap_comm": True,
+        "reduce_scatter": True,
+        "allgather_partitions": True,
+    }
+    if int(getattr(args, "zero_allgather_bucket_size", 0) or 0) > 0:
+        zero_config["allgather_bucket_size"] = int(args.zero_allgather_bucket_size)
+    if int(getattr(args, "zero_reduce_bucket_size", 0) or 0) > 0:
+        zero_config["reduce_bucket_size"] = int(args.zero_reduce_bucket_size)
+    if getattr(args, "zero_cpu_offload_optimizer", False):
+        zero_config["offload_optimizer"] = {"device": "cpu"}
+    if stage == 3 and getattr(args, "zero_cpu_offload_parameters", False):
+        zero_config["offload_param"] = {"device": "cpu"}
+
+    config: dict[str, Any] = {
+        "zero_allow_untested_optimizer": True,
+        "zero_optimization": zero_config,
+    }
+    precision = getattr(args, "float_precision", "32-true")
+    if precision in {"bf16-mixed", "bf16", "bf16-true"}:
+        config["bf16"] = {"enabled": True}
+        config["fp16"] = {"enabled": False}
+    elif precision in {"16-mixed", "16-true", "fp16"}:
+        config["fp16"] = {"enabled": True}
+    return config
 
 
 def _build_deepspeed_strategy(args, stage: int):
@@ -356,21 +418,28 @@ def _build_deepspeed_strategy(args, stage: int):
                 f"contains zero_optimization.stage={configured_stage}."
             )
         config["zero_optimization"]["stage"] = stage
+        if getattr(args, "float_precision", "32-true") in {"bf16-mixed", "bf16", "bf16-true"}:
+            config.setdefault("bf16", {})["enabled"] = True
+            config.setdefault("fp16", {})["enabled"] = False
         kwargs = {"config": config}
     else:
-        kwargs = {
-            "stage": stage,
-            "offload_optimizer": getattr(args, "zero_cpu_offload_optimizer", False),
-            "offload_parameters": getattr(args, "zero_cpu_offload_parameters", False) if stage == 3 else False,
-        }
-        if int(getattr(args, "zero_allgather_bucket_size", 0) or 0) > 0:
-            kwargs["allgather_bucket_size"] = int(args.zero_allgather_bucket_size)
-        if int(getattr(args, "zero_reduce_bucket_size", 0) or 0) > 0:
-            kwargs["reduce_bucket_size"] = int(args.zero_reduce_bucket_size)
-        if getattr(args, "zero_contiguous_gradients", False):
-            kwargs["contiguous_gradients"] = True
+        kwargs = {"config": _build_zero_config(args, stage)}
 
     kwargs = _filter_strategy_kwargs(strategy_cls, kwargs)
+    config = kwargs.get("config")
+    if isinstance(config, dict):
+        configured_stage = config.get("zero_optimization", {}).get("stage")
+        if int(configured_stage) != stage:
+            raise RuntimeError(
+                f"Internal DeepSpeed config error: requested ZeRO stage {stage}, "
+                f"but strategy config has stage={configured_stage}."
+            )
+        print(
+            f"[train_engine=zero-{stage}] DeepSpeed config stage={configured_stage}, "
+            f"bf16={config.get('bf16', {}).get('enabled', False)}, "
+            f"fp16={config.get('fp16', {}).get('enabled', False)}",
+            flush=True,
+        )
     return strategy_cls(**kwargs)
 
 
@@ -380,16 +449,17 @@ def prepare_deepspeed_zero_args(args, engine: str) -> None:
     args.train_engine = engine
 
     mcmc_gradient_mode = getattr(args, "mcmc_gradient_mode", "second_order")
-    if stage == 3 and mcmc_gradient_mode != "first_order_cd":
+    if stage == 3 and mcmc_gradient_mode not in {"first_order_cd", "first_order_cd_v2"}:
         raise NotImplementedError(
             "train_engine=zero-3 shards model parameters and is only enabled with "
-            "--mcmc_gradient_mode first_order_cd in this phase. Use zero-1/zero-2 "
-            "for exact second-order EBT training."
+            "--mcmc_gradient_mode first_order_cd/first_order_cd_v2 in this phase. "
+            "Use zero-1/zero-2 for exact second-order EBT training."
         )
     if stage == 3:
         _warn(
-            "Enabling experimental ZeRO-3 with first_order_cd. Parameters are sharded, "
-            "so exact second-order MCMC remains unsupported on this path."
+            f"Enabling experimental ZeRO-3 with {mcmc_gradient_mode}. Parameters are sharded, "
+            "so exact second-order MCMC remains unsupported on this path. "
+            "first_order_cd_v2 is recommended for lower sampler graph retention."
         )
 
     _import_deepspeed_strategy._local_repo = getattr(args, "deepspeed_repo_path", "")
@@ -409,12 +479,38 @@ def prepare_deepspeed_zero_args(args, engine: str) -> None:
         _warn("Forcing truncate_mcmc=True to reduce retained high-order graph memory under ZeRO.")
         args.truncate_mcmc = True
 
-    if getattr(args, "optimizer", "adamw") == "muon_adamw" and not getattr(args, "zero_allow_muon_adamw", False):
-        _warn(
-            "MuonAdamW is not enabled for DeepSpeed ZeRO-1/2 by default because its custom "
-            "optimizer state layout has not been validated with ZeRO partitioning. "
-            "Falling back to layered AdamW param groups."
-        )
+    if getattr(args, "optimizer", "adamw") == "muon_adamw":
+        zero_muon_policy = getattr(args, "zero_muon_policy", None)
+        if zero_muon_policy is None:
+            zero_muon_policy = getattr(args, "zero3_muon_policy", "adamw") if stage == 3 else "adamw"
+        if getattr(args, "zero_allow_muon_adamw", False):
+            _warn(
+                "--zero_allow_muon_adamw is deprecated and ignored. DeepSpeed ZeRO "
+                "flattens or partitions optimizer parameters before calling the base "
+                "optimizer, which breaks Muon's full-matrix update."
+            )
+        if zero_muon_policy == "error":
+            raise NotImplementedError(
+                f"MuonAdamW is not supported with train_engine=zero-{stage}. DeepSpeed ZeRO "
+                "passes flattened/partitioned optimizer tensors to the base optimizer, while "
+                "MuonAdamW expects each Muon group parameter to be a full 2D matrix for "
+                "orthogonalization. Use train_engine=lightning_ddp for Muon, or let ZeRO "
+                "fall back to layered AdamW with --zero_muon_policy adamw."
+            )
+        if zero_muon_policy != "adamw":
+            raise ValueError(f"Unsupported zero_muon_policy={zero_muon_policy!r}")
+        if stage in {1, 2}:
+            _warn(
+                "MuonAdamW requested with ZeRO-1/2, but DeepSpeed's ZeRO optimizer "
+                "calls the base optimizer on flattened partition tensors. Falling back "
+                "to layered AdamW to avoid Muon shape errors."
+            )
+        else:
+            _warn(
+                "MuonAdamW requested with ZeRO-3, but ZeRO-3 partitions parameters and "
+                "Muon's matrix orthogonalization needs full regular 2D tensors. Falling "
+                "back to layered AdamW."
+            )
         args.optimizer = "adamw"
         args.layered_lr = True
 
@@ -434,6 +530,45 @@ def prepare_deepspeed_zero_args(args, engine: str) -> None:
     args.distributed_strategy = _build_deepspeed_strategy(args, stage)
     print(
         f"[train_engine={engine}] Using Lightning DeepSpeedStrategy ZeRO stage {stage}; "
-        "parameters remain replicated for exact second-order EBT compatibility.",
+        + (
+            "parameters are partitioned, so only first-order/surrogate MCMC is enabled."
+            if stage == 3
+            else "parameters remain replicated for exact second-order EBT compatibility."
+        ),
+        flush=True,
+    )
+
+
+def apply_deepspeed_zero_model_policy(model_trainer, args, engine: str) -> None:
+    """Apply model-side ZeRO policies before Lightning hands the module to DeepSpeed."""
+    stage = _zero_stage(engine)
+    model_trainer._openebm_train_engine = engine
+    if stage != 3:
+        return
+
+    requested_dtype = getattr(args, "zero3_param_dtype", "fp32")
+    target_dtype = torch.float32 if requested_dtype == "fp32" else torch.bfloat16
+    dtype_counts_before: dict[str, int] = {}
+    converted = 0
+    skipped = 0
+
+    for _name, param in model_trainer.named_parameters():
+        if not param.is_floating_point():
+            skipped += 1
+            continue
+        dtype_counts_before[str(param.dtype)] = dtype_counts_before.get(str(param.dtype), 0) + param.numel()
+        if param.dtype != target_dtype:
+            param.data = param.data.to(dtype=target_dtype)
+            if param.grad is not None:
+                param.grad = param.grad.to(dtype=target_dtype)
+            converted += 1
+
+    # Keep the EBT step-size scalar numerically stable unless the user explicitly
+    # requests true bf16 ZeRO-3 params. For the common bf16-mixed path, all model
+    # params are fp32 and DeepSpeed/autocast handles bf16 compute.
+    print(
+        f"[train_engine={engine}] ZeRO-3 uniform parameter dtype policy: "
+        f"target={target_dtype}, converted_params={converted}, skipped_non_float={skipped}, "
+        f"before={dtype_counts_before}",
         flush=True,
     )

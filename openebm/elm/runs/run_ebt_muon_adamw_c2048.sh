@@ -26,8 +26,9 @@
 #SBATCH --output=logs/slurm/nlp/ebt-d26-stable_%A-%a.log
 
 ### 基础配置 ###
-# RUN_PREFIX 用于 exp_id 生成（如需手动指定 EXP_ID，设置 EXP_ID 环境变量）
-RUN_PREFIX="${RUN_PREFIX:-ebt-d26-ctx2048-ve}"
+# EXP_ID 未显式指定时会根据运行时关键配置自动生成。
+# 可选设置 RUN_PREFIX 覆盖自动命名的前缀；设置 EXP_ID 可完全手动指定目录名。
+RUN_PREFIX="${RUN_PREFIX:-}"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
@@ -48,7 +49,9 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export WANDB_MODE="offline"
 
 mkdir -p logs/slurm/nlp/
-module purge
+if command -v module >/dev/null 2>&1; then
+    module purge
+fi
 
 ################################################################################
 # EBT 核心超参数 (严格遵循官方建议)
@@ -192,6 +195,7 @@ BETA2=0.95
 
 # 梯度裁剪: 标准设置
 GRADIENT_CLIP_VAL=1.0
+FLOAT_PRECISION="${FLOAT_PRECISION:-32-true}"
 
 ################################################################################
 # 验证与数据加载配置
@@ -305,11 +309,12 @@ if [ "${TRAIN_ENGINE}" = "fsdp2" ]; then
 --fsdp_state_dict_type ${FSDP_STATE_DICT_TYPE:-sharded} \
 --fsdp_wrap_policy ${FSDP_WRAP_POLICY:-transformer_block} \
 --fsdp_reshard_after_forward ${FSDP_RESHARD_AFTER_FORWARD:-false} \
+--fsdp_muon_dtensor_policy ${FSDP_MUON_DTENSOR_POLICY:-adamw} \
 --fsdp_force_truncate_mcmc"
     if [ "${FSDP_CPU_OFFLOAD:-0}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_cpu_offload"
     fi
-    if [ "${FSDP_ALLOW_MUON_ADAMW:-0}" = "1" ]; then
+    if [ "${FSDP_ALLOW_MUON_ADAMW:-1}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_allow_muon_adamw"
     fi
     if [ "${FSDP_FIRST_ORDER_MCMC_DEBUG:-0}" = "1" ]; then
@@ -334,6 +339,9 @@ elif [ "${TRAIN_ENGINE}" = "zero-1" ] || [ "${TRAIN_ENGINE}" = "zero-2" ] || [ "
     if [ "${ZERO_CPU_OFFLOAD_PARAMETERS:-0}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --zero_cpu_offload_parameters"
     fi
+    if [ "${TRAIN_ENGINE}" = "zero-3" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero3" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero3_param_dtype ${ZERO3_PARAM_DTYPE:-fp32}"
+    fi
     if [ "${ZERO_CONTIGUOUS_GRADIENTS:-0}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --zero_contiguous_gradients"
     fi
@@ -346,8 +354,11 @@ elif [ "${TRAIN_ENGINE}" = "zero-1" ] || [ "${TRAIN_ENGINE}" = "zero-2" ] || [ "
     if [ "${ZERO_ALLOW_COMPILE:-0}" = "1" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allow_compile"
     fi
-    if [ "${ZERO_ALLOW_MUON_ADAMW:-0}" = "1" ]; then
-        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allow_muon_adamw"
+    if [ -n "${ZERO_MUON_POLICY:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_muon_policy ${ZERO_MUON_POLICY}"
+    fi
+    if [ -n "${ZERO3_MUON_POLICY:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero3_muon_policy ${ZERO3_MUON_POLICY}"
     fi
     if [ "${ZERO_ALLGATHER_BUCKET_SIZE:-0}" != "0" ]; then
         ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allgather_bucket_size ${ZERO_ALLGATHER_BUCKET_SIZE}"
@@ -383,6 +394,74 @@ WANDB_FLAGS=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/utils/exp_layout.sh"
 
+short_train_engine_tag() {
+    case "${TRAIN_ENGINE}" in
+        lightning_ddp) echo "ddp" ;;
+        fsdp2) echo "fsdp2" ;;
+        zero-1|deepspeed-zero1) echo "z1" ;;
+        zero-2|deepspeed-zero2) echo "z2" ;;
+        zero-3|deepspeed-zero3) echo "z3" ;;
+        *) echo "${TRAIN_ENGINE}" | tr '_' '-' ;;
+    esac
+}
+
+short_mcmc_gradient_tag() {
+    case "${MCMC_GRADIENT_MODE:-second_order}" in
+        second_order) echo "2nd" ;;
+        first_order_cd) echo "foCD" ;;
+        first_order_cd_v2) echo "foCDv2" ;;
+        first_order_debug) echo "foDbg" ;;
+        *) echo "${MCMC_GRADIENT_MODE}" | tr '_' '-' ;;
+    esac
+}
+
+short_precision_tag() {
+    case "${FLOAT_PRECISION}" in
+        32-true|32|fp32) echo "fp32" ;;
+        bf16-mixed|bf16) echo "bf16" ;;
+        16-mixed|fp16) echo "fp16" ;;
+        *) echo "${FLOAT_PRECISION}" | tr '_' '-' ;;
+    esac
+}
+
+short_fsdp_wrap_tag() {
+    if [ "${TRAIN_ENGINE}" != "fsdp2" ]; then
+        return 0
+    fi
+    case "${FSDP_WRAP_POLICY:-transformer_block}" in
+        transformer_block) echo "-wrapblk" ;;
+        none) echo "-wrapnone" ;;
+        *) echo "-wrap$(echo "${FSDP_WRAP_POLICY}" | tr '_' '-')" ;;
+    esac
+}
+
+short_optimizer_tag() {
+    local opt_tag="adamw"
+    if echo "${OPTION_FLAGS}" | grep -q -- "--optimizer muon_adamw"; then
+        opt_tag="muon"
+    fi
+
+    if [ "${TRAIN_ENGINE}" = "fsdp2" ] && [ "${FSDP_ALLOW_MUON_ADAMW:-1}" != "1" ]; then
+        opt_tag="adamw"
+    elif { [ "${TRAIN_ENGINE}" = "zero-1" ] || [ "${TRAIN_ENGINE}" = "zero-2" ] || [ "${TRAIN_ENGINE}" = "zero-3" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero1" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero2" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero3" ]; }; then
+        opt_tag="adamw"
+    fi
+    echo "${opt_tag}"
+}
+
+if [ -z "${EXP_ID:-}" ]; then
+    RUN_ENGINE_TAG="$(short_train_engine_tag)"
+    RUN_MCMC_GRAD_TAG="$(short_mcmc_gradient_tag)"
+    RUN_OPT_TAG="$(short_optimizer_tag)"
+    RUN_PRECISION_TAG="$(short_precision_tag)"
+    RUN_FSDP_WRAP_TAG="$(short_fsdp_wrap_tag)"
+    RUN_TS="$(_exp_timestamp)"
+    RUN_BASE_PREFIX="${RUN_PREFIX:-${MODEL_SIZE}-c${CONTEXT_LENGTH}}"
+    EXP_ID="${RUN_BASE_PREFIX}-${RUN_ENGINE_TAG}-${RUN_MCMC_GRAD_TAG}-${RUN_OPT_TAG}-${RUN_PRECISION_TAG}${RUN_FSDP_WRAP_TAG}-b${DEVICE_BATCH_SIZE}x${GRAD_ACCUM}-m${MCMC_NUM_STEPS}-${RUN_TS}"
+    [ -n "${EXP_TAG:-}" ] && EXP_ID="${EXP_ID}-${EXP_TAG}"
+    export EXP_ID
+fi
+
 exp_init_base_train "$0" "muon_adamw"
 export RUN_NAME="${EXP_ID}"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -402,8 +481,12 @@ exp_save_hparams "${EXP_DIR}/base_train" \
     "target_total_tokens=${TARGET_TOTAL_TOKENS}" \
     "mcmc_step_size=${MCMC_STEP_SIZE}" \
     "mcmc_lr_multiplier=${MCMC_STEP_SIZE_LR_MULTIPLIER}" \
+    "mcmc_gradient_mode=${MCMC_GRADIENT_MODE:-second_order}" \
+    "train_engine=${TRAIN_ENGINE}" \
+    "float_precision=${FLOAT_PRECISION}" \
+    "fsdp_wrap_policy=${FSDP_WRAP_POLICY:-transformer_block}" \
     "use_mcmc_time_embed=${USE_MCMC_TIME_EMBED}" \
-    "optimizer=muon_adamw"
+    "optimizer=$(short_optimizer_tag)"
 
 LOG_FILE="${EXP_LOG_FILE}"
 
@@ -486,11 +569,11 @@ echo ""
 echo -e "${CYAN}▶ 学习率配置${NC}"
 print_separator "─" 60
 print_kv "Peak LR (Base)" "${PEAK_LR}"
-local alpha_lr=$(awk "BEGIN {printf \"%.4f\", ${PEAK_LR} * ${MCMC_STEP_SIZE_LR_MULTIPLIER}}")
+alpha_lr=$(awk "BEGIN {printf \"%.4f\", ${PEAK_LR} * ${MCMC_STEP_SIZE_LR_MULTIPLIER}}")
 print_kv "Alpha Effective LR" "${BOLD}${alpha_lr}${NC} (=${PEAK_LR}×${MCMC_STEP_SIZE_LR_MULTIPLIER})"
 print_kv "Warmup Steps" "${WARM_UP_STEPS} (5%)"
 print_kv "Min LR Scale" "${MIN_LR_SCALE}"
-local final_lr=$(awk "BEGIN {printf \"%.8f\", ${PEAK_LR}/${MIN_LR_SCALE}}")
+final_lr=$(awk "BEGIN {printf \"%.8f\", ${PEAK_LR}/${MIN_LR_SCALE}}")
 print_kv "Final LR" "${final_lr}"
 
 echo ""
@@ -518,6 +601,10 @@ print_separator "─" 60
 print_kv "Run Name" "${RUN_NAME}"
 print_kv "Log File" "${LOG_FILE}"
 print_kv "WandB Mode" "${WANDB_MODE}"
+print_kv "Train Engine" "${TRAIN_ENGINE}"
+print_kv "MCMC Gradient Mode" "${MCMC_GRADIENT_MODE:-second_order}"
+print_kv "Float Precision" "${FLOAT_PRECISION}"
+print_kv "Effective Optimizer" "$(short_optimizer_tag)"
 
 echo ""
 echo -e "${YELLOW}⚠ 重要说明${NC}"
@@ -527,7 +614,9 @@ echo "  3. Alpha LR 仍由 MCMC_STEP_SIZE_LR_MULTIPLIER × PEAK_LR 控制 (EBT �
 echo "  4. 监控关键指标: train_loss, Alpha_MCMC, Global_LR"
 
 echo ""
-read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
+if [ "${DRY_RUN:-0}" != "1" ]; then
+    read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
+fi
 
 ################################################################################
 # 写入日志头
@@ -591,6 +680,10 @@ Option Flags:             ${OPTION_FLAGS:-"None (Baseline)"}
 MCMC Gradient Flags:      ${MCMC_GRADIENT_FLAGS:-"None (second_order default)"}
 Compile Flags:            ${COMPILE_FLAGS:-"None"}
 Engine Flags:             ${ENGINE_FLAGS:-"None (Lightning/DDP default)"}
+Train Engine:             ${TRAIN_ENGINE}
+MCMC Gradient Mode:       ${MCMC_GRADIENT_MODE:-second_order}
+Float Precision:          ${FLOAT_PRECISION}
+Effective Optimizer:      $(short_optimizer_tag)
 
 ================================================================================
 [训练输出]
@@ -610,6 +703,15 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 echo ""
 print_header "开始训练"
 echo ""
+
+if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo "[DRY_RUN] Skipping torchrun launch."
+    echo "[DRY_RUN] Engine Flags: ${ENGINE_FLAGS:-None}"
+    echo "[DRY_RUN] MCMC Gradient Flags: ${MCMC_GRADIENT_FLAGS:-None}"
+    echo "[DRY_RUN] Float Precision: ${FLOAT_PRECISION}"
+    echo "[DRY_RUN] Effective Optimizer: $(short_optimizer_tag)"
+    exit 0
+fi
 
 set +e
 torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/train.py \
@@ -658,7 +760,7 @@ $([ "$USE_MCMC_TIME_EMBED" = true ] && echo "--use_mcmc_time_embed") \
 --wandb_project 'nlp_pretrain' \
 --log_model_archi \
 --set_matmul_precision "medium" \
---float_precision "32-true" \
+--float_precision "${FLOAT_PRECISION}" \
 --manual_gc_collect_every_n_steps -1 \
 --save_top_k_ckpts ${SAVE_TOP_K} \
 --save_periodic_steps 1000 \
@@ -702,8 +804,8 @@ else
         echo -e "${YELLOW}⚠ 检测到 OOM - 建议减小 DEVICE_BATCH_SIZE${NC}"
     fi
 
-    if grep -q "nan\|NaN\|inf\|Inf" "${LOG_FILE}" 2>/dev/null | head -5; then
-        echo -e "${YELLOW}⚠ 检测到 NaN/Inf - 可能需要进一步降低学习率${NC}"
+    if grep -Eiq "(^|[^[:alnum:]_])nan([^[:alnum:]_]|$)|(train_)?loss:[[:space:]]*(nan|inf)|valid_loss:[[:space:]]*(nan|inf)" "${LOG_FILE}" 2>/dev/null; then
+        echo -e "${YELLOW}⚠ 检测到 loss NaN/Inf - 可能需要进一步降低学习率${NC}"
     fi
 fi
 

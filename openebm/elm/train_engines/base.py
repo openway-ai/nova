@@ -66,7 +66,9 @@ def apply_train_engine(model_trainer, args) -> None:
         apply_fsdp2_wrapping(model_trainer, args)
         return
     if engine in {"zero-1", "zero-2", "zero-3"}:
-        model_trainer._openebm_train_engine = engine
+        from openebm.elm.train_engines.deepspeed_zero import apply_deepspeed_zero_model_policy
+
+        apply_deepspeed_zero_model_policy(model_trainer, args, engine)
         return
     raise NotImplementedError(
         f"train_engine={engine!r} is reserved for future work. "

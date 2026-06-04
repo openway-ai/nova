@@ -91,6 +91,7 @@ class ModelTrainer(LightningModule):
         # Training throughput tracking
         self._train_step_start_time = None
         self._train_start_time = None  # wall-clock start for ETA
+        self._last_cuda_memory_metrics = {}
 
         # Dataloader resume state: 用于从 checkpoint 恢复 dataloader 位置
         self._dataloader_resume_state = None
@@ -310,6 +311,10 @@ class ModelTrainer(LightningModule):
             self._rng_resume_state = None
             print(f"[Exact Resume] RNG states restored for rank {self.global_rank}")
 
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            self._last_cuda_memory_metrics = {}
+
         if self.hparams.debug_unused_parameters: 
             for name, param in self.model.named_parameters():
                 if param.requires_grad and "image_encoder" not in name: # NOTE need to modify this code to exclude specific frozen portions
@@ -430,6 +435,68 @@ class ModelTrainer(LightningModule):
                 continue
             dist.all_reduce(grad, op=dist.ReduceOp.SUM)
             grad.div_(world_size)
+
+    def _collect_cuda_memory_metrics(self):
+        if not torch.cuda.is_available():
+            return {}
+
+        device = torch.cuda.current_device()
+        local_values = {
+            "allocated": torch.cuda.memory_allocated(device) / 1024**3,
+            "reserved": torch.cuda.memory_reserved(device) / 1024**3,
+            "peak_allocated": torch.cuda.max_memory_allocated(device) / 1024**3,
+            "peak_reserved": torch.cuda.max_memory_reserved(device) / 1024**3,
+        }
+        max_values = dict(local_values)
+
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                values_tensor = torch.tensor(
+                    [
+                        local_values["allocated"],
+                        local_values["reserved"],
+                        local_values["peak_allocated"],
+                        local_values["peak_reserved"],
+                    ],
+                    device=torch.device("cuda", device),
+                    dtype=torch.float32,
+                )
+                dist.all_reduce(values_tensor, op=dist.ReduceOp.MAX)
+                max_values = {
+                    "allocated": values_tensor[0].item(),
+                    "reserved": values_tensor[1].item(),
+                    "peak_allocated": values_tensor[2].item(),
+                    "peak_reserved": values_tensor[3].item(),
+                }
+        except Exception:
+            max_values = dict(local_values)
+
+        metrics = {}
+        for key, value in local_values.items():
+            metrics[f"memory/{key}_rank_gb"] = value
+        for key, value in max_values.items():
+            metrics[f"memory/{key}_max_gb"] = value
+        return metrics
+
+    def _is_native_fsdp2_engine(self):
+        return getattr(self.hparams, "train_engine", "lightning_ddp") == "fsdp2"
+
+    def _metric_sync_dist(self):
+        # Native torch FSDP2 already drives model collectives outside Lightning's
+        # distributed strategy. Extra per-step Lightning metric all-gathers can
+        # interleave with FSDP all-gathers and leave ranks waiting on different
+        # collective sequence numbers, so keep FSDP2 metric logging rank-local.
+        return not self._is_native_fsdp2_engine()
+
+    def _is_global_rank_zero(self):
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                return dist.get_rank() == 0
+        except Exception:
+            pass
+        return not hasattr(self, "trainer") or self.trainer is None or self.trainer.is_global_zero
         
     def on_train_batch_end(self, outputs, batch, batch_idx):
         #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
@@ -474,6 +541,15 @@ class ModelTrainer(LightningModule):
         self._train_step_start_time = now
         if self._train_start_time is None:
             self._train_start_time = now
+
+        memory_metrics = self._collect_cuda_memory_metrics()
+        self._last_cuda_memory_metrics = memory_metrics
+        if memory_metrics:
+            self.log_dict(memory_metrics, prog_bar=False, on_step=True, on_epoch=False)
+            self.log("gpu_mem_allocated_gb", memory_metrics["memory/allocated_rank_gb"],
+                     prog_bar=False, on_step=True, on_epoch=False)
+            self.log("gpu_mem_reserved_gb", memory_metrics["memory/reserved_rank_gb"],
+                     prog_bar=False, on_step=True, on_epoch=False)
 
     # def on_train_epoch_end(self): ## not effective for EBT
     #     if self.hparams.optimizer != "adamw": # e.g. for lars need to manually update epoch
@@ -688,7 +764,7 @@ class ModelTrainer(LightningModule):
         self._last_valid_metrics['bpb'] = epoch_bpb
 
         # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
-        if self.logger is not None:
+        if self.logger is not None and self._is_global_rank_zero():
             try:
                 self.logger.experiment.log({'valid_bpb': epoch_bpb}, step=self.global_step)
             except Exception:
@@ -1216,6 +1292,34 @@ class ModelTrainer(LightningModule):
             print("[train_engine=fsdp2] AdamW foreach/fused disabled for DTensor compatibility.")
         return kwargs
 
+    @staticmethod
+    def _adamw_eager_step_param(param, grad, state, group):
+        if not state:
+            state['step'] = 0
+            state['exp_avg'] = torch.zeros_like(param)
+            state['exp_avg_sq'] = torch.zeros_like(param)
+
+        exp_avg = state['exp_avg']
+        exp_avg_sq = state['exp_avg_sq']
+        state['step'] += 1
+
+        lr = group['lr']
+        beta1, beta2 = group['betas']
+        eps = group['eps']
+        weight_decay = group['weight_decay']
+
+        if weight_decay != 0:
+            param.mul_(1 - lr * weight_decay)
+
+        exp_avg.lerp_(grad, 1 - beta1)
+        exp_avg_sq.lerp_(grad.square(), 1 - beta2)
+
+        bias1 = 1 - beta1 ** state['step']
+        bias2 = 1 - beta2 ** state['step']
+        denom = (exp_avg_sq / bias2).sqrt().add_(eps)
+        step_size = lr / bias1
+        param.addcdiv_(exp_avg, denom, value=-step_size)
+
     def get_optimizer(self, optimizer_parameters): # function for once gotten optimizer_parameters to get optimizer, i.e. adamw, lars, etc
         optimizer_parameters = self._split_optimizer_groups_for_fsdp2(optimizer_parameters)
         if self.hparams.optimizer == "lars":
@@ -1368,16 +1472,38 @@ class ModelTrainer(LightningModule):
         ve_embed_params = []
         ve_gate_params = []
         transformer_matrix_params = []
+        transformer_dtensor_matrix_params = []
         transformer_scalar_params = []
+        train_engine = getattr(self.hparams, 'train_engine', 'lightning_ddp')
+        fsdp2_muon_dtensor_policy = getattr(self.hparams, 'fsdp_muon_dtensor_policy', 'adamw')
         for name, param in self.model.transformer.named_parameters():
             if 'value_embeds.' in name:
                 ve_embed_params.append(param)
             elif 've_gate.' in name:
                 ve_gate_params.append(param)
             elif param.ndim >= 2:
-                transformer_matrix_params.append(param)
+                if train_engine == "fsdp2" and self._is_dtensor_parameter(param):
+                    transformer_dtensor_matrix_params.append(param)
+                else:
+                    transformer_matrix_params.append(param)
             else:
                 transformer_scalar_params.append(param)
+
+        if transformer_dtensor_matrix_params:
+            if fsdp2_muon_dtensor_policy == "error":
+                raise RuntimeError(
+                    "FSDP2 MuonAdamW requested, but transformer matrix parameters are DTensors. "
+                    "NanoChat Muon stacks full Tensor parameters and cannot safely update DTensor shards. "
+                    "Use --fsdp_muon_dtensor_policy adamw to route DTensor matrices through a "
+                    "DTensor-safe AdamW branch, or use --fsdp_wrap_policy none for a diagnostic "
+                    "full-Muon run without FSDP2 sharding."
+                )
+            print(
+                "[Muon+AdamW][FSDP2] Routing "
+                f"{len(transformer_dtensor_matrix_params)} DTensor matrix params through eager AdamW; "
+                f"{len(transformer_matrix_params)} regular matrix params remain eligible for Muon.",
+                flush=True,
+            )
 
         # --- 构建 param_groups ---
         param_groups = []
@@ -1415,6 +1541,12 @@ class ModelTrainer(LightningModule):
                 kind='adamw', params=ve_gate_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
+        if transformer_dtensor_matrix_params:
+            param_groups.append(dict(
+                kind='adamw', params=transformer_dtensor_matrix_params,
+                lr=self.hparams.peak_learning_rate, betas=adam_betas, eps=1e-10,
+                weight_decay=self.hparams.weight_decay, adamw_impl='eager_dtensor',
+            ))
 
         # Muon groups: 按 shape 分组 (Muon 要求同组参数 shape 相同用于 stack)
         shape_groups = {}
@@ -1437,6 +1569,23 @@ class ModelTrainer(LightningModule):
         if use_cpu_offload:
             class PLMuonAdamW(MuonAdamW):
                 """MuonAdamW + CPU offload: AdamW 和 Muon 优化器状态均存放在 CPU。"""
+
+                def _step_adamw(self, group):
+                    use_eager = group.get('adamw_impl') == 'eager_dtensor'
+                    if not use_eager:
+                        for p in group['params']:
+                            if p.grad is not None and (
+                                ModelTrainer._is_dtensor_parameter(p) or ModelTrainer._is_dtensor_parameter(p.grad)
+                            ):
+                                use_eager = True
+                                break
+                    if not use_eager:
+                        return super()._step_adamw(group)
+
+                    for p in group['params']:
+                        if p.grad is None:
+                            continue
+                        ModelTrainer._adamw_eager_step_param(p, p.grad, self.state[p], group)
 
                 @torch.no_grad()
                 def step(self, closure=None):
@@ -1503,6 +1652,24 @@ class ModelTrainer(LightningModule):
         else:
             class PLMuonAdamW(MuonAdamW):
                 """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
+
+                def _step_adamw(self, group):
+                    use_eager = group.get('adamw_impl') == 'eager_dtensor'
+                    if not use_eager:
+                        for p in group['params']:
+                            if p.grad is not None and (
+                                ModelTrainer._is_dtensor_parameter(p) or ModelTrainer._is_dtensor_parameter(p.grad)
+                            ):
+                                use_eager = True
+                                break
+                    if not use_eager:
+                        return super()._step_adamw(group)
+
+                    for p in group['params']:
+                        if p.grad is None:
+                            continue
+                        ModelTrainer._adamw_eager_step_param(p, p.grad, self.state[p], group)
+
                 @torch.no_grad()
                 def step(self, closure=None):
                     if closure is not None:
@@ -1521,6 +1688,7 @@ class ModelTrainer(LightningModule):
 
         # --- 日志 ---
         num_muon_params = sum(p.numel() for p in transformer_matrix_params)
+        num_dtensor_adamw_params = sum(p.numel() for p in transformer_dtensor_matrix_params)
         num_ve_params = (
             sum(p.numel() for p in ve_embed_params) +
             sum(p.numel() for p in ve_gate_params)
@@ -1530,6 +1698,7 @@ class ModelTrainer(LightningModule):
             sum(p.numel() for p in embedding_params) +
             sum(p.numel() for p in vocab_to_embed_params) +
             sum(p.numel() for p in transformer_scalar_params) +
+            num_dtensor_adamw_params +
             num_ve_params
         )
         print(f"=" * 80)
@@ -1539,6 +1708,11 @@ class ModelTrainer(LightningModule):
         print(f"  AdamW params: {num_adamw_params:,} ({num_adamw_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
         if num_ve_params > 0:
             print(f"  VE params: {num_ve_params:,} (AdamW, embedding_lr)")
+        if num_dtensor_adamw_params > 0:
+            print(
+                f"  FSDP2 DTensor matrix params: {num_dtensor_adamw_params:,} "
+                "(AdamW eager fallback; Muon requires full regular Tensor params)"
+            )
         print(f"  Muon LR: {muon_lr}, momentum: {muon_momentum}, ns_steps: {muon_ns_steps}, beta2: {muon_beta2}")
         print(f"  Alpha LR: {alpha_lr} (AdamW) [EBT 特有]")
         print(f"  Embedding LR: {embedding_lr} (AdamW)")
@@ -2017,7 +2191,7 @@ class ModelTrainer(LightningModule):
             if phase == "train":
                 # 训练阶段：on_step=True, on_epoch=False
                 # 每个 train step 独立上报，不跨 step 累积。
-                self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True,
+                self.log_dict(scalar_metrics, sync_dist=self._metric_sync_dist(), prog_bar=True,
                               on_step=True, on_epoch=False)
             else:
                 # 验证/测试阶段：on_step=False, on_epoch=True
@@ -2026,7 +2200,7 @@ class ModelTrainer(LightningModule):
                 # 不会跨多次 val_check_interval 累积（不存在"280次val被平均"的问题）。
                 # ModelCheckpoint 在 on_validation_end 查询 epoch-level 指标，
                 # 必须用 on_epoch=True 才能让 valid_loss 出现在 returned metrics 里。
-                self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True,
+                self.log_dict(scalar_metrics, sync_dist=self._metric_sync_dist(), prog_bar=True,
                               on_step=False, on_epoch=True)
 
         # === 增强的调试日志 (仅 train 阶段) ===
@@ -2077,17 +2251,8 @@ class ModelTrainer(LightningModule):
             self.log("step", float(current_step), prog_bar=True, on_step=True, on_epoch=False)
             self.log("progress_pct", progress_pct, prog_bar=False, on_step=True, on_epoch=False)
 
-            # GPU 内存使用 (如果可用)
-            if torch.cuda.is_available():
-                gpu_mem_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-                gpu_mem_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
-                self.log("gpu_mem_allocated_gb", gpu_mem_allocated, prog_bar=False,
-                         on_step=True, on_epoch=False)
-                self.log("gpu_mem_reserved_gb", gpu_mem_reserved, prog_bar=False,
-                         on_step=True, on_epoch=False)
-
             # === 丰富训练日志 (仅 rank 0 打印, 避免 DDP 重复) ===
-            if self.trainer.is_global_zero:
+            if self._is_global_rank_zero():
                 # --- 时间统计 ---
                 dt_ms = (getattr(self, '_last_dt', None) or 0.0) * 1000.0
                 wall_elapsed = 0.0
@@ -2161,6 +2326,16 @@ class ModelTrainer(LightningModule):
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
 
                 # --- 打印 ---
+                memory_metrics = getattr(self, '_last_cuda_memory_metrics', {})
+                mem_str = ""
+                if memory_metrics:
+                    mem_str = (
+                        " | mem: "
+                        f"{memory_metrics.get('memory/allocated_max_gb', 0.0):.2f}/"
+                        f"{memory_metrics.get('memory/reserved_max_gb', 0.0):.2f}/"
+                        f"{memory_metrics.get('memory/peak_allocated_max_gb', 0.0):.2f}GB"
+                    )
+
                 alpha_val_str = ""
                 if self.hparams.mcmc_step_size_learnable:
                     alpha_val = self.model.alpha.detach()
@@ -2176,6 +2351,7 @@ class ModelTrainer(LightningModule):
                     f"mfu: {mfu:.2f} | "
                     f"epoch: {epoch} | "
                     f"total time: {total_min:.2f}m"
+                    f"{mem_str}"
                     f"{eta_str}"
                     f"{alpha_val_str}",
                     flush=True,
