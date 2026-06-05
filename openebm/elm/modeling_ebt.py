@@ -318,11 +318,14 @@ class EBT_NLP(LightningModule):
 
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
+                compute_pred_hidden = return_pred_hiddens
+                if return_pred_hiddens and self.hparams.truncate_mcmc:
+                    compute_pred_hidden = i == (len(mcmc_steps) - 1)
 
                 predicted_tokens, energy_preds, predicted_tokens_for_loss, pred_hidden_step = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
                     langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
-                    real_token_ids=x, compute_pred_hidden=return_pred_hiddens,
+                    real_token_ids=x, compute_pred_hidden=compute_pred_hidden,
                 )
                 predicted_energies.append(energy_preds)
                 predicted_distributions.append(predicted_tokens_for_loss)
@@ -336,6 +339,7 @@ class EBT_NLP(LightningModule):
 
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None, global_step=None):
         no_randomness = False if phase == "train" else True
+        learning = phase == "train"
         predicted_pred_hiddens = None  # set only on TF-head path
         if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
             # all_tokens = x['input_ids'].squeeze(dim=1)
@@ -344,10 +348,10 @@ class EBT_NLP(LightningModule):
             if self.use_tf_head:
                 predicted_distributions, predicted_energies, predicted_pred_hiddens = self(
                     input_ids, return_raw_logits=True, replay_buffer_logits=replay_buffer_logits,
-                    no_randomness=no_randomness, return_pred_hiddens=True,
+                    no_randomness=no_randomness, learning=learning, return_pred_hiddens=True,
                 )
             else:
-                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness)
+                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness, learning=learning)
             # Replay buffer is seeded with MCMC's raw distribution (NOT the TF-head logits) so
             # buffer semantics stay consistent across baseline/TF runs.
             self.replay_buffer.update(all_tokens.detach(), predicted_distributions[-1].detach()) # update using the final predicted distributions
@@ -356,10 +360,10 @@ class EBT_NLP(LightningModule):
             next_token_indices = x[1].squeeze(dim=0)
             if self.use_tf_head:
                 predicted_distributions, predicted_energies, predicted_pred_hiddens = self(
-                    input_ids, return_raw_logits=True, no_randomness=no_randomness, return_pred_hiddens=True,
+                    input_ids, return_raw_logits=True, no_randomness=no_randomness, learning=learning, return_pred_hiddens=True,
                 )
             else:
-                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
+                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness, learning=learning)
 
             # input_ids = x['input_ids'].squeeze(dim=1)[:, :-1]
             # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
@@ -372,7 +376,7 @@ class EBT_NLP(LightningModule):
             # keeps the shared call signature but does not unembed this tensor.
             prev_embed = self.embeddings(input_ids)  # first-layer anchor, [B, S, D]
             predicted_distributions = [
-                self.tf_head(pred_hidden_step, prev_embed)  # [B, S, V]
+                None if pred_hidden_step is None else self.tf_head(pred_hidden_step, prev_embed)  # [B, S, V]
                 for pred_hidden_step in predicted_pred_hiddens
             ]
 
@@ -389,7 +393,26 @@ class EBT_NLP(LightningModule):
 
         reconstruction_loss = 0
         total_mcmc_steps = len(predicted_energies) # in general this equals self.hparams.mcmc_num_steps, isnt in case of rand number
-        for mcmc_step, (predicted_distribution, predicted_energy) in enumerate(zip(predicted_distributions, predicted_energies)):
+        initial_loss = None
+        initial_pred_energies = None
+        final_pred_energies = None
+        final_reconstruction_loss = None
+        ppl_loss = None
+        final_predicted_distribution = None
+        final_label_smoothing = 0.0
+        for mcmc_step, predicted_energy in enumerate(predicted_energies):
+            if mcmc_step == 0:
+                initial_pred_energies = predicted_energy.squeeze().mean().detach()
+            if mcmc_step == (total_mcmc_steps - 1):
+                final_pred_energies = predicted_energy.squeeze().mean().detach()
+
+            predicted_distribution = predicted_distributions[mcmc_step]
+            if predicted_distribution is None:
+                if self.hparams.truncate_mcmc and mcmc_step != (total_mcmc_steps - 1):
+                    continue
+                raise RuntimeError("Missing predicted distribution for a supervised MCMC step.")
+
+            label_smoothing = 0.0
             if self.hparams.soften_target_prob_dist != 0.0:
                 if total_mcmc_steps <= 1:
                     label_smoothing = 0.0
@@ -418,19 +441,25 @@ class EBT_NLP(LightningModule):
                     reconstruction_loss = cce_loss
                     ppl_loss = torch.exp(cce_loss).detach()
                     final_reconstruction_loss = cce_loss.detach()
+                    final_predicted_distribution = predicted_distribution
+                    final_label_smoothing = label_smoothing
             else:
                 reconstruction_loss += cce_loss
                 if mcmc_step == (total_mcmc_steps - 1):
                     ppl_loss = torch.exp(cce_loss).detach()
                     final_reconstruction_loss = cce_loss.detach()
+                    final_predicted_distribution = predicted_distribution
+                    final_label_smoothing = label_smoothing
                     reconstruction_loss = reconstruction_loss / total_mcmc_steps # normalize so is indifferent to number of mcmc steps
                 
             #pure logging things (no function for training)
             if mcmc_step == 0:
                 initial_loss = cce_loss.detach()
-                initial_pred_energies = predicted_energy.squeeze().mean().detach()
-            if mcmc_step == (total_mcmc_steps - 1):
-                final_pred_energies = predicted_energy.squeeze().mean().detach()
+
+        if final_reconstruction_loss is None or ppl_loss is None or final_predicted_distribution is None:
+            raise RuntimeError("No final-step reconstruction loss was computed.")
+        if initial_loss is None:
+            initial_loss = final_reconstruction_loss
         
         initial_final_pred_energies_gap = initial_pred_energies - final_pred_energies
 
@@ -449,10 +478,10 @@ class EBT_NLP(LightningModule):
             # yielding mean_loss × count rather than sum(per_token_loss[valid]).
             # predicted_distribution from the last MCMC step is already (-1, vocab_size).
             if self.hparams.soften_target_prob_dist != 0.0:
-                per_token_ce = F.cross_entropy(predicted_distribution, next_token_indices,
-                                                label_smoothing=label_smoothing, ignore_index=-1, reduction='none')
+                per_token_ce = F.cross_entropy(final_predicted_distribution, next_token_indices,
+                                                label_smoothing=final_label_smoothing, ignore_index=-1, reduction='none')
             else:
-                per_token_ce = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1, reduction='none')
+                per_token_ce = F.nll_loss(final_predicted_distribution, next_token_indices, ignore_index=-1, reduction='none')
             bpb_loss, bpb_nats, bpb_bytes = calculate_bpb_score(next_token_indices, per_token_ce.detach(), token_bytes)
         else:
             bpb_loss = 0
