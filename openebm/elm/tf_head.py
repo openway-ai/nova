@@ -1,13 +1,14 @@
 """TF (teacher-forced, Gemma-drafter-style) head modules for EBT.
 
 Decoupled from the blockwise/MTP machinery in `nova/ebt/`. Each head takes
-`(pred_hidden, prev_token_embed) -> logits` and is used in plain (K=1) NTP
-on top of EBT's MCMC pred_hidden output. See `TF_HEAD_ARCHITECTURE.md` §9.
+`(pred_hidden_or_state, prev_token_embed) -> logits` and is used in plain
+(K=1) NTP on top of EBT's MCMC output. See `TF_HEAD_ARCHITECTURE.md` §9.
 
-Three variants exposed via `build_tf_head(hparams)`:
+Variants exposed via `build_tf_head(hparams)`:
   - "linear":         Linear(2D, D) -> Linear(D, V)
   - "direct_unembed": Linear(D, V) over post-update trunk pred_hidden
   - "pre_update_hidden_unembed": Linear(D, V) over energy-forward trunk pred_hidden
+  - "post_update_state_unembed": Linear over post-update free-embedding state
   - "transformer":    Linear(2D, D) -> L x causal AR block -> RMSNorm -> Linear(D, V)
 
 The transformer variant matches Gemma-drafter's "concat-then-project + L tiny
@@ -87,11 +88,13 @@ class TFLinearHead(nn.Module):
 
 
 class TFDirectUnembedHead(nn.Module):
-    """Test2 head: project the trunk last-layer candidate hidden to vocab logits.
+    """Project a D-dim TF signal to vocab logits.
 
     `prev_token_embed` is the first-layer embedding from self.embeddings(input_ids)
     and is intentionally ignored here. It stays in the signature only to match the
-    shared TF-head interface used by the linear/transformer heads.
+    shared TF-head interface used by the linear/transformer heads. The D-dim input
+    can be a trunk last-layer hidden or a free-embedding MCMC state, depending on
+    the selected tf_head_type.
     """
 
     def __init__(self, dim: int, vocab_size: int):
@@ -101,6 +104,57 @@ class TFDirectUnembedHead(nn.Module):
     def forward(self, pred_hidden: torch.Tensor, prev_token_embed: torch.Tensor) -> torch.Tensor:
         del prev_token_embed
         return self.proj(pred_hidden)
+
+
+class TFPostUpdateStateUnembedHead(nn.Module):
+    """Decode the post-update free-embedding MCMC state.
+
+    Optional modes:
+      - RMSNorm: z_{i+1} -> RMSNorm -> Linear(D,V)
+      - concat zi: concat(z_i, z_{i+1}) -> Linear(2D,V)
+      - concat prev embed: concat(z_{i+1}, embed(input_ids)) -> Linear(2D,V)
+      - both: concat(z_i, RMSNorm(z_{i+1})) -> Linear(2D,V)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        vocab_size: int,
+        use_rmsnorm: bool = False,
+        concat_zi: bool = False,
+        concat_prev_embed: bool = False,
+    ):
+        super().__init__()
+        self.use_rmsnorm = use_rmsnorm
+        self.concat_zi = concat_zi
+        self.concat_prev_embed = concat_prev_embed
+        if concat_zi and concat_prev_embed:
+            raise ValueError("post-update state head supports only one concat source at a time.")
+        self.state_norm = _TFRMSNorm(dim) if use_rmsnorm else None
+        in_dim = 2 * dim if (concat_zi or concat_prev_embed) else dim
+        self.proj = nn.Linear(in_dim, vocab_size, bias=False)
+
+    def forward(self, state_input: torch.Tensor | tuple[torch.Tensor, torch.Tensor], prev_token_embed: torch.Tensor) -> torch.Tensor:
+        if self.concat_zi:
+            if not isinstance(state_input, tuple) or len(state_input) != 2:
+                raise ValueError("post_update_state_concat_zi expects (z_next, z_i).")
+            z_next, z_i = state_input
+        else:
+            if isinstance(state_input, tuple):
+                z_next = state_input[0]
+            else:
+                z_next = state_input
+            z_i = None
+
+        if self.state_norm is not None:
+            z_next = self.state_norm(z_next)
+
+        if self.concat_zi:
+            z_next = torch.cat([z_i, z_next], dim=-1)
+        elif self.concat_prev_embed:
+            z_next = torch.cat([z_next, prev_token_embed], dim=-1)
+
+        return self.proj(z_next)
 
 
 class TFTransformerHead(nn.Module):
@@ -139,7 +193,8 @@ def build_tf_head(hparams) -> nn.Module:
     """Factory that consumes hparams namespace from train.py CLI flags.
 
     Reads:
-      hparams.tf_head_type       in {"linear", "direct_unembed", "pre_update_hidden_unembed", "transformer"}
+      hparams.tf_head_type       in {"linear", "direct_unembed", "pre_update_hidden_unembed",
+                                     "post_update_state_unembed", "transformer"}
       hparams.tf_head_layers     int (transformer only)
       hparams.tf_head_n_heads    int, 0 -> inherit hparams.multiheaded_attention_heads
       hparams.tf_head_ffn_mult   float
@@ -154,6 +209,15 @@ def build_tf_head(hparams) -> nn.Module:
 
     if head_type in {"direct_unembed", "pre_update_hidden_unembed"}:
         return TFDirectUnembedHead(dim=dim, vocab_size=vocab_size)
+
+    if head_type == "post_update_state_unembed":
+        return TFPostUpdateStateUnembedHead(
+            dim=dim,
+            vocab_size=vocab_size,
+            use_rmsnorm=bool(getattr(hparams, "post_update_state_use_rmsnorm", False)),
+            concat_zi=bool(getattr(hparams, "post_update_state_concat_zi", False)),
+            concat_prev_embed=bool(getattr(hparams, "post_update_state_concat_prev_embed", False)),
+        )
 
     if head_type == "transformer":
         n_heads_override = int(getattr(hparams, "tf_head_n_heads", 0))

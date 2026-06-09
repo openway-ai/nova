@@ -1323,6 +1323,8 @@ class ModelTrainer(LightningModule):
         - vocab_to_embed: AdamW, 独立绝对 LR (EBT 特有, 保守), 无 weight decay
         - transformer / TF-head 标量 (ndim < 2): AdamW, 独立绝对 LR, 无 weight decay
         - transformer / TF-head 矩阵 (ndim >= 2): Muon, 按 shape 分组 (Muon 要求同组参数 shape 相同)
+        - 可选: post_update_state_unembed 的 TF-head 矩阵可通过
+          --post_update_state_tf_head_adamw 放入 AdamW，避免大 vocab head 进入 Muon
 
         LR 设计原理:
         - embedding 不在 MCMC 循环内, 梯度行为与 NanoChat 一致, 可用高 LR
@@ -1413,6 +1415,12 @@ class ModelTrainer(LightningModule):
             else:
                 transformer_scalar_params.append(param)
         tf_head_matrix_params, tf_head_scalar_params = self._split_tf_head_params()
+        post_state_tf_head_adamw = (
+            getattr(self.hparams, 'tf_head_type', '') == 'post_update_state_unembed'
+            and bool(getattr(self.hparams, 'post_update_state_tf_head_adamw', False))
+        )
+        tf_head_matrix_adamw_params = tf_head_matrix_params if post_state_tf_head_adamw else []
+        tf_head_matrix_muon_params = [] if post_state_tf_head_adamw else tf_head_matrix_params
 
         # --- 构建 param_groups ---
         param_groups = []
@@ -1456,10 +1464,15 @@ class ModelTrainer(LightningModule):
                 kind='adamw', params=energy_head_matrix_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
+        if tf_head_matrix_adamw_params:
+            param_groups.append(dict(
+                kind='adamw', params=tf_head_matrix_adamw_params,
+                lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
 
         # Muon groups: 按 shape 分组 (Muon 要求同组参数 shape 相同用于 stack)
         shape_groups = {}
-        muon_matrix_params = transformer_matrix_params + tf_head_matrix_params
+        muon_matrix_params = transformer_matrix_params + tf_head_matrix_muon_params
         for p in muon_matrix_params:
             shape_groups.setdefault(p.shape, []).append(p)
 
@@ -1566,6 +1579,8 @@ class ModelTrainer(LightningModule):
         num_tf_head_matrix_params = sum(p.numel() for p in tf_head_matrix_params)
         num_tf_head_scalar_params = sum(p.numel() for p in tf_head_scalar_params)
         num_tf_head_params = num_tf_head_matrix_params + num_tf_head_scalar_params
+        num_tf_head_matrix_muon_params = sum(p.numel() for p in tf_head_matrix_muon_params)
+        num_tf_head_matrix_adamw_params = sum(p.numel() for p in tf_head_matrix_adamw_params)
         num_muon_params = sum(p.numel() for p in muon_matrix_params)
         num_ve_params = (
             sum(p.numel() for p in ve_embed_params) +
@@ -1589,7 +1604,9 @@ class ModelTrainer(LightningModule):
         if num_tf_head_params > 0:
             print(
                 f"  TF head params: {num_tf_head_params:,} "
-                f"(matrix/Muon: {num_tf_head_matrix_params:,}, scalar/AdamW: {num_tf_head_scalar_params:,})"
+                f"(matrix/Muon: {num_tf_head_matrix_muon_params:,}, "
+                f"matrix/AdamW: {num_tf_head_matrix_adamw_params:,}, "
+                f"scalar/AdamW: {num_tf_head_scalar_params:,})"
             )
         if num_ve_params > 0:
             print(f"  VE params: {num_ve_params:,} (AdamW, embedding_lr)")

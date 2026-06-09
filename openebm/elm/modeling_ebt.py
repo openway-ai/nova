@@ -70,17 +70,36 @@ class EBT_NLP(LightningModule):
 
         self.transformer = setup_ebt(self.hparams)
 
-        # TF head sits AFTER MCMC and consumes the trunk's candidate-position
-        # pred_hidden (post-norm / last-layer hidden) to produce final CE logits.
-        # Some head variants also use embed(input_ids[t]) as a first-layer
-        # teacher-forced anchor; direct_unembed intentionally ignores that anchor.
+        # TF head sits AFTER MCMC and consumes either the trunk's candidate-position
+        # pred_hidden (post-norm / last-layer hidden) or the free-embedding MCMC
+        # state to produce final CE logits. Some head variants also use
+        # embed(input_ids[t]) as a first-layer teacher-forced anchor; direct
+        # unembedding variants intentionally ignore that anchor.
         # Default off; toggled by --use_tf_head. Keeps original EBT CE path intact
         # when off.
         self.use_tf_head = bool(getattr(self.hparams, "use_tf_head", False))
         self.use_pre_update_hidden_unembed = getattr(self.hparams, "tf_head_type", "") == "pre_update_hidden_unembed"
+        self.use_post_update_state_unembed = getattr(self.hparams, "tf_head_type", "") == "post_update_state_unembed"
+        self.post_update_state_use_rmsnorm = bool(getattr(self.hparams, "post_update_state_use_rmsnorm", False))
+        self.post_update_state_concat_zi = bool(getattr(self.hparams, "post_update_state_concat_zi", False))
+        self.post_update_state_concat_prev_embed = bool(getattr(self.hparams, "post_update_state_concat_prev_embed", False))
         self.truncate_mcmc_per_step_ce = bool(getattr(self.hparams, "truncate_mcmc_per_step_ce", False))
         if self.truncate_mcmc_per_step_ce and not self.hparams.truncate_mcmc:
             raise ValueError("--truncate_mcmc_per_step_ce requires --truncate_mcmc.")
+        if (
+            self.post_update_state_use_rmsnorm
+            or self.post_update_state_concat_zi
+            or self.post_update_state_concat_prev_embed
+        ) and not self.use_post_update_state_unembed:
+            raise ValueError(
+                "post_update_state_* options only apply when "
+                "--tf_head_type post_update_state_unembed."
+            )
+        if self.post_update_state_concat_zi and self.post_update_state_concat_prev_embed:
+            raise ValueError(
+                "--post_update_state_concat_zi and --post_update_state_concat_prev_embed "
+                "are mutually exclusive; use one concat ablation at a time."
+            )
         if self.use_tf_head:
             self.tf_head = build_tf_head(self.hparams)
             init_whole_model_weights(
@@ -112,6 +131,11 @@ class EBT_NLP(LightningModule):
                     "--free_embedding_mcmc is incompatible with mcmc_replay_buffer "
                     "(buffer stores V-dim logits)."
                 )
+        if self.use_tf_head and self.use_post_update_state_unembed and not self.use_free_embedding_mcmc:
+            raise ValueError(
+                "--tf_head_type post_update_state_unembed requires --free_embedding_mcmc: "
+                "the post-update state must be D-dim before Linear(D, V) unembedding."
+            )
 
         self._alpha_debug_step = 0  # counter for alpha diagnostic prints
         if self.hparams.debug_unused_parameters:
@@ -193,10 +217,13 @@ class EBT_NLP(LightningModule):
         # create_graph=True 的 autograd.grad 与 compiled graph 不兼容
         # 所以若 transformer 已被 torch.compile 编译，MCMC 中需要用 eager 版本
         transformer = getattr(self, 'transformer_eager', self.transformer)
-        # First trunk forward: always produces energy. The pre_update_hidden_unembed
-        # ablation also consumes this same forward's candidate hidden for CE, so it
-        # avoids the post-update second trunk forward used by direct_unembed.
+        # First trunk forward: always produces energy. pre_update_hidden_unembed
+        # also consumes this same forward's candidate hidden for CE. The post-update
+        # state variant waits until after the energy-gradient update below.
         pred_hidden_step = None
+        pre_update_state_for_head = None
+        if compute_pred_hidden and self.use_post_update_state_unembed and self.post_update_state_concat_zi:
+            pre_update_state_for_head = predicted_tokens
         use_pre_update_hidden = compute_pred_hidden and self.use_pre_update_hidden_unembed
         if use_pre_update_hidden:
             energy_preds, pred_hidden_step = transformer(
@@ -252,9 +279,17 @@ class EBT_NLP(LightningModule):
         if self.hparams.sharpen_predicted_distribution != 0.0:
             predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
 
+        # post_update_state_unembed decodes the updated free-embedding state z_{i+1}
+        # directly, so it also skips the post-update second trunk forward.
+        if compute_pred_hidden and self.use_post_update_state_unembed:
+            if self.post_update_state_concat_zi:
+                pred_hidden_step = (predicted_tokens, pre_update_state_for_head)
+            else:
+                pred_hidden_step = predicted_tokens
+
         # Second trunk forward — POST-update — to extract pred_hidden for the
-        # default TF-head path. pre_update_hidden_unembed intentionally skips this
-        # and uses pred_hidden_step from the energy forward above.
+        # default TF-head path. pre_update_hidden_unembed uses pred_hidden_step from
+        # the energy forward above; post_update_state_unembed uses z_{i+1} directly.
         if compute_pred_hidden and pred_hidden_step is None:
             if self.use_free_embedding_mcmc:
                 # post-update predicted_tokens IS already D-dim — feed straight to trunk.
@@ -391,10 +426,11 @@ class EBT_NLP(LightningModule):
             # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
 
         if self.use_tf_head:
-            # Replace per-step distributions with TF-head outputs. pred_hidden_step
-            # is the trunk post-norm candidate hidden from return_pred_hidden=True.
-            # prev_embed is only the first-layer token embedding; direct_unembed
-            # keeps the shared call signature but does not unembed this tensor.
+            # Replace per-step distributions with TF-head outputs. Most variants
+            # consume trunk post-norm candidate hidden; post_update_state_unembed
+            # consumes the post-update free-embedding MCMC state instead.
+            # prev_embed is only the first-layer token embedding; direct unembedding
+            # variants keep the shared call signature but do not use it.
             prev_embed = self.embeddings(input_ids)  # first-layer anchor, [B, S, D]
             predicted_distributions = [
                 None if pred_hidden_step is None else self.tf_head(pred_hidden_step, prev_embed)  # [B, S, V]

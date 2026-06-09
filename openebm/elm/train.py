@@ -503,16 +503,17 @@ if __name__ == '__main__':
     parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
 
     # TF (teacher-forced, Gemma-drafter-style) head — sits AFTER MCMC and consumes
-    # trunk pred_hidden for CE logits. Some variants also use embed(input_ids[t])
-    # as a first-layer anchor; direct_unembed projects pred_hidden directly.
+    # either trunk pred_hidden or the free-embedding MCMC state for CE logits. Some
+    # variants also use embed(input_ids[t]) as a first-layer anchor.
     # See TF_HEAD_ARCHITECTURE.md §9 and openebm/elm/tf_head.py.
     parser.add_argument("--use_tf_head", action="store_true", default=False,
         help="Replace MCMC-derived CE with TF head on top of trunk pred_hidden. Default off.")
-    parser.add_argument("--tf_head_type", choices=["linear", "transformer", "direct_unembed", "pre_update_hidden_unembed"], type=str, default="transformer",
+    parser.add_argument("--tf_head_type", choices=["linear", "transformer", "direct_unembed", "pre_update_hidden_unembed", "post_update_state_unembed"], type=str, default="transformer",
         help="TF head variant. 'transformer' = L-block causal head (Gemma drafter). "
              "'linear' = concat+project. "
              "'direct_unembed' = project post-update trunk pred_hidden directly. "
-             "'pre_update_hidden_unembed' = project the energy-forward pre-update trunk pred_hidden directly.")
+             "'pre_update_hidden_unembed' = project the energy-forward pre-update trunk pred_hidden directly. "
+             "'post_update_state_unembed' = project the post-update free-embedding MCMC state directly.")
     parser.add_argument("--tf_head_layers", type=int, default=1,
         help="Number of causal AR blocks in the transformer head (L=1 is empirical sweet spot).")
     parser.add_argument("--tf_head_n_heads", type=int, default=0,
@@ -528,6 +529,14 @@ if __name__ == '__main__':
     parser.add_argument("--free_embed_noise_scale", type=float, default=1.0,
         help="Multiplier on initial corruption noise when free_embedding_mcmc=True (doc §4 noise rescaling). "
              "Higher = harder denoising = forces model to use context.")
+    parser.add_argument("--post_update_state_use_rmsnorm", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed only: apply RMSNorm to z_{i+1} before Linear(D,V).")
+    parser.add_argument("--post_update_state_concat_zi", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed only: decode concat(z_i, z_{i+1}) with Linear(2D,V).")
+    parser.add_argument("--post_update_state_concat_prev_embed", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed only: decode concat(z_{i+1}, embed(input_ids)) with Linear(2D,V).")
+    parser.add_argument("--post_update_state_tf_head_adamw", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed with --optimizer muon_adamw: put TF-head matrix params in AdamW instead of Muon.")
 
     parser.add_argument("--use_ve", help="启用 Value Embedding (VE)，为交替层添加可学习的值嵌入", action="store_true", default=False)
 
