@@ -6,7 +6,8 @@ on top of EBT's MCMC pred_hidden output. See `TF_HEAD_ARCHITECTURE.md` §9.
 
 Three variants exposed via `build_tf_head(hparams)`:
   - "linear":         Linear(2D, D) -> Linear(D, V)
-  - "direct_unembed": Linear(D, V) over trunk pred_hidden as an explicit test2 ablation
+  - "direct_unembed": Linear(D, V) over post-update trunk pred_hidden
+  - "pre_update_hidden_unembed": Linear(D, V) over energy-forward trunk pred_hidden
   - "transformer":    Linear(2D, D) -> L x causal AR block -> RMSNorm -> Linear(D, V)
 
 The transformer variant matches Gemma-drafter's "concat-then-project + L tiny
@@ -138,7 +139,7 @@ def build_tf_head(hparams) -> nn.Module:
     """Factory that consumes hparams namespace from train.py CLI flags.
 
     Reads:
-      hparams.tf_head_type       in {"linear", "direct_unembed", "transformer"}
+      hparams.tf_head_type       in {"linear", "direct_unembed", "pre_update_hidden_unembed", "transformer"}
       hparams.tf_head_layers     int (transformer only)
       hparams.tf_head_n_heads    int, 0 -> inherit hparams.multiheaded_attention_heads
       hparams.tf_head_ffn_mult   float
@@ -151,7 +152,7 @@ def build_tf_head(hparams) -> nn.Module:
     if head_type == "linear":
         return TFLinearHead(dim=dim, vocab_size=vocab_size)
 
-    if head_type == "direct_unembed":
+    if head_type in {"direct_unembed", "pre_update_hidden_unembed"}:
         return TFDirectUnembedHead(dim=dim, vocab_size=vocab_size)
 
     if head_type == "transformer":

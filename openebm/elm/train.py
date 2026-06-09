@@ -213,7 +213,7 @@ def main(args):
     opt_name = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
     ckpt_dir = args.checkpoint_dir if args.checkpoint_dir else f"./logs/checkpoints/{args.run_name}"
     checkpoint_filename = f"s={{step}}-{args.model_size}-ctx{args.context_length}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
-    save_last = (args.save_periodic_steps <= 0)  # periodic 启用时不需要 last.ckpt，periodic 已覆盖 crash recovery
+    save_last = (args.save_periodic_steps <= 0 and args.save_top_k_ckpts != 0)  # save_top_k=0 means no checkpoint files
     checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=ckpt_dir, filename=checkpoint_filename, verbose=True, min_free_gb=50)
 
     # 定期保存 checkpoint（不依赖 val_loss），防止 SFT 后期模型丢失
@@ -508,17 +508,17 @@ if __name__ == '__main__':
     # See TF_HEAD_ARCHITECTURE.md §9 and openebm/elm/tf_head.py.
     parser.add_argument("--use_tf_head", action="store_true", default=False,
         help="Replace MCMC-derived CE with TF head on top of trunk pred_hidden. Default off.")
-    parser.add_argument("--tf_head_type", choices=["linear", "transformer", "direct_unembed"], type=str, default="transformer",
+    parser.add_argument("--tf_head_type", choices=["linear", "transformer", "direct_unembed", "pre_update_hidden_unembed"], type=str, default="transformer",
         help="TF head variant. 'transformer' = L-block causal head (Gemma drafter). "
              "'linear' = concat+project. "
-             "'direct_unembed' = explicit test2 ablation: project trunk pred_hidden directly.")
+             "'direct_unembed' = project post-update trunk pred_hidden directly. "
+             "'pre_update_hidden_unembed' = project the energy-forward pre-update trunk pred_hidden directly.")
     parser.add_argument("--tf_head_layers", type=int, default=1,
         help="Number of causal AR blocks in the transformer head (L=1 is empirical sweet spot).")
     parser.add_argument("--tf_head_n_heads", type=int, default=0,
         help="Attention heads inside TF head block; 0 inherits trunk's multiheaded_attention_heads.")
     parser.add_argument("--tf_head_ffn_mult", type=float, default=4.0,
         help="FFN expansion factor inside TF head transformer block.")
-
     # Free embedding MCMC: iterate in D-dim embedding space directly (instead of V-dim logit).
     # Skips the softmax + matmul(embeddings.weight) conversion at trunk input. Requires
     # --use_tf_head (TF head provides the discrete CE supervision; without it the D-dim iterate
@@ -541,6 +541,9 @@ if __name__ == '__main__':
     parser.add_argument("--ebt_act_func", help="activation function to use for energy based transformer, NOTE is only supported for ebt_time_embed. silu (default from llama2) worked best", type=str, default="silu")
 
     parser.add_argument("--truncate_mcmc", help="truncate mcmc and only use final step of loss to calculate, for S2 models", action="store_true", default=False)
+    parser.add_argument("--truncate_mcmc_per_step_ce", action="store_true", default=False,
+        help="Use S2-style truncated MCMC gradients while still averaging CE over all supervised MCMC steps. "
+             "Requires --truncate_mcmc; useful to isolate final-only CE from create_graph truncation.")
 
     parser.add_argument("--mcmc_replay_buffer", help="enables a replay buffer for MCMC, particularly S2 models", action="store_true", default=False)
 

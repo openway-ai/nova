@@ -1390,13 +1390,24 @@ class ModelTrainer(LightningModule):
         # VE 参数单独收集，分配给 AdamW (不能放入 Muon)
         ve_embed_params = []
         ve_gate_params = []
+        energy_head_matrix_params = []
         transformer_matrix_params = []
         transformer_scalar_params = []
+        pre_update_hidden_unembed = getattr(self.hparams, 'tf_head_type', '') == 'pre_update_hidden_unembed'
         for name, param in self.model.transformer.named_parameters():
-            if 'value_embeds.' in name:
+            if not param.requires_grad:
+                continue
+            clean_name = name.replace('_orig_mod.', '')
+            if 'value_embeds.' in clean_name:
                 ve_embed_params.append(param)
-            elif 've_gate.' in name:
+            elif 've_gate.' in clean_name:
                 ve_gate_params.append(param)
+            elif pre_update_hidden_unembed and clean_name.startswith('final_layer.') and param.ndim >= 2:
+                # pre_update_hidden_unembed takes CE logits from the trunk hidden
+                # before the MCMC update. With the default inter-step detach, the
+                # scalar energy head can legitimately receive no CE gradient.
+                # Muon stacks every grad in a shape group and cannot handle None.
+                energy_head_matrix_params.append(param)
             elif param.ndim >= 2:
                 transformer_matrix_params.append(param)
             else:
@@ -1438,6 +1449,11 @@ class ModelTrainer(LightningModule):
         if ve_gate_params:
             param_groups.append(dict(
                 kind='adamw', params=ve_gate_params,
+                lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if energy_head_matrix_params:
+            param_groups.append(dict(
+                kind='adamw', params=energy_head_matrix_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
 
@@ -1561,7 +1577,8 @@ class ModelTrainer(LightningModule):
             sum(p.numel() for p in vocab_to_embed_params) +
             sum(p.numel() for p in transformer_scalar_params) +
             num_tf_head_scalar_params +
-            num_ve_params
+            num_ve_params +
+            sum(p.numel() for p in energy_head_matrix_params)
         )
         total_optimized_params = num_muon_params + num_adamw_params
         print(f"=" * 80)
@@ -1576,6 +1593,12 @@ class ModelTrainer(LightningModule):
             )
         if num_ve_params > 0:
             print(f"  VE params: {num_ve_params:,} (AdamW, embedding_lr)")
+        if energy_head_matrix_params:
+            print(
+                "  Energy final-layer matrix params: "
+                f"{sum(p.numel() for p in energy_head_matrix_params):,} "
+                "(AdamW for pre_update_hidden_unembed)"
+            )
         print(f"  Muon LR: {muon_lr}, momentum: {muon_momentum}, ns_steps: {muon_ns_steps}, beta2: {muon_beta2}")
         print(f"  Alpha LR: {alpha_lr} (AdamW) [EBT 特有]")
         print(f"  Embedding LR: {embedding_lr} (AdamW)")

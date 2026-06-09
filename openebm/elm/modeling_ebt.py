@@ -77,6 +77,10 @@ class EBT_NLP(LightningModule):
         # Default off; toggled by --use_tf_head. Keeps original EBT CE path intact
         # when off.
         self.use_tf_head = bool(getattr(self.hparams, "use_tf_head", False))
+        self.use_pre_update_hidden_unembed = getattr(self.hparams, "tf_head_type", "") == "pre_update_hidden_unembed"
+        self.truncate_mcmc_per_step_ce = bool(getattr(self.hparams, "truncate_mcmc_per_step_ce", False))
+        if self.truncate_mcmc_per_step_ce and not self.hparams.truncate_mcmc:
+            raise ValueError("--truncate_mcmc_per_step_ce requires --truncate_mcmc.")
         if self.use_tf_head:
             self.tf_head = build_tf_head(self.hparams)
             init_whole_model_weights(
@@ -189,28 +193,46 @@ class EBT_NLP(LightningModule):
         # create_graph=True 的 autograd.grad 与 compiled graph 不兼容
         # 所以若 transformer 已被 torch.compile 编译，MCMC 中需要用 eager 版本
         transformer = getattr(self, 'transformer_eager', self.transformer)
-        # First trunk forward — energy only. pred_hidden is intentionally NOT taken from here:
-        # at this point predicted_tokens is the pre-update leaf (detach()'d under default
-        # no_mcmc_detach=False), so any hidden state from this forward has no alpha gradient.
-        # The TF-head pred_hidden comes from a second forward AFTER the alpha-bearing update.
-        energy_preds = transformer(
-            all_embeddings,
-            start_pos=start_pos,
-            mcmc_step=mcmc_step,
-            real_token_ids=real_token_ids,
-            predicted_tokens=predicted_tokens,
-        ) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+        # First trunk forward: always produces energy. The pre_update_hidden_unembed
+        # ablation also consumes this same forward's candidate hidden for CE, so it
+        # avoids the post-update second trunk forward used by direct_unembed.
+        pred_hidden_step = None
+        use_pre_update_hidden = compute_pred_hidden and self.use_pre_update_hidden_unembed
+        if use_pre_update_hidden:
+            energy_preds, pred_hidden_step = transformer(
+                all_embeddings,
+                start_pos=start_pos,
+                mcmc_step=mcmc_step,
+                real_token_ids=real_token_ids,
+                predicted_tokens=predicted_tokens,
+                return_pred_hidden=True,
+            )
+        else:
+            energy_preds = transformer(
+                all_embeddings,
+                start_pos=start_pos,
+                mcmc_step=mcmc_step,
+                real_token_ids=real_token_ids,
+                predicted_tokens=predicted_tokens,
+            ) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
         energy_preds = energy_preds.reshape(-1, 1)
         
         with torch.amp.autocast(device_type='cuda', enabled=False):
             energy_f32 = energy_preds.float()
             if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
                 if i == (num_mcmc_steps - 1):
-                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
+                    create_graph_step = learning
                 else:
-                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=False)[0]
+                    create_graph_step = False
             else:
-                predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
+                create_graph_step = learning
+            retain_graph_step = create_graph_step or (learning and use_pre_update_hidden)
+            predicted_tokens_grad = torch.autograd.grad(
+                [energy_f32.sum()],
+                [predicted_tokens],
+                create_graph=create_graph_step,
+                retain_graph=retain_graph_step,
+            )[0]
         # predicted_tokens_grad has shape B, S, V
         
         if self.hparams.clamp_futures_grad:
@@ -230,14 +252,10 @@ class EBT_NLP(LightningModule):
         if self.hparams.sharpen_predicted_distribution != 0.0:
             predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
 
-        # Second trunk forward — POST-update — to extract pred_hidden for TF head.
-        # Why a second forward: post-update predicted_tokens depends on alpha (via
-        # `pt - alpha * grad`), so a trunk forward consuming it produces pred_hidden
-        # that carries alpha in its autograd graph. The first (energy) forward used
-        # the pre-update detached leaf, so it carries no alpha. Without this second
-        # forward, alpha would be frozen under TF-head training.
-        pred_hidden_step = None
-        if compute_pred_hidden:
+        # Second trunk forward — POST-update — to extract pred_hidden for the
+        # default TF-head path. pre_update_hidden_unembed intentionally skips this
+        # and uses pred_hidden_step from the energy forward above.
+        if compute_pred_hidden and pred_hidden_step is None:
             if self.use_free_embedding_mcmc:
                 # post-update predicted_tokens IS already D-dim — feed straight to trunk.
                 post_pred_embeddings = predicted_tokens
@@ -319,7 +337,7 @@ class EBT_NLP(LightningModule):
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
                 compute_pred_hidden = return_pred_hiddens
-                if return_pred_hiddens and self.hparams.truncate_mcmc:
+                if return_pred_hiddens and self.hparams.truncate_mcmc and not self.truncate_mcmc_per_step_ce:
                     compute_pred_hidden = i == (len(mcmc_steps) - 1)
 
                 predicted_tokens, energy_preds, predicted_tokens_for_loss, pred_hidden_step = self._mcmc_step_excluded(
@@ -327,7 +345,10 @@ class EBT_NLP(LightningModule):
                     langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
                     real_token_ids=x, compute_pred_hidden=compute_pred_hidden,
                 )
-                predicted_energies.append(energy_preds)
+                if self.hparams.contrastive_loss:
+                    predicted_energies.append(energy_preds)
+                else:
+                    predicted_energies.append(energy_preds.detach())
                 predicted_distributions.append(predicted_tokens_for_loss)
                 if return_pred_hiddens:
                     predicted_pred_hiddens.append(pred_hidden_step)
@@ -397,9 +418,11 @@ class EBT_NLP(LightningModule):
         initial_pred_energies = None
         final_pred_energies = None
         final_reconstruction_loss = None
+        reconstruction_loss_steps = 0
         ppl_loss = None
         final_predicted_distribution = None
         final_label_smoothing = 0.0
+        final_step_only_loss = self.hparams.truncate_mcmc and not self.truncate_mcmc_per_step_ce
         for mcmc_step, predicted_energy in enumerate(predicted_energies):
             if mcmc_step == 0:
                 initial_pred_energies = predicted_energy.squeeze().mean().detach()
@@ -408,7 +431,7 @@ class EBT_NLP(LightningModule):
 
             predicted_distribution = predicted_distributions[mcmc_step]
             if predicted_distribution is None:
-                if self.hparams.truncate_mcmc and mcmc_step != (total_mcmc_steps - 1):
+                if final_step_only_loss and mcmc_step != (total_mcmc_steps - 1):
                     continue
                 raise RuntimeError("Missing predicted distribution for a supervised MCMC step.")
 
@@ -436,7 +459,7 @@ class EBT_NLP(LightningModule):
                 )
             cce_loss = per_token_step_loss.sum() / supervised_tokens_denom
             
-            if self.hparams.truncate_mcmc:
+            if final_step_only_loss:
                 if mcmc_step == (total_mcmc_steps - 1):
                     reconstruction_loss = cce_loss
                     ppl_loss = torch.exp(cce_loss).detach()
@@ -445,12 +468,12 @@ class EBT_NLP(LightningModule):
                     final_label_smoothing = label_smoothing
             else:
                 reconstruction_loss += cce_loss
+                reconstruction_loss_steps += 1
                 if mcmc_step == (total_mcmc_steps - 1):
                     ppl_loss = torch.exp(cce_loss).detach()
                     final_reconstruction_loss = cce_loss.detach()
                     final_predicted_distribution = predicted_distribution
                     final_label_smoothing = label_smoothing
-                    reconstruction_loss = reconstruction_loss / total_mcmc_steps # normalize so is indifferent to number of mcmc steps
                 
             #pure logging things (no function for training)
             if mcmc_step == 0:
@@ -458,6 +481,10 @@ class EBT_NLP(LightningModule):
 
         if final_reconstruction_loss is None or ppl_loss is None or final_predicted_distribution is None:
             raise RuntimeError("No final-step reconstruction loss was computed.")
+        if not final_step_only_loss:
+            if reconstruction_loss_steps == 0:
+                raise RuntimeError("No supervised MCMC-step reconstruction loss was computed.")
+            reconstruction_loss = reconstruction_loss / reconstruction_loss_steps
         if initial_loss is None:
             initial_loss = final_reconstruction_loss
         
