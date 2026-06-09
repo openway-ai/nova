@@ -20,7 +20,12 @@ export MODEL_SIZE="d26"
 # PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep9562_20260424_211606/s=step=12374-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7007.ckpt"
 
 # after sft_train c2048
-PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova-sft/nova/logs/ebt_runs/d26-ctx2048-20260422/sft_train/checkpoints/s=step=2984-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.5680.ckpt"
+# PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova-sft/nova/logs/ebt_runs/d26-ctx2048-20260422/sft_train/checkpoints/s=step=2984-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.5680.ckpt"
+
+# base train 需要sft-train
+# PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova/logs/checkpoints/s2-step1-learnablealpha-init300-freeembed-direct-2node-8gpu-bf16mixed_0605_1441_d26_ctx2048_bs512_lr0.0012_2nodes_8gpus/s=step=6999-d26-ctx2048-lr0.0012-bs1x32-muon_adamw-valid_loss=valid_loss=2.5051.ckpt"
+
+PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova-sft/nova/logs/ebt_runs/d26-ctx2048-20260522-s2-fixedalpha397/sft_train/checkpoints/s=step=1703-d26-ctx2048-lr0.00024-bs1x32-muon_adamw-valid_loss=valid_loss=0.6867.ckpt"
 
 ### 环境变量 ###
 HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
@@ -258,7 +263,6 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --max_steps ${MAX_STEPS} \
 --max_scheduling_steps ${MAX_SCHEDULING_STEPS} \
 --dataset_name "sudoku_sft" \
---num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
 --limit_val_batches ${LIMIT_VAL_BATCHES} \
 --val_sanity 1 \

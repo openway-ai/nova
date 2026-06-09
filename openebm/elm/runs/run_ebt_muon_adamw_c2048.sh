@@ -424,6 +424,12 @@ short_precision_tag() {
     esac
 }
 
+short_zero3_param_dtype_tag() {
+    if [ "${TRAIN_ENGINE}" = "zero-3" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero3" ]; then
+        echo "-p${ZERO3_PARAM_DTYPE:-fp32}"
+    fi
+}
+
 short_fsdp_wrap_tag() {
     if [ "${TRAIN_ENGINE}" != "fsdp2" ]; then
         return 0
@@ -454,10 +460,11 @@ if [ -z "${EXP_ID:-}" ]; then
     RUN_MCMC_GRAD_TAG="$(short_mcmc_gradient_tag)"
     RUN_OPT_TAG="$(short_optimizer_tag)"
     RUN_PRECISION_TAG="$(short_precision_tag)"
+    RUN_ZERO3_PARAM_DTYPE_TAG="$(short_zero3_param_dtype_tag)"
     RUN_FSDP_WRAP_TAG="$(short_fsdp_wrap_tag)"
     RUN_TS="$(_exp_timestamp)"
     RUN_BASE_PREFIX="${RUN_PREFIX:-${MODEL_SIZE}-c${CONTEXT_LENGTH}}"
-    EXP_ID="${RUN_BASE_PREFIX}-${RUN_ENGINE_TAG}-${RUN_MCMC_GRAD_TAG}-${RUN_OPT_TAG}-${RUN_PRECISION_TAG}${RUN_FSDP_WRAP_TAG}-b${DEVICE_BATCH_SIZE}x${GRAD_ACCUM}-m${MCMC_NUM_STEPS}-${RUN_TS}"
+    EXP_ID="${RUN_BASE_PREFIX}-${RUN_ENGINE_TAG}-${RUN_MCMC_GRAD_TAG}-${RUN_OPT_TAG}-${RUN_PRECISION_TAG}${RUN_ZERO3_PARAM_DTYPE_TAG}${RUN_FSDP_WRAP_TAG}-b${DEVICE_BATCH_SIZE}x${GRAD_ACCUM}-m${MCMC_NUM_STEPS}-${RUN_TS}"
     [ -n "${EXP_TAG:-}" ] && EXP_ID="${EXP_ID}-${EXP_TAG}"
     export EXP_ID
 fi
