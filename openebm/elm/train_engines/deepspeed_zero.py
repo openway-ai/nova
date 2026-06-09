@@ -391,7 +391,18 @@ def _build_zero_config(args, stage: int) -> dict[str, Any]:
         "zero_optimization": zero_config,
     }
     precision = getattr(args, "float_precision", "32-true")
-    if precision in {"bf16-mixed", "bf16", "bf16-true"}:
+    zero3_param_dtype = getattr(args, "zero3_param_dtype", "fp32")
+    if stage == 3 and zero3_param_dtype == "fp32":
+        # Lightning would otherwise inject bf16.enabled=True for
+        # precision=bf16-mixed. In this local DeepSpeed Stage3 implementation,
+        # bf16 Stage3 can create mixed bf16/fp32 ds_tensor partitions even when
+        # the source module parameters are uniform fp32, and defragment() then
+        # asserts on mixed dtypes. Keep ZeRO-3 parameter partitions fp32; the
+        # user-facing precision flag still documents the intended mixed compute
+        # mode, but DeepSpeed's parameter storage remains uniform.
+        config["bf16"] = {"enabled": False}
+        config["fp16"] = {"enabled": False}
+    elif precision in {"bf16-mixed", "bf16", "bf16-true"}:
         config["bf16"] = {"enabled": True}
         config["fp16"] = {"enabled": False}
     elif precision in {"16-mixed", "16-true", "fp16"}:
@@ -418,7 +429,10 @@ def _build_deepspeed_strategy(args, stage: int):
                 f"contains zero_optimization.stage={configured_stage}."
             )
         config["zero_optimization"]["stage"] = stage
-        if getattr(args, "float_precision", "32-true") in {"bf16-mixed", "bf16", "bf16-true"}:
+        if stage == 3 and getattr(args, "zero3_param_dtype", "fp32") == "fp32":
+            config.setdefault("bf16", {})["enabled"] = False
+            config.setdefault("fp16", {})["enabled"] = False
+        elif getattr(args, "float_precision", "32-true") in {"bf16-mixed", "bf16", "bf16-true"}:
             config.setdefault("bf16", {})["enabled"] = True
             config.setdefault("fp16", {})["enabled"] = False
         kwargs = {"config": config}
