@@ -64,6 +64,8 @@ class SudokuMixedIterableDataset(_IterableDataset):
         self.max_iter = max_iter
         self.device = device
         self.data_dir = data_dir or DEFAULT_SUDOKU_V2_DIR
+        if isinstance(resume_state_dict, dict) and "sudoku_ratio" in resume_state_dict:
+            sudoku_ratio = float(resume_state_dict["sudoku_ratio"])
         # v3: public mutable; AdaptiveRatioCallback may rewrite this between batches.
         self.sudoku_ratio = sudoku_ratio
         self.resume_state_dict = resume_state_dict
@@ -74,9 +76,19 @@ class SudokuMixedIterableDataset(_IterableDataset):
         self.last_state_dict = None
         self._runtime_initialized = False
         self._seed = seed
-        self.it = 0
+        self.it = int(resume_state_dict.get("it", 0)) if isinstance(resume_state_dict, dict) else 0
+        self._mix_rng = None
+        self._mix_rng_state = (
+            copy.deepcopy(resume_state_dict.get("mix_rng_state"))
+            if isinstance(resume_state_dict, dict)
+            else None
+        )
         # v3: source of the most-recently yielded batch ('sudoku' | 'sft').
-        self.last_batch_source = None
+        self.last_batch_source = (
+            resume_state_dict.get("last_batch_source")
+            if isinstance(resume_state_dict, dict)
+            else None
+        )
 
         # 预估两侧 iterator 的 max_iter 上界。因为按概率采样，每侧实际用量 ≈ max_iter * ratio。
         # 给 1.5 倍缓冲避免 StopIteration（底层 iterator 对 train split 是循环的）
@@ -118,11 +130,18 @@ class SudokuMixedIterableDataset(_IterableDataset):
 
     def _build_state_dict(self):
         """Combine child states with our mix counter."""
+        mix_rng_state = (
+            self._mix_rng.getstate()
+            if self._mix_rng is not None
+            else copy.deepcopy(self._mix_rng_state)
+        )
         return {
             "state_version": self.STATE_VERSION,
             "split": self.split,
             "it": self.it,
             "sudoku_ratio": self.sudoku_ratio,
+            "mix_rng_state": mix_rng_state,
+            "last_batch_source": self.last_batch_source,
             "sudoku_state": self.sudoku_ds.state_dict(),
             "sft_state": self.sft_ds.state_dict(),
         }
@@ -145,6 +164,11 @@ class SudokuMixedIterableDataset(_IterableDataset):
                 return
         self.resume_state_dict = copy.deepcopy(state_dict)
         if isinstance(state_dict, dict):
+            if "sudoku_ratio" in state_dict:
+                self.sudoku_ratio = float(state_dict["sudoku_ratio"])
+            self._mix_rng_state = copy.deepcopy(state_dict.get("mix_rng_state"))
+            self._mix_rng = None
+            self.last_batch_source = state_dict.get("last_batch_source")
             if "sudoku_state" in state_dict:
                 self.sudoku_ds.load_state_dict(state_dict["sudoku_state"])
             if "sft_state" in state_dict:
@@ -152,14 +176,24 @@ class SudokuMixedIterableDataset(_IterableDataset):
             self.it = int(state_dict.get("it", 0))
         self._runtime_initialized = False
 
+    def _init_mix_rng(self):
+        base_seed = self._seed if self._seed is not None else 20260508
+        rng = random.Random(base_seed + 9973)
+        if self._mix_rng_state is not None:
+            rng.setstate(self._mix_rng_state)
+        else:
+            for _ in range(max(0, int(self.it))):
+                rng.random()
+        self._mix_rng = rng
+
     # ── Iteration ──────────────────────────────────────────────────────
 
     def __iter__(self):
         sudoku_iter = iter(self.sudoku_ds)
         sft_iter = iter(self.sft_ds)
         # 用独立 rng 决定每步从哪侧采样，避免干扰底层数据增强 rng
-        base_seed = self._seed if self._seed is not None else 20260508
-        mix_rng = random.Random(base_seed + 9973)
+        if self._mix_rng is None:
+            self._init_mix_rng()
 
         while True:
             if self.split == "train" and self.it >= self.max_iter:
@@ -168,7 +202,7 @@ class SudokuMixedIterableDataset(_IterableDataset):
             # v3: re-read mutable sudoku_ratio every step so AdaptiveRatioCallback
             # mutations take effect on the next batch.
             current_ratio = float(self.sudoku_ratio)
-            pick_sudoku = mix_rng.random() < current_ratio
+            pick_sudoku = self._mix_rng.random() < current_ratio
             try:
                 if pick_sudoku:
                     batch = next(sudoku_iter)
