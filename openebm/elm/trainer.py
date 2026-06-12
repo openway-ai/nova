@@ -709,6 +709,18 @@ class ModelTrainer(LightningModule):
         self._last_valid_metrics['empty_supervision_batch'] = self._val_empty_supervision_batches
         self.log("valid_loss", epoch_loss, prog_bar=True, sync_dist=False)
 
+        if getattr(self.trainer, "is_global_zero", True):
+            valid_summary = (
+                f"[Validation] global_step={self.global_step} | "
+                f"valid_loss: {epoch_loss.detach().item():.6f} | "
+                f"valid_bpb: {epoch_bpb:.6f}"
+            )
+            valid_summary += (
+                f" | valid_supervised_tokens: {self._val_supervised_tokens} | "
+                f"valid_empty_supervision_batch: {self._val_empty_supervision_batches}"
+            )
+            print(valid_summary, flush=True)
+
         # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
         if self.logger is not None:
             try:
@@ -1158,7 +1170,7 @@ class ModelTrainer(LightningModule):
         sys.stdout.flush()
 
     def eval_step(self, batch, phase, token_bytes=None):
-        things_to_log = self.model.forward_loss_wrapper(batch, phase, token_bytes=token_bytes, global_step=self.global_step) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop
+        things_to_log = self.model.forward_loss_wrapper(batch, phase, token_bytes=token_bytes) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop
 
         if len(self.metrics) > 0:
             raise NotImplementedError("Need to implement torchmetrics stuff, i.e. looping through self.torchmetrics_dict.keys(), checking to make sure 'phase in key', and updating based off predicted and labels i.e. self.torchmetrics_dict[key].update(logits, labels), more info https://lightning.ai/docs/torchmetrics/stable/pages/lightning.html (just be careful make sure to detach logits before using them and only update current phase). recommended to possibly return things_to_log and logits from forward_loss_wrapper to do this easily")
@@ -1238,9 +1250,70 @@ class ModelTrainer(LightningModule):
                 enable_wd_decay=enable_wd_decay
             )
         return lr_scheduler
+
+    def _split_tf_head_params(self):
+        tf_head_matrix_params = []
+        tf_head_scalar_params = []
+        if not bool(getattr(self.hparams, 'use_tf_head', False)):
+            return tf_head_matrix_params, tf_head_scalar_params
+        if not hasattr(self.model, 'tf_head') or self.model.tf_head is None:
+            return tf_head_matrix_params, tf_head_scalar_params
+
+        for _, param in self.model.tf_head.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.ndim >= 2:
+                tf_head_matrix_params.append(param)
+            else:
+                tf_head_scalar_params.append(param)
+        return tf_head_matrix_params, tf_head_scalar_params
+
+    def _validate_optimizer_param_coverage(self, optimizer):
+        named_trainable_params = [
+            (name, param) for name, param in self.model.named_parameters()
+            if param.requires_grad
+        ]
+        id_to_name = {id(param): name for name, param in named_trainable_params}
+        seen_param_groups = {}
+        duplicate_params = []
+
+        for group_idx, group in enumerate(optimizer.param_groups):
+            for param in group['params']:
+                if not getattr(param, 'requires_grad', False):
+                    continue
+                param_id = id(param)
+                if param_id in seen_param_groups:
+                    duplicate_params.append(
+                        (id_to_name.get(param_id, '<unnamed>'), seen_param_groups[param_id], group_idx)
+                    )
+                else:
+                    seen_param_groups[param_id] = group_idx
+
+        missing_params = [
+            (name, param.numel()) for name, param in named_trainable_params
+            if id(param) not in seen_param_groups
+        ]
+        if not missing_params and not duplicate_params:
+            return
+
+        messages = ["Optimizer parameter coverage check failed."]
+        if missing_params:
+            preview = ", ".join(f"{name}({numel:,})" for name, numel in missing_params[:20])
+            if len(missing_params) > 20:
+                preview += f", ... +{len(missing_params) - 20} more"
+            messages.append(f"Missing trainable params: {preview}")
+        if duplicate_params:
+            preview = ", ".join(
+                f"{name}(groups {first}->{second})" for name, first, second in duplicate_params[:20]
+            )
+            if len(duplicate_params) > 20:
+                preview += f", ... +{len(duplicate_params) - 20} more"
+            messages.append(f"Duplicate optimizer params: {preview}")
+        raise RuntimeError("\n".join(messages))
     
     def get_optimizer_scheduler_dict(self, optimizer_parameters):
         optimizer = self.get_optimizer(optimizer_parameters)
+        self._validate_optimizer_param_coverage(optimizer)
         lr_scheduler = self.get_lr_scheduler(optimizer)
         # lr_schedule will work each step
         return {
@@ -1260,8 +1333,10 @@ class ModelTrainer(LightningModule):
         - alpha: AdamW, 高 LR (mcmc_step_size_lr_multiplier × peak_lr), 无 weight decay [EBT 特有]
         - embeddings: AdamW, 独立绝对 LR (对齐 NanoChat embedding_lr), 无 weight decay
         - vocab_to_embed: AdamW, 独立绝对 LR (EBT 特有, 保守), 无 weight decay
-        - transformer 标量 (ndim < 2): AdamW, 独立绝对 LR, 无 weight decay
-        - transformer 矩阵 (ndim >= 2): Muon, 按 shape 分组 (Muon 要求同组参数 shape 相同)
+        - transformer / TF-head 标量 (ndim < 2): AdamW, 独立绝对 LR, 无 weight decay
+        - transformer / TF-head 矩阵 (ndim >= 2): Muon, 按 shape 分组 (Muon 要求同组参数 shape 相同)
+        - 可选: post_update_state_unembed 的 TF-head 矩阵可通过
+          --post_update_state_tf_head_adamw 放入 AdamW，避免大 vocab head 进入 Muon
 
         LR 设计原理:
         - embedding 不在 MCMC 循环内, 梯度行为与 NanoChat 一致, 可用高 LR
@@ -1329,17 +1404,35 @@ class ModelTrainer(LightningModule):
         # VE 参数单独收集，分配给 AdamW (不能放入 Muon)
         ve_embed_params = []
         ve_gate_params = []
+        energy_head_matrix_params = []
         transformer_matrix_params = []
         transformer_scalar_params = []
+        pre_update_hidden_unembed = getattr(self.hparams, 'tf_head_type', '') == 'pre_update_hidden_unembed'
         for name, param in self.model.transformer.named_parameters():
-            if 'value_embeds.' in name:
+            if not param.requires_grad:
+                continue
+            clean_name = name.replace('_orig_mod.', '')
+            if 'value_embeds.' in clean_name:
                 ve_embed_params.append(param)
-            elif 've_gate.' in name:
+            elif 've_gate.' in clean_name:
                 ve_gate_params.append(param)
+            elif pre_update_hidden_unembed and clean_name.startswith('final_layer.') and param.ndim >= 2:
+                # pre_update_hidden_unembed takes CE logits from the trunk hidden
+                # before the MCMC update. With the default inter-step detach, the
+                # scalar energy head can legitimately receive no CE gradient.
+                # Muon stacks every grad in a shape group and cannot handle None.
+                energy_head_matrix_params.append(param)
             elif param.ndim >= 2:
                 transformer_matrix_params.append(param)
             else:
                 transformer_scalar_params.append(param)
+        tf_head_matrix_params, tf_head_scalar_params = self._split_tf_head_params()
+        post_state_tf_head_adamw = (
+            getattr(self.hparams, 'tf_head_type', '') == 'post_update_state_unembed'
+            and bool(getattr(self.hparams, 'post_update_state_tf_head_adamw', False))
+        )
+        tf_head_matrix_adamw_params = tf_head_matrix_params if post_state_tf_head_adamw else []
+        tf_head_matrix_muon_params = [] if post_state_tf_head_adamw else tf_head_matrix_params
 
         # --- 构建 param_groups ---
         param_groups = []
@@ -1360,9 +1453,10 @@ class ModelTrainer(LightningModule):
                 kind='adamw', params=vocab_to_embed_params,
                 lr=vocab_to_embed_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
-        if transformer_scalar_params:
+        scalar_params = transformer_scalar_params + tf_head_scalar_params
+        if scalar_params:
             param_groups.append(dict(
-                kind='adamw', params=transformer_scalar_params,
+                kind='adamw', params=scalar_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
         # VE embedding 参数: AdamW, 使用 embedding_lr (与 NanoChat 一致)
@@ -1377,10 +1471,21 @@ class ModelTrainer(LightningModule):
                 kind='adamw', params=ve_gate_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
+        if energy_head_matrix_params:
+            param_groups.append(dict(
+                kind='adamw', params=energy_head_matrix_params,
+                lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if tf_head_matrix_adamw_params:
+            param_groups.append(dict(
+                kind='adamw', params=tf_head_matrix_adamw_params,
+                lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
 
         # Muon groups: 按 shape 分组 (Muon 要求同组参数 shape 相同用于 stack)
         shape_groups = {}
-        for p in transformer_matrix_params:
+        muon_matrix_params = transformer_matrix_params + tf_head_matrix_muon_params
+        for p in muon_matrix_params:
             shape_groups.setdefault(p.shape, []).append(p)
 
         for shape in sorted(shape_groups.keys()):
@@ -1473,6 +1578,7 @@ class ModelTrainer(LightningModule):
                     super().step()
 
         optimizer = PLMuonAdamW(param_groups)
+        self._validate_optimizer_param_coverage(optimizer)
 
         # 设置 initial_lr (PL LR scheduler 需要)
         for group in optimizer.param_groups:
@@ -1482,7 +1588,12 @@ class ModelTrainer(LightningModule):
         lr_scheduler = self.get_lr_scheduler(optimizer)
 
         # --- 日志 ---
-        num_muon_params = sum(p.numel() for p in transformer_matrix_params)
+        num_tf_head_matrix_params = sum(p.numel() for p in tf_head_matrix_params)
+        num_tf_head_scalar_params = sum(p.numel() for p in tf_head_scalar_params)
+        num_tf_head_params = num_tf_head_matrix_params + num_tf_head_scalar_params
+        num_tf_head_matrix_muon_params = sum(p.numel() for p in tf_head_matrix_muon_params)
+        num_tf_head_matrix_adamw_params = sum(p.numel() for p in tf_head_matrix_adamw_params)
+        num_muon_params = sum(p.numel() for p in muon_matrix_params)
         num_ve_params = (
             sum(p.numel() for p in ve_embed_params) +
             sum(p.numel() for p in ve_gate_params)
@@ -1492,15 +1603,31 @@ class ModelTrainer(LightningModule):
             sum(p.numel() for p in embedding_params) +
             sum(p.numel() for p in vocab_to_embed_params) +
             sum(p.numel() for p in transformer_scalar_params) +
-            num_ve_params
+            num_tf_head_scalar_params +
+            num_ve_params +
+            sum(p.numel() for p in energy_head_matrix_params)
         )
+        total_optimized_params = num_muon_params + num_adamw_params
         print(f"=" * 80)
         print(f"[Muon+AdamW] 混合优化器已启用:")
         print(f"  Muon groups: {len(shape_groups)} (按 shape 分组)")
-        print(f"  Muon params: {num_muon_params:,} ({num_muon_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
-        print(f"  AdamW params: {num_adamw_params:,} ({num_adamw_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
+        print(f"  Muon params: {num_muon_params:,} ({num_muon_params/total_optimized_params*100:.1f}%)")
+        print(f"  AdamW params: {num_adamw_params:,} ({num_adamw_params/total_optimized_params*100:.1f}%)")
+        if num_tf_head_params > 0:
+            print(
+                f"  TF head params: {num_tf_head_params:,} "
+                f"(matrix/Muon: {num_tf_head_matrix_muon_params:,}, "
+                f"matrix/AdamW: {num_tf_head_matrix_adamw_params:,}, "
+                f"scalar/AdamW: {num_tf_head_scalar_params:,})"
+            )
         if num_ve_params > 0:
             print(f"  VE params: {num_ve_params:,} (AdamW, embedding_lr)")
+        if energy_head_matrix_params:
+            print(
+                "  Energy final-layer matrix params: "
+                f"{sum(p.numel() for p in energy_head_matrix_params):,} "
+                "(AdamW for pre_update_hidden_unembed)"
+            )
         print(f"  Muon LR: {muon_lr}, momentum: {muon_momentum}, ns_steps: {muon_ns_steps}, beta2: {muon_beta2}")
         print(f"  Alpha LR: {alpha_lr} (AdamW) [EBT 特有]")
         print(f"  Embedding LR: {embedding_lr} (AdamW)")
@@ -1550,6 +1677,7 @@ class ModelTrainer(LightningModule):
                         transformer_matrix_params.append(param)
                     else:  # 标量/向量参数 (biases, layer norms, etc.)
                         transformer_scalar_params.append(param)
+                tf_head_matrix_params, tf_head_scalar_params = self._split_tf_head_params()
 
                 # 学习率倍数 (可通过命令行参数覆盖)
                 embedding_lr_mult = getattr(self.hparams, 'embedding_lr_mult', 0.3)
@@ -1569,10 +1697,10 @@ class ModelTrainer(LightningModule):
                     {'params': vocab_to_embed_params, 'weight_decay': 0.0,
                      'lr': self.hparams.peak_learning_rate * vocab_to_embed_lr_mult},
                     # Transformer 矩阵: 主学习率
-                    {'params': transformer_matrix_params, 'weight_decay': self.hparams.weight_decay,
+                    {'params': transformer_matrix_params + tf_head_matrix_params, 'weight_decay': self.hparams.weight_decay,
                      'lr': self.hparams.peak_learning_rate},
                     # Transformer 标量: 较高学习率，无 weight decay
-                    {'params': transformer_scalar_params, 'weight_decay': 0.0,
+                    {'params': transformer_scalar_params + tf_head_scalar_params, 'weight_decay': 0.0,
                      'lr': self.hparams.peak_learning_rate * scalar_lr_mult},
                 ]
 
@@ -1585,6 +1713,11 @@ class ModelTrainer(LightningModule):
                 print(f"  - vocab_to_embed LR: {self.hparams.peak_learning_rate * vocab_to_embed_lr_mult}")
                 print(f"  - Transformer Matrix LR: {self.hparams.peak_learning_rate}")
                 print(f"  - Transformer Scalar LR: {self.hparams.peak_learning_rate * scalar_lr_mult}")
+                if tf_head_matrix_params or tf_head_scalar_params:
+                    print(
+                        f"  - TF head params: "
+                        f"{sum(p.numel() for p in tf_head_matrix_params) + sum(p.numel() for p in tf_head_scalar_params):,}"
+                    )
             else:
                 # 原始实现
                 alpha_param = self.model.alpha

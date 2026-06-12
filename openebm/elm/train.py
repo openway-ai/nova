@@ -16,7 +16,8 @@ except Exception:
     pass
 
 # 抑制 CUDA stream 不匹配警告（恢复训练时的已知问题）
-if hasattr(torch.autograd.graph, 'set_warn_on_accumulate_grad_stream_mismatch'):
+# 仅 torch >= 2.6 提供该 API；旧版本静默跳过。
+if hasattr(torch.autograd.graph, "set_warn_on_accumulate_grad_stream_mismatch"):
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 try:
@@ -212,7 +213,7 @@ def main(args):
     opt_name = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
     ckpt_dir = args.checkpoint_dir if args.checkpoint_dir else f"./logs/checkpoints/{args.run_name}"
     checkpoint_filename = f"s={{step}}-{args.model_size}-ctx{args.context_length}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
-    save_last = (args.save_periodic_steps <= 0)  # periodic 启用时不需要 last.ckpt，periodic 已覆盖 crash recovery
+    save_last = (args.save_periodic_steps <= 0 and args.save_top_k_ckpts != 0)  # save_top_k=0 means no checkpoint files
     checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=ckpt_dir, filename=checkpoint_filename, verbose=True, min_free_gb=50)
 
     # 定期保存 checkpoint（不依赖 val_loss），防止 SFT 后期模型丢失
@@ -480,6 +481,8 @@ if __name__ == '__main__':
     parser.add_argument("--randomize_mcmc_step_size_scale", help="randomize the value of mcmc_step_size by a factor specified, i.e. if is 2 will mult by 2 and div by 2 and thats the range to sample from uniformly", type=float, default=1)
     
     parser.add_argument("--mcmc_num_steps", help="number of MCMC steps, try 2-5, check data samples as well to see how many we need. NOTE if are using time embed or adaln is the number of energy landscapes", type=int, default=2)
+    parser.add_argument("--zero_mcmc_ce_only", action="store_true", default=False,
+        help="Strict K=0 ablation: require --mcmc_num_steps 0 and train only the TF-head CE path from the initial corrupted/free-embedding state, without energy-head forward, autograd.grad, or MCMC update.")
 
     parser.add_argument("--randomize_mcmc_num_steps", help="makes mcmc_num_steps random, each step at each landscape is repeated uniform(1, 1+randomize_mcmc_num_steps) times (unless randomize_mcmc_num_steps_min is set, then thats the min value). if ebt_type is default each landscape is the same, so it effectively just randomized mcmc_num_steps", type=int, default=0)
 
@@ -501,6 +504,44 @@ if __name__ == '__main__':
 
     parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
 
+    # TF (teacher-forced, Gemma-drafter-style) head — sits AFTER MCMC and consumes
+    # either trunk pred_hidden or the free-embedding MCMC state for CE logits. Some
+    # variants also use embed(input_ids[t]) as a first-layer anchor.
+    # See TF_HEAD_ARCHITECTURE.md §9 and openebm/elm/tf_head.py.
+    parser.add_argument("--use_tf_head", action="store_true", default=False,
+        help="Replace MCMC-derived CE with TF head on top of trunk pred_hidden. Default off.")
+    parser.add_argument("--tf_head_type", choices=["linear", "transformer", "direct_unembed", "pre_update_hidden_unembed", "post_update_state_unembed"], type=str, default="transformer",
+        help="TF head variant. 'transformer' = L-block causal head (Gemma drafter). "
+             "'linear' = concat+project. "
+             "'direct_unembed' = project post-update trunk pred_hidden directly. "
+             "'pre_update_hidden_unembed' = project the energy-forward pre-update trunk pred_hidden directly. "
+             "'post_update_state_unembed' = project the post-update free-embedding MCMC state directly.")
+    parser.add_argument("--tf_head_layers", type=int, default=1,
+        help="Number of causal AR blocks in the transformer head (L=1 is empirical sweet spot).")
+    parser.add_argument("--tf_head_n_heads", type=int, default=0,
+        help="Attention heads inside TF head block; 0 inherits trunk's multiheaded_attention_heads.")
+    parser.add_argument("--tf_head_ffn_mult", type=float, default=4.0,
+        help="FFN expansion factor inside TF head transformer block.")
+    # Free embedding MCMC: iterate in D-dim embedding space directly (instead of V-dim logit).
+    # Skips the softmax + matmul(embeddings.weight) conversion at trunk input. Requires
+    # --use_tf_head (TF head provides the discrete CE supervision; without it the D-dim iterate
+    # has no decode path). See blockwise_free_embedding_optimizations_2026-06-01.md.
+    parser.add_argument("--free_embedding_mcmc", action="store_true", default=False,
+        help="Run MCMC in D-dim free embedding space instead of V-dim logit space. Requires --use_tf_head.")
+    parser.add_argument("--free_embed_noise_scale", type=float, default=1.0,
+        help="Multiplier on initial corruption noise when free_embedding_mcmc=True (doc §4 noise rescaling). "
+             "Higher = harder denoising = forces model to use context.")
+    parser.add_argument("--post_update_state_use_rmsnorm", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed only: apply RMSNorm to z_{i+1} before Linear(D,V).")
+    parser.add_argument("--post_update_state_concat_zi", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed only: decode concat(z_i, z_{i+1}) with Linear(2D,V).")
+    parser.add_argument("--post_update_state_concat_prev_embed", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed only: decode concat(z_{i+1}, embed(input_ids)) with Linear(2D,V).")
+    parser.add_argument("--post_update_state_detach_prev_embed", action="store_true", default=False,
+        help="For post_update_state_unembed + concat_prev_embed only: detach embed(input_ids) before TF-head CE.")
+    parser.add_argument("--post_update_state_tf_head_adamw", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed with --optimizer muon_adamw: put TF-head matrix params in AdamW instead of Muon.")
+
     parser.add_argument("--use_ve", help="启用 Value Embedding (VE)，为交替层添加可学习的值嵌入", action="store_true", default=False)
 
     parser.add_argument("--use_mcmc_time_embed", action="store_true", default=False,
@@ -513,6 +554,9 @@ if __name__ == '__main__':
     parser.add_argument("--ebt_act_func", help="activation function to use for energy based transformer, NOTE is only supported for ebt_time_embed. silu (default from llama2) worked best", type=str, default="silu")
 
     parser.add_argument("--truncate_mcmc", help="truncate mcmc and only use final step of loss to calculate, for S2 models", action="store_true", default=False)
+    parser.add_argument("--truncate_mcmc_per_step_ce", action="store_true", default=False,
+        help="Use S2-style truncated MCMC gradients while still averaging CE over all supervised MCMC steps. "
+             "Requires --truncate_mcmc; useful to isolate final-only CE from create_graph truncation.")
 
     parser.add_argument("--mcmc_replay_buffer", help="enables a replay buffer for MCMC, particularly S2 models", action="store_true", default=False)
 
