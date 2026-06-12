@@ -164,7 +164,8 @@ class AdaptiveRatioCallback:
 
     Determinism: each rank runs the same callback against the same `global_step`,
     so DDP ranks stay in sync without explicit broadcast. The retention guard
-    keys off the rank-0-reduced `_last_valid_metrics['valid_loss_sft']`.
+    keys off the epoch-level `valid_loss_sft` from Lightning callback metrics,
+    falling back to the module's cached validation metrics.
     """
 
     def __init__(
@@ -252,12 +253,22 @@ class AdaptiveRatioCallback:
         ds = self._get_mixed_dataset(trainer)
         if ds is None:
             return
-        last_metrics = getattr(pl_module, '_last_valid_metrics', None)
-        if not last_metrics:
-            return
-        sft_loss = last_metrics.get('valid_loss_sft')
+        sft_loss = None
+        callback_metrics = getattr(trainer, 'callback_metrics', None)
+        if callback_metrics is not None:
+            try:
+                sft_loss = callback_metrics.get('valid_loss_sft')
+            except AttributeError:
+                pass
+        if sft_loss is None:
+            last_metrics = getattr(pl_module, '_last_valid_metrics', None)
+            if not last_metrics:
+                return
+            sft_loss = last_metrics.get('valid_loss_sft')
         if sft_loss is None:
             return
+        if isinstance(sft_loss, torch.Tensor):
+            sft_loss = sft_loss.detach().float().item()
         delta = float(sft_loss) - _V3_SFT_BASELINE
         before = float(ds.sudoku_ratio)
         if delta > _V3_SFT_TOLERANCE:
@@ -750,6 +761,24 @@ class ModelTrainer(LightningModule):
         self._val_bpb_nats = 0.0
         self._val_bpb_bytes = 0
 
+    def _cache_valid_metric(self, key, value):
+        """Cache validation metrics with and without the Lightning phase prefix."""
+        if not hasattr(self, '_last_valid_metrics'):
+            self._last_valid_metrics = {}
+        self._last_valid_metrics[key] = value
+        self._last_valid_metrics[f'valid_{key}'] = value
+
+    def _active_sudoku_ratio(self, default=0.6):
+        """Read the mutable mixed-dataset ratio, falling back to static hparams."""
+        try:
+            train_dl = getattr(self.trainer, 'train_dataloader', None)
+            dataset = getattr(train_dl, 'dataset', None)
+            if dataset is not None and hasattr(dataset, 'sudoku_ratio'):
+                return float(dataset.sudoku_ratio)
+        except Exception:
+            pass
+        return float(getattr(self.hparams, 'sudoku_ratio', default))
+
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         # Move token_bytes to the same device as the model if needed
         token_bytes = self.token_bytes
@@ -814,9 +843,9 @@ class ModelTrainer(LightningModule):
             if k in ('bpb', 'bpb_nats', 'bpb_bytes'):
                 continue
             if isinstance(v, torch.Tensor) and v.dim() == 0:
-                self._last_valid_metrics[f"{k}{suffix}"] = v.detach().item()
+                self._cache_valid_metric(f"{k}{suffix}", v.detach().item())
             elif isinstance(v, (int, float)):
-                self._last_valid_metrics[f"{k}{suffix}"] = v
+                self._cache_valid_metric(f"{k}{suffix}", v)
 
     def on_validation_epoch_end(self):
         """Compute mixed validation metrics and epoch-level BPB."""
@@ -827,13 +856,14 @@ class ModelTrainer(LightningModule):
         sources = getattr(self, '_val_loader_sources', None)
         buf = getattr(self, '_val_source_buf', None)
         if sources and buf:
-            ratio = float(getattr(self.hparams, 'sudoku_ratio', 0.6))
+            ratio = self._active_sudoku_ratio(default=0.6)
             weights = {'sudoku': ratio, 'sft': 1.0 - ratio}
             # 收集所有指标 key 的并集
             all_keys = set()
             for src in sources:
                 all_keys.update(buf.get(src, {}).keys())
             mixed = {}
+            source_means = {}
             # v3: also compute a fixed 0.5/0.5 balanced version so cross-ratio runs are
             # comparable. The ratio-weighted `mixed[k]` is intentionally biased toward the
             # heavier source — use it for ratio-aware monitoring and `balanced[k]` for
@@ -850,6 +880,7 @@ class ModelTrainer(LightningModule):
                     if slot is None or slot['count'].item() == 0:
                         continue
                     mean = (slot['sum'] / slot['count']).item()
+                    source_means.setdefault(src, {})[k] = mean
                     w = weights.get(src, 0.0)
                     bw = balanced_weights.get(src, 0.0)
                     total += w * mean
@@ -866,31 +897,27 @@ class ModelTrainer(LightningModule):
                 if slot['bytes'] > 0:
                     bpb = slot['nats'] / (math.log(2) * slot['bytes'])
                     mixed[f'bpb_{src}'] = bpb
-                    if not hasattr(self, '_last_valid_metrics'):
-                        self._last_valid_metrics = {}
-                    self._last_valid_metrics[f'bpb_{src}'] = bpb
+                    self._cache_valid_metric(f'bpb_{src}', bpb)
+
+            for src, means in source_means.items():
+                for k, v in means.items():
+                    self._cache_valid_metric(f'{k}_{src}', v)
 
             if mixed:
                 self.log_metrics(mixed, "valid")
-                if not hasattr(self, '_last_valid_metrics'):
-                    self._last_valid_metrics = {}
                 for k, v in mixed.items():
-                    self._last_valid_metrics[k] = v
+                    self._cache_valid_metric(k, v)
             if balanced:
                 self.log_metrics(balanced, "valid")
-                if not hasattr(self, '_last_valid_metrics'):
-                    self._last_valid_metrics = {}
                 for k, v in balanced.items():
-                    self._last_valid_metrics[k] = v
+                    self._cache_valid_metric(k, v)
 
         if self._val_bpb_bytes > 0:
             epoch_bpb = self._val_bpb_nats / (math.log(2) * self._val_bpb_bytes)
         else:
             epoch_bpb = float('inf')
         # 用 epoch-level BPB 覆盖 _last_valid_metrics 中的 per-batch 值
-        if not hasattr(self, '_last_valid_metrics'):
-            self._last_valid_metrics = {}
-        self._last_valid_metrics['bpb'] = epoch_bpb
+        self._cache_valid_metric('bpb', epoch_bpb)
 
         # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
         if self.logger is not None:
