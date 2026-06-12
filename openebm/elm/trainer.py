@@ -112,6 +112,194 @@ if _PROJECT_ROOT not in sys.path:
 
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 
+
+# ── v3 utilities for Sudoku adaptive-ratio + difficulty schedule ──────────────
+
+# Three-phase schedule (P3 + P4) used in the v3 spec:
+#   step <  600                        → 0.6   (warmup)
+#   600 ≤ step < 2400                  → 0.85  (focus)
+#   step ≥ 2400                        → 0.7   (consolidation)
+# The retention guard then clips this around `valid_loss_sft` drift on each val tick.
+_V3_RATIO_PHASES = [
+    {'lo': 0,    'hi': 600,   'ratio': 0.6},
+    {'lo': 600,  'hi': 2400,  'ratio': 0.85},
+    {'lo': 2400, 'hi': 10**9, 'ratio': 0.7},
+]
+# Difficulty bucket weights aligned with SudokuSFTV2IterableDataset.DIFFICULTY_BUCKETS
+# (hard 17-22, medium 23-28, easy 29-34). P5 in the v3 spec.
+_V3_DIFFICULTY_PHASES = [
+    {'lo': 0,    'hi': 600,   'weights': [0.33, 0.33, 0.34]},   # warmup uniform
+    {'lo': 600,  'hi': 2400,  'weights': [0.55, 0.30, 0.15]},   # focus on hard tail
+    {'lo': 2400, 'hi': 10**9, 'weights': [0.40, 0.35, 0.25]},   # consolidation
+]
+# Retention guard (P4): SFT-loss target used to keep core SFT capability from drifting.
+# v2 baseline `valid_loss_sft` was 1.121 across the 0.4/0.6/0.8 sweep; we accept up to
+# +0.03 over baseline before cutting `sudoku_ratio` by 0.05 (floor 0.50).
+_V3_SFT_BASELINE = 1.121
+_V3_SFT_TOLERANCE = 0.03
+_V3_RATIO_FLOOR = 0.50
+_V3_RATIO_CEIL = 0.85
+_V3_RATIO_STEP = 0.05
+
+
+def _v3_three_phase_value(step, phases, default):
+    for p in phases:
+        if p['lo'] <= step < p['hi']:
+            return p['ratio'] if 'ratio' in p else p['weights']
+    return default
+
+
+def _v3_initial_bucket_weights(schedule_name):
+    """Return the warmup-phase bucket weights for the given schedule, or None for `fixed`.
+
+    `fixed`        → None (legacy uniform sampling over the whole pool).
+    `three_phase`  → returns the warmup-phase weights; AdaptiveRatioCallback later
+                     rotates buckets per phase.
+    Anything else  → None (treated as `fixed`).
+    """
+    if schedule_name == 'three_phase':
+        return list(_V3_DIFFICULTY_PHASES[0]['weights'])
+    return None
+
+
+class AdaptiveRatioCallback:
+    """Lightning callback wiring v3 sudoku schedules + retention guard (P3 + P4 + P5).
+
+    Three responsibilities:
+      1. Mutates `train_dataloader.dataset.sudoku_ratio` per `_V3_RATIO_PHASES`
+         on every training-batch start.
+      2. Mutates `train_dataloader.dataset.sudoku_ds.bucket_weights` per
+         `_V3_DIFFICULTY_PHASES` so RRN-train resampling tracks the schedule.
+      3. After each validation epoch, reads `valid_loss_sft` (already all-reduced)
+         and adjusts `sudoku_ratio` ± _V3_RATIO_STEP within [floor, ceil] based on
+         the SFT drift — primary core-preservation mechanism in v3 since KD is
+         deferred.
+
+    Determinism: each rank runs the same callback against the same `global_step`,
+    so DDP ranks stay in sync without explicit broadcast. The retention guard
+    keys off the epoch-level `valid_loss_sft` from Lightning callback metrics,
+    falling back to the module's cached validation metrics.
+    """
+
+    def __init__(
+        self,
+        ratio_schedule='three_phase_with_guard',
+        difficulty_schedule='three_phase',
+    ):
+        try:
+            from lightning.pytorch.callbacks import Callback as _LCB
+        except ImportError:
+            from pytorch_lightning.callbacks import Callback as _LCB
+        # Subclass at construction time so we don't import Callback at module load
+        # (the Lightning version is already established by the trainer module).
+        AdaptiveRatioCallback._mixin_callback(self, _LCB)
+        self.ratio_schedule = ratio_schedule
+        self.difficulty_schedule = difficulty_schedule
+        self._last_logged_step = -1
+
+    @staticmethod
+    def _mixin_callback(instance, callback_cls):
+        # Ensure isinstance(instance, Callback) is true so Lightning accepts it.
+        instance.__class__ = type(
+            'AdaptiveRatioCallback', (AdaptiveRatioCallback, callback_cls), {},
+        )
+
+    # ── helpers ────────────────────────────────────────────────────────
+
+    def _get_mixed_dataset(self, trainer):
+        train_dl = getattr(trainer, 'train_dataloader', None)
+        if train_dl is None:
+            return None
+        ds = getattr(train_dl, 'dataset', None)
+        # Only act on SudokuMixedIterableDataset (guard against other datasets).
+        if ds is None or not hasattr(ds, 'sudoku_ratio') or not hasattr(ds, 'sudoku_ds'):
+            return None
+        return ds
+
+    def _phase_ratio(self, step):
+        return _v3_three_phase_value(step, _V3_RATIO_PHASES, default=0.6)
+
+    def _phase_bucket_weights(self, step):
+        return list(_v3_three_phase_value(step, _V3_DIFFICULTY_PHASES, default=[1, 1, 1]))
+
+    # ── Lightning hooks ────────────────────────────────────────────────
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):  # type: ignore[override]
+        ds = self._get_mixed_dataset(trainer)
+        if ds is None:
+            return
+        step = int(trainer.global_step)
+        # 1. base ratio from the three-phase schedule
+        if self.ratio_schedule in ('three_phase', 'three_phase_with_guard'):
+            base = self._phase_ratio(step)
+            # Don't overwrite a guard-adjusted ratio mid-phase: only sync the *floor*
+            # of the schedule. We apply phase-on-transition edges; guard nudges live
+            # in on_validation_epoch_end.
+            current = float(ds.sudoku_ratio)
+            phase_lo = max(_V3_RATIO_FLOOR, base - 0.10)
+            phase_hi = min(_V3_RATIO_CEIL, base + 0.05)
+            if not (phase_lo <= current <= phase_hi):
+                ds.sudoku_ratio = float(base)
+        elif self.ratio_schedule == 'fixed':
+            pass  # leave alone
+        # 2. difficulty bucket weights
+        if self.difficulty_schedule == 'three_phase':
+            sudoku_ds = getattr(ds, 'sudoku_ds', None)
+            if sudoku_ds is not None and hasattr(sudoku_ds, 'bucket_weights'):
+                sudoku_ds.bucket_weights = self._phase_bucket_weights(step)
+        # 3. periodic log so the run.log shows the active schedule
+        if step != self._last_logged_step and (step % 100 == 0):
+            try:
+                pl_module.log_metrics(
+                    {
+                        'sudoku_ratio_active': float(ds.sudoku_ratio),
+                    },
+                    'train',
+                )
+            except Exception:
+                pass
+            self._last_logged_step = step
+
+    def on_validation_epoch_end(self, trainer, pl_module):  # type: ignore[override]
+        if self.ratio_schedule != 'three_phase_with_guard':
+            return
+        ds = self._get_mixed_dataset(trainer)
+        if ds is None:
+            return
+        sft_loss = None
+        callback_metrics = getattr(trainer, 'callback_metrics', None)
+        if callback_metrics is not None:
+            try:
+                sft_loss = callback_metrics.get('valid_loss_sft')
+            except AttributeError:
+                pass
+        if sft_loss is None:
+            last_metrics = getattr(pl_module, '_last_valid_metrics', None)
+            if not last_metrics:
+                return
+            sft_loss = last_metrics.get('valid_loss_sft')
+        if sft_loss is None:
+            return
+        if isinstance(sft_loss, torch.Tensor):
+            sft_loss = sft_loss.detach().float().item()
+        delta = float(sft_loss) - _V3_SFT_BASELINE
+        before = float(ds.sudoku_ratio)
+        if delta > _V3_SFT_TOLERANCE:
+            new_r = max(_V3_RATIO_FLOOR, before - _V3_RATIO_STEP)
+        elif delta < 0.0:
+            new_r = min(_V3_RATIO_CEIL, before + _V3_RATIO_STEP)
+        else:
+            new_r = before
+        if abs(new_r - before) > 1e-6:
+            ds.sudoku_ratio = float(new_r)
+            try:
+                pl_module.log_metrics({'sudoku_ratio_guard_adjusted': float(new_r)}, 'valid')
+            except Exception:
+                pass
+            print(f"[AdaptiveRatioCallback] valid_loss_sft={sft_loss:.4f} "
+                  f"(Δ={delta:+.4f}) → sudoku_ratio {before:.2f} → {new_r:.2f}")
+
+
 class ModelTrainer(LightningModule):
     def __init__(self, hparams, trained_model = None):
         super().__init__()
@@ -592,7 +780,10 @@ class ModelTrainer(LightningModule):
             print(f"[Checkpoint] Rank {rank} 恢复 RNG state: keys={list(self._rng_resume_state.keys())}")
 
     def on_validation_epoch_start(self):
-        """Reset BPB accumulators at the start of each validation epoch."""
+        """Reset validation accumulators at the start of each validation epoch."""
+        self._val_source_buf = {}
+        self._val_source_bpb = {}
+        self._val_source_loss_buf = {}
         self._val_loss_sum = None
         self._val_loss_tokens = None
         self._val_bpb_nats = 0.0
@@ -600,24 +791,57 @@ class ModelTrainer(LightningModule):
         self._val_supervised_tokens = 0
         self._val_empty_supervision_batches = 0
 
-    def validation_step(self, batch, batch_idx):
+    def _cache_valid_metric(self, key, value):
+        """Cache validation metrics with and without the Lightning phase prefix."""
+        if not hasattr(self, '_last_valid_metrics'):
+            self._last_valid_metrics = {}
+        self._last_valid_metrics[key] = value
+        self._last_valid_metrics[f'valid_{key}'] = value
+
+    def _active_sudoku_ratio(self, default=0.6):
+        """Read the mutable mixed-dataset ratio, falling back to static hparams."""
+        try:
+            train_dl = getattr(self.trainer, 'train_dataloader', None)
+            dataset = getattr(train_dl, 'dataset', None)
+            if dataset is not None and hasattr(dataset, 'sudoku_ratio'):
+                return float(dataset.sudoku_ratio)
+        except Exception:
+            pass
+        return float(getattr(self.hparams, 'sudoku_ratio', default))
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
         if batch_idx < 2:
-            _sft_trainer_debug(f"validation_step_start batch_idx={batch_idx}")
-        # Move token_bytes to the same device as the model if needed
+            _sft_trainer_debug(
+                f"validation_step_start batch_idx={batch_idx} dataloader_idx={dataloader_idx}"
+            )
+
         token_bytes = self.token_bytes
         if token_bytes is not None and token_bytes.device != self.device:
             token_bytes = token_bytes.to(self.device)
         eval_step_dict = self.eval_step(batch, "valid", token_bytes)
+
         if batch_idx < 2:
             keys = ",".join(sorted(eval_step_dict.keys()))
-            _sft_trainer_debug(f"validation_step_eval_done batch_idx={batch_idx} keys={keys}")
+            _sft_trainer_debug(
+                f"validation_step_eval_done batch_idx={batch_idx} "
+                f"dataloader_idx={dataloader_idx} keys={keys}"
+            )
         if getattr(self.trainer, "sanity_checking", False):
             if batch_idx < 2:
-                _sft_trainer_debug(f"validation_step_sanity_skip_logging batch_idx={batch_idx}")
+                _sft_trainer_debug(
+                    f"validation_step_sanity_skip_logging batch_idx={batch_idx} "
+                    f"dataloader_idx={dataloader_idx}"
+                )
             return
+
+        sources = getattr(self, '_val_loader_sources', None)
+        has_source = sources is not None and 0 <= dataloader_idx < len(sources)
+        src = sources[dataloader_idx] if has_source else None
 
         loss_value = eval_step_dict.get('loss', None)
         supervised_tokens = eval_step_dict.get('supervised_tokens', 0)
+        loss_tensor = None
+        token_tensor = None
         if loss_value is not None:
             if isinstance(loss_value, torch.Tensor):
                 loss_tensor = loss_value.detach().to(device=self.device, dtype=torch.float32)
@@ -632,7 +856,45 @@ class ModelTrainer(LightningModule):
                 self._val_loss_tokens = torch.zeros((), device=self.device, dtype=torch.float32)
             self._val_loss_sum = self._val_loss_sum + loss_tensor * token_tensor
             self._val_loss_tokens = self._val_loss_tokens + token_tensor
-        self.log_metrics(eval_step_dict, "valid")
+            if has_source:
+                source_loss = self._val_source_loss_buf.setdefault(
+                    src,
+                    {
+                        'sum': torch.zeros((), device=self.device, dtype=torch.float32),
+                        'tokens': torch.zeros((), device=self.device, dtype=torch.float32),
+                    },
+                )
+                source_loss['sum'] = source_loss['sum'] + loss_tensor * token_tensor
+                source_loss['tokens'] = source_loss['tokens'] + token_tensor
+
+        if has_source:
+            tagged = {
+                f"{k}_{src}": v
+                for k, v in eval_step_dict.items()
+                if k not in ('loss', 'bpb', 'bpb_nats', 'bpb_bytes')
+            }
+            self.log_metrics(tagged, "valid")
+            buf = self._val_source_buf.setdefault(src, {})
+            for k, v in eval_step_dict.items():
+                if k in ('bpb', 'bpb_nats', 'bpb_bytes'):
+                    continue
+                if isinstance(v, torch.Tensor) and v.dim() == 0:
+                    val = v.detach().float()
+                elif isinstance(v, (int, float)):
+                    val = torch.tensor(float(v), device=self.device)
+                else:
+                    continue
+                slot = buf.setdefault(
+                    k,
+                    {
+                        'sum': torch.zeros((), device=self.device),
+                        'count': torch.zeros((), device=self.device),
+                    },
+                )
+                slot['sum'] = slot['sum'] + val
+                slot['count'] = slot['count'] + 1
+        else:
+            self.log_metrics(eval_step_dict, "valid")
 
         # 累积 BPB 的 nats/bytes，用于 epoch-level 正确计算
         # (BPB = sum(nats) / (log2 * sum(bytes)), 不能对 per-batch BPB 做算术平均)
@@ -644,6 +906,11 @@ class ModelTrainer(LightningModule):
             bpb_bytes = bpb_bytes.item()
         self._val_bpb_nats += bpb_nats
         self._val_bpb_bytes += bpb_bytes
+        if has_source:
+            bpb_slot = self._val_source_bpb.setdefault(src, {'nats': 0.0, 'bytes': 0})
+            bpb_slot['nats'] += bpb_nats
+            bpb_slot['bytes'] += bpb_bytes
+
         supervised_tokens = eval_step_dict.get('supervised_tokens', 0)
         empty_supervision_batch = eval_step_dict.get('empty_supervision_batch', 0)
         if isinstance(supervised_tokens, torch.Tensor):
@@ -653,24 +920,24 @@ class ModelTrainer(LightningModule):
         self._val_supervised_tokens += supervised_tokens
         self._val_empty_supervision_batches += empty_supervision_batch
 
-        # 缓存最新 valid 指标，供 train 进度条显示
-        if not hasattr(self, '_last_valid_metrics'):
-            self._last_valid_metrics = {}
+        suffix = f"_{src}" if has_source else ""
         for k, v in eval_step_dict.items():
-            # 跳过 BPB 累积中间量，它们不应作为独立指标显示
-            if k in ('bpb_nats', 'bpb_bytes'):
+            if k in ('bpb', 'bpb_nats', 'bpb_bytes'):
                 continue
-            if k == 'loss':
+            if k == 'loss' and not has_source:
                 continue
             if isinstance(v, torch.Tensor) and v.dim() == 0:
-                self._last_valid_metrics[k] = v.detach().item()
+                self._cache_valid_metric(f"{k}{suffix}", v.detach().item())
             elif isinstance(v, (int, float)):
-                self._last_valid_metrics[k] = v
+                self._cache_valid_metric(f"{k}{suffix}", v)
+
         if batch_idx < 2:
-            _sft_trainer_debug(f"validation_step_done batch_idx={batch_idx}")
+            _sft_trainer_debug(
+                f"validation_step_done batch_idx={batch_idx} dataloader_idx={dataloader_idx}"
+            )
 
     def on_validation_epoch_end(self):
-        """Compute epoch-level BPB from accumulated nats/bytes and override the cached value."""
+        """Compute mixed validation metrics plus token-weighted epoch loss/BPB."""
         if getattr(self.trainer, "sanity_checking", False):
             _sft_trainer_debug("validation_epoch_end_sanity_skip_logging")
             return
@@ -695,25 +962,97 @@ class ModelTrainer(LightningModule):
             epoch_loss = loss_sum / loss_tokens
         else:
             epoch_loss = torch.tensor(float('inf'), device=self.device, dtype=torch.float32)
+        epoch_loss_value = epoch_loss.detach().item()
+
+        sources = getattr(self, '_val_loader_sources', None)
+        buf = getattr(self, '_val_source_buf', None)
+        if sources and buf:
+            ratio = self._active_sudoku_ratio(default=0.6)
+            weights = {'sudoku': ratio, 'sft': 1.0 - ratio}
+            balanced_weights = {'sudoku': 0.5, 'sft': 0.5}
+            all_keys = set()
+            for src in sources:
+                all_keys.update(buf.get(src, {}).keys())
+
+            source_means = {}
+            for src in sources:
+                for k, slot in buf.get(src, {}).items():
+                    if slot['count'].item() > 0:
+                        source_means.setdefault(src, {})[k] = (slot['sum'] / slot['count']).item()
+
+            source_loss_buf = getattr(self, '_val_source_loss_buf', {})
+            for src, slot in source_loss_buf.items():
+                src_loss_sum = slot['sum'].clone()
+                src_loss_tokens = slot['tokens'].clone()
+                if dist.is_initialized():
+                    dist.all_reduce(src_loss_sum, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(src_loss_tokens, op=dist.ReduceOp.SUM)
+                if src_loss_tokens.item() > 0:
+                    source_means.setdefault(src, {})['loss'] = (
+                        src_loss_sum / src_loss_tokens
+                    ).detach().item()
+
+            mixed = {}
+            balanced = {}
+            for k in all_keys:
+                total = 0.0
+                wsum = 0.0
+                btotal = 0.0
+                bwsum = 0.0
+                for src in sources:
+                    if k not in source_means.get(src, {}):
+                        continue
+                    mean = source_means[src][k]
+                    w = weights.get(src, 0.0)
+                    bw = balanced_weights.get(src, 0.0)
+                    total += w * mean
+                    wsum += w
+                    btotal += bw * mean
+                    bwsum += bw
+                if wsum > 0:
+                    out_key = 'loss_ratio_weighted' if k == 'loss' else k
+                    mixed[out_key] = total / wsum
+                if bwsum > 0:
+                    balanced[k + '_balanced'] = btotal / bwsum
+
+            source_bpb = getattr(self, '_val_source_bpb', {})
+            for src, slot in source_bpb.items():
+                if slot['bytes'] > 0:
+                    bpb = slot['nats'] / (math.log(2) * slot['bytes'])
+                    mixed[f'bpb_{src}'] = bpb
+                    self._cache_valid_metric(f'bpb_{src}', bpb)
+
+            for src, means in source_means.items():
+                for k, v in means.items():
+                    self._cache_valid_metric(f'{k}_{src}', v)
+                    if k == 'loss':
+                        self.log(f"valid_loss_{src}", v, prog_bar=False, sync_dist=False)
+
+            if mixed:
+                self.log_metrics(mixed, "valid")
+                for k, v in mixed.items():
+                    self._cache_valid_metric(k, v)
+            if balanced:
+                self.log_metrics(balanced, "valid")
+                for k, v in balanced.items():
+                    self._cache_valid_metric(k, v)
 
         if self._val_bpb_bytes > 0:
             epoch_bpb = self._val_bpb_nats / (math.log(2) * self._val_bpb_bytes)
         else:
             epoch_bpb = float('inf')
-        # 用 epoch-level BPB 覆盖 _last_valid_metrics 中的 per-batch 值
-        if not hasattr(self, '_last_valid_metrics'):
-            self._last_valid_metrics = {}
-        self._last_valid_metrics['loss'] = epoch_loss.detach().item()
-        self._last_valid_metrics['bpb'] = epoch_bpb
-        self._last_valid_metrics['supervised_tokens'] = self._val_supervised_tokens
-        self._last_valid_metrics['empty_supervision_batch'] = self._val_empty_supervision_batches
+
+        self._cache_valid_metric('loss', epoch_loss_value)
+        self._cache_valid_metric('bpb', epoch_bpb)
+        self._cache_valid_metric('supervised_tokens', self._val_supervised_tokens)
+        self._cache_valid_metric('empty_supervision_batch', self._val_empty_supervision_batches)
         self.log("valid_loss", epoch_loss, prog_bar=True, sync_dist=False)
 
         # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
         if self.logger is not None:
             try:
                 self.logger.experiment.log({
-                    'valid_loss': epoch_loss.detach().item(),
+                    'valid_loss': epoch_loss_value,
                     'valid_bpb': epoch_bpb,
                     'valid_supervised_tokens': self._val_supervised_tokens,
                     'valid_empty_supervision_batch': self._val_empty_supervision_batches,
@@ -1817,6 +2156,26 @@ class ModelTrainer(LightningModule):
                 device=self.device,
                 resume_state_dict=resume_state,
             )
+        elif getattr(self.hparams, 'dataset_name', 'nanochat') == 'sudoku_mixed':
+            from openebm.elm.data.sudoku_mixed_dataset import generate_sudoku_mixed_dataloader
+            # v3: derive bucket weights from --sudoku_difficulty_schedule (if any). The
+            # AdaptiveRatioCallback will mutate dataset.sudoku_ds.bucket_weights per
+            # phase so only the warmup-phase initial value is set here.
+            blank_weight = float(getattr(self.hparams, 'sudoku_blank_loss_weight', 1.0))
+            difficulty_sched = getattr(self.hparams, 'sudoku_difficulty_schedule', 'fixed')
+            initial_bucket_weights = _v3_initial_bucket_weights(difficulty_sched)
+            train_dataloader = generate_sudoku_mixed_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.max_steps * self.hparams.accumulate_grad_batches,
+                split="train",
+                device=self.device,
+                resume_state_dict=resume_state,
+                sudoku_ratio=getattr(self.hparams, 'sudoku_ratio', 0.6),
+                blank_loss_weight=blank_weight,
+                difficulty_bucket_weights=initial_bucket_weights,
+            )
         else:
             train_dataloader = generate_dataloader(
                 tokenizer=tokenizer,
@@ -1864,6 +2223,31 @@ class ModelTrainer(LightningModule):
                 split="val",
                 device=self.device,
             )
+        elif getattr(self.hparams, 'dataset_name', 'nanochat') == 'sudoku_mixed':
+            # 方案A: 验证阶段拆分为两个独立 dataloader,
+            # 分别评估 Sudoku v2 与 nanochat SFT, 再按 sudoku_ratio 加权得到 mixed 指标
+            from openebm.elm.data.sudoku_dataset_v2 import generate_sudoku_sft_v2_dataloader
+            from openebm.elm.dataset_sft import generate_sft_dataloader
+            sudoku_val_loader = generate_sudoku_sft_v2_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.val_steps,
+                split="val",
+                device=self.device,
+                augment=False,
+            )
+            sft_val_loader = generate_sft_dataloader(
+                tokenizer=tokenizer,
+                batch_size=self.hparams.batch_size_per_device,
+                max_len=self.hparams.context_length,
+                max_iter=self.hparams.val_steps,
+                split="val",
+                device=self.device,
+            )
+            # 顺序对应 self._val_loader_sources, validation_step 用 dataloader_idx 区分
+            self._val_loader_sources = ['sudoku', 'sft']
+            val_dataloader = [sudoku_val_loader, sft_val_loader]
         else:
             val_dataloader = generate_dataloader(
                 tokenizer=tokenizer,
@@ -2154,6 +2538,17 @@ class ModelTrainer(LightningModule):
                     valid_str += f" | valid_bpb: {valid_bpb_val:.4f}"
                 if valid_ppl_val is not None:
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
+                # 方案A: 当存在拆分来源时, 额外展示 sudoku / sft 各自指标
+                for src in ('sudoku', 'sft'):
+                    sub_loss = last_valid.get(f'loss_{src}', None)
+                    sub_bpb = last_valid.get(f'bpb_{src}', None)
+                    sub_ppl = last_valid.get(f'perplexity_{src}', None)
+                    if sub_loss is not None:
+                        valid_str += f" | {src}_loss: {sub_loss:.4f}"
+                    if sub_bpb is not None:
+                        valid_str += f" | {src}_bpb: {sub_bpb:.4f}"
+                    if sub_ppl is not None:
+                        valid_str += f" | {src}_ppl: {sub_ppl:.2f}"
 
                 # --- 打印 ---
                 # alpha_val_str = ""
