@@ -709,6 +709,18 @@ class ModelTrainer(LightningModule):
         self._last_valid_metrics['empty_supervision_batch'] = self._val_empty_supervision_batches
         self.log("valid_loss", epoch_loss, prog_bar=True, sync_dist=False)
 
+        if getattr(self.trainer, "is_global_zero", True):
+            valid_summary = (
+                f"[Validation] global_step={self.global_step} | "
+                f"valid_loss: {epoch_loss.detach().item():.6f} | "
+                f"valid_bpb: {epoch_bpb:.6f}"
+            )
+            valid_summary += (
+                f" | valid_supervised_tokens: {self._val_supervised_tokens} | "
+                f"valid_empty_supervision_batch: {self._val_empty_supervision_batches}"
+            )
+            print(valid_summary, flush=True)
+
         # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
         if self.logger is not None:
             try:

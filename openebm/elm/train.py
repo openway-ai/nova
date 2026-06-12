@@ -481,6 +481,8 @@ if __name__ == '__main__':
     parser.add_argument("--randomize_mcmc_step_size_scale", help="randomize the value of mcmc_step_size by a factor specified, i.e. if is 2 will mult by 2 and div by 2 and thats the range to sample from uniformly", type=float, default=1)
     
     parser.add_argument("--mcmc_num_steps", help="number of MCMC steps, try 2-5, check data samples as well to see how many we need. NOTE if are using time embed or adaln is the number of energy landscapes", type=int, default=2)
+    parser.add_argument("--zero_mcmc_ce_only", action="store_true", default=False,
+        help="Strict K=0 ablation: require --mcmc_num_steps 0 and train only the TF-head CE path from the initial corrupted/free-embedding state, without energy-head forward, autograd.grad, or MCMC update.")
 
     parser.add_argument("--randomize_mcmc_num_steps", help="makes mcmc_num_steps random, each step at each landscape is repeated uniform(1, 1+randomize_mcmc_num_steps) times (unless randomize_mcmc_num_steps_min is set, then thats the min value). if ebt_type is default each landscape is the same, so it effectively just randomized mcmc_num_steps", type=int, default=0)
 
@@ -535,6 +537,8 @@ if __name__ == '__main__':
         help="For tf_head_type=post_update_state_unembed only: decode concat(z_i, z_{i+1}) with Linear(2D,V).")
     parser.add_argument("--post_update_state_concat_prev_embed", action="store_true", default=False,
         help="For tf_head_type=post_update_state_unembed only: decode concat(z_{i+1}, embed(input_ids)) with Linear(2D,V).")
+    parser.add_argument("--post_update_state_detach_prev_embed", action="store_true", default=False,
+        help="For post_update_state_unembed + concat_prev_embed only: detach embed(input_ids) before TF-head CE.")
     parser.add_argument("--post_update_state_tf_head_adamw", action="store_true", default=False,
         help="For tf_head_type=post_update_state_unembed with --optimizer muon_adamw: put TF-head matrix params in AdamW instead of Muon.")
 

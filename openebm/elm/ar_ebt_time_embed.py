@@ -841,6 +841,7 @@ class EBTTimeConcat(nn.Module):
         real_token_ids: Optional[torch.Tensor] = None,
         predicted_tokens: Optional[torch.Tensor] = None,
         return_pred_hidden: bool = False,
+        return_energy: bool = True,
     ):
         """
         Perform a forward pass through the Transformer model.
@@ -851,6 +852,9 @@ class EBTTimeConcat(nn.Module):
             mcmc_step (int): Current MCMC step index, used for time embeddings.
             return_pred_hidden (bool): When True, also return the post-norm hidden
                 state at candidate positions ([B, S, D]) used by the TF head.
+            return_energy (bool): When False, skip the final scalar energy head.
+                This is used by strict K=0 CE-only ablations that need trunk hidden
+                states but must not run energy-related computation.
 
         Returns:
             torch.Tensor: Output energies after applying the Transformer model.
@@ -918,11 +922,13 @@ class EBTTimeConcat(nn.Module):
             embeddings = self.norm(embeddings)
             if self.use_mcmc_time_embed:
                 embeddings = embeddings[:, 1:] # remove temporal embed
-            energies = self.final_layer(embeddings)
-
-            energies = energies[:, embeddings.shape[1] // 2:]
+            split_idx = embeddings.shape[1] // 2
+            energies = None
+            if return_energy:
+                energies = self.final_layer(embeddings)
+                energies = energies[:, split_idx:]
             if return_pred_hidden:
                 # Candidate-position hidden state, post-norm, [B, S, D] — for TF head.
-                pred_hidden = embeddings[:, embeddings.shape[1] // 2:]
+                pred_hidden = embeddings[:, split_idx:]
                 return energies, pred_hidden
             return energies

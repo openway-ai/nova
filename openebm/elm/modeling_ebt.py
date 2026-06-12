@@ -31,6 +31,19 @@ class EBT_NLP(LightningModule):
             self.hparams.update(hparams)
         else:
             self.hparams.update(vars(hparams))
+
+        self.zero_mcmc_ce_only = bool(getattr(self.hparams, "zero_mcmc_ce_only", False))
+        if self.hparams.mcmc_num_steps < 0:
+            raise ValueError("--mcmc_num_steps must be >= 0.")
+        if self.hparams.mcmc_num_steps == 0 and not self.zero_mcmc_ce_only:
+            raise ValueError("--mcmc_num_steps 0 requires --zero_mcmc_ce_only.")
+        if self.zero_mcmc_ce_only:
+            if self.hparams.mcmc_num_steps != 0:
+                raise ValueError("--zero_mcmc_ce_only requires --mcmc_num_steps 0.")
+            if self.hparams.mcmc_step_size_learnable:
+                raise ValueError("--zero_mcmc_ce_only does not use alpha; omit --mcmc_step_size_learnable.")
+            if getattr(self.hparams, "randomize_mcmc_num_steps", 0) != 0:
+                raise ValueError("--zero_mcmc_ce_only is incompatible with --randomize_mcmc_num_steps.")
         
         # tokenizer = AutoTokenizer.from_pretrained(self.hparams.tokenizer, clean_up_tokenization_spaces = False)
         # Use tokenizer_obj if available (set by ModelTrainer), otherwise use tokenizer directly
@@ -83,6 +96,7 @@ class EBT_NLP(LightningModule):
         self.post_update_state_use_rmsnorm = bool(getattr(self.hparams, "post_update_state_use_rmsnorm", False))
         self.post_update_state_concat_zi = bool(getattr(self.hparams, "post_update_state_concat_zi", False))
         self.post_update_state_concat_prev_embed = bool(getattr(self.hparams, "post_update_state_concat_prev_embed", False))
+        self.post_update_state_detach_prev_embed = bool(getattr(self.hparams, "post_update_state_detach_prev_embed", False))
         self.truncate_mcmc_per_step_ce = bool(getattr(self.hparams, "truncate_mcmc_per_step_ce", False))
         if self.truncate_mcmc_per_step_ce and not self.hparams.truncate_mcmc:
             raise ValueError("--truncate_mcmc_per_step_ce requires --truncate_mcmc.")
@@ -90,6 +104,7 @@ class EBT_NLP(LightningModule):
             self.post_update_state_use_rmsnorm
             or self.post_update_state_concat_zi
             or self.post_update_state_concat_prev_embed
+            or self.post_update_state_detach_prev_embed
         ) and not self.use_post_update_state_unembed:
             raise ValueError(
                 "post_update_state_* options only apply when "
@@ -99,6 +114,11 @@ class EBT_NLP(LightningModule):
             raise ValueError(
                 "--post_update_state_concat_zi and --post_update_state_concat_prev_embed "
                 "are mutually exclusive; use one concat ablation at a time."
+            )
+        if self.post_update_state_detach_prev_embed and not self.post_update_state_concat_prev_embed:
+            raise ValueError(
+                "--post_update_state_detach_prev_embed requires "
+                "--post_update_state_concat_prev_embed."
             )
         if self.use_tf_head:
             self.tf_head = build_tf_head(self.hparams)
@@ -136,6 +156,25 @@ class EBT_NLP(LightningModule):
                 "--tf_head_type post_update_state_unembed requires --free_embedding_mcmc: "
                 "the post-update state must be D-dim before Linear(D, V) unembedding."
             )
+        if self.zero_mcmc_ce_only:
+            if not self.use_tf_head:
+                raise ValueError("--zero_mcmc_ce_only requires --use_tf_head for CE supervision.")
+            if not self.use_free_embedding_mcmc:
+                raise ValueError("--zero_mcmc_ce_only currently supports the free-embedding TF-head path only.")
+            if self.use_post_update_state_unembed:
+                raise ValueError(
+                    "--zero_mcmc_ce_only has no post-update state; use --tf_head_type direct_unembed, "
+                    "linear, transformer, or pre_update_hidden_unembed."
+                )
+            if self.hparams.ebt_type != "time_embed":
+                raise ValueError("--zero_mcmc_ce_only currently requires --ebt_type time_embed.")
+            if getattr(self.hparams, "use_mcmc_time_embed", False):
+                raise ValueError("--zero_mcmc_ce_only is incompatible with --use_mcmc_time_embed.")
+            if getattr(self.hparams, "contrastive_loss", False):
+                raise ValueError("--zero_mcmc_ce_only is incompatible with --contrastive_loss.")
+            if hasattr(self.transformer, "final_layer"):
+                for param in self.transformer.final_layer.parameters():
+                    param.requires_grad = False
 
         self._alpha_debug_step = 0  # counter for alpha diagnostic prints
         if self.hparams.debug_unused_parameters:
@@ -168,6 +207,24 @@ class EBT_NLP(LightningModule):
                 return torch.matmul(predicted_tokens, self.embeddings.weight)
             return self.vocab_to_embed(predicted_tokens)
         return self.vocab_to_embed(predicted_tokens)
+
+    def _zero_mcmc_ce_only_pred_hidden(self, predicted_tokens, real_embeddings_input, start_pos, real_token_ids):
+        if not self.use_free_embedding_mcmc:
+            raise RuntimeError("--zero_mcmc_ce_only currently expects D-dim free-embedding state.")
+
+        all_embeddings = torch.cat((real_embeddings_input.detach(), predicted_tokens), dim=1)
+        energy_preds, pred_hidden_step = self.transformer(
+            all_embeddings,
+            start_pos=start_pos,
+            mcmc_step=0,
+            real_token_ids=real_token_ids,
+            predicted_tokens=predicted_tokens,
+            return_pred_hidden=True,
+            return_energy=False,
+        )
+        if energy_preds is not None:
+            raise RuntimeError("--zero_mcmc_ce_only expected the transformer to skip energy output.")
+        return pred_hidden_step
 
     @torch.compiler.disable
     def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps,
@@ -345,8 +402,22 @@ class EBT_NLP(LightningModule):
         predicted_tokens = self.corrupt_embeddings(real_embeddings_input) # B, S, V
         if replay_buffer_logits is not None: # using replay buffer, use the logits instead of corruption
             predicted_tokens[batch_size - replay_buffer_logits.shape[0]:] = replay_buffer_logits # NOTE this assumes the fresh data is concatted first
-                
-        
+
+        if self.zero_mcmc_ce_only:
+            if replay_buffer_logits is not None:
+                raise RuntimeError("--zero_mcmc_ce_only is incompatible with replay_buffer_logits.")
+            pred_hidden_step = self._zero_mcmc_ce_only_pred_hidden(
+                predicted_tokens,
+                real_embeddings_input,
+                start_pos,
+                real_token_ids=x,
+            )
+            zero_energy = pred_hidden_step.new_zeros(batch_size * seq_length, 1)
+            if return_pred_hiddens:
+                return [None], [zero_energy], [pred_hidden_step]
+            return [None], [zero_energy]
+
+
         mcmc_steps = [] # in the general case of no randomize_mcmc_num_steps then this has len == self.hparams.randomize_mcmc_num_steps
         for step in range(self.hparams.mcmc_num_steps):
             if not no_randomness and hasattr(self.hparams, 'randomize_mcmc_num_steps') and self.hparams.randomize_mcmc_num_steps > 0:
@@ -432,6 +503,8 @@ class EBT_NLP(LightningModule):
             # prev_embed is only the first-layer token embedding; direct unembedding
             # variants keep the shared call signature but do not use it.
             prev_embed = self.embeddings(input_ids)  # first-layer anchor, [B, S, D]
+            if self.post_update_state_detach_prev_embed:
+                prev_embed = prev_embed.detach()
             predicted_distributions = [
                 None if pred_hidden_step is None else self.tf_head(pred_hidden_step, prev_embed)  # [B, S, V]
                 for pred_hidden_step in predicted_pred_hiddens
