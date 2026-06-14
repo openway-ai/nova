@@ -104,6 +104,8 @@ LARGE_MODEL_ALIASES = {"qwen3p6_27b", "deepseek_r1_0528"}
 class ParseResult:
     pred: Optional[List[int]]
     strategy: str
+    failure_reason: str = ""
+    candidate_count: int = 0
 
 
 def flatten_board(board: Any) -> List[int]:
@@ -214,9 +216,13 @@ def _row_digits(line: str) -> Optional[List[int]]:
     return None
 
 
-def _extract_grid_lines(text: str) -> Optional[List[int]]:
+def _is_completed_board(pred: Sequence[int]) -> bool:
+    return len(pred) == 81 and all(isinstance(v, int) and 1 <= int(v) <= 9 for v in pred)
+
+
+def _extract_grid_line_candidates(text: str) -> List[List[int]]:
     rows: List[List[int]] = []
-    best: Optional[List[int]] = None
+    candidates: List[List[int]] = []
     for line in text.splitlines():
         row = _row_digits(line)
         if row is None:
@@ -224,57 +230,102 @@ def _extract_grid_lines(text: str) -> Optional[List[int]]:
             # nearly complete grid; prose should.
             if rows and re.fullmatch(r"[\s`|:.-]*", line):
                 continue
+            if len(rows) >= 9:
+                candidates.append([v for r in rows[-9:] for v in r])
             rows = []
             continue
         rows.append(row)
         if len(rows) >= 9:
             tail = rows[-9:]
-            best = [v for r in tail for v in r]
-    return best
+            candidates.append([v for r in tail for v in r])
+    if len(rows) >= 9:
+        candidates.append([v for r in rows[-9:] for v in r])
+    return candidates
 
 
-def _extract_digit_run(text: str) -> Optional[List[int]]:
-    runs = re.findall(r"[0-9]{81,}", text)
-    if not runs:
-        return None
-    return [int(ch) for ch in runs[-1][-81:]]
+def _extract_digit_run_candidates(text: str) -> List[List[int]]:
+    candidates: List[List[int]] = []
+    for match in re.finditer(r"[0-9]{81,}", text):
+        run = match.group(0)
+        candidates.append([int(ch) for ch in run[-81:]])
+    return candidates
 
 
-def _extract_whitespace_digits(text: str) -> Optional[List[int]]:
+def _extract_whitespace_digit_candidates(text: str) -> List[List[int]]:
     nums = [int(tok) for tok in text.split() if tok.isdigit() and len(tok) == 1]
     if len(nums) >= 81:
-        return nums[-81:]
-    return None
+        return [nums[-81:]]
+    return []
 
 
-def _extract_all_digits(text: str) -> Optional[List[int]]:
+def _extract_all_digit_candidates(text: str) -> List[List[int]]:
     nums = [int(ch) for ch in re.findall(r"[0-9]", text)]
     if len(nums) >= 81:
-        return nums[-81:]
-    return None
+        return [nums[-81:]]
+    return []
+
+
+def _candidate_rows(section_name: str, section: str) -> List[Tuple[List[int], str]]:
+    """Return candidate final grids in encounter order for one text section."""
+    candidates: List[Tuple[List[int], str]] = []
+    for pred in _extract_grid_line_candidates(section):
+        candidates.append((pred, f"{section_name}:grid_lines"))
+    for pred in _extract_digit_run_candidates(section):
+        candidates.append((pred, f"{section_name}:digit_run"))
+
+    # Free-form all-digit extraction is intentionally limited to explicit answer
+    # sections. In raw chain-of-thought it can accidentally collect coordinates
+    # or candidate notes and turn them into a bogus Sudoku grid.
+    explicit_answer_section = section_name.startswith("after_") and section_name != "after_think"
+    if explicit_answer_section:
+        for pred in _extract_whitespace_digit_candidates(section):
+            candidates.append((pred, f"{section_name}:whitespace_digits"))
+        for pred in _extract_all_digit_candidates(section):
+            candidates.append((pred, f"{section_name}:all_digits"))
+    return candidates
 
 
 def parse_llm_board(text: str) -> ParseResult:
     """Extract the final 81 Sudoku digits from raw model output.
 
-    Parsed means "format-valid": we found 81 digits. Digits may include 0, and
-    Sudoku-rule validity is computed separately as `is_valid_sudoku`.
+    Parsed means we found a completed 9x9 answer grid containing only digits
+    1-9. Echoed puzzles or intermediate grids with 0/`.` blanks are treated as
+    parse failures instead of answer grids.
     """
     if not text:
-        return ParseResult(None, "empty")
+        return ParseResult(None, "empty", failure_reason="empty_response")
 
-    extractors = [
-        ("grid_lines", _extract_grid_lines),
-        ("digit_run", _extract_digit_run),
-        ("whitespace_digits", _extract_whitespace_digits),
-        ("all_digits", _extract_all_digits),
-    ]
+    total_candidates = 0
+    rejected_incomplete = 0
     for section_name, section in _priority_sections(text):
-        for extractor_name, extractor in extractors:
-            pred = extractor(section)
-            if pred is not None and len(pred) == 81:
-                return ParseResult(pred, f"{section_name}:{extractor_name}")
-    return ParseResult(None, "failed")
+        candidates = _candidate_rows(section_name, section)
+        total_candidates += len(candidates)
+        for extractor_name in ["grid_lines", "digit_run", "whitespace_digits", "all_digits"]:
+            valid_candidates = [
+                (pred, strategy)
+                for pred, strategy in candidates
+                if strategy.endswith(f":{extractor_name}")
+                and len(pred) == 81
+                and _is_completed_board(pred)
+            ]
+            if valid_candidates:
+                pred, strategy = valid_candidates[-1]
+                return ParseResult(pred, strategy, candidate_count=total_candidates)
+        rejected_incomplete += sum(1 for pred, _ in candidates if len(pred) == 81)
+
+    if rejected_incomplete:
+        return ParseResult(
+            None,
+            "failed:incomplete_or_non_1_9_grid",
+            failure_reason="found_81_cells_but_not_completed_1_9_grid",
+            candidate_count=total_candidates,
+        )
+    return ParseResult(
+        None,
+        "failed:no_grid",
+        failure_reason="no_completed_9x9_grid_found",
+        candidate_count=total_candidates,
+    )
 
 
 def infer_response_format(response: Optional[str], pred: Optional[List[int]]) -> str:

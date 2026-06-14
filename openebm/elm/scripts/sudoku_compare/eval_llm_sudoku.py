@@ -10,6 +10,7 @@ import argparse
 import gc
 import hashlib
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -191,12 +192,27 @@ class VLLMRunner:
         }
         if args.pipeline_parallel_size > 1:
             llm_kwargs["pipeline_parallel_size"] = args.pipeline_parallel_size
+        if args.distributed_executor_backend:
+            llm_kwargs["distributed_executor_backend"] = args.distributed_executor_backend
+        if args.data_parallel_size > 1:
+            if args.distributed_executor_backend != "external_launcher":
+                raise ValueError(
+                    "vLLM offline LLM(data_parallel_size>1) is not supported in a "
+                    "single Python process. Use --distributed-executor-backend "
+                    "external_launcher with an external DP launcher, or keep "
+                    "--data-parallel-size 1 and run multiple model/shard processes."
+                )
+            llm_kwargs["data_parallel_size"] = args.data_parallel_size
+        if args.data_parallel_size_local:
+            llm_kwargs["data_parallel_size_local"] = args.data_parallel_size_local
         if args.quantization:
             llm_kwargs["quantization"] = args.quantization
         if args.max_model_len:
             llm_kwargs["max_model_len"] = args.max_model_len
         if args.enforce_eager:
             llm_kwargs["enforce_eager"] = True
+        if args.attention_backend and args.attention_backend.lower() != "auto":
+            llm_kwargs["attention_config"] = {"backend": args.attention_backend}
 
         self.llm = LLM(**llm_kwargs)
         sampling_kwargs: Dict[str, Any] = {
@@ -326,6 +342,243 @@ def response_for_log(response: str, args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
+def runtime_device_info(args: argparse.Namespace) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "assigned_gpus": args.assigned_gpus or os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "parallel_strategy": args.parallel_strategy or "",
+        "backend": args.backend,
+        "batch_size": args.batch_size,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "pipeline_parallel_size": args.pipeline_parallel_size,
+        "data_parallel_size": args.data_parallel_size,
+        "data_parallel_size_local": args.data_parallel_size_local,
+    }
+    try:
+        import torch
+
+        info["torch_cuda_available"] = bool(torch.cuda.is_available())
+        info["torch_device_count"] = int(torch.cuda.device_count())
+        devices = []
+        for idx in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(idx)
+            devices.append(
+                {
+                    "local_index": idx,
+                    "name": props.name,
+                    "total_memory_gib": round(props.total_memory / (1024**3), 3),
+                }
+            )
+        info["devices"] = devices
+    except Exception as e:
+        info["torch_error"] = f"{type(e).__name__}: {e}"
+    return info
+
+
+def response_for_trace(response: str, args: argparse.Namespace) -> Dict[str, Any]:
+    if args.trace_log == "none":
+        logged = ""
+    elif args.trace_log == "full" or len(response) <= args.trace_log_chars:
+        logged = response
+    else:
+        logged = response[-args.trace_log_chars :]
+    return {
+        "full_model_output": logged,
+        "trace_log_mode": args.trace_log,
+        "trace_was_truncated": logged != response,
+    }
+
+
+def board_or_empty(pred: Any) -> str:
+    if isinstance(pred, list) and len(pred) == 81:
+        try:
+            return format_board([int(v) for v in pred])
+        except Exception:
+            return ""
+    return ""
+
+
+def filled_cell_acc(row: Dict[str, Any]) -> float:
+    total = int(row.get("filled_total", 0) or 0)
+    if total <= 0:
+        return 0.0
+    return float(row.get("filled_correct", 0) or 0) / total
+
+
+def case_note(row: Dict[str, Any], max_tokens: int) -> str:
+    if row.get("fully_solved"):
+        return "fully solved; exact board match"
+    if not row.get("parsed"):
+        reason = row.get("parse_failure_reason") or row.get("parser_strategy") or "parse failed"
+        if int(row.get("tokens_generated", 0) or 0) >= max_tokens:
+            return f"parse failed after hitting max_tokens; {reason}"
+        return f"parse failed; {reason}"
+    missing = int(row.get("filled_total", 0) or 0) - int(row.get("filled_correct", 0) or 0)
+    if missing <= 1:
+        return "near miss; at most one originally blank cell is wrong"
+    if not row.get("is_valid_sudoku"):
+        return "parsed 9x9 answer but it violates Sudoku constraints"
+    if int(row.get("tokens_generated", 0) or 0) >= max_tokens:
+        return "wrong answer and generation hit max_tokens"
+    return "wrong parsed answer"
+
+
+def trace_row_from_eval_row(row: Dict[str, Any], response: str, args: argparse.Namespace) -> Dict[str, Any]:
+    pred = row.get("pred")
+    trace = {
+        "split": row.get("split", "test"),
+        "idx": row.get("idx"),
+        "model": row.get("model"),
+        "model_path": row.get("model_path"),
+        "resolved_model_dir": row.get("resolved_model_dir"),
+        "puzzle_text": row.get("puzzle_text", ""),
+        "prompt_used": row.get("prompt_used", ""),
+        **response_for_trace(response, args),
+        "parsed_answer": pred,
+        "parsed_answer_text": board_or_empty(pred),
+        "parser_strategy": row.get("parser_strategy", ""),
+        "parse_failure_reason": row.get("parse_failure_reason", ""),
+        "parser_candidate_count": row.get("parser_candidate_count", 0),
+        "correct_answer_text": row.get("solution_text", ""),
+        "is_correct": bool(row.get("fully_solved")),
+        "fully_solved": bool(row.get("fully_solved")),
+        "parsed": bool(row.get("parsed")),
+        "is_valid_sudoku": bool(row.get("is_valid_sudoku")),
+        "correct": row.get("correct", 0),
+        "total": row.get("total", 81),
+        "given_total": row.get("given_total", 0),
+        "given_correct": row.get("given_correct", 0),
+        "filled_total": row.get("filled_total", 0),
+        "filled_correct": row.get("filled_correct", 0),
+        "filled_cell_acc": filled_cell_acc(row),
+        "elapsed_s": row.get("elapsed_s", 0.0),
+        "tokens_generated": row.get("tokens_generated", 0),
+    }
+    trace["case_note"] = case_note(trace, args.max_tokens)
+    return trace
+
+
+def trace_rows_from_existing_rows(
+    rows: Sequence[Dict[str, Any]],
+    existing_traces: Sequence[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> List[Dict[str, Any]]:
+    traced = {row.get("idx") for row in existing_traces if isinstance(row.get("idx"), int)}
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        idx = row.get("idx")
+        if not isinstance(idx, int) or idx in traced:
+            continue
+        trace = trace_row_from_eval_row(row, str(row.get("response", "") or ""), args)
+        trace["trace_source"] = "test_jsonl_response"
+        if row.get("response_was_truncated"):
+            trace["case_note"] = (
+                f"{trace.get('case_note', '')}; reconstructed from truncated test.jsonl response"
+            ).strip("; ")
+        out.append(trace)
+    return out
+
+
+def add_progress_event(path: Path, event: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **event}
+    with open(path, "a", buffering=1) as fp:
+        fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def write_trace_exports(model_out_dir: Path, traces: Sequence[Dict[str, Any]], args: argparse.Namespace) -> None:
+    trace_dir = model_out_dir / "traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    all_rows = dedupe_sort_rows(traces)
+    write_jsonl(trace_dir / "all.jsonl", all_rows)
+
+    correct = [row for row in all_rows if row.get("fully_solved")]
+    wrong = [row for row in all_rows if not row.get("fully_solved")]
+    parse_failed = [row for row in all_rows if not row.get("parsed")]
+    invalid_sudoku = [
+        row for row in wrong if row.get("parsed") and not row.get("is_valid_sudoku")
+    ]
+    near_miss = sorted(
+        [row for row in wrong if row.get("parsed")],
+        key=lambda row: (
+            int(row.get("filled_total", 0) or 0) - int(row.get("filled_correct", 0) or 0),
+            -filled_cell_acc(row),
+            int(row.get("idx", 0) or 0),
+        ),
+    )
+
+    limit = max(1, int(args.case_examples_per_type))
+    correct_examples = correct[:limit]
+    wrong_examples = wrong[:limit]
+    write_jsonl(trace_dir / "correct_examples.jsonl", correct_examples)
+    write_jsonl(trace_dir / "wrong_examples.jsonl", wrong_examples)
+    # Backward-compatible aliases for the original 5-case requirement.
+    write_jsonl(trace_dir / "correct_5.jsonl", correct_examples[:5])
+    write_jsonl(trace_dir / "wrong_5.jsonl", wrong_examples[:5])
+    write_jsonl(trace_dir / "parse_failed.jsonl", parse_failed)
+    write_jsonl(trace_dir / "near_miss.jsonl", near_miss[:limit])
+    write_jsonl(trace_dir / "invalid_sudoku.jsonl", invalid_sudoku[:limit])
+
+    typical: List[Dict[str, Any]] = []
+    for category, rows in [
+        ("correct", correct[:limit]),
+        ("wrong", wrong[:limit]),
+        ("near_miss", near_miss[:limit]),
+        ("parse_failed", parse_failed[:limit]),
+        ("invalid_sudoku", invalid_sudoku[:limit]),
+    ]:
+        for row in rows:
+            item = dict(row)
+            item["case_category"] = category
+            typical.append(item)
+    write_jsonl(trace_dir / "typical_cases.jsonl", typical)
+    write_json(
+        trace_dir / "trace_summary.json",
+        {
+            "n": len(all_rows),
+            "correct": len(correct),
+            "wrong": len(wrong),
+            "parse_failed": len(parse_failed),
+            "invalid_sudoku": len(invalid_sudoku),
+            "near_miss_candidates": len(near_miss),
+            "trace_log_mode": args.trace_log,
+            "case_examples_per_type": limit,
+            "files": {
+                "all": str(trace_dir / "all.jsonl"),
+                "correct_examples": str(trace_dir / "correct_examples.jsonl"),
+                "wrong_examples": str(trace_dir / "wrong_examples.jsonl"),
+                "correct_5_alias": str(trace_dir / "correct_5.jsonl"),
+                "wrong_5_alias": str(trace_dir / "wrong_5.jsonl"),
+                "parse_failed": str(trace_dir / "parse_failed.jsonl"),
+                "near_miss": str(trace_dir / "near_miss.jsonl"),
+                "invalid_sudoku": str(trace_dir / "invalid_sudoku.jsonl"),
+                "typical_cases": str(trace_dir / "typical_cases.jsonl"),
+            },
+        },
+    )
+
+
+def clear_trace_exports(model_out_dir: Path) -> None:
+    trace_dir = model_out_dir / "traces"
+    if not trace_dir.is_dir():
+        return
+    for name in [
+        "all.jsonl",
+        "correct_examples.jsonl",
+        "wrong_examples.jsonl",
+        "correct_5.jsonl",
+        "wrong_5.jsonl",
+        "parse_failed.jsonl",
+        "near_miss.jsonl",
+        "invalid_sudoku.jsonl",
+        "typical_cases.jsonl",
+        "trace_summary.json",
+    ]:
+        path = trace_dir / name
+        if path.is_file():
+            path.unlink()
+
+
 def make_invalid_generation_row(
     idx: int,
     name: str,
@@ -355,6 +608,8 @@ def make_invalid_generation_row(
         "response_was_truncated": False,
         "pred": None,
         "parser_strategy": "generation_error",
+        "parse_failure_reason": f"{type(error).__name__}: {error}",
+        "parser_candidate_count": 0,
         "solution_format": "unknown",
         "puzzle_format": "grid",
         **scored,
@@ -374,18 +629,27 @@ def evaluate_one_model(
     model_out_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = model_out_dir / "test.jsonl"
     summary_path = model_out_dir / "summary.json"
+    progress_path = model_out_dir / "progress.jsonl"
+    trace_path = model_out_dir / "traces" / "all.jsonl"
 
     if args.overwrite and jsonl_path.exists():
         jsonl_path.write_text("")
+    if args.overwrite and progress_path.exists():
+        progress_path.write_text("")
+    if args.overwrite:
+        clear_trace_exports(model_out_dir)
 
     done = set()
     existing_rows = []
+    existing_traces = []
     if args.resume and jsonl_path.is_file():
         selected = set(indices)
         existing_rows = [row for row in read_jsonl(jsonl_path) if row.get("idx") in selected]
         done = {int(r["idx"]) for r in existing_rows if isinstance(r.get("idx"), int)}
+        existing_traces = [row for row in read_jsonl(trace_path) if row.get("idx") in selected]
 
     pending = [idx for idx in indices if idx not in done]
+    device_info = runtime_device_info(args)
     config = {
         "model": name,
         "model_path": str(raw_model_path),
@@ -406,28 +670,86 @@ def evaluate_one_model(
             "save_prompts": args.save_prompts,
             "response_log": args.response_log,
             "response_log_chars": args.response_log_chars,
+            "trace_log": args.trace_log,
+            "trace_log_chars": args.trace_log_chars,
+        },
+        "vllm": {
+            "attention_backend": args.attention_backend,
+            "enforce_eager": args.enforce_eager,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "pipeline_parallel_size": args.pipeline_parallel_size,
+            "data_parallel_size": args.data_parallel_size,
+            "data_parallel_size_local": args.data_parallel_size_local,
+            "distributed_executor_backend": args.distributed_executor_backend,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "max_model_len": args.max_model_len,
+        },
+        "runtime": device_info,
+        "outputs": {
+            "jsonl": str(jsonl_path),
+            "summary": str(summary_path),
+            "progress": str(progress_path),
+            "traces": str(model_out_dir / "traces"),
         },
     }
     write_json(model_out_dir / "config.json", config)
 
     print(f"[eval_llm_sudoku] model={name} path={resolved_model_dir}")
     print(f"[eval_llm_sudoku] pending={len(pending)} already_done={len(done)} out={jsonl_path}")
+    print(
+        "[eval_llm_sudoku] parallel "
+        f"strategy={device_info.get('parallel_strategy') or 'manual'} "
+        f"assigned_gpus={device_info.get('assigned_gpus') or '<all visible>'} "
+        f"torch_device_count={device_info.get('torch_device_count', 'unknown')} "
+        f"batch_size={args.batch_size} tp={args.tensor_parallel_size} "
+        f"pp={args.pipeline_parallel_size} dp={args.data_parallel_size}"
+    )
+    add_progress_event(
+        progress_path,
+        {
+            "event": "model_start",
+            "model": name,
+            "selected": len(indices),
+            "pending": len(pending),
+            "already_done": len(done),
+            "batch_size": args.batch_size,
+            "runtime": device_info,
+        },
+    )
     if not pending:
         rows = dedupe_sort_rows(existing_rows)
         summary = summarize_rows(rows, model=name, params=params_for_run(name, args))
         write_json(summary_path, summary)
+        traces = dedupe_sort_rows(
+            list(existing_traces) + trace_rows_from_existing_rows(rows, existing_traces, args)
+        )
+        if traces:
+            write_trace_exports(model_out_dir, traces, args)
+        add_progress_event(progress_path, {"event": "model_finish", "model": name, "summary": summary})
         return summary
 
     runner = make_runner(resolved_model_dir, args)
     all_new_rows: List[Dict[str, Any]] = []
+    all_new_traces: List[Dict[str, Any]] = []
 
-    iterator = range(0, len(pending), args.batch_size)
+    batch_starts = range(0, len(pending), args.batch_size)
+    total_batches = (len(pending) + args.batch_size - 1) // args.batch_size
+    pbar = None
     if tqdm is not None:
-        iterator = tqdm(iterator, total=(len(pending) + args.batch_size - 1) // args.batch_size, desc=name)
+        pbar = tqdm(
+            total=len(pending),
+            desc=name,
+            unit="sample",
+            dynamic_ncols=True,
+        )
 
+    eval_start = time.time()
+    completed_new = 0
+    tokens_new = 0
     with open(jsonl_path, "a", buffering=1) as fp:
-        for start in iterator:
+        for start in batch_starts:
             batch_indices = pending[start : start + args.batch_size]
+            batch_num = start // args.batch_size + 1
             prompts: List[str] = []
             prompt_texts: List[str] = []
             puzzles: List[List[int]] = []
@@ -449,6 +771,25 @@ def evaluate_one_model(
                 solutions.append(solution)
 
             try:
+                print(
+                    f"[eval_llm_sudoku] {name} batch={batch_num}/{total_batches} "
+                    f"start idx={batch_indices[0]}..{batch_indices[-1]} "
+                    f"batch_size={len(batch_indices)} completed={completed_new}/{len(pending)} "
+                    f"tokens={tokens_new}"
+                )
+                add_progress_event(
+                    progress_path,
+                    {
+                        "event": "batch_start",
+                        "model": name,
+                        "batch": batch_num,
+                        "total_batches": total_batches,
+                        "batch_indices": [int(i) for i in batch_indices],
+                        "completed": completed_new,
+                        "selected": len(indices),
+                        "tokens_generated": tokens_new,
+                    },
+                )
                 t0 = time.time()
                 outputs = runner.generate(prompts)
                 batch_elapsed = time.time() - t0
@@ -469,9 +810,53 @@ def evaluate_one_model(
                     )
                     fp.write(json.dumps(row, ensure_ascii=False) + "\n")
                     all_new_rows.append(row)
+                    all_new_traces.append(trace_row_from_eval_row(row, row["response"], args))
+                completed_new += len(batch_indices)
+                if pbar is not None:
+                    pbar.update(len(batch_indices))
                 continue
 
             per_sample_elapsed = batch_elapsed / max(len(outputs), 1)
+            batch_tokens = sum(int(token_count or 0) for _, token_count in outputs)
+            tokens_new += batch_tokens
+            completed_new += len(outputs)
+            wall_elapsed = max(time.time() - eval_start, 1e-9)
+            batch_tokens_per_s = batch_tokens / max(batch_elapsed, 1e-9)
+            total_tokens_per_s = tokens_new / wall_elapsed
+            samples_per_s = completed_new / wall_elapsed
+            print(
+                f"[eval_llm_sudoku] {name} batch={batch_num}/{total_batches} "
+                f"done samples={len(outputs)} batch_s={batch_elapsed:.3f} "
+                f"batch_tokens={batch_tokens} batch_tok/s={batch_tokens_per_s:.2f} "
+                f"completed={completed_new}/{len(pending)} total_tokens={tokens_new} "
+                f"tok/s={total_tokens_per_s:.2f} samples/s={samples_per_s:.4f}"
+            )
+            add_progress_event(
+                progress_path,
+                {
+                    "event": "batch_end",
+                    "model": name,
+                    "batch": batch_num,
+                    "total_batches": total_batches,
+                    "batch_size": len(outputs),
+                    "batch_elapsed_s": batch_elapsed,
+                    "batch_tokens": batch_tokens,
+                    "batch_tokens_per_s": batch_tokens_per_s,
+                    "completed": completed_new,
+                    "selected": len(indices),
+                    "tokens_generated": tokens_new,
+                    "tokens_per_s": total_tokens_per_s,
+                    "samples_per_s": samples_per_s,
+                },
+            )
+            if pbar is not None:
+                pbar.update(len(outputs))
+                pbar.set_postfix(
+                    completed=f"{completed_new}/{len(pending)}",
+                    tokens=tokens_new,
+                    tok_s=f"{total_tokens_per_s:.1f}",
+                    sample_s=f"{samples_per_s:.3f}",
+                )
 
             for idx, puzzle, solution, puzzle_text, prompt, (response, token_count) in zip(
                 batch_indices, puzzles, solutions, prompt_texts, prompts, outputs
@@ -496,19 +881,32 @@ def evaluate_one_model(
                     **response_for_log(response, args),
                     "pred": parse_result.pred,
                     "parser_strategy": parse_result.strategy,
+                    "parse_failure_reason": parse_result.failure_reason,
+                    "parser_candidate_count": parse_result.candidate_count,
                     "solution_format": infer_response_format(response, parse_result.pred),
                     "puzzle_format": "grid",
                     **scored,
                 }
                 fp.write(json.dumps(row, ensure_ascii=False) + "\n")
                 all_new_rows.append(row)
+                all_new_traces.append(trace_row_from_eval_row(row, response, args))
+    if pbar is not None:
+        pbar.close()
 
     rows = dedupe_sort_rows(existing_rows + all_new_rows + read_jsonl(jsonl_path))
     selected = set(indices)
     rows = [row for row in rows if row.get("idx") in selected]
     write_jsonl(jsonl_path, rows)
+    traces = dedupe_sort_rows(
+        existing_traces
+        + trace_rows_from_existing_rows(existing_rows, existing_traces, args)
+        + all_new_traces
+    )
+    traces = [row for row in traces if row.get("idx") in selected]
+    write_trace_exports(model_out_dir, traces, args)
     summary = summarize_rows(rows, model=name, params=params_for_run(name, args))
     write_json(summary_path, summary)
+    add_progress_event(progress_path, {"event": "model_finish", "model": name, "summary": summary})
     print(
         f"[eval_llm_sudoku] {name}: n={summary['n']} "
         f"board_acc={summary['board_acc']:.4f} "
@@ -542,6 +940,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_RESULTS_ROOT / "llm")
+    parser.add_argument(
+        "--run-summary-name",
+        default="run_summary.json",
+        help="Filename under --out-dir for this invocation's model summary list.",
+    )
     parser.add_argument("--revision", default=None, help="Snapshot hash under snapshots/, optional.")
     parser.add_argument("--params", default=None, help="Override params string for all selected models.")
     parser.add_argument(
@@ -575,17 +978,52 @@ def build_parser() -> argparse.ArgumentParser:
         default=12000,
         help="Tail characters kept when --response-log=truncated.",
     )
+    parser.add_argument(
+        "--trace-log",
+        choices=["truncated", "full", "none"],
+        default="full",
+        help="How much raw model output to keep in traces/all.jsonl.",
+    )
+    parser.add_argument(
+        "--trace-log-chars",
+        type=int,
+        default=50000,
+        help="Tail characters kept when --trace-log=truncated.",
+    )
+    parser.add_argument(
+        "--case-examples-per-type",
+        type=int,
+        default=5,
+        help="Representative examples to export for correct/wrong/near-miss categories.",
+    )
     chat_group = parser.add_mutually_exclusive_group()
     chat_group.add_argument("--use-chat-template", dest="use_chat_template", action="store_true")
     chat_group.add_argument("--raw-prompt", dest="use_chat_template", action="store_false")
     parser.set_defaults(use_chat_template=True)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
+    parser.add_argument("--data-parallel-size", type=int, default=1)
+    parser.add_argument("--data-parallel-size-local", type=int, default=None)
+    parser.add_argument(
+        "--distributed-executor-backend",
+        default=None,
+        help=(
+            "vLLM distributed executor backend. Required as external_launcher "
+            "before using --data-parallel-size > 1 with offline LLM."
+        ),
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--dtype", default="bfloat16", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--quantization", default=None, help="vLLM quantization, e.g. awq/fp8.")
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--attention-backend",
+        default=None,
+        help="vLLM attention backend, e.g. FLASHINFER, FLASH_ATTN, TRITON_ATTN, or auto.",
+    )
+    parser.add_argument("--assigned-gpus", default="", help="Human-readable GPU ids assigned by the launcher.")
+    parser.add_argument("--parallel-strategy", default="", help="Human-readable launcher parallel strategy.")
     parser.add_argument("--device-map", default="auto", help="transformers backend only.")
     trust_group = parser.add_mutually_exclusive_group()
     trust_group.add_argument("--trust-remote-code", dest="trust_remote_code", action="store_true")
@@ -614,6 +1052,26 @@ def main() -> None:
         raise SystemExit("--max-tokens must be > 0")
     if args.response_log_chars <= 0:
         raise SystemExit("--response-log-chars must be > 0")
+    if args.trace_log_chars <= 0:
+        raise SystemExit("--trace-log-chars must be > 0")
+    if args.case_examples_per_type <= 0:
+        raise SystemExit("--case-examples-per-type must be > 0")
+    if args.tensor_parallel_size <= 0:
+        raise SystemExit("--tensor-parallel-size must be > 0")
+    if args.pipeline_parallel_size <= 0:
+        raise SystemExit("--pipeline-parallel-size must be > 0")
+    if args.data_parallel_size <= 0:
+        raise SystemExit("--data-parallel-size must be > 0")
+    if args.data_parallel_size_local is not None and args.data_parallel_size_local <= 0:
+        raise SystemExit("--data-parallel-size-local must be > 0")
+    if args.backend == "vllm" and args.data_parallel_size > 1:
+        if args.distributed_executor_backend != "external_launcher":
+            raise SystemExit(
+                "vLLM offline LLM rejects single-process data_parallel_size>1. "
+                "Use --distributed-executor-backend external_launcher with an "
+                "external launcher, or use the shell script's parallel small-model "
+                "mode with SMALL_DP=1."
+            )
     args._model_params_map = parse_model_params(args.model_params)
 
     random.seed(args.seed)
@@ -636,7 +1094,7 @@ def main() -> None:
         name, model_path = model_spec_to_name_path(spec)
         summaries.append(evaluate_one_model(name, model_path, samples, indices, args))
 
-    write_json(Path(args.out_dir) / "run_summary.json", {"models": summaries})
+    write_json(Path(args.out_dir) / args.run_summary_name, {"models": summaries})
 
 
 if __name__ == "__main__":

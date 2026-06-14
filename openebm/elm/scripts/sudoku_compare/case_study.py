@@ -124,6 +124,26 @@ def status(row: Optional[Dict[str, Any]]) -> str:
     return f"wrong, blank-cell acc={100.0 * cell_acc(row):.2f}%"
 
 
+def model_meta(row: Optional[Dict[str, Any]]) -> str:
+    if row is None:
+        return ""
+    parts = []
+    if row.get("parser_strategy"):
+        parts.append(f"parser={row.get('parser_strategy')}")
+    if row.get("parse_failure_reason"):
+        parts.append(f"parse_failure={row.get('parse_failure_reason')}")
+    if row.get("tokens_generated") is not None:
+        parts.append(f"tokens={row.get('tokens_generated')}")
+    if row.get("elapsed_s") is not None:
+        try:
+            parts.append(f"elapsed={float(row.get('elapsed_s')):.3f}s")
+        except Exception:
+            pass
+    if row.get("response_was_truncated"):
+        parts.append("response_in_test_jsonl=truncated; see traces/all.jsonl")
+    return "; ".join(parts)
+
+
 def render_prediction(pred: Any, solution: Sequence[int]) -> str:
     if not isinstance(pred, list) or len(pred) != 81:
         return "INVALID/UNPARSED"
@@ -186,6 +206,10 @@ def write_case(
         row = model_rows.get(model, {}).get(idx)
         pred = row.get("pred") if row else None
         lines.append(f"### {model}: {status(row)}")
+        meta = model_meta(row)
+        if meta:
+            lines.append("")
+            lines.append(f"`{meta}`")
         lines.append("```text")
         lines.append(render_prediction(pred, solution))
         lines.append("```")
@@ -202,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-result-dirs", nargs="*", type=Path, default=[])
     parser.add_argument("--small-models", nargs="*", default=sorted(SMALL_MODEL_ALIASES))
     parser.add_argument("--large-models", nargs="*", default=sorted(LARGE_MODEL_ALIASES))
-    parser.add_argument("--cases-per-type", type=int, default=2)
+    parser.add_argument("--cases-per-type", type=int, default=5)
     parser.add_argument("--out-md", type=Path, default=None)
     return parser
 
@@ -282,8 +306,10 @@ def main() -> None:
         "",
         f"Data: `{args.data_dir}` SATNet test split.",
         f"EBM rows: `{ebm_jsonl}`.",
+        f"LLM root: `{llm_root}`.",
         "",
-        "Wrong cells are highlighted with square brackets. `invalid` means the parser could not extract an 81-digit final grid.",
+        "Wrong cells are highlighted with square brackets. `invalid` means the parser could not extract a completed 1-9 final grid.",
+        "Full raw LLM outputs and representative correct/wrong/near-miss/parse-failed cases are stored under each model's `traces/` directory.",
         "",
     ]
     for title, indices in selected:
