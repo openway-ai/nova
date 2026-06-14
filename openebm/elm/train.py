@@ -39,6 +39,50 @@ from openebm.elm.train_engines import apply_train_engine, prepare_train_engine
 from openebm.elm.trainer import ModelTrainer
 from openebm.elm.utils import init_wandb_watch, model_sizes
 
+def validate_first_order_landscape_args(args):
+    mcmc_gradient_mode = getattr(args, "mcmc_gradient_mode", "second_order")
+    proposal_mode = getattr(args, "proposal_aware_nce_proposal", "uniform")
+    relaxed_cd_coeff = float(getattr(args, "proposal_aware_nce_relaxed_cd_coeff", 0.0) or 0.0)
+    nce_base_coeff = float(getattr(args, "proposal_aware_nce_base_coeff", 1.0) or 0.0)
+    rank_coeff = float(getattr(args, "proposal_aware_nce_rank_coeff", 0.0) or 0.0)
+    k = int(getattr(args, "proposal_aware_nce_k", 1) or 1)
+
+    if mcmc_gradient_mode == "proposal_aware_nce":
+        if relaxed_cd_coeff > 0.0 and proposal_mode != "mcmc_final":
+            raise ValueError(
+                "--proposal_aware_nce_relaxed_cd_coeff requires "
+                "--proposal_aware_nce_proposal mcmc_final."
+            )
+        if nce_base_coeff < 0.0:
+            raise ValueError("--proposal_aware_nce_base_coeff must be non-negative.")
+        if relaxed_cd_coeff < 0.0:
+            raise ValueError("--proposal_aware_nce_relaxed_cd_coeff must be non-negative.")
+        if rank_coeff < 0.0:
+            raise ValueError("--proposal_aware_nce_rank_coeff must be non-negative.")
+        if nce_base_coeff == 0.0 and relaxed_cd_coeff == 0.0 and rank_coeff == 0.0:
+            raise ValueError(
+                "proposal_aware_nce has no active inner objective: "
+                "base_coeff, relaxed_cd_coeff, and rank_coeff are all zero."
+            )
+        if k < 1:
+            raise ValueError("--proposal_aware_nce_k must be >= 1.")
+        if k > 1:
+            print(
+                "[proposal_aware_nce] WARNING: k>1 expands dense [B,K,S,V] token tensors. "
+                "Use k=1 for the first FSDP2/ZeRO-3 memory validation.",
+                flush=True,
+            )
+
+    graph_safe_first_order_modes = {"first_order_cd_v2", "first_order_nce", "proposal_aware_nce"}
+    if mcmc_gradient_mode in graph_safe_first_order_modes and getattr(args, "mcmc_step_size_learnable", False):
+        print(
+            f"[{mcmc_gradient_mode}] WARNING: disabling mcmc_step_size_learnable because graph-safe "
+            "first-order objectives detach the MCMC sampler endpoint. Alpha would not receive the "
+            "original second-order landscape gradient on this path.",
+            flush=True,
+        )
+        args.mcmc_step_size_learnable = False
+
 @rank_zero_only # to ensure only one wandb run is created, if didnt do that then each GPU would create its own wandb run
 def setup_wandb(args): 
     import wandb
@@ -62,6 +106,8 @@ def main(args):
         args.no_wandb = True
         args.detect_anomaly = True
         args.limit_train_batches = 1
+
+    validate_first_order_landscape_args(args)
 
     os.makedirs("./logs", exist_ok=True)
 
@@ -519,14 +565,17 @@ if __name__ == '__main__':
     parser.add_argument("--no_mcmc_detach", help="dont detach between mcmc steps, probably need to use for S2 models but can increase instability due to longer gradient computation graphs", action="store_true", default=False)
 
     parser.add_argument("--mcmc_gradient_mode", type=str, default="second_order",
-        choices=["second_order", "first_order_debug", "first_order_cd", "first_order_cd_v2"],
+        choices=["second_order", "first_order_debug", "first_order_cd", "first_order_cd_v2", "first_order_nce", "proposal_aware_nce"],
         help=(
             "Controls whether MCMC refinement participates in higher-order autograd. "
             "second_order preserves the current EBT objective. first_order_debug forces "
             "autograd.grad(create_graph=False) for isolation only. first_order_cd uses "
             "detached MCMC samples with a first-order contrastive energy surrogate. "
             "first_order_cd_v2 keeps the same surrogate but drops sampler graph refs and "
-            "recomputes positive/negative energies in one transformer pass."
+            "recomputes positive/negative energies in one transformer pass. first_order_nce "
+            "uses the same graph-safe recomputation path with a logistic NCE energy loss. "
+            "proposal_aware_nce uses sampled negatives from a known proposal distribution "
+            "with an explicit log-q correction; the default uniform proposal skips MCMC."
         ))
 
     parser.add_argument("--first_order_cd_loss_coeff", type=float, default=1.0,
@@ -544,6 +593,62 @@ if __name__ == '__main__':
             "Optional alpha-only CE coefficient for first_order_cd. The default keeps "
             "the surrogate purely first-order in model parameters; set >0 only if you "
             "want the detached MCMC CE term to tune alpha."
+        ))
+
+    parser.add_argument("--first_order_nce_loss_coeff", type=float, default=1.0,
+        help="Loss coefficient for mcmc_gradient_mode=first_order_nce.")
+
+    parser.add_argument("--proposal_aware_nce_loss_coeff", type=float, default=1.0,
+        help="Loss coefficient for mcmc_gradient_mode=proposal_aware_nce.")
+
+    parser.add_argument("--proposal_aware_nce_base_coeff", type=float, default=1.0,
+        help=(
+            "Coefficient for the discrete proposal-aware NCE term inside "
+            "mcmc_gradient_mode=proposal_aware_nce. Set <1 when using relaxed CD "
+            "as the landscape-dominant objective."
+        ))
+
+    parser.add_argument("--proposal_aware_nce_k", type=int, default=1,
+        help="Number of proposal negatives per valid token for proposal_aware_nce.")
+
+    parser.add_argument("--proposal_aware_nce_proposal", type=str, default="uniform",
+        choices=["uniform", "mcmc_final"],
+        help=(
+            "Proposal distribution for proposal_aware_nce. uniform is exact and skips MCMC. "
+            "mcmc_final reuses the detached final MCMC logits as an adaptive stop-gradient "
+            "proposal and is therefore approximate rather than strict NCE."
+        ))
+
+    parser.add_argument("--proposal_aware_nce_logz_offset", type=float, default=None,
+        help=(
+            "Fixed log-normalizer offset a(c,t) used by proposal_aware_nce. "
+            "Default None uses log(vocab_size) for uniform and 0 for mcmc_final."
+        ))
+
+    parser.add_argument("--proposal_aware_nce_rank_coeff", type=float, default=0.0,
+        help="Optional ranking auxiliary coefficient for proposal_aware_nce.")
+
+    parser.add_argument("--proposal_aware_nce_rank_margin", type=float, default=1.0,
+        help="Margin for proposal_aware_nce ranking auxiliary.")
+
+    parser.add_argument("--proposal_aware_nce_exclude_positive_negatives",
+        help=(
+            "When sampling proposal negatives, exclude the ground-truth token from "
+            "the negative draw. This is a landscape-oriented option and is not strict NCE."
+        ),
+        action="store_true", default=False)
+
+    parser.add_argument("--proposal_aware_nce_relaxed_cd_coeff", type=float, default=0.0,
+        help=(
+            "Optional continuous relaxed-state CD auxiliary for proposal_aware_nce. "
+            "Requires --proposal_aware_nce_proposal mcmc_final and directly contrasts "
+            "the positive one-hot target against the detached final MCMC relaxed state."
+        ))
+
+    parser.add_argument("--proposal_aware_nce_relaxed_cd_margin", type=float, default=0.0,
+        help=(
+            "Margin for proposal_aware_nce relaxed CD auxiliary. The default 0.0 matches "
+            "the first_order_cd_v2 CE-style softplus(E_pos - E_relaxed) objective."
         ))
 
     parser.add_argument("--contrastive_loss", help="uses a contrastive loss to shape the landscape of EBM, idea from IRED paper https://arxiv.org/abs/2406.11179", action="store_true", default=False)

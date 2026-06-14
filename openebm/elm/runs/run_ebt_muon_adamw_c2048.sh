@@ -255,7 +255,8 @@ OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio
 ################################################################################
 # 默认不传，保持当前 second_order EBT 训练目标。
 # 启用 FSDP/ZeRO-3 友好的一阶 surrogate:
-#   MCMC_GRADIENT_MODE=first_order_cd TRAIN_ENGINE=fsdp2 bash ...
+#   MCMC_GRADIENT_MODE=first_order_nce TRAIN_ENGINE=fsdp2 bash ...
+#   MCMC_GRADIENT_MODE=proposal_aware_nce TRAIN_ENGINE=fsdp2 bash ...
 MCMC_GRADIENT_FLAGS=""
 if [ -n "${MCMC_GRADIENT_MODE:-}" ]; then
     MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --mcmc_gradient_mode ${MCMC_GRADIENT_MODE}"
@@ -271,6 +272,49 @@ if [ -n "${FIRST_ORDER_CD_MARGIN:-}" ]; then
 fi
 if [ -n "${FIRST_ORDER_CD_ALPHA_CE_COEFF:-}" ]; then
     MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_alpha_ce_coeff ${FIRST_ORDER_CD_ALPHA_CE_COEFF}"
+fi
+if [ -n "${FIRST_ORDER_NCE_LOSS_COEFF:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_nce_loss_coeff ${FIRST_ORDER_NCE_LOSS_COEFF}"
+fi
+if [ -n "${PROPOSAL_AWARE_NCE_LOSS_COEFF:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --proposal_aware_nce_loss_coeff ${PROPOSAL_AWARE_NCE_LOSS_COEFF}"
+fi
+if [ -n "${PROPOSAL_AWARE_NCE_BASE_COEFF:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --proposal_aware_nce_base_coeff ${PROPOSAL_AWARE_NCE_BASE_COEFF}"
+fi
+if [ -n "${PROPOSAL_AWARE_NCE_K:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --proposal_aware_nce_k ${PROPOSAL_AWARE_NCE_K}"
+fi
+if [ -n "${PROPOSAL_AWARE_NCE_PROPOSAL:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --proposal_aware_nce_proposal ${PROPOSAL_AWARE_NCE_PROPOSAL}"
+fi
+if [ -n "${PROPOSAL_AWARE_NCE_LOGZ_OFFSET:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --proposal_aware_nce_logz_offset ${PROPOSAL_AWARE_NCE_LOGZ_OFFSET}"
+fi
+if [ -n "${PROPOSAL_AWARE_NCE_RANK_COEFF:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --proposal_aware_nce_rank_coeff ${PROPOSAL_AWARE_NCE_RANK_COEFF}"
+fi
+if [ -n "${PROPOSAL_AWARE_NCE_RANK_MARGIN:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --proposal_aware_nce_rank_margin ${PROPOSAL_AWARE_NCE_RANK_MARGIN}"
+fi
+if [ "${PROPOSAL_AWARE_NCE_EXCLUDE_POSITIVE_NEGATIVES:-false}" = "true" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --proposal_aware_nce_exclude_positive_negatives"
+fi
+if [ -n "${PROPOSAL_AWARE_NCE_RELAXED_CD_COEFF:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --proposal_aware_nce_relaxed_cd_coeff ${PROPOSAL_AWARE_NCE_RELAXED_CD_COEFF}"
+fi
+if [ -n "${PROPOSAL_AWARE_NCE_RELAXED_CD_MARGIN:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --proposal_aware_nce_relaxed_cd_margin ${PROPOSAL_AWARE_NCE_RELAXED_CD_MARGIN}"
+fi
+
+MCMC_STEP_SIZE_LEARNABLE_FLAG=""
+if [ "${MCMC_STEP_SIZE_LEARNABLE}" = "true" ]; then
+    case "${MCMC_GRADIENT_MODE:-second_order}" in
+        first_order_cd_v2|first_order_nce|proposal_aware_nce)
+            echo "[run_ebt_muon_adamw_c2048] Disabling --mcmc_step_size_learnable for graph-safe first-order mode ${MCMC_GRADIENT_MODE}; sampler endpoint is detached." ;;
+        *)
+            MCMC_STEP_SIZE_LEARNABLE_FLAG="--mcmc_step_size_learnable" ;;
+    esac
 fi
 
 
@@ -410,6 +454,8 @@ short_mcmc_gradient_tag() {
         second_order) echo "2nd" ;;
         first_order_cd) echo "foCD" ;;
         first_order_cd_v2) echo "foCDv2" ;;
+        first_order_nce) echo "foNCE" ;;
+        proposal_aware_nce) echo "paNCE" ;;
         first_order_debug) echo "foDbg" ;;
         *) echo "${MCMC_GRADIENT_MODE}" | tr '_' '-' ;;
     esac
@@ -552,6 +598,7 @@ echo -e "${CYAN}▶ EBT 核心参数 (官方推荐)${NC}"
 print_separator "─" 60
 print_kv "MCMC Step Size" "${MCMC_STEP_SIZE}"
 print_kv "MCMC LR Multiplier" "${MCMC_STEP_SIZE_LR_MULTIPLIER} (3× step_size)"
+print_kv "MCMC Step Learnable" "$([ -n "${MCMC_STEP_SIZE_LEARNABLE_FLAG}" ] && echo true || echo false)"
 print_kv "MCMC Num Steps" "${MCMC_NUM_STEPS}"
 print_kv "EBT Type" "${EBT_TYPE}"
 print_kv "Normalize Init Condition" "${NORMALIZE_INITIAL_CONDITION}"
@@ -610,6 +657,14 @@ print_kv "Log File" "${LOG_FILE}"
 print_kv "WandB Mode" "${WANDB_MODE}"
 print_kv "Train Engine" "${TRAIN_ENGINE}"
 print_kv "MCMC Gradient Mode" "${MCMC_GRADIENT_MODE:-second_order}"
+if [ "${MCMC_GRADIENT_MODE:-second_order}" = "proposal_aware_nce" ]; then
+    print_kv "Proposal Aware NCE Proposal" "${PROPOSAL_AWARE_NCE_PROPOSAL:-uniform}"
+    print_kv "Proposal Aware NCE K" "${PROPOSAL_AWARE_NCE_K:-1}"
+    print_kv "Proposal Aware NCE Base" "${PROPOSAL_AWARE_NCE_BASE_COEFF:-1.0}"
+    print_kv "Proposal Aware NCE Rank Coeff" "${PROPOSAL_AWARE_NCE_RANK_COEFF:-0.0}"
+    print_kv "Proposal Aware Relaxed CD" "${PROPOSAL_AWARE_NCE_RELAXED_CD_COEFF:-0.0}"
+    print_kv "Proposal Exclude Positive" "${PROPOSAL_AWARE_NCE_EXCLUDE_POSITIVE_NEGATIVES:-false}"
+fi
 print_kv "Float Precision" "${FLOAT_PRECISION}"
 print_kv "Effective Optimizer" "$(short_optimizer_tag)"
 
@@ -617,8 +672,8 @@ echo ""
 echo -e "${YELLOW}⚠ 重要说明${NC}"
 echo "  1. EBT 核心参数 (MCMC) 保持官方推荐值不变"
 echo "  2. 优化器/LR调度/Weight Decay 对齐 NanoChat base_train.py"
-echo "  3. Alpha LR 仍由 MCMC_STEP_SIZE_LR_MULTIPLIER × PEAK_LR 控制 (EBT 特有)"
-echo "  4. 监控关键指标: train_loss, Alpha_MCMC, Global_LR"
+echo "  3. Alpha LR 仅在 MCMC Step Learnable=true 时生效；graph-safe 一阶模式默认关闭"
+echo "  4. 监控关键指标: train_loss/valid_objective, valid_final_ce, valid_bpb, first_order_energy_gap"
 
 echo ""
 if [ "${DRY_RUN:-0}" != "1" ]; then
@@ -734,7 +789,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --normalize_initial_condition \
 --ebt_type ${EBT_TYPE} \
 --denoising_initial_condition ${DENOISING_INITIAL_CONDITION} \
---mcmc_step_size_learnable \
+${MCMC_STEP_SIZE_LEARNABLE_FLAG} \
 --mcmc_step_size ${MCMC_STEP_SIZE} \
 --mcmc_step_size_lr_multiplier ${MCMC_STEP_SIZE_LR_MULTIPLIER} \
 --mcmc_num_steps ${MCMC_NUM_STEPS} \

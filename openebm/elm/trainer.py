@@ -719,6 +719,7 @@ class ModelTrainer(LightningModule):
         """Reset BPB accumulators at the start of each validation epoch."""
         self._val_bpb_nats = 0.0
         self._val_bpb_bytes = 0
+        self._val_bpb_tokens = 0
 
     def validation_step(self, batch, batch_idx):
         # Move token_bytes to the same device as the model if needed
@@ -732,19 +733,23 @@ class ModelTrainer(LightningModule):
         # (BPB = sum(nats) / (log2 * sum(bytes)), 不能对 per-batch BPB 做算术平均)
         bpb_nats = eval_step_dict.get('bpb_nats', 0)
         bpb_bytes = eval_step_dict.get('bpb_bytes', 0)
+        bpb_tokens = eval_step_dict.get('bpb_tokens', 0)
         if isinstance(bpb_nats, torch.Tensor):
             bpb_nats = bpb_nats.item()
         if isinstance(bpb_bytes, torch.Tensor):
             bpb_bytes = bpb_bytes.item()
+        if isinstance(bpb_tokens, torch.Tensor):
+            bpb_tokens = bpb_tokens.item()
         self._val_bpb_nats += bpb_nats
         self._val_bpb_bytes += bpb_bytes
+        self._val_bpb_tokens += bpb_tokens
 
         # 缓存最新 valid 指标，供 train 进度条显示
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
         for k, v in eval_step_dict.items():
             # 跳过 BPB 累积中间量，它们不应作为独立指标显示
-            if k in ('bpb_nats', 'bpb_bytes'):
+            if k in ('bpb', 'bpb_nats', 'bpb_bytes', 'bpb_tokens', 'bpb_nats_per_token', 'bpb_bytes_per_token'):
                 continue
             if isinstance(v, torch.Tensor) and v.dim() == 0:
                 self._last_valid_metrics[k] = v.detach().item()
@@ -758,15 +763,35 @@ class ModelTrainer(LightningModule):
             epoch_bpb = self._val_bpb_nats / (math.log(2) * self._val_bpb_bytes)
         else:
             epoch_bpb = float('inf')
+        if self._val_bpb_tokens > 0:
+            epoch_nats_per_token = self._val_bpb_nats / self._val_bpb_tokens
+            epoch_bytes_per_token = self._val_bpb_bytes / self._val_bpb_tokens
+        else:
+            epoch_nats_per_token = 0.0
+            epoch_bytes_per_token = 0.0
         # 用 epoch-level BPB 覆盖 _last_valid_metrics 中的 per-batch 值
         if not hasattr(self, '_last_valid_metrics'):
             self._last_valid_metrics = {}
         self._last_valid_metrics['bpb'] = epoch_bpb
+        self._last_valid_metrics['bpb_nats_per_token'] = epoch_nats_per_token
+        self._last_valid_metrics['bpb_bytes_per_token'] = epoch_bytes_per_token
+        self._last_valid_metrics['bpb_tokens'] = self._val_bpb_tokens
+        self._last_valid_metrics['bpb_bytes'] = self._val_bpb_bytes
 
         # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
         if self.logger is not None and self._is_global_rank_zero():
             try:
-                self.logger.experiment.log({'valid_bpb': epoch_bpb}, step=self.global_step)
+                self.logger.experiment.log(
+                    {
+                        'valid_bpb': epoch_bpb,
+                        'valid_bpb_total_nats': self._val_bpb_nats,
+                        'valid_bpb_total_bytes': self._val_bpb_bytes,
+                        'valid_bpb_total_tokens': self._val_bpb_tokens,
+                        'valid_bpb_nats_per_token': epoch_nats_per_token,
+                        'valid_bpb_bytes_per_token': epoch_bytes_per_token,
+                    },
+                    step=self.global_step,
+                )
             except Exception:
                 pass
 
@@ -2143,13 +2168,13 @@ class ModelTrainer(LightningModule):
         keys = list(metrics_dict.keys()) # Iterate over a copy of the keys to avoid modification issues during iteration
         for key in keys:
             # 跳过 BPB 相关指标，它们不应通过 Lightning log_dict 上报：
-            # - bpb_nats/bpb_bytes: BPB 累积中间量
+            # - bpb_nats/bpb_bytes/bpb_tokens: BPB 累积中间量
             # - bpb (非 train 阶段): BPB 是比率指标 (nats/bytes)，
             #   Lightning 的 on_epoch=True 会对 per-batch bpb 做算术平均，这是数学错误的
             #   正确做法是在 on_validation_epoch_end 中从累积 nats/bytes 重新计算
-            if key in ('bpb_nats', 'bpb_bytes'):
+            if key in ('bpb_nats', 'bpb_bytes', 'bpb_tokens'):
                 continue
-            if key == 'bpb' and phase != 'train':
+            if key in ('bpb', 'bpb_nats_per_token', 'bpb_bytes_per_token') and phase != 'train':
                 continue
 
             value = metrics_dict[key]
@@ -2313,17 +2338,23 @@ class ModelTrainer(LightningModule):
                     loss_val = loss_val.item()
 
                 # --- 最新 valid 指标 ---
+                import math as _math
                 last_valid = getattr(self, '_last_valid_metrics', {})
-                valid_loss_val = last_valid.get('loss', None)
+                valid_loss_val = last_valid.get('objective_loss', last_valid.get('loss', None))
+                valid_final_ce_val = last_valid.get('final_step_ce', last_valid.get('final_step_loss', None))
                 valid_bpb_val = last_valid.get('bpb', None)
                 valid_ppl_val = last_valid.get('perplexity', None)
                 valid_str = ""
                 if valid_loss_val is not None:
-                    valid_str += f" | valid_loss: {valid_loss_val:.4f}"
+                    valid_str += f" | valid_objective: {valid_loss_val:.4f}"
+                if valid_final_ce_val is not None:
+                    valid_str += f" | valid_final_ce: {valid_final_ce_val:.4f}"
                 if valid_bpb_val is not None:
                     valid_str += f" | valid_bpb: {valid_bpb_val:.4f}"
-                if valid_ppl_val is not None:
+                if valid_ppl_val is not None and _math.isfinite(valid_ppl_val):
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
+                elif valid_ppl_val is not None:
+                    valid_str += " | valid_ppl: overflow"
 
                 # --- 打印 ---
                 memory_metrics = getattr(self, '_last_cuda_memory_metrics', {})
