@@ -16,12 +16,7 @@ $$
 那么训练目标最应该对齐的是采样轨迹上这个向量场本身，而不只是能量值高低。把采样器实际访问的 relaxed token 状态分布记作 \(\mu\)，理想误差可写成：
 
 $$
-\mathcal D(\theta)
-=
-\mathbb E_{x\sim\mu}
-\left[
-\|\nabla_xE_\theta(x)-\nabla_xE_\*(x)\|^2
-\right].
+\mathcal{D}(\theta) = \mathbb{E}_{x\sim\mu} \left[ \|\nabla_x E_\theta(x) - \nabla_x E_*(x)\|^2 \right]
 $$
 
 按“对 \(\nabla_xE_\theta\) 的约束有多直接”排序，当前判断是：
@@ -29,11 +24,13 @@ $$
 $$
 \text{second\_order}
 \succ
-\text{first\_order\_cd + trajectory-local descent CD}
+\text{待实现：data-anchored local CD / denoising-style 一阶 surrogate}
 \succ
 \text{first\_order\_cd}
 \approx
 \text{proposal\_aware\_nce + relaxed\_cd}
+\approx
+\text{first\_order\_cd + trajectory-local descent CD}
 \succ
 \text{first\_order\_nce / pure proposal NCE}.
 $$
@@ -44,7 +41,8 @@ $$
 - 当前 `first_order_cd` 是 graph-safe 的 endpoint relaxed ranking：跑 MCMC 到终点、detach、重算正负 energy，优化 \(\operatorname{softplus}(E^+-E^-)\)。
 - 当前 `first_order_cd` 不是“小步 raw CD / score-matching leading term”实现，因为它只使用最终 endpoint，且不是原始相邻小步能量差。
 - NCE / proposal-aware NCE 主要改善负样本覆盖和能量校准，不会自动恢复 \(\nabla_xE_\theta\) 的 field 监督阶数。
-- 本次新增的最高效可行选项是 **trajectory-local descent CD**：不回传 sampler 图，复用已保存的 detached MCMC 轨迹点，重算相邻状态能量并最小化 \(E(z_{k+s})-E(z_k)\)。它提升的是“轨迹覆盖 + 采样方向能量斜率”近似，不等同于 data-started raw CD 的严格 score-matching Taylor 项。
+- 已实现的 **trajectory-local descent CD** 只应视作默认关闭的 sampler-consistency regularizer：因为 \(z_{k+1}\) 本来就是当前能量梯度下降产生的，\(E(z_{k+1})<E(z_k)\) 通常已由 sampler 自身满足；该项不应被当作强二阶近似主线。
+- 更值得新增的主线是 **data-anchored local CD / denoising-style 一阶 surrogate**：在真实 token 邻域构造局部负样本或 near/far denoising pair，用一阶能量差逼近“朝数据方向能量下降”的局部 directional derivative。
 
 ## 1. 本文的理论标尺
 
@@ -134,6 +132,32 @@ $$
 
 它主要约束“正样本所在 basin 的能量低于终点所在 basin”。这个约束有价值，但它是 **level-set / endpoint ranking**，不直接告诉模型在 \(z_0,\dots,z_K\) 中间各点的 \(\nabla_xE_\theta\) 应该指向哪里、大小应是多少。
 
+更关键的是，它和原始二阶目标的语义不同。原始 `second_order` 的训练信号来自最终预测分布 \(z_K\) 与真实 token 的 CE / NLL，希望的是：
+
+$$
+z_K \rightarrow x^+.
+$$
+
+而 `first_order_cd` 的 endpoint ranking 希望的是：
+
+$$
+E_\theta(c,x^+) < E_\theta(c,z_K).
+$$
+
+当 \(z_K\) 明显错误、离 \(x^+\) 很远时，这个排序是合理的：真实 token 应该处在更低能量 basin，采样器才有动力朝数据走。但当 \(z_K\) 已经接近 \(x^+\)，继续把 \(z_K\) 当作 negative 并强行推高能量就不再符合“让最终预测等于真实 token”的原始二阶目标。理想行为应接近：
+
+$$
+E_\theta(c,z_K)-E_\theta(c,x^+) \approx m\cdot d(z_K,x^+),
+$$
+
+其中 \(d(z_K,x^+)\) 是预测错误程度，例如 CE、KL、\(1-p_{z_K}(x^+)\) 或 embedding/probability 距离。于是：
+
+- \(z_K\) 很错：\(E(x^+)\) 应明显低于 \(E(z_K)\)。
+- \(z_K\) 接近正确：energy gap 应变小，避免把 near-correct 状态继续推高。
+- \(z_K=x^+\)：两者能量应相等或至少不再继续拉开。
+
+因此，`first_order_cd` 的方向不是完全错，但它缺少 **distance-aware / correctness-aware gap control**。后续一阶 surrogate 不应只追求更大的 \(E(z_K)-E(x^+)\)，而应让 energy gap 与预测错误程度一致。
+
 因此判断一阶近似优劣时，我采用三个标准：
 
 | 标准 | 问题 | 越好意味着 |
@@ -141,6 +165,7 @@ $$
 | 阶数 | loss 是否显式或隐式含 \(\nabla_xE_\theta\) 信息 | 更像 field objective |
 | 覆盖 | 约束覆盖 data 邻域、endpoint，还是整条轨迹 | 更贴采样器实际路径 |
 | 饱和 | 能量差拉开后训练信号是否关闭 | 更稳定地继续塑形 |
+| gap 校准 | energy gap 是否随预测错误程度变小/变大 | 更贴近 \(z_K\rightarrow x^+\) 的原始二阶语义 |
 
 ## 2. 当前实现对照
 
@@ -149,7 +174,9 @@ $$
 | `second_order` | `openebm/elm/modeling_ebt.py:140-150` 中 `create_graph_for_mcmc=True`；CE 聚合在 `:318-342`、`:396-401` | loss 反传穿过每步 \(\nabla_zE_\theta\)，包含 \(\nabla_\theta\nabla_zE_\theta\) | pathwise-field，覆盖整条 MCMC 轨迹 | 最高；小模型 teacher / gold baseline |
 | `first_order_debug` | mode 说明在 `openebm/elm/train.py:567-579`；FSDP2 warning 在 `openebm/elm/train_engines/fsdp2.py:50-55` | 只关闭 sampler 的 `create_graph`；CE 对模型主参数信号不完整 | 诊断路径 | 不作为训练近似方案 |
 | `first_order_cd` | graph-safe detach 在 `openebm/elm/modeling_ebt.py:239-244`；combined 重算在 `:536-552`；CE ranking 在 `:583-604` | \(L=\mathrm{CE}([-E^+,-E^-],0)=\mathrm{softplus}(E^+-E^-)\) | endpoint relaxed level-set/ranking | 中；当前最实用一阶 baseline，但不是 local raw CD |
-| `first_order_cd + first_order_local_cd_coeff>0` | loss 接入在 `openebm/elm/modeling_ebt.py:386-395`；局部能量重算在 `:624-694`；参数在 `openebm/elm/train.py:610-630` | \(L=L_{\mathrm{endpoint}}+\lambda\,\mathbb E[E(z_{k+s})-E(z_k)]\) | endpoint ranking + 轨迹局部能量斜率 | 中偏高；覆盖 MCMC 中间状态，但仍不含 \(\nabla_\theta\nabla_zE\) |
+| 待实现：`distance-aware first_order_cd` | 建议在 `calculate_contrastive_loss()` 的 endpoint delta 上加 stop-gradient distance 权重或 margin | \(d(z_K,x^+)\operatorname{softplus}(E^+-E_K)\) 或 \(\operatorname{softplus}(E^+-E_K+m d)\) | correctness-aware endpoint ranking | 中偏高；修复 near-correct fake 被继续推高的问题，但仍不是 field loss |
+| `first_order_cd + first_order_local_cd_coeff>0` | loss 接入在 `openebm/elm/modeling_ebt.py:386-395`；局部能量重算在 `:624-694`；参数在 `openebm/elm/train.py:610-630` | \(L=L_{\mathrm{endpoint}}+\lambda\,\mathbb E[E(z_{k+s})-E(z_k)]\) | endpoint ranking + 轨迹局部能量斜率 | 中/不确定；能量下降通常已由 sampler 构造出来，更多是弱 consistency regularizer |
+| 待实现：`data-anchored local CD / denoise-rank` | 建议复用 `calculate_contrastive_loss` 的 one-hot 构造与 combined transformer 重算路径；新增辅助函数见第 5 节 | data 邻域 \(x^+\)、\(\tilde x\) 或 near/far pair 的局部能量差 | data-anchored local directional derivative | 中偏高；仍是一阶参数梯度，但比 trajectory-local descent 更有监督锚点 |
 | `first_order_nce` | 同 `first_order_cd` 重算路径；NCE loss 在 `openebm/elm/modeling_ebt.py:587-594` | \(L=\mathrm{softplus}(E^+)+\mathrm{softplus}(-E^-)\) | endpoint 绝对能量校准 | 中偏低；校准能量零点，不增加 field 阶数 |
 | `proposal_aware_nce + uniform` | 无 MCMC 快路径在 `openebm/elm/modeling_ebt.py:257-297`；uniform proposal 在 `:670-703` | 均匀离散负样本 + log-q / offset 修正 | density-ratio / 分类边界 | 低；覆盖广但离 MCMC 轨迹远 |
 | `proposal_aware_nce + mcmc_final` | endpoint proposal 在 `openebm/elm/modeling_ebt.py:705-737`；NCE logit 在 `:822-831` | 从 final logits 采离散负样本，用近似 logq 修正 | endpoint proposal-aware classification | 中偏低；改善覆盖/校准，不改变零阶本质 |
@@ -240,110 +267,287 @@ neg_loss = F.softplus(r_neg)...
 - 但 loss 仍然只依赖能量值 \(E\)，不包含 \(\nabla_xE\) 或 \(\nabla_\theta\nabla_xE\)。
 - 因此它适合做 calibration / coverage auxiliary，不应被当作二阶 field loss 的直接替代。
 
-## 4. Trajectory-local raw CD 的合理性判断
+## 4. Trajectory-local descent CD 的合理性修正
 
-### 4.1 严格 data-started raw CD 与当前 OpenEBM 轨迹不同
+### 4.1 你的质疑是正确的：当前 MCMC 轨迹天然倾向能量下降
 
-第 1.2 节的 Taylor 结论严格对应的是 data-started CD：从正样本或数据邻域状态 \(x^+\) 出发，取一个小步负样本 \(\tilde x=x^++O(\varepsilon)\)，然后最小化 \(E(x^+)-E(\tilde x)\)。这时 raw energy difference 的期望里会出现 \(\|\nabla_xE\|^2-\mathrm{tr}H\)。
+当前 OpenEBM 的 MCMC 轨迹从初始 relaxed/noise token 出发，按当前模型能量做梯度下降：
 
-当前 OpenEBM 的 MCMC 轨迹不是这种 data-started CD。代码事实：
+$$
+z_{k+1}=z_k-\alpha\nabla_zE_\theta(c,z_k)+\epsilon_k.
+$$
+
+忽略噪声并做小步 Taylor 展开，记 \(g_k=\nabla_zE_\theta(c,z_k)\)、\(H_k=\nabla_z^2E_\theta(c,z_k)\)，则
+
+$$
+E(z_{k+1})-E(z_k)
+=
+-\alpha\|g_k\|^2
++
+\frac{\alpha^2}{2}g_k^\top H_kg_k
++
+O(\alpha^3).
+$$
+
+只要步长不太大、噪声不主导，第一项会使 \(E(z_{k+1})<E(z_k)\)。因此，已实现的 trajectory-local descent CD：
+
+$$
+L_{\mathrm{local}}
+=
+\mathbb E[E(z_{k+s})-E(z_k)]
+$$
+
+很大程度上是在强化 sampler 自己已经构造出来的能量下降关系。它不是 data-started raw CD，也不自动恢复第 1.2 节的 score-matching Taylor 通道。
+
+### 4.2 该项剩余的意义：弱 consistency regularizer，而不是强二阶近似
+
+代码事实：
 
 - 初始 relaxed token 来自 `corrupt_embeddings`，`random_noise`/`zeros` 分支在 `openebm/elm/modeling_ebt.py:464-469`，不是从 one-hot 正样本附近初始化。
 - `first_order_cd`/`first_order_nce`/`proposal_aware_nce` 在 `openebm/elm/modeling_ebt.py:239-244` 保存的是每步更新后的 detached `predicted_distributions`。
-- 当前 endpoint `first_order_cd` 只使用最后一个 detached 状态，loss 接入在 `openebm/elm/modeling_ebt.py:364-386`。
+- 已实现局部项从这些 detached states 取相邻 pair，见 `openebm/elm/modeling_ebt.py:624-650`，并优化 \(E(z_{k+s})-E(z_k)\)，见 `:671-684`。
 
-因此，如果把 data-started 公式 \(E(z_k)-E(z_{k+1})\) 直接套到当前 noise-started sampler 轨迹上，会出现方向问题：当前 MCMC 更新本身沿能量下降方向前进，通常希望 \(E(z_{k+1})<E(z_k)\)。若最小化 \(E(z_k)-E(z_{k+1})\)，训练会倾向于把早期状态能量压低、把后续状态能量抬高，和 sampler descent 方向相反，也会和 endpoint CD 希望“data 能量低于 fake endpoint”的排序产生冲突。
+它仍可能有少量工程价值：
 
-结论：**当前实现条件下，不应把 trajectory-local raw CD 理解为严格 score-matching Taylor 项；更合理的是把它改造成 sampler-direction 的局部能量斜率约束。**
+- 作为 consistency regularizer，显式要求重算 energy 后的排序与 sampler 生成轨迹一致。
+- 若 detached sampler 状态与重算 energy 的数值路径存在偏差，它能暴露这种不一致。
+- `softplus` 小系数版本可以作为稳定化探针，观察 `first_order_local_cd_energy_delta` 是否与预期一致。
 
-### 4.2 与二阶梯度的真实近似关系
+但它对“更接近二阶梯度图”的贡献是高度不确定的：
 
-二阶 pathwise 梯度包含：
-
-$$
-\nabla_\theta L
-\supset
-\sum_k
-\frac{\partial L}{\partial z_K}
-\left(\prod_{j>k}\frac{\partial z_{j+1}}{\partial z_j}\right)
-\left[-\alpha_k\nabla_\theta\nabla_zE_\theta(c,z_k)\right].
-$$
-
-本次实现的一阶局部项是：
-
-$$
-L_{\mathrm{local}}
-=
-\mathbb E_{k,t}
-\left[
-E_\theta(c,z_{k+s,t})-E_\theta(c,z_{k,t})
-\right],
-$$
-
-其中 \(z\) 已 detach，\(s\) 是 stride，\(t\) 是有效 token 位置。其参数梯度为：
-
-$$
-\nabla_\theta L_{\mathrm{local}}
-=
-\mathbb E_{k,t}
-\left[
-\nabla_\theta E_\theta(c,z_{k+s,t})
--
-\nabla_\theta E_\theta(c,z_{k,t})
-\right].
-$$
-
-它比 endpoint ranking 更接近二阶目标的原因：
-
-- 覆盖从 endpoint 扩展到 MCMC 中间状态，监督区域更接近采样器实际访问的 \(\mathrm{supp}(\mu)\)。
-- raw 版本不饱和，能持续塑造局部能量斜率。
-- 最小化 \(E(z_{k+s})-E(z_k)\) 会鼓励 sampler 前进方向能量下降，和当前 MCMC update 的使用方式一致。
-
-它仍然不是二阶 field loss，主要误差来源：
-
+- 没有 data anchor，只比较模型自己生成的两个状态，不告诉模型这条下降路是否朝向真实 token。
 - detach 轨迹，完全没有 \(\nabla_\theta\nabla_zE\) 和跨步 credit assignment。
-- 只约束 scalar energy slope，不约束 \(\nabla_zE\) 的具体方向和范数。
-- 当前实现复用最后一步 `mcmc_step=self.hparams.mcmc_num_steps - 1` 的 energy landscape 重算所有 pair，见 `openebm/elm/modeling_ebt.py:663-669`；如果 time embedding 让不同步能量面差异很大，这会引入近似误差。
-- 现有 `predicted_distributions` 保存的是更新后的状态；没有保存 MCMC 初始 \(z_0\) 到第一步后的 pair。若要覆盖真正第一步，需要额外保存初始 relaxed token，当前为兼容性暂不改 forward 返回结构。
+- 只约束 scalar energy slope，不约束 \(\nabla_zE\) 的方向和范数。
+- raw 版本会持续把 \(E(z_{k+s})-E(z_k)\) 推得更负，可能只是放大自生成坡度，而不是让 field 更正确。
 
-### 4.3 最有效可行设计
+结论：**trajectory-local descent CD 应保留为默认关闭的低优先级实验项，不应作为最高优先级二阶近似方案。** 若要跑，建议只用小系数并以 teacher gradient cosine 判断，而不是看它自己的 loss 是否下降。
 
-最稳妥的方案不是替换 `first_order_cd`，而是在 endpoint CD 上加小权重局部项：
+## 5. 更优先的待实现方案：data-anchored local CD / denoising-style 一阶 surrogate
 
-$$
-L
-=
-c_{\mathrm{endpoint}}L_{\mathrm{endpoint}}
-+
-\lambda_{\mathrm{local}}L_{\mathrm{local}}.
-$$
+### 5.1 为什么它比 trajectory-local descent CD 更有意义
 
-其中：
+trajectory-local descent CD 的问题是没有真实 token 锚点；而 data-anchored 方案从 \(x^+\) 或 \(x^+\) 的局部扰动出发，直接告诉模型“哪个方向更靠近数据”。这更接近下游想要的 denoising field：
 
 $$
-L_{\mathrm{endpoint}}
-=
-\operatorname{softplus}(E(x^+)-E(z_K)),
+s_\theta(c,z)=-\nabla_zE_\theta(c,z)
+\quad\text{应指向}\quad
+x^+-z.
+$$
+
+如果只用能量值做一阶参数训练，可以通过局部 near/far pair 逼近这个方向约束。给定数据邻域扰动点 \(z_\sigma\)，定义
+
+$$
+v=x^+-z_\sigma,
 \quad
-L_{\mathrm{local}}
-=
-\frac{1}{|\mathcal K|}
-\sum_{k\in\mathcal K}
-\left[
-E(z_{k+s})-E(z_k)
-\right].
+z_{\mathrm{near}}=z_\sigma+\eta v,
+\quad
+z_{\mathrm{far}}=z_\sigma-\eta v.
 $$
 
-优先级判断：
+对能量差做 Taylor：
 
-- `num_pairs=1, stride=1` 最值得先做：只多覆盖一对相邻小步，额外成本最低，最不容易偏离局部假设。
-- `num_pairs=2` 是第二优先级：检查覆盖增加是否提升二阶 teacher cosine。
-- 不建议一开始用全轨迹 pair：中后段状态距离可能较大，局部假设弱，且额外 transformer 前向会增加显存/时间。
-- `raw` 是最直接的局部斜率项；若能量 delta 过大、loss 变负过快或梯度不稳，再切到 `softplus`。
+$$
+E(z_{\mathrm{near}})-E(z_{\mathrm{far}})
+\approx
+2\eta\nabla_zE_\theta(c,z_\sigma)^\top v.
+$$
 
-## 5. 已实现的兼容 option
+最小化该差值会推动
 
-### 5.1 代码路径与公式
+$$
+\nabla_zE_\theta(c,z_\sigma)^\top (x^+-z_\sigma)<0,
+$$
+
+等价于让 score \(-\nabla_zE_\theta\) 与回到数据的方向 \(x^+-z_\sigma\) 对齐。它仍然只需要对参数的一阶梯度，因为 loss 本身只含 energy values，不显式反传 \(\nabla_zE\)。
+
+### 5.2 三个可落地变体
+
+**变体 A：data-anchored local CD**
+
+构造 data 邻域负样本：
+
+$$
+z_{\mathrm{neg}}
+=
+\operatorname{perturb}(x^+;\sigma),
+\quad
+L_{\mathrm{data\_local\_cd}}
+=
+E_\theta(c,x^+)-E_\theta(c,z_{\mathrm{neg}}).
+$$
+
+如果 \(z_{\mathrm{neg}}\) 是 \(x^+\) 的小步 Langevin 或小噪声扰动，这比 endpoint CD 更接近第 1.2 节的 local raw CD / score-matching leading term。它的覆盖主要是 data 邻域，不覆盖整条 MCMC trajectory，但监督方向明确。
+
+**变体 B：denoising-style near/far ranking**
+
+先采样局部 corrupted state：
+
+$$
+z_\sigma=(1-\sigma)x^+ + \sigma u,
+$$
+
+其中 \(u\) 可取 uniform token distribution、softmax Gaussian logits，或从当前模型 proposal 中采样的 detached distribution。再构造 near/far：
+
+$$
+z_{\mathrm{near}}=(1-\eta)z_\sigma+\eta x^+,
+\quad
+z_{\mathrm{far}}=(1+\eta)z_\sigma-\eta x^+,
+$$
+
+并投影/裁剪回有效 relaxed-token 表示。目标：
+
+$$
+L_{\mathrm{denoise\_rank}}
+=
+E_\theta(c,z_{\mathrm{near}})
+-
+E_\theta(c,z_{\mathrm{far}}),
+$$
+
+或稳定版本：
+
+$$
+L_{\mathrm{denoise\_rank}}
+=
+\operatorname{softplus}
+\left(
+E_\theta(c,z_{\mathrm{near}})
+-
+E_\theta(c,z_{\mathrm{far}})
++m
+\right).
+$$
+
+这个目标比 trajectory-local descent CD 更值得优先验证，因为它约束的是“朝真实 token 方向能量下降”，不是“沿模型自己刚走过的方向继续下降”。
+
+**变体 C：distance-aware endpoint CD**
+
+这不是 data-neighborhood field 约束，但它直接修复当前 endpoint CD 的一个语义偏差：当 \(z_K\) 已接近真实 token 时，不应继续把它作为强 negative 推高。定义 stop-gradient 距离：
+
+$$
+d_K=\operatorname{sg}\left[d(z_K,x^+)\right],
+$$
+
+例如：
+
+$$
+d_K=1-p_{z_K}(x^+),
+\quad\text{或}\quad
+d_K=\operatorname{CE}(z_K,x^+).
+$$
+
+可以使用 distance-weighted CD：
+
+$$
+L_{\mathrm{dw\_cd}}
+=
+d_K\cdot \operatorname{softplus}(E(x^+)-E(z_K)).
+$$
+
+也可以使用 distance-aware margin：
+
+$$
+L_{\mathrm{dam\_cd}}
+=
+\operatorname{softplus}(E(x^+)-E(z_K)+m\cdot d_K).
+$$
+
+直觉：
+
+- \(z_K\) 很错时，\(d_K\) 大，仍要求 \(E(x^+)\ll E(z_K)\)。
+- \(z_K\) 接近正确时，\(d_K\) 小，降低继续推高 \(z_K\) 的力度。
+- \(z_K=x^+\) 时，理想上不再制造额外 energy gap。
+
+这个方案的优点是改动小，直接复用当前 `first_order_cd` 的 endpoint energy 重算路径；缺点是仍然是 endpoint scalar ranking，不提供显式 field 方向监督。因此它适合作为 `first_order_cd` 的低成本修正，而不是替代 data-anchored denoising surrogate。
+
+### 5.3 最小实现设计
+
+建议先把 data-anchored denoise-rank 作为 `first_order_cd` 的另一个默认关闭 auxiliary，而不是新增主模式：
+
+- 新增参数：
+  - `--first_order_data_local_cd_coeff`，默认 `0.0`。
+  - `--first_order_data_local_cd_noise`，推荐先试 `0.05/0.1/0.2`。
+  - `--first_order_data_local_cd_eta`，推荐先试 `0.25/0.5`。
+  - `--first_order_data_local_cd_loss_type {raw,softplus}`，默认先用 `softplus` 更稳。
+  - `--first_order_data_local_cd_num_samples`，默认 `1`。
+  - `--first_order_data_local_cd_noise_mode {uniform,gaussian_logits}`，默认 `uniform`。
+- 复用 `calculate_contrastive_loss()` 中 one-hot target 构造逻辑，或抽出公共 helper。
+- 在 `forward_loss_wrapper()` 的 `first_order_cd` 分支中，和 endpoint CD 一起组合：
+
+```python
+total_loss = first_order_cd_loss_coeff * endpoint_cd_loss
+if first_order_data_local_cd_coeff > 0:
+    data_local_loss, data_local_metrics = self.calculate_data_anchored_local_cd_loss(
+        input_ids,
+        next_token_indices,
+    )
+    total_loss = total_loss + first_order_data_local_cd_coeff * data_local_loss
+```
+
+`calculate_data_anchored_local_cd_loss()` 最小伪代码：
+
+```python
+true_probs = one_hot(next_token_indices).masked_fill(~valid_positions, 0)
+noise_probs = uniform_or_gaussian_probs_like(true_probs)
+z_sigma = (1 - sigma) * true_probs + sigma * noise_probs
+
+near = normalize_or_clamp((1 - eta) * z_sigma + eta * true_probs)
+far = normalize_or_clamp((1 + eta) * z_sigma - eta * true_probs)
+
+near_energy, far_energy = recompute_energies_in_one_transformer_call(near, far)
+delta = near_energy - far_energy
+loss = delta.mean()              # raw
+# or loss = F.softplus(delta + margin).mean()
+```
+
+工程注意点：
+
+- `far` 可能出现负概率；最简单方案是先在 logits 空间做 near/far，或对 probability-space 结果 `clamp_min(0)` 后重新归一化。第一版应在文档和日志里标注该投影带来的近似误差。
+- valid mask 必须和 `calculate_contrastive_loss()` 一样处理 padding token，避免无效位置参与 energy ranking。
+- 该项可与 endpoint `first_order_cd` 混合；不建议一开始替代 endpoint CD。
+- 若需要更接近 data-started CD，可增加一版 one-step detached Langevin negative：从 \(x^+\) 或 \(z_\sigma\) 出发计算一次 \(\nabla_zE\)，`create_graph=False`，得到 `z_neg.detach()` 后再做 \(E(x^+)-E(z_neg)\)。这比 near/far ranking 更贵，但仍避免二阶 sampler 图。
+
+distance-aware endpoint CD 的最小实现可放在 `calculate_contrastive_loss()` 或其外层：
+
+```python
+fake_probs = softmax(fake_pred_tokens.detach())
+target_prob = fake_probs.gather(-1, safe_next_token_indices.unsqueeze(-1)).squeeze(-1)
+d = (1.0 - target_prob).detach()
+
+base_delta = real_energies.squeeze(-1) - fake_energies.squeeze(-1)
+if loss_type == "distance_weighted_ce":
+    per_token_loss = d.reshape(-1) * F.softplus(base_delta)
+elif loss_type == "distance_margin":
+    margin = first_order_cd_distance_margin * d.reshape(-1)
+    per_token_loss = F.softplus(base_delta + margin)
+```
+
+建议新增参数：
+
+- `--first_order_cd_loss_type {ce,margin,distance_weighted_ce,distance_margin}`
+- `--first_order_cd_distance_metric {one_minus_true_prob,ce}`
+- `--first_order_cd_distance_margin`，默认 `1.0`
+- `--first_order_cd_distance_weight_floor`，默认 `0.0`，用于避免 near-correct 样本完全无梯度。
+
+### 5.4 风险与验证
+
+风险：
+
+- 只覆盖 data 邻域，不能直接监督远离数据但采样器会经过的中段区域。
+- 噪声太小会导致信号弱；噪声太大会破坏 local Taylor 假设。
+- raw loss 可能无界，第一版建议优先跑 `softplus`。
+- near/far projection 若处理不当，可能学到 simplex 边界伪影。
+
+验证：
+
+- 首要指标仍是与 `second_order` teacher 的 gradient cosine / relerr。
+- 额外记录 \(E(z_{\mathrm{near}})-E(z_{\mathrm{far}})\)、endpoint energy gap、valid/task metric。
+- 若 teacher cosine 提升但 valid/task 不提升，说明 local field 方向更接近但全局 basin 排序不足；可增加 endpoint CD 权重。
+- 若 valid/task 提升但 teacher cosine 不提升，应把收益解释为 data-neighborhood regularization，而不是更准确二阶近似。
+
+## 6. 已实现的兼容 option
+
+### 6.1 代码路径与公式
 
 本次实现把局部项挂在 `mcmc_gradient_mode=first_order_cd` 下，默认关闭。
 
@@ -387,7 +591,7 @@ L_{\mathrm{local}}
 \right].
 $$
 
-### 5.2 新增参数
+### 6.2 新增参数
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
@@ -397,36 +601,36 @@ $$
 | `--first_order_local_cd_loss_type` | `raw` | `raw` 或 `softplus` |
 | `--first_order_local_cd_margin` | `0.0` | `softplus` 内部 margin |
 
-### 5.3 推荐实验配置
+### 6.3 低优先级 sanity-check 配置
 
-第一条建议：
-
-```bash
-MCMC_GRADIENT_MODE=first_order_cd \
-FIRST_ORDER_LOCAL_CD_COEFF=0.1 \
-FIRST_ORDER_LOCAL_CD_NUM_PAIRS=1 \
-FIRST_ORDER_LOCAL_CD_PAIR_STRIDE=1 \
-FIRST_ORDER_LOCAL_CD_LOSS_TYPE=raw
-```
-
-如果 `first_order_local_cd_energy_delta` 快速变成很大的负数、gradient norm 明显异常，改跑：
+该项不再作为主要二阶近似方向。若需要验证它是否还有 consistency regularization 收益，建议先用小系数和 `softplus`：
 
 ```bash
 MCMC_GRADIENT_MODE=first_order_cd \
-FIRST_ORDER_LOCAL_CD_COEFF=0.1 \
+FIRST_ORDER_LOCAL_CD_COEFF=0.03 \
 FIRST_ORDER_LOCAL_CD_NUM_PAIRS=1 \
 FIRST_ORDER_LOCAL_CD_PAIR_STRIDE=1 \
 FIRST_ORDER_LOCAL_CD_LOSS_TYPE=softplus \
 FIRST_ORDER_LOCAL_CD_MARGIN=0.0
 ```
 
-推荐 sweep：
+只在 teacher cosine 明确提升时，再短跑 raw 对照：
 
-- `FIRST_ORDER_LOCAL_CD_COEFF=0.03/0.1/0.3`
+```bash
+MCMC_GRADIENT_MODE=first_order_cd \
+FIRST_ORDER_LOCAL_CD_COEFF=0.03 \
+FIRST_ORDER_LOCAL_CD_NUM_PAIRS=1 \
+FIRST_ORDER_LOCAL_CD_PAIR_STRIDE=1 \
+FIRST_ORDER_LOCAL_CD_LOSS_TYPE=raw
+```
+
+不建议一开始 sweep 大范围参数。若确实有效，再试：
+
+- `FIRST_ORDER_LOCAL_CD_COEFF=0.03/0.1`
 - `FIRST_ORDER_LOCAL_CD_NUM_PAIRS=1/2`
-- 只有小模型 teacher cosine 提升后，再尝试 `0.5` 或更多 pairs。
+- 只有小模型 teacher cosine 提升后，再考虑更多 pairs；否则停止。
 
-### 5.4 NCE 作为辅助校准线
+### 6.4 NCE 作为辅助校准线
 
 现有代码已经能跑一条无需先改代码的 hybrid：
 
@@ -444,9 +648,9 @@ PROPOSAL_AWARE_NCE_K=1
 - 额外加入少量 proposal-aware NCE 校准。
 - 如果任务指标提升但二阶 field cosine 不提升，应解释为“校准/覆盖收益”，不是“二阶近似更准”。
 
-## 6. 实验判断标准
+## 7. 实验判断标准
 
-### 6.1 P0：二阶 teacher 对齐评估
+### 7.1 P0：二阶 teacher 对齐评估
 
 先用小模型和小 batch 建立 teacher：
 
@@ -477,38 +681,63 @@ $$
 | 候选 | 目的 |
 |---|---|
 | `first_order_cd` | 当前 baseline |
-| `first_order_cd + local_cd(raw,num_pairs=1,coeff=0.1)` | 验证局部轨迹斜率是否更接近二阶梯度 |
-| `first_order_cd + local_cd(raw,num_pairs=2,coeff=0.1)` | 验证增加轨迹覆盖是否继续有益 |
-| `first_order_cd + local_cd(softplus,num_pairs=1,coeff=0.1)` | 验证稳定化是否牺牲 field 对齐 |
+| 待实现：`distance-aware first_order_cd` | 验证 correctness-aware gap 是否更贴近 \(z_K\rightarrow x^+\) |
+| 待实现：`first_order_cd + data_anchored_denoise_rank` | 验证 data-neighborhood directional derivative 是否更接近二阶 field |
+| 待实现：`first_order_cd + data_local_cd` | 验证 data-started 小扰动 raw CD 是否恢复 score-matching 通道 |
+| `first_order_cd + trajectory_local_descent_cd` | 低优先级 sanity check；验证 sampler-consistency 是否有额外收益 |
 | `proposal_aware_nce + mcmc_final + relaxed_cd` | 现有 hybrid |
 
-### 6.2 P1：验证已实现的 trajectory-local descent CD
+### 7.2 P1：实现并验证 data-anchored local CD / denoise-rank
 
-已实现参数：
+建议先实现第 5.3 节的参数：
 
-- `--first_order_local_cd_coeff`
-- `--first_order_local_cd_num_pairs`
-- `--first_order_local_cd_pair_stride`
-- `--first_order_local_cd_loss_type {raw,softplus}`
-- `--first_order_local_cd_margin`
+- `--first_order_data_local_cd_coeff`
+- `--first_order_data_local_cd_noise`
+- `--first_order_data_local_cd_eta`
+- `--first_order_data_local_cd_loss_type {raw,softplus}`
+- `--first_order_data_local_cd_num_samples`
+- `--first_order_data_local_cd_noise_mode {uniform,gaussian_logits}`
 
 优先消融：
 
 | 实验 | 判断 |
 |---|---|
-| raw, `coeff=0.03/0.1/0.3`, `num_pairs=1` | 是否比 `first_order_cd` 更接近二阶 gradient |
-| raw, `num_pairs=2` | 增加局部覆盖是否继续有益 |
-| raw vs softplus | 稳定化是否损害 field 对齐 |
-| `stride=1` vs `stride=2` | 更长局部间隔是否破坏近似 |
+| distance-weighted endpoint CD, \(d=1-p(x^+)\) | near-correct \(z_K\) 是否不再被过度推高 |
+| distance-margin endpoint CD, \(m d\) | energy gap 是否能随错误程度缩放 |
+| denoise-rank softplus, `noise=0.1`, `eta=0.25`, `coeff=0.1` | 第一条最稳配置；验证 data-anchored 方向约束 |
+| denoise-rank raw vs softplus | raw 是否提供更强 field 对齐，或是否不稳定 |
+| `noise=0.05/0.1/0.2` | 找到 local Taylor 仍成立且信号足够强的噪声尺度 |
+| `eta=0.25/0.5` | near/far 间隔是否过大导致非局部偏差 |
+| data-local CD: \(E(x^+)-E(z_{\mathrm{neg}})\) | 验证更接近 data-started CD 的能量差形式 |
+| one-step detached Langevin negative | 验证更接近 CD-1 的负样本是否值得额外一次 token-gradient 开销 |
 
 必须同时记录：
 
 - `first_order_energy_gap`：endpoint fake 与 real 的能量差。
-- `first_order_local_cd_energy_delta`：局部 \(E(z_{k+s})-E(z_k)\)。
-- `first_order_local_cd_loss`：raw 或 softplus 后的局部项。
+- endpoint distance：\(1-p_{z_K}(x^+)\) 或 CE，用来检查 energy gap 是否随错误程度缩放。
+- data-local energy delta：\(E(z_{\mathrm{near}})-E(z_{\mathrm{far}})\) 或 \(E(x^+)-E(z_{\mathrm{neg}})\)。
+- denoise pair 的 noise/eta、valid mask token 数、梯度 norm。
 - 梯度方向 cosine / relerr：最终判断依据，不能只看 loss 下降。
 
-### 6.3 P1：现有 hybrid 辅助线
+### 7.3 P2：低优先级验证已实现的 trajectory-local descent CD
+
+该项已经实现，但由于 \(z_{k+1}\) 本来由当前能量下降产生，预期只可能提供弱 consistency regularization。若要保留 sanity check，使用小系数：
+
+```bash
+MCMC_GRADIENT_MODE=first_order_cd \
+FIRST_ORDER_LOCAL_CD_COEFF=0.03 \
+FIRST_ORDER_LOCAL_CD_NUM_PAIRS=1 \
+FIRST_ORDER_LOCAL_CD_PAIR_STRIDE=1 \
+FIRST_ORDER_LOCAL_CD_LOSS_TYPE=softplus
+```
+
+判据：
+
+- 若 teacher cosine 不高于 `first_order_cd`，该项不应继续投入。
+- 若 `first_order_local_cd_energy_delta` 本来已经为负且继续变得更负，但 teacher cosine 不提升，说明它只是在放大自生成坡度。
+- 不建议将 raw trajectory-local loss 作为主目标；raw 只适合短 smoke。
+
+### 7.4 P2：现有 hybrid 辅助线
 
 无需代码改动，先跑：
 
@@ -526,15 +755,15 @@ PROPOSAL_AWARE_NCE_K=1
 - 若 valid/task metric 提升但 cosine 不提升，应把收益归因到 calibration / coverage。
 - 若 cosine 和 task metric 都提升，再考虑提高 `K` 或 `base_coeff`。
 
-### 6.4 P2：NCE 工程增强
+### 7.5 P3：NCE 工程增强
 
-这些放在 local CD 验证之后：
+这些放在 data-anchored local CD 验证之后：
 
 - `PROPOSAL_AWARE_NCE_K=2/4`：增加离散负样本覆盖，但显存随 K 增。
 - `PROPOSAL_AWARE_NCE_RANK_COEFF=0.02/0.05`：hard negative ranking。
 - 可学习 logZ / offset：改善 NCE calibration，不直接提升 field 阶数。
 
-### 6.5 P3：大模型稳定性回归
+### 7.6 P3：大模型稳定性回归
 
 小模型确认后再上 FSDP2/ZeRO：
 
@@ -543,12 +772,14 @@ PROPOSAL_AWARE_NCE_K=1
 - 先禁用随机 step count，降低评估噪声。
 - 监控 energy gap、gradient norm、`pct_gradient_clipped`。
 
-## 7. 最终执行顺序
+## 8. 最终执行顺序
 
 1. 用小模型建立 `second_order` teacher 的 gradient / field 对齐评估。
 2. 对比当前 `first_order_cd` 和现有 `proposal_aware_nce + mcmc_final + relaxed_cd`。
-3. 跑已实现的 `first_order_cd + first_order_local_cd_coeff=0.1,num_pairs=1,raw`。
-4. 若 local descent CD 的二阶 cosine 更高，再做 `num_pairs=2`、`coeff=0.03/0.3` 和 `softplus` 稳定化消融。
-5. 只有在 field 对齐不退化时，再加入 NCE 的 `K>1`、hard negative、logZ offset。
+3. 先实现 `distance-aware first_order_cd`，验证 near-correct \(z_K\) 不再被继续强推高。
+4. 再实现 `data-anchored denoise-rank`，先跑 `softplus, noise=0.1, eta=0.25, coeff=0.1`。
+5. 若 data-anchored 方案的 teacher cosine 提升，再做 raw/softplus、noise、eta 和 data-local CD 变体消融。
+6. 已实现的 trajectory-local descent CD 只作为低优先级 sanity check；若 teacher cosine 不提升，不继续投入。
+7. 只有在 field 对齐不退化时，再加入 NCE 的 `K>1`、hard negative、logZ offset。
 
-这份文档的判断依据是：**训练目标是否在采样器实际轨迹上直接约束 \(\nabla_xE_\theta\)**。能量 gap、valid loss、NCE loss 都有参考价值，但不能单独证明某个一阶目标更接近二阶梯度图。
+这份文档的判断依据是：**训练目标是否以有监督锚点约束 \(\nabla_xE_\theta\) 的方向/局部 directional derivative，而不只是制造能量 gap**。能量 gap、valid loss、NCE loss 都有参考价值，但不能单独证明某个一阶目标更接近二阶梯度图。
