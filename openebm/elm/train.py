@@ -43,9 +43,12 @@ def validate_first_order_landscape_args(args):
     mcmc_gradient_mode = getattr(args, "mcmc_gradient_mode", "second_order")
     proposal_mode = getattr(args, "proposal_aware_nce_proposal", "uniform")
     relaxed_cd_coeff = float(getattr(args, "proposal_aware_nce_relaxed_cd_coeff", 0.0) or 0.0)
+    local_cd_coeff = float(getattr(args, "first_order_local_cd_coeff", 0.0) or 0.0)
     nce_base_coeff = float(getattr(args, "proposal_aware_nce_base_coeff", 1.0) or 0.0)
     rank_coeff = float(getattr(args, "proposal_aware_nce_rank_coeff", 0.0) or 0.0)
     k = int(getattr(args, "proposal_aware_nce_k", 1) or 1)
+    local_cd_num_pairs = int(getattr(args, "first_order_local_cd_num_pairs", 1) or 1)
+    local_cd_pair_stride = int(getattr(args, "first_order_local_cd_pair_stride", 1) or 1)
 
     if mcmc_gradient_mode == "proposal_aware_nce":
         if relaxed_cd_coeff > 0.0 and proposal_mode != "mcmc_final":
@@ -73,7 +76,24 @@ def validate_first_order_landscape_args(args):
                 flush=True,
             )
 
-    graph_safe_first_order_modes = {"first_order_cd_v2", "first_order_nce", "proposal_aware_nce"}
+    if local_cd_coeff != 0.0:
+        if mcmc_gradient_mode != "first_order_cd":
+            raise ValueError("--first_order_local_cd_coeff is only supported with --mcmc_gradient_mode first_order_cd.")
+        if local_cd_coeff < 0.0:
+            raise ValueError("--first_order_local_cd_coeff must be non-negative.")
+        if local_cd_num_pairs < 1:
+            raise ValueError("--first_order_local_cd_num_pairs must be >= 1.")
+        if local_cd_pair_stride < 1:
+            raise ValueError("--first_order_local_cd_pair_stride must be >= 1.")
+        if int(getattr(args, "mcmc_num_steps", 1) or 1) <= local_cd_pair_stride:
+            print(
+                "[first_order_cd] WARNING: first_order_local_cd has no adjacent stored pair "
+                "when mcmc_num_steps <= first_order_local_cd_pair_stride; the auxiliary "
+                "loss will be zero unless random extra steps create more states.",
+                flush=True,
+            )
+
+    graph_safe_first_order_modes = {"first_order_cd", "first_order_nce", "proposal_aware_nce"}
     if mcmc_gradient_mode in graph_safe_first_order_modes and getattr(args, "mcmc_step_size_learnable", False):
         print(
             f"[{mcmc_gradient_mode}] WARNING: disabling mcmc_step_size_learnable because graph-safe "
@@ -565,13 +585,12 @@ if __name__ == '__main__':
     parser.add_argument("--no_mcmc_detach", help="dont detach between mcmc steps, probably need to use for S2 models but can increase instability due to longer gradient computation graphs", action="store_true", default=False)
 
     parser.add_argument("--mcmc_gradient_mode", type=str, default="second_order",
-        choices=["second_order", "first_order_debug", "first_order_cd", "first_order_cd_v2", "first_order_nce", "proposal_aware_nce"],
+        choices=["second_order", "first_order_debug", "first_order_cd", "first_order_nce", "proposal_aware_nce"],
         help=(
             "Controls whether MCMC refinement participates in higher-order autograd. "
             "second_order preserves the current EBT objective. first_order_debug forces "
             "autograd.grad(create_graph=False) for isolation only. first_order_cd uses "
-            "detached MCMC samples with a first-order contrastive energy surrogate. "
-            "first_order_cd_v2 keeps the same surrogate but drops sampler graph refs and "
+            "detached MCMC samples with a graph-safe contrastive energy surrogate and "
             "recomputes positive/negative energies in one transformer pass. first_order_nce "
             "uses the same graph-safe recomputation path with a logistic NCE energy loss. "
             "proposal_aware_nce uses sampled negatives from a known proposal distribution "
@@ -588,12 +607,27 @@ if __name__ == '__main__':
     parser.add_argument("--first_order_cd_margin", type=float, default=1.0,
         help="Margin used when --first_order_cd_loss_type margin.")
 
-    parser.add_argument("--first_order_cd_alpha_ce_coeff", type=float, default=0.0,
+    parser.add_argument("--first_order_local_cd_coeff", type=float, default=0.0,
         help=(
-            "Optional alpha-only CE coefficient for first_order_cd. The default keeps "
-            "the surrogate purely first-order in model parameters; set >0 only if you "
-            "want the detached MCMC CE term to tune alpha."
+            "Optional trajectory-local auxiliary coefficient for mcmc_gradient_mode=first_order_cd. "
+            "Default 0 keeps the original endpoint first_order_cd behavior."
         ))
+
+    parser.add_argument("--first_order_local_cd_num_pairs", type=int, default=1,
+        help="Number of adjacent detached MCMC state pairs to use for first_order_local_cd.")
+
+    parser.add_argument("--first_order_local_cd_pair_stride", type=int, default=1,
+        help="Stride between detached MCMC states used by first_order_local_cd.")
+
+    parser.add_argument("--first_order_local_cd_loss_type", type=str, default="raw",
+        choices=["raw", "softplus"],
+        help=(
+            "Trajectory-local loss for first_order_cd. raw minimizes E(z_{k+s})-E(z_k); "
+            "softplus applies softplus to the same descent-signed energy delta."
+        ))
+
+    parser.add_argument("--first_order_local_cd_margin", type=float, default=0.0,
+        help="Margin added inside softplus for --first_order_local_cd_loss_type softplus.")
 
     parser.add_argument("--first_order_nce_loss_coeff", type=float, default=1.0,
         help="Loss coefficient for mcmc_gradient_mode=first_order_nce.")
@@ -648,7 +682,7 @@ if __name__ == '__main__':
     parser.add_argument("--proposal_aware_nce_relaxed_cd_margin", type=float, default=0.0,
         help=(
             "Margin for proposal_aware_nce relaxed CD auxiliary. The default 0.0 matches "
-            "the first_order_cd_v2 CE-style softplus(E_pos - E_relaxed) objective."
+            "the first_order_cd CE-style softplus(E_pos - E_relaxed) objective."
         ))
 
     parser.add_argument("--contrastive_loss", help="uses a contrastive loss to shape the landscape of EBM, idea from IRED paper https://arxiv.org/abs/2406.11179", action="store_true", default=False)

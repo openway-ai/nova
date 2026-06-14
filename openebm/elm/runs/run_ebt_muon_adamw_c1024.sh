@@ -186,8 +186,20 @@ fi
 if [ -n "${FIRST_ORDER_CD_MARGIN:-}" ]; then
     MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_margin ${FIRST_ORDER_CD_MARGIN}"
 fi
-if [ -n "${FIRST_ORDER_CD_ALPHA_CE_COEFF:-}" ]; then
-    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_alpha_ce_coeff ${FIRST_ORDER_CD_ALPHA_CE_COEFF}"
+if [ -n "${FIRST_ORDER_LOCAL_CD_COEFF:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_coeff ${FIRST_ORDER_LOCAL_CD_COEFF}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_NUM_PAIRS:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_num_pairs ${FIRST_ORDER_LOCAL_CD_NUM_PAIRS}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_PAIR_STRIDE:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_pair_stride ${FIRST_ORDER_LOCAL_CD_PAIR_STRIDE}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_LOSS_TYPE:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_loss_type ${FIRST_ORDER_LOCAL_CD_LOSS_TYPE}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_MARGIN:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_margin ${FIRST_ORDER_LOCAL_CD_MARGIN}"
 fi
 
 ################################################################################

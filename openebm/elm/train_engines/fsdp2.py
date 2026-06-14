@@ -51,7 +51,7 @@ def prepare_fsdp2_args(args) -> None:
         _warn(
             "mcmc_gradient_mode=first_order_debug only disables create_graph in the sampler. "
             "It is useful for isolating FSDP2 failures but does not provide a full model-training "
-            "signal from the CE objective. Use first_order_cd_v2, first_order_nce, or proposal_aware_nce for training."
+            "signal from the CE objective. Use first_order_cd, first_order_nce, or proposal_aware_nce for training."
         )
 
     if getattr(args, "fsdp_force_truncate_mcmc", False) and not getattr(args, "truncate_mcmc", False):
