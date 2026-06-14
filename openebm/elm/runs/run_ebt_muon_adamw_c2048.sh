@@ -270,8 +270,20 @@ fi
 if [ -n "${FIRST_ORDER_CD_MARGIN:-}" ]; then
     MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_margin ${FIRST_ORDER_CD_MARGIN}"
 fi
-if [ -n "${FIRST_ORDER_CD_ALPHA_CE_COEFF:-}" ]; then
-    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_alpha_ce_coeff ${FIRST_ORDER_CD_ALPHA_CE_COEFF}"
+if [ -n "${FIRST_ORDER_LOCAL_CD_COEFF:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_coeff ${FIRST_ORDER_LOCAL_CD_COEFF}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_NUM_PAIRS:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_num_pairs ${FIRST_ORDER_LOCAL_CD_NUM_PAIRS}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_PAIR_STRIDE:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_pair_stride ${FIRST_ORDER_LOCAL_CD_PAIR_STRIDE}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_LOSS_TYPE:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_loss_type ${FIRST_ORDER_LOCAL_CD_LOSS_TYPE}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_MARGIN:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_margin ${FIRST_ORDER_LOCAL_CD_MARGIN}"
 fi
 if [ -n "${FIRST_ORDER_NCE_LOSS_COEFF:-}" ]; then
     MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_nce_loss_coeff ${FIRST_ORDER_NCE_LOSS_COEFF}"
@@ -310,7 +322,7 @@ fi
 MCMC_STEP_SIZE_LEARNABLE_FLAG=""
 if [ "${MCMC_STEP_SIZE_LEARNABLE}" = "true" ]; then
     case "${MCMC_GRADIENT_MODE:-second_order}" in
-        first_order_cd_v2|first_order_nce|proposal_aware_nce)
+        first_order_cd|first_order_nce|proposal_aware_nce)
             echo "[run_ebt_muon_adamw_c2048] Disabling --mcmc_step_size_learnable for graph-safe first-order mode ${MCMC_GRADIENT_MODE}; sampler endpoint is detached." ;;
         *)
             MCMC_STEP_SIZE_LEARNABLE_FLAG="--mcmc_step_size_learnable" ;;
@@ -453,7 +465,6 @@ short_mcmc_gradient_tag() {
     case "${MCMC_GRADIENT_MODE:-second_order}" in
         second_order) echo "2nd" ;;
         first_order_cd) echo "foCD" ;;
-        first_order_cd_v2) echo "foCDv2" ;;
         first_order_nce) echo "foNCE" ;;
         proposal_aware_nce) echo "paNCE" ;;
         first_order_debug) echo "foDbg" ;;
@@ -657,6 +668,12 @@ print_kv "Log File" "${LOG_FILE}"
 print_kv "WandB Mode" "${WANDB_MODE}"
 print_kv "Train Engine" "${TRAIN_ENGINE}"
 print_kv "MCMC Gradient Mode" "${MCMC_GRADIENT_MODE:-second_order}"
+if [ "${MCMC_GRADIENT_MODE:-second_order}" = "first_order_cd" ]; then
+    print_kv "First Order Local CD" "${FIRST_ORDER_LOCAL_CD_COEFF:-0.0}"
+    print_kv "Local CD Pairs" "${FIRST_ORDER_LOCAL_CD_NUM_PAIRS:-1}"
+    print_kv "Local CD Stride" "${FIRST_ORDER_LOCAL_CD_PAIR_STRIDE:-1}"
+    print_kv "Local CD Loss" "${FIRST_ORDER_LOCAL_CD_LOSS_TYPE:-raw}"
+fi
 if [ "${MCMC_GRADIENT_MODE:-second_order}" = "proposal_aware_nce" ]; then
     print_kv "Proposal Aware NCE Proposal" "${PROPOSAL_AWARE_NCE_PROPOSAL:-uniform}"
     print_kv "Proposal Aware NCE K" "${PROPOSAL_AWARE_NCE_K:-1}"

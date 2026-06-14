@@ -236,7 +236,7 @@ class EBT_NLP(LightningModule):
                     langevin_dynamics_noise_std, step_alpha, start_pos, learning, return_raw_logits,
                     real_token_ids=x
                 )
-                if getattr(self.hparams, "mcmc_gradient_mode", "second_order") in {"first_order_cd_v2", "first_order_nce", "proposal_aware_nce"}:
+                if getattr(self.hparams, "mcmc_gradient_mode", "second_order") in {"first_order_cd", "first_order_nce", "proposal_aware_nce"}:
                     # These first-order objectives recompute positive and
                     # negative energies below. Keep only detached sampler
                     # outputs here so MCMC does not retain transformer graphs.
@@ -350,7 +350,7 @@ class EBT_NLP(LightningModule):
         
         initial_final_pred_energies_gap = initial_pred_energies - final_pred_energies
 
-        use_first_order_surrogate = mcmc_gradient_mode in {"first_order_cd", "first_order_cd_v2", "first_order_nce"}
+        use_first_order_surrogate = mcmc_gradient_mode in {"first_order_cd", "first_order_nce"}
         proposal_metrics = {}
         if mcmc_gradient_mode == "proposal_aware_nce":
             contrastive_loss, proposal_metrics = self.calculate_proposal_aware_nce_loss(
@@ -373,7 +373,7 @@ class EBT_NLP(LightningModule):
                 next_token_indices,
                 fake_pred_tokens=predicted_distributions[-1].detach(),
                 recompute_fake_energy=True,
-                combine_recomputed_energies=mcmc_gradient_mode in {"first_order_cd_v2", "first_order_nce"},
+                combine_recomputed_energies=mcmc_gradient_mode in {"first_order_cd", "first_order_nce"},
                 loss_mode="nce" if use_nce_loss else None,
                 return_metrics=True,
             )
@@ -384,14 +384,15 @@ class EBT_NLP(LightningModule):
                 else getattr(self.hparams, "first_order_cd_loss_coeff", 1.0)
             )
             total_loss = loss_coeff * contrastive_loss
-            alpha_ce_coeff = getattr(self.hparams, "first_order_cd_alpha_ce_coeff", 0.0)
-            if mcmc_gradient_mode in {"first_order_cd_v2", "first_order_nce"} and alpha_ce_coeff != 0.0:
-                raise ValueError(
-                    f"{mcmc_gradient_mode} drops sampler graph references and does not support "
-                    "--first_order_cd_alpha_ce_coeff. Use first_order_cd for that diagnostic path."
+            local_cd_coeff = float(getattr(self.hparams, "first_order_local_cd_coeff", 0.0) or 0.0)
+            if mcmc_gradient_mode == "first_order_cd" and local_cd_coeff != 0.0:
+                local_cd_loss, local_cd_metrics = self.calculate_trajectory_local_cd_loss(
+                    input_ids,
+                    next_token_indices,
+                    predicted_distributions,
                 )
-            if alpha_ce_coeff != 0.0:
-                total_loss = total_loss + alpha_ce_coeff * reconstruction_loss
+                total_loss = total_loss + local_cd_coeff * local_cd_loss
+                proposal_metrics.update(local_cd_metrics)
             contrastive_loss = contrastive_loss.detach()
         elif self.hparams.contrastive_loss: # works by pushing up on energies model predicted and pushing down on energy of true samples
             contrastive_loss = self.calculate_contrastive_loss(predicted_energies, input_ids, next_token_indices)
@@ -619,6 +620,78 @@ class EBT_NLP(LightningModule):
                 'first_order_energy_gap': energy_gap,
             }
         return contrastive_loss
+
+    def calculate_trajectory_local_cd_loss(self, input_ids, next_token_indices, predicted_distributions):
+        batch_size = input_ids.shape[0]
+        seq_length = input_ids.shape[1]
+        device = next_token_indices.device
+        dtype = self.embeddings.weight.dtype
+
+        valid_positions = next_token_indices.reshape(batch_size, seq_length) != -1
+        stride = int(getattr(self.hparams, "first_order_local_cd_pair_stride", 1) or 1)
+        max_pairs = int(getattr(self.hparams, "first_order_local_cd_num_pairs", 1) or 1)
+        stride = max(stride, 1)
+        max_pairs = max(max_pairs, 1)
+        available_pairs = max(len(predicted_distributions) - stride, 0)
+        pair_count = min(max_pairs, available_pairs)
+
+        if pair_count <= 0:
+            zero = self.embeddings.weight.sum() * 0.0
+            return zero, {
+                'first_order_local_cd_loss': zero.detach(),
+                'first_order_local_cd_energy_delta': zero.detach(),
+                'first_order_local_cd_pairs_used': zero.detach(),
+            }
+
+        pair_logits = []
+        for pair_idx in range(pair_count):
+            earlier = predicted_distributions[pair_idx].detach().reshape(batch_size, seq_length, self.vocab_size)
+            later = predicted_distributions[pair_idx + stride].detach().reshape(batch_size, seq_length, self.vocab_size)
+            pair_logits.extend([earlier, later])
+
+        local_logits = torch.cat(pair_logits, dim=0)
+        local_valid_positions = valid_positions.repeat(pair_count * 2, 1)
+        local_tokens, local_embeddings = self._relaxed_logits_to_tokens_and_embeddings(
+            local_logits,
+            valid_positions=local_valid_positions,
+        )
+
+        real_embeddings_input = self.embeddings(input_ids)
+        repeated_real_embeddings = real_embeddings_input.repeat(pair_count * 2, 1, 1)
+        combined_embeddings = torch.cat((repeated_real_embeddings, local_embeddings), dim=1)
+        repeated_input_ids = input_ids.repeat(pair_count * 2, 1)
+        local_energies = self.transformer(
+            combined_embeddings,
+            start_pos=0,
+            mcmc_step=self.hparams.mcmc_num_steps - 1,
+            real_token_ids=repeated_input_ids,
+            predicted_tokens=local_tokens,
+        ).reshape(pair_count, 2, batch_size, seq_length)
+
+        earlier_energies = local_energies[:, 0].float()
+        later_energies = local_energies[:, 1].float()
+        energy_delta = later_energies - earlier_energies
+        local_valid = valid_positions.unsqueeze(0).expand(pair_count, -1, -1)
+
+        if local_valid.any():
+            valid_delta = energy_delta[local_valid]
+            loss_type = getattr(self.hparams, "first_order_local_cd_loss_type", "raw")
+            if loss_type == "softplus":
+                margin = float(getattr(self.hparams, "first_order_local_cd_margin", 0.0) or 0.0)
+                local_cd_loss = F.softplus(valid_delta + margin).mean()
+            else:
+                local_cd_loss = valid_delta.mean()
+            mean_delta = valid_delta.mean().detach()
+        else:
+            local_cd_loss = energy_delta.sum() * 0.0
+            mean_delta = local_cd_loss.detach()
+
+        pairs_used = torch.tensor(float(pair_count), device=device, dtype=dtype)
+        return local_cd_loss, {
+            'first_order_local_cd_loss': local_cd_loss.detach(),
+            'first_order_local_cd_energy_delta': mean_delta,
+            'first_order_local_cd_pairs_used': pairs_used,
+        }
 
     def _one_hot_token_probs(self, token_indices, valid_positions):
         safe_token_indices = token_indices.clamp(min=0)
