@@ -236,8 +236,8 @@ class EBT_NLP(LightningModule):
                     langevin_dynamics_noise_std, step_alpha, start_pos, learning, return_raw_logits,
                     real_token_ids=x
                 )
-                if getattr(self.hparams, "mcmc_gradient_mode", "second_order") == "first_order_cd_v2":
-                    # The v2 first-order CD objective recomputes positive and
+                if getattr(self.hparams, "mcmc_gradient_mode", "second_order") in {"first_order_cd_v2", "first_order_nce", "proposal_aware_nce"}:
+                    # These first-order objectives recompute positive and
                     # negative energies below. Keep only detached sampler
                     # outputs here so MCMC does not retain transformer graphs.
                     predicted_energies.append(energy_preds.detach())
@@ -252,6 +252,50 @@ class EBT_NLP(LightningModule):
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
         no_randomness = False if phase == "train" else True
         learning = phase == "train"
+        mcmc_gradient_mode = getattr(self.hparams, "mcmc_gradient_mode", "second_order")
+        proposal_mode = getattr(self.hparams, "proposal_aware_nce_proposal", "uniform")
+        proposal_aware_no_mcmc = (
+            mcmc_gradient_mode == "proposal_aware_nce"
+            and proposal_mode != "mcmc_final"
+        )
+
+        if proposal_aware_no_mcmc:
+            input_ids = x[0].squeeze(dim=0)
+            next_token_indices = x[1].squeeze(dim=0)
+            if self.hparams.execution_mode == "finetune":
+                next_token_indices = mask_q_tokens(next_token_indices, self.tokenizer)
+            next_token_indices = next_token_indices.reshape(-1)
+            contrastive_loss, proposal_metrics = self.calculate_proposal_aware_nce_loss(
+                input_ids,
+                next_token_indices,
+                proposal_logits=None,
+            )
+            loss_coeff = getattr(self.hparams, "proposal_aware_nce_loss_coeff", 1.0)
+            total_loss = loss_coeff * contrastive_loss
+            zero = total_loss.detach() * 0.0
+            log_dict = {
+                'loss': total_loss,
+                'initial_loss' : zero,
+                'reconstruction_loss': zero,
+                'final_step_loss': zero,
+                'contrastive_loss' : contrastive_loss.detach(),
+                'initial_final_pred_energies_gap': proposal_metrics['proposal_aware_nce_energy_gap'],
+                'perplexity': zero,
+                'bpb': zero,
+                'bpb_nats': zero,
+                'bpb_bytes': zero,
+                'bpb_tokens': zero,
+                'bpb_nats_per_token': zero,
+                'bpb_bytes_per_token': zero,
+                'objective_loss': total_loss.detach(),
+                'initial_step_ce': zero,
+                'final_step_ce': zero,
+                'mcmc_ce_improvement': zero,
+                'perplexity_is_finite': zero,
+            }
+            log_dict.update(proposal_metrics)
+            return log_dict
+
         if not no_randomness and self.mcmc_replay_buffer: # dont do this when doing val/testing
             # all_tokens = x['input_ids'].squeeze(dim=1)
             all_tokens = x[0].squeeze(dim=0)
@@ -306,26 +350,44 @@ class EBT_NLP(LightningModule):
         
         initial_final_pred_energies_gap = initial_pred_energies - final_pred_energies
 
-        mcmc_gradient_mode = getattr(self.hparams, "mcmc_gradient_mode", "second_order")
-        use_first_order_cd = mcmc_gradient_mode in {"first_order_cd", "first_order_cd_v2"}
-        if use_first_order_cd:
-            # In first-order CD mode, the MCMC sampler is detached from model
+        use_first_order_surrogate = mcmc_gradient_mode in {"first_order_cd", "first_order_cd_v2", "first_order_nce"}
+        proposal_metrics = {}
+        if mcmc_gradient_mode == "proposal_aware_nce":
+            contrastive_loss, proposal_metrics = self.calculate_proposal_aware_nce_loss(
+                input_ids,
+                next_token_indices,
+                proposal_logits=predicted_distributions[-1].detach(),
+            )
+            loss_coeff = getattr(self.hparams, "proposal_aware_nce_loss_coeff", 1.0)
+            total_loss = loss_coeff * contrastive_loss
+            contrastive_loss = contrastive_loss.detach()
+        elif use_first_order_surrogate:
+            # In first-order surrogate modes, the MCMC sampler is detached from model
             # parameters. Recompute positive/negative energies at detached token
             # states so the optimization and validation losses use the same
             # first-order EBM objective. CE is still logged separately below.
-            contrastive_loss = self.calculate_contrastive_loss(
+            use_nce_loss = mcmc_gradient_mode == "first_order_nce"
+            contrastive_loss, surrogate_metrics = self.calculate_contrastive_loss(
                 predicted_energies,
                 input_ids,
                 next_token_indices,
                 fake_pred_tokens=predicted_distributions[-1].detach(),
                 recompute_fake_energy=True,
-                combine_recomputed_energies=mcmc_gradient_mode == "first_order_cd_v2",
+                combine_recomputed_energies=mcmc_gradient_mode in {"first_order_cd_v2", "first_order_nce"},
+                loss_mode="nce" if use_nce_loss else None,
+                return_metrics=True,
             )
-            total_loss = getattr(self.hparams, "first_order_cd_loss_coeff", 1.0) * contrastive_loss
+            proposal_metrics.update(surrogate_metrics)
+            loss_coeff = (
+                getattr(self.hparams, "first_order_nce_loss_coeff", 1.0)
+                if use_nce_loss
+                else getattr(self.hparams, "first_order_cd_loss_coeff", 1.0)
+            )
+            total_loss = loss_coeff * contrastive_loss
             alpha_ce_coeff = getattr(self.hparams, "first_order_cd_alpha_ce_coeff", 0.0)
-            if mcmc_gradient_mode == "first_order_cd_v2" and alpha_ce_coeff != 0.0:
+            if mcmc_gradient_mode in {"first_order_cd_v2", "first_order_nce"} and alpha_ce_coeff != 0.0:
                 raise ValueError(
-                    "first_order_cd_v2 drops sampler graph references and does not support "
+                    f"{mcmc_gradient_mode} drops sampler graph references and does not support "
                     "--first_order_cd_alpha_ce_coeff. Use first_order_cd for that diagnostic path."
                 )
             if alpha_ce_coeff != 0.0:
@@ -350,11 +412,20 @@ class EBT_NLP(LightningModule):
                                                 label_smoothing=label_smoothing, ignore_index=-1, reduction='none')
             else:
                 per_token_ce = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1, reduction='none')
-            bpb_loss, bpb_nats, bpb_bytes = calculate_bpb_score(next_token_indices, per_token_ce.detach(), token_bytes)
+            bpb_loss, bpb_nats, bpb_bytes, bpb_tokens = calculate_bpb_score(
+                next_token_indices,
+                per_token_ce.detach(),
+                token_bytes,
+            )
+            bpb_nats_per_token = bpb_nats / bpb_tokens if bpb_tokens > 0 else 0.0
+            bpb_bytes_per_token = bpb_bytes / bpb_tokens if bpb_tokens > 0 else 0.0
         else:
             bpb_loss = 0
             bpb_nats = 0
             bpb_bytes = 0
+            bpb_tokens = 0
+            bpb_nats_per_token = 0.0
+            bpb_bytes_per_token = 0.0
 
         log_dict = {
             'loss': total_loss,
@@ -367,7 +438,16 @@ class EBT_NLP(LightningModule):
             'bpb': bpb_loss,
             'bpb_nats': bpb_nats,    # accumulated nats for epoch-level BPB
             'bpb_bytes': bpb_bytes,  # accumulated bytes for epoch-level BPB
+            'bpb_tokens': bpb_tokens,
+            'bpb_nats_per_token': bpb_nats_per_token,
+            'bpb_bytes_per_token': bpb_bytes_per_token,
+            'objective_loss': total_loss.detach(),
+            'initial_step_ce': initial_loss,
+            'final_step_ce': final_reconstruction_loss,
+            'mcmc_ce_improvement': initial_loss - final_reconstruction_loss,
+            'perplexity_is_finite': torch.isfinite(ppl_loss).to(ppl_loss.dtype),
         }
+        log_dict.update(proposal_metrics)
         return log_dict
     
 
@@ -391,7 +471,9 @@ class EBT_NLP(LightningModule):
     
     def calculate_contrastive_loss(self, predicted_energies, input_ids, next_token_indices,
                                    fake_pred_tokens=None, recompute_fake_energy=False,
-                                   combine_recomputed_energies=False):
+                                   combine_recomputed_energies=False,
+                                   loss_mode=None,
+                                   return_metrics=False):
         batch_size = input_ids.shape[0]
         seq_length = input_ids.shape[1]
         real_embeddings_input = self.embeddings(input_ids)
@@ -451,7 +533,7 @@ class EBT_NLP(LightningModule):
                 fake_embeddings = self.vocab_to_embed(fake_pred_tokens)
 
             if combine_recomputed_energies:
-                # Used by first_order_cd_v2: one larger transformer call avoids
+                # Used by graph-safe first-order modes: one larger transformer call avoids
                 # two separate ZeRO-3/FSDP parameter materialization cycles.
                 all_true_embeddings = torch.cat((real_embeddings_input, true_embeddings), dim=1)
                 all_fake_embeddings = torch.cat((real_embeddings_input, fake_embeddings), dim=1)
@@ -501,7 +583,15 @@ class EBT_NLP(LightningModule):
         energy_targets = torch.zeros(real_energies.shape[0], dtype=torch.long, device=fake_energies.device)
         padding_positions = ~valid_positions.reshape(-1)
         energy_targets[padding_positions] = -100 # prevents nans instead of using self.tokenizer_pad_token_id, as setting this to 0 leads to issues
-        if getattr(self.hparams, "first_order_cd_loss_type", "ce") == "margin":
+        loss_mode = loss_mode or getattr(self.hparams, "first_order_cd_loss_type", "ce")
+        if loss_mode == "nce":
+            per_token_loss = F.softplus(real_energies.squeeze(-1)) + F.softplus(-fake_energies.squeeze(-1))
+            valid_flat = valid_positions.reshape(-1)
+            if valid_flat.any():
+                contrastive_loss = per_token_loss[valid_flat].mean()
+            else:
+                contrastive_loss = per_token_loss.sum() * 0.0
+        elif loss_mode == "margin":
             margin = getattr(self.hparams, "first_order_cd_margin", 1.0)
             per_token_loss = F.relu(margin + real_energies.squeeze(-1) - fake_energies.squeeze(-1))
             valid_flat = valid_positions.reshape(-1)
@@ -511,7 +601,292 @@ class EBT_NLP(LightningModule):
                 contrastive_loss = per_token_loss.sum() * 0.0
         else:
             contrastive_loss = F.cross_entropy(-1 * energy_stack, energy_targets, ignore_index=-100)
+        if return_metrics:
+            valid_flat = valid_positions.reshape(-1)
+            real_energy_flat = real_energies.squeeze(-1).float()
+            fake_energy_flat = fake_energies.squeeze(-1).float()
+            if valid_flat.any():
+                real_energy_mean = real_energy_flat[valid_flat].mean().detach()
+                fake_energy_mean = fake_energy_flat[valid_flat].mean().detach()
+                energy_gap = (fake_energy_flat - real_energy_flat)[valid_flat].mean().detach()
+            else:
+                real_energy_mean = contrastive_loss.detach() * 0.0
+                fake_energy_mean = contrastive_loss.detach() * 0.0
+                energy_gap = contrastive_loss.detach() * 0.0
+            return contrastive_loss, {
+                'first_order_real_energy': real_energy_mean,
+                'first_order_fake_energy': fake_energy_mean,
+                'first_order_energy_gap': energy_gap,
+            }
         return contrastive_loss
+
+    def _one_hot_token_probs(self, token_indices, valid_positions):
+        safe_token_indices = token_indices.clamp(min=0)
+        token_probs = torch.zeros(
+            (*safe_token_indices.shape, self.vocab_size),
+            device=token_indices.device,
+            dtype=self.embeddings.weight.dtype,
+        )
+        token_probs.scatter_(-1, safe_token_indices.unsqueeze(-1), 1.0)
+        token_probs = token_probs.masked_fill(~valid_positions.unsqueeze(-1), 0.0)
+        return token_probs
+
+    def _token_probs_to_embeddings(self, token_probs):
+        if self.hparams.vocab_to_embed_uses_prob_dist:
+            return torch.matmul(token_probs, self.embeddings.weight)
+        return self.vocab_to_embed(token_probs)
+
+    def _relaxed_logits_to_tokens_and_embeddings(self, relaxed_logits, valid_positions=None):
+        relaxed_logits = relaxed_logits.detach()
+        if self.hparams.normalize_initial_condition:
+            if getattr(self.hparams, 'float_precision', '') == "bf16-true":
+                relaxed_tokens = self.softmax(relaxed_logits)
+            else:
+                relaxed_tokens = self.softmax(relaxed_logits.float()).to(relaxed_logits.dtype)
+        else:
+            relaxed_tokens = relaxed_logits
+        if valid_positions is not None:
+            relaxed_tokens = relaxed_tokens.masked_fill(~valid_positions.unsqueeze(-1), 0.0)
+        return relaxed_tokens, self._token_probs_to_embeddings(relaxed_tokens)
+
+    def _proposal_aware_logz_offset(self, proposal_mode, reference):
+        configured = getattr(self.hparams, "proposal_aware_nce_logz_offset", None)
+        if configured is not None:
+            return reference.new_tensor(float(configured))
+        if proposal_mode == "uniform":
+            return reference.new_tensor(math.log(float(self.vocab_size)))
+        return reference.new_tensor(0.0)
+
+    def _sample_proposal_negatives(self, next_token_indices_2d, valid_positions, proposal_logits=None):
+        proposal_mode = getattr(self.hparams, "proposal_aware_nce_proposal", "uniform")
+        k = int(getattr(self.hparams, "proposal_aware_nce_k", 1))
+        if k < 1:
+            raise ValueError("--proposal_aware_nce_k must be >= 1.")
+
+        batch_size, seq_length = next_token_indices_2d.shape
+        safe_next = next_token_indices_2d.clamp(min=0)
+        exclude_positive = bool(getattr(self.hparams, "proposal_aware_nce_exclude_positive_negatives", False))
+
+        if proposal_mode == "uniform":
+            if exclude_positive:
+                if self.vocab_size <= 1:
+                    raise ValueError("Cannot exclude positive negatives with vocab_size <= 1.")
+                neg_indices = torch.randint(
+                    low=0,
+                    high=self.vocab_size - 1,
+                    size=(batch_size, k, seq_length),
+                    device=next_token_indices_2d.device,
+                )
+                neg_indices = neg_indices + (neg_indices >= safe_next[:, None, :]).long()
+                logq_neg_value = -math.log(float(self.vocab_size - 1))
+            else:
+                neg_indices = torch.randint(
+                    low=0,
+                    high=self.vocab_size,
+                    size=(batch_size, k, seq_length),
+                    device=next_token_indices_2d.device,
+                )
+                logq_neg_value = -math.log(float(self.vocab_size))
+            logq_value = -math.log(float(self.vocab_size))
+            logq_pos = torch.full(
+                (batch_size, seq_length),
+                logq_value,
+                device=next_token_indices_2d.device,
+                dtype=torch.float32,
+            )
+            logq_neg = torch.full(
+                (batch_size, k, seq_length),
+                logq_neg_value,
+                device=next_token_indices_2d.device,
+                dtype=torch.float32,
+            )
+            return neg_indices, logq_pos, logq_neg
+
+        if proposal_mode == "mcmc_final":
+            if proposal_logits is None:
+                raise ValueError("proposal_aware_nce_proposal=mcmc_final requires proposal_logits.")
+            proposal_logits = proposal_logits.detach().reshape(batch_size, seq_length, self.vocab_size)
+            log_probs = F.log_softmax(proposal_logits.float(), dim=-1)
+            probs_3d = log_probs.exp()
+            if exclude_positive:
+                if self.vocab_size <= 1:
+                    raise ValueError("Cannot exclude positive negatives with vocab_size <= 1.")
+                probs_excluding_positive = probs_3d.scatter(
+                    -1,
+                    safe_next.unsqueeze(-1),
+                    0.0,
+                )
+                row_sums = probs_excluding_positive.sum(dim=-1, keepdim=True)
+                fallback = torch.ones_like(probs_excluding_positive)
+                fallback = fallback.scatter(-1, safe_next.unsqueeze(-1), 0.0)
+                fallback = fallback / float(self.vocab_size - 1)
+                probs_3d = torch.where(
+                    row_sums > 1e-12,
+                    probs_excluding_positive / row_sums.clamp_min(1e-12),
+                    fallback,
+                )
+            probs = probs_3d.reshape(-1, self.vocab_size)
+            sampled = torch.multinomial(probs, num_samples=k, replacement=True)
+            neg_indices = sampled.view(batch_size, seq_length, k).permute(0, 2, 1).contiguous()
+            logq_pos = log_probs.gather(-1, safe_next.unsqueeze(-1)).squeeze(-1)
+            logq_neg_source = torch.log(probs_3d.clamp_min(1e-30)) if exclude_positive else log_probs
+            logq_neg = logq_neg_source.gather(
+                -1,
+                neg_indices.permute(0, 2, 1).reshape(batch_size, seq_length, k)
+            ).permute(0, 2, 1).contiguous()
+            return neg_indices, logq_pos, logq_neg
+
+        raise ValueError(
+            f"Unknown proposal_aware_nce_proposal={proposal_mode}. "
+            "Supported values: uniform, mcmc_final."
+        )
+
+    def calculate_proposal_aware_nce_loss(self, input_ids, next_token_indices, proposal_logits=None):
+        batch_size = input_ids.shape[0]
+        seq_length = input_ids.shape[1]
+        next_token_indices_2d = next_token_indices.reshape(batch_size, seq_length)
+        valid_positions = next_token_indices_2d != -1
+        valid_flat = valid_positions.reshape(-1)
+
+        proposal_mode = getattr(self.hparams, "proposal_aware_nce_proposal", "uniform")
+        k = int(getattr(self.hparams, "proposal_aware_nce_k", 1))
+        nce_base_coeff = float(getattr(self.hparams, "proposal_aware_nce_base_coeff", 1.0))
+        relaxed_cd_coeff = float(getattr(self.hparams, "proposal_aware_nce_relaxed_cd_coeff", 0.0))
+        use_relaxed_cd = relaxed_cd_coeff != 0.0
+        if use_relaxed_cd and proposal_logits is None:
+            raise ValueError(
+                "--proposal_aware_nce_relaxed_cd_coeff requires a final MCMC relaxed state. "
+                "Use --proposal_aware_nce_proposal mcmc_final."
+            )
+        neg_indices, logq_pos, logq_neg = self._sample_proposal_negatives(
+            next_token_indices_2d,
+            valid_positions,
+            proposal_logits=proposal_logits,
+        )
+
+        real_embeddings_input = self.embeddings(input_ids)
+        true_probs = self._one_hot_token_probs(next_token_indices_2d, valid_positions)
+        true_embeddings = self._token_probs_to_embeddings(true_probs)
+
+        neg_valid_positions = valid_positions[:, None, :].expand(-1, k, -1)
+        neg_probs = self._one_hot_token_probs(neg_indices, neg_valid_positions)
+        fake_embeddings = self._token_probs_to_embeddings(neg_probs)
+        if use_relaxed_cd:
+            relaxed_tokens = proposal_logits.detach().reshape(batch_size, seq_length, self.vocab_size)
+            relaxed_tokens, relaxed_embeddings = self._relaxed_logits_to_tokens_and_embeddings(
+                relaxed_tokens,
+                valid_positions=valid_positions,
+            )
+
+        expanded_real_embeddings = real_embeddings_input[:, None, :, :].expand(-1, k, -1, -1)
+        expanded_input_ids = input_ids[:, None, :].expand(-1, k, -1)
+
+        all_true_embeddings = torch.cat((real_embeddings_input, true_embeddings), dim=1)
+        all_fake_embeddings = torch.cat(
+            (
+                expanded_real_embeddings.reshape(batch_size * k, seq_length, -1),
+                fake_embeddings.reshape(batch_size * k, seq_length, -1),
+            ),
+            dim=1,
+        )
+        combined_embeddings_parts = [all_true_embeddings, all_fake_embeddings]
+        combined_input_ids_parts = [input_ids, expanded_input_ids.reshape(batch_size * k, seq_length)]
+        combined_pred_tokens_parts = [
+            true_probs,
+            neg_probs.reshape(batch_size * k, seq_length, self.vocab_size),
+        ]
+        if use_relaxed_cd:
+            all_relaxed_embeddings = torch.cat((real_embeddings_input, relaxed_embeddings), dim=1)
+            combined_embeddings_parts.append(all_relaxed_embeddings)
+            combined_input_ids_parts.append(input_ids)
+            combined_pred_tokens_parts.append(relaxed_tokens)
+
+        combined_embeddings = torch.cat(combined_embeddings_parts, dim=0)
+        combined_input_ids = torch.cat(combined_input_ids_parts, dim=0)
+        combined_pred_tokens = torch.cat(combined_pred_tokens_parts, dim=0)
+
+        combined_energies = self.transformer(
+            combined_embeddings,
+            start_pos=0,
+            mcmc_step=self.hparams.mcmc_num_steps - 1,
+            real_token_ids=combined_input_ids,
+            predicted_tokens=combined_pred_tokens,
+        ).reshape(-1, seq_length, 1)
+        real_energies = combined_energies[:batch_size].squeeze(-1)
+        fake_end = batch_size + batch_size * k
+        fake_energies = combined_energies[batch_size:fake_end].reshape(batch_size, k, seq_length)
+        relaxed_energies = None
+        if use_relaxed_cd:
+            relaxed_energies = combined_energies[fake_end:fake_end + batch_size].squeeze(-1)
+
+        log_k = math.log(float(k))
+        logz_offset = self._proposal_aware_logz_offset(proposal_mode, real_energies)
+        r_pos = -real_energies.float() - logq_pos.float() - logz_offset - log_k
+        r_neg = -fake_energies.float() - logq_neg.float() - logz_offset - log_k
+
+        if valid_flat.any():
+            pos_loss = F.softplus(-r_pos).reshape(-1)[valid_flat].mean()
+            neg_loss = F.softplus(r_neg).permute(0, 2, 1).reshape(batch_size * seq_length, k)
+            neg_loss = neg_loss[valid_flat].mean()
+            nce_loss = pos_loss + neg_loss
+        else:
+            nce_loss = (r_pos.sum() + r_neg.sum()) * 0.0
+        weighted_nce_loss = nce_base_coeff * nce_loss
+        proposal_loss = weighted_nce_loss
+
+        rank_coeff = float(getattr(self.hparams, "proposal_aware_nce_rank_coeff", 0.0))
+        rank_loss = proposal_loss.detach() * 0.0
+        if rank_coeff != 0.0:
+            margin = float(getattr(self.hparams, "proposal_aware_nce_rank_margin", 1.0))
+            hard_fake_energies = fake_energies.min(dim=1).values.float()
+            per_token_rank = F.softplus(real_energies.float() - hard_fake_energies + margin)
+            if valid_flat.any():
+                rank_loss = per_token_rank.reshape(-1)[valid_flat].mean()
+            else:
+                rank_loss = per_token_rank.sum() * 0.0
+            proposal_loss = proposal_loss + rank_coeff * rank_loss
+
+        relaxed_cd_loss = proposal_loss.detach() * 0.0
+        if use_relaxed_cd:
+            relaxed_cd_margin = float(getattr(self.hparams, "proposal_aware_nce_relaxed_cd_margin", 0.0))
+            per_token_relaxed_cd = F.softplus(
+                real_energies.float() - relaxed_energies.float() + relaxed_cd_margin
+            )
+            if valid_flat.any():
+                relaxed_cd_loss = per_token_relaxed_cd.reshape(-1)[valid_flat].mean()
+            else:
+                relaxed_cd_loss = per_token_relaxed_cd.sum() * 0.0
+            proposal_loss = proposal_loss + relaxed_cd_coeff * relaxed_cd_loss
+
+        if valid_flat.any():
+            energy_gap = (fake_energies.mean(dim=1) - real_energies).reshape(-1)[valid_flat].mean().detach()
+            if relaxed_energies is not None:
+                relaxed_energy_gap = (relaxed_energies - real_energies).reshape(-1)[valid_flat].mean().detach()
+            else:
+                relaxed_energy_gap = proposal_loss.detach() * 0.0
+            mean_logq_pos = logq_pos.reshape(-1)[valid_flat].mean().detach()
+            mean_logq_neg = logq_neg.permute(0, 2, 1).reshape(batch_size * seq_length, k)[valid_flat].mean().detach()
+        else:
+            energy_gap = proposal_loss.detach() * 0.0
+            relaxed_energy_gap = proposal_loss.detach() * 0.0
+            mean_logq_pos = proposal_loss.detach() * 0.0
+            mean_logq_neg = proposal_loss.detach() * 0.0
+
+        metrics = {
+            'proposal_aware_nce_loss': proposal_loss.detach(),
+            'proposal_aware_nce_base_loss': nce_loss.detach(),
+            'proposal_aware_nce_weighted_base_loss': weighted_nce_loss.detach(),
+            'proposal_aware_nce_rank_loss': rank_loss.detach(),
+            'proposal_aware_nce_relaxed_cd_loss': relaxed_cd_loss.detach(),
+            'proposal_aware_nce_energy_gap': energy_gap,
+            'proposal_aware_nce_relaxed_energy_gap': relaxed_energy_gap,
+            'proposal_aware_nce_logq_pos': mean_logq_pos,
+            'proposal_aware_nce_logq_neg': mean_logq_neg,
+            'proposal_aware_nce_logz_offset': logz_offset.detach(),
+            'proposal_aware_nce_base_coeff': real_energies.new_tensor(nce_base_coeff).detach(),
+            'proposal_aware_nce_relaxed_cd_coeff': real_energies.new_tensor(relaxed_cd_coeff).detach(),
+        }
+        return proposal_loss, metrics
     
     def warm_up_finished(self):
         if self.hparams.clamp_max_after_warm_up != 0.0:

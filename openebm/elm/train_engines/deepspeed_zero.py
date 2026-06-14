@@ -463,17 +463,17 @@ def prepare_deepspeed_zero_args(args, engine: str) -> None:
     args.train_engine = engine
 
     mcmc_gradient_mode = getattr(args, "mcmc_gradient_mode", "second_order")
-    if stage == 3 and mcmc_gradient_mode not in {"first_order_cd", "first_order_cd_v2"}:
+    if stage == 3 and mcmc_gradient_mode not in {"first_order_cd", "first_order_cd_v2", "first_order_nce", "proposal_aware_nce"}:
         raise NotImplementedError(
             "train_engine=zero-3 shards model parameters and is only enabled with "
-            "--mcmc_gradient_mode first_order_cd/first_order_cd_v2 in this phase. "
+            "--mcmc_gradient_mode first_order_cd/first_order_cd_v2/first_order_nce/proposal_aware_nce in this phase. "
             "Use zero-1/zero-2 for exact second-order EBT training."
         )
     if stage == 3:
         _warn(
             f"Enabling experimental ZeRO-3 with {mcmc_gradient_mode}. Parameters are sharded, "
             "so exact second-order MCMC remains unsupported on this path. "
-            "first_order_cd_v2 is recommended for lower sampler graph retention."
+            "first_order_cd_v2, first_order_nce, or proposal_aware_nce is recommended for lower sampler graph retention."
         )
 
     _import_deepspeed_strategy._local_repo = getattr(args, "deepspeed_repo_path", "")

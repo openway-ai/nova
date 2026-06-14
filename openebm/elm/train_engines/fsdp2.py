@@ -44,14 +44,14 @@ def prepare_fsdp2_args(args) -> None:
     if mcmc_gradient_mode == "second_order":
         _warn(
             "mcmc_gradient_mode=second_order keeps the current EBT double-backward path and is known "
-            "to be fragile with wrapped FSDP2 transformer blocks. Use first_order_cd for the FSDP-safe "
+            "to be fragile with wrapped FSDP2 transformer blocks. Use a first-order surrogate for the FSDP-safe "
             "surrogate path, or fsdp_wrap_policy=none for diagnosis."
         )
     elif mcmc_gradient_mode == "first_order_debug":
         _warn(
             "mcmc_gradient_mode=first_order_debug only disables create_graph in the sampler. "
             "It is useful for isolating FSDP2 failures but does not provide a full model-training "
-            "signal from the CE objective. Use first_order_cd for training."
+            "signal from the CE objective. Use first_order_cd_v2, first_order_nce, or proposal_aware_nce for training."
         )
 
     if getattr(args, "fsdp_force_truncate_mcmc", False) and not getattr(args, "truncate_mcmc", False):
