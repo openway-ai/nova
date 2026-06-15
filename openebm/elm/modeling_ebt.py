@@ -25,6 +25,35 @@ PRECISION_TO_MCMC_DTYPE = {
 }
 
 class EBT_NLP(LightningModule):
+    @staticmethod
+    def _parse_per_step_float_values(raw_value, num_steps, default_value, flag_name):
+        if raw_value is None or str(raw_value).strip() == "":
+            return [float(default_value)] * num_steps
+        values = [item.strip() for item in str(raw_value).split(",")]
+        if len(values) != num_steps:
+            raise ValueError(f"{flag_name} must have exactly {num_steps} comma-separated values.")
+        try:
+            return [float(item) for item in values]
+        except ValueError as exc:
+            raise ValueError(f"{flag_name} must contain only float values.") from exc
+
+    @staticmethod
+    def _parse_per_step_bool_mask(raw_value, num_steps, default_value, flag_name):
+        if raw_value is None or str(raw_value).strip() == "":
+            return [bool(default_value)] * num_steps
+        values = [item.strip().lower() for item in str(raw_value).split(",")]
+        if len(values) != num_steps:
+            raise ValueError(f"{flag_name} must have exactly {num_steps} comma-separated values.")
+        mask = []
+        for item in values:
+            if item in ("1", "true", "t", "yes", "y"):
+                mask.append(True)
+            elif item in ("0", "false", "f", "no", "n"):
+                mask.append(False)
+            else:
+                raise ValueError(f"{flag_name} entries must be 0/1 or true/false.")
+        return mask
+
     def __init__(self, hparams):
         super().__init__()
         if isinstance(hparams, dict):#passed in from model ckpt
@@ -53,10 +82,24 @@ class EBT_NLP(LightningModule):
         self.vocab_size = self.tokenizer.get_vocab_size() # len(self.tokenizer) # self.vocab_size = self.tokenizer.vocab_size caused errors since is smaller than len(self.tokenizer), is 50254 for neox-20b, len tokenizer is 50277 so decided to use that
         self.hparams.vocab_size = self.vocab_size
         
-        if self.hparams.mcmc_step_size_learnable and getattr(self.hparams, 'mcmc_step_size_per_step', False):
+        if getattr(self.hparams, 'mcmc_step_size_per_step', False):
+            if not self.hparams.mcmc_step_size_learnable:
+                raise ValueError("--mcmc_step_size_per_step requires --mcmc_step_size_learnable.")
+            alpha_values = self._parse_per_step_float_values(
+                getattr(self.hparams, 'mcmc_step_size_per_step_values', ""),
+                self.hparams.mcmc_num_steps,
+                self.hparams.mcmc_step_size,
+                "--mcmc_step_size_per_step_values",
+            )
+            alpha_learnable_mask = self._parse_per_step_bool_mask(
+                getattr(self.hparams, 'mcmc_step_size_per_step_learnable_mask', ""),
+                self.hparams.mcmc_num_steps,
+                self.hparams.mcmc_step_size_learnable,
+                "--mcmc_step_size_per_step_learnable_mask",
+            )
             self.alpha = nn.ParameterList([
-                nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size), dtype=torch.float32))
-                for _ in range(self.hparams.mcmc_num_steps)
+                nn.Parameter(torch.tensor(value, dtype=torch.float32), requires_grad=learnable)
+                for value, learnable in zip(alpha_values, alpha_learnable_mask)
             ])
         else:
             self.alpha = nn.Parameter(torch.tensor(float(self.hparams.mcmc_step_size), dtype=torch.float32),
@@ -189,7 +232,11 @@ class EBT_NLP(LightningModule):
         trainer is present, so overriding to() is insufficient.
         """
         result = super()._apply(fn)
-        result.alpha.data = result.alpha.data.to(dtype=torch.float32)
+        if isinstance(result.alpha, nn.ParameterList):
+            for alpha_param in result.alpha:
+                alpha_param.data = alpha_param.data.to(dtype=torch.float32)
+        else:
+            result.alpha.data = result.alpha.data.to(dtype=torch.float32)
         return result
 
     def _logits_to_pred_embeddings(self, predicted_tokens):
@@ -320,7 +367,9 @@ class EBT_NLP(LightningModule):
         # predicted_tokens_grad has shape B, S, V
         
         if self.hparams.clamp_futures_grad:
-            _alpha_for_clamp = self.alpha[mcmc_step] if isinstance(self.alpha, nn.ParameterList) else self.alpha
+            _alpha_for_clamp = alpha if alpha is not None else (
+                self.alpha[mcmc_step] if isinstance(self.alpha, nn.ParameterList) else self.alpha
+            )
             min_and_max = self.hparams.clamp_futures_grad_max_change / torch.clamp(_alpha_for_clamp.float(), min=0.0001)
             # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
             predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
@@ -445,10 +494,19 @@ class EBT_NLP(LightningModule):
                 compute_pred_hidden = return_pred_hiddens
                 if return_pred_hiddens and self.hparams.truncate_mcmc and not self.truncate_mcmc_per_step_ce:
                     compute_pred_hidden = i == (len(mcmc_steps) - 1)
+                step_alpha = alpha
+                if isinstance(self.alpha, nn.ParameterList):
+                    step_alpha = torch.clamp(self.alpha[mcmc_step], min=0.0001).float()
+                    if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
+                        expanded_alpha = step_alpha.expand(batch_size, seq_length, 1)
+                        scale = self.hparams.randomize_mcmc_step_size_scale
+                        low = step_alpha / scale
+                        high = step_alpha * scale
+                        step_alpha = low + torch.rand_like(expanded_alpha) * (high - low)
 
                 predicted_tokens, energy_preds, predicted_tokens_for_loss, pred_hidden_step = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
-                    langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
+                    langevin_dynamics_noise_std, step_alpha, start_pos, learning, return_raw_logits,
                     real_token_ids=x, compute_pred_hidden=compute_pred_hidden,
                 )
                 if self.hparams.contrastive_loss:
@@ -735,8 +793,10 @@ class EBT_NLP(LightningModule):
         real_embeddings_input = self.embeddings(original_real_input_ids)  # (B, S, D)
         original_predicted_tokens = self.corrupt_embeddings(real_embeddings_input)  # (B, S, V)
 
-        alpha = self.alpha * self.hparams.infer_ebt_override_alpha if 0 < self.hparams.infer_ebt_override_alpha < 1 else (
-            torch.tensor(self.hparams.infer_ebt_override_alpha, device=self.device) if self.hparams.infer_ebt_override_alpha >= 1 else self.alpha
+        alpha = None if isinstance(self.alpha, nn.ParameterList) else (
+            self.alpha * self.hparams.infer_ebt_override_alpha if 0 < self.hparams.infer_ebt_override_alpha < 1 else (
+                torch.tensor(self.hparams.infer_ebt_override_alpha, device=self.device) if self.hparams.infer_ebt_override_alpha >= 1 else self.alpha
+            )
         )
 
         noise = (torch.tensor(
@@ -859,6 +919,22 @@ class EBT_NLP(LightningModule):
         pred_states_list = []
         pred_states_list.append(initial_pred_tokens)
 
+        def get_alpha_for_step(step_idx, use_model_alpha=False):
+            if isinstance(self.alpha, nn.ParameterList):
+                base_alpha = self.alpha[min(step_idx, len(self.alpha) - 1)]
+                override_alpha = self.hparams.infer_ebt_override_alpha
+                if not use_model_alpha and override_alpha >= 1:
+                    step_alpha = torch.tensor(override_alpha, device=self.device)
+                elif not use_model_alpha and 0 < override_alpha < 1:
+                    step_alpha = base_alpha * override_alpha
+                else:
+                    step_alpha = base_alpha
+            elif use_model_alpha:
+                step_alpha = self.alpha
+            else:
+                step_alpha = adjusted_alpha
+            return torch.clamp(step_alpha, min=0.0001).float()
+
         def do_mcmc_step(step_idx, cur_pred_tokens, alpha):
             with torch.set_grad_enabled(True):
                 cur_pred_tokens = cur_pred_tokens.detach().requires_grad_()
@@ -948,20 +1024,23 @@ class EBT_NLP(LightningModule):
             total_steps = self.hparams.infer_ebt_num_steps if self.hparams.infer_ebt_num_steps > 1 else self.hparams.mcmc_num_steps
             pred_state = initial_pred_tokens
             for step_idx in range(total_steps):
-                pred_state = do_mcmc_step(step_idx, pred_state, adjusted_alpha)
+                pred_state = do_mcmc_step(step_idx, pred_state, get_alpha_for_step(step_idx))
                 pred_states_list.append(pred_state)
         else:
             # alternative ebt_type i.e. adaln or time embed
             pred_state = initial_pred_tokens
             for step_idx in range(self.hparams.mcmc_num_steps):
                 if self.hparams.infer_steps_final_landscape and step_idx != (self.hparams.mcmc_num_steps - 1):
-                    alpha = self.alpha if self.hparams.infer_alpha_final_landscape else adjusted_alpha
+                    alpha = get_alpha_for_step(step_idx, use_model_alpha=self.hparams.infer_alpha_final_landscape)
                     pred_state = do_mcmc_step(step_idx, pred_state, alpha)
                     pred_states_list.append(pred_state)
                 else:
                     inner_steps = self.hparams.infer_ebt_num_steps if self.hparams.infer_ebt_num_steps != 1 else (self.hparams.randomize_mcmc_num_steps_min if self.hparams.randomize_mcmc_num_steps_min != 0 else 1)
                     for _ in range(inner_steps):
-                        alpha = self.alpha if (self.hparams.infer_alpha_final_landscape and step_idx != (self.hparams.mcmc_num_steps - 1)) else adjusted_alpha
+                        alpha = get_alpha_for_step(
+                            step_idx,
+                            use_model_alpha=self.hparams.infer_alpha_final_landscape and step_idx != (self.hparams.mcmc_num_steps - 1),
+                        )
                         pred_state = do_mcmc_step(step_idx, pred_state, alpha)
                         pred_states_list.append(pred_state)
 

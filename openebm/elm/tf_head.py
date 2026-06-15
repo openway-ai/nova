@@ -6,6 +6,7 @@ Decoupled from the blockwise/MTP machinery in `nova/ebt/`. Each head takes
 
 Variants exposed via `build_tf_head(hparams)`:
   - "linear":         Linear(2D, D) -> Linear(D, V)
+  - "concat_direct_unembed": Linear(2D, V) over concat(pred_hidden, prev_embed)
   - "direct_unembed": Linear(D, V) over post-update trunk pred_hidden
   - "pre_update_hidden_unembed": Linear(D, V) over energy-forward trunk pred_hidden
   - "post_update_state_unembed": Linear over post-update free-embedding state
@@ -85,6 +86,18 @@ class TFLinearHead(nn.Module):
     def forward(self, pred_hidden: torch.Tensor, prev_token_embed: torch.Tensor) -> torch.Tensor:
         x = torch.cat([pred_hidden, prev_token_embed], dim=-1)
         return self.out_proj(self.down_proj(x))
+
+
+class TFConcatDirectUnembedHead(nn.Module):
+    """Directly project concat(pred_hidden, prev_embed) to vocab logits."""
+
+    def __init__(self, dim: int, vocab_size: int):
+        super().__init__()
+        self.proj = nn.Linear(2 * dim, vocab_size, bias=False)
+
+    def forward(self, pred_hidden: torch.Tensor, prev_token_embed: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([pred_hidden, prev_token_embed], dim=-1)
+        return self.proj(x)
 
 
 class TFDirectUnembedHead(nn.Module):
@@ -193,8 +206,9 @@ def build_tf_head(hparams) -> nn.Module:
     """Factory that consumes hparams namespace from train.py CLI flags.
 
     Reads:
-      hparams.tf_head_type       in {"linear", "direct_unembed", "pre_update_hidden_unembed",
-                                     "post_update_state_unembed", "transformer"}
+      hparams.tf_head_type       in {"linear", "concat_direct_unembed", "direct_unembed",
+                                     "pre_update_hidden_unembed", "post_update_state_unembed",
+                                     "transformer"}
       hparams.tf_head_layers     int (transformer only)
       hparams.tf_head_n_heads    int, 0 -> inherit hparams.multiheaded_attention_heads
       hparams.tf_head_ffn_mult   float
@@ -206,6 +220,9 @@ def build_tf_head(hparams) -> nn.Module:
 
     if head_type == "linear":
         return TFLinearHead(dim=dim, vocab_size=vocab_size)
+
+    if head_type == "concat_direct_unembed":
+        return TFConcatDirectUnembedHead(dim=dim, vocab_size=vocab_size)
 
     if head_type in {"direct_unembed", "pre_update_hidden_unembed"}:
         return TFDirectUnembedHead(dim=dim, vocab_size=vocab_size)

@@ -1325,6 +1325,11 @@ class ModelTrainer(LightningModule):
             }
         }
 
+    def _alpha_optimizer_params(self):
+        if isinstance(self.model.alpha, nn.ParameterList):
+            return [p for p in self.model.alpha.parameters() if p.requires_grad]
+        return [self.model.alpha] if self.model.alpha.requires_grad else []
+
     def _configure_muon_adamw_optimizer(self):
         """
         Muon + AdamW 混合优化器 (复用 nanochat/optim.py 的 MuonAdamW)
@@ -1391,10 +1396,7 @@ class ModelTrainer(LightningModule):
         alpha_lr = self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate
 
         # --- 参数收集 ---
-        if isinstance(self.model.alpha, nn.ParameterList):
-            alpha_params = list(self.model.alpha.parameters())
-        else:
-            alpha_params = [self.model.alpha]
+        alpha_params = self._alpha_optimizer_params()
         embedding_params = list(self.model.embeddings.parameters())
 
         vocab_to_embed_params = []
@@ -1661,7 +1663,7 @@ class ModelTrainer(LightningModule):
 
             if use_layered_lr:
                 # 分层参数组 (参考 NanoChat base_train.py)
-                alpha_param = [self.model.alpha]
+                alpha_param = self._alpha_optimizer_params()
                 embedding_params = list(self.model.embeddings.parameters())
 
                 # vocab_to_embed 参数 (类似 unembedding)
@@ -1720,14 +1722,18 @@ class ModelTrainer(LightningModule):
                     )
             else:
                 # 原始实现
-                alpha_param = self.model.alpha
+                alpha_param = self._alpha_optimizer_params()
                 other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha'])]
                 assert len(other_params) > 1, "Could not gather model params correctly please investigate"
 
-                optimizer_parameters = [
-                    {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},
+                optimizer_parameters = []
+                if alpha_param:
+                    optimizer_parameters.append(
+                        {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate}
+                    )
+                optimizer_parameters.append(
                     {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate}
-                ]
+                )
 
             return self.get_optimizer_scheduler_dict(optimizer_parameters)
             
@@ -1744,16 +1750,17 @@ class ModelTrainer(LightningModule):
         
     def configure_optimizers_vid(self):
         if self.hparams.model_name == "ebt":
-            alpha_param = self.model.alpha
+            alpha_param = self._alpha_optimizer_params()
             encoder_params = list(self.model.image_encoder.parameters())
             other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha', 'image_encoder'])]
             assert len(other_params) > 1, "Could not gather model params correctly please investigate"
             
             optimizer_parameters = [
-                {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},  # No weight decay for alpha
                 {'params': encoder_params, 'weight_decay': 0.0, 'lr': 0.0},
                 {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate}  # Weight decay for other parameters
             ]
+            if alpha_param:
+                optimizer_parameters.insert(0, {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate})  # No weight decay for alpha
             return self.get_optimizer_scheduler_dict(optimizer_parameters)
             
         elif self.hparams.model_name == "baseline_transformer":
@@ -1771,14 +1778,15 @@ class ModelTrainer(LightningModule):
         
     def configure_optimizers_img(self):
         if self.hparams.model_name == "ebt":
-            alpha_param = self.model.alpha
+            alpha_param = self._alpha_optimizer_params()
             other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha', 'image_encoder', 'text_encoder'])]
             assert len(other_params) > 1, "Could not gather model params correctly please investigate"
             
             optimizer_parameters = [
-                {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},  # No weight decay for alpha
                 {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate} # Weight decay for other parameters
             ]
+            if alpha_param:
+                optimizer_parameters.insert(0, {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate})  # No weight decay for alpha
             
             # if self.hparams.image_task == "t2i": # do this bc other models wont have these 'sub' models
             #     image_encoder_params = list(self.model.image_encoder.parameters())
