@@ -12,8 +12,10 @@
 # Conda 环境激活（仅远程集群需要，本地调试可跳过）
 if [[ -f /root/miniconda3/etc/profile.d/conda.sh ]]; then
     source /root/miniconda3/etc/profile.d/conda.sh
-    conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
-    export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH}"
+    OPENEBM_HOME_DEFAULT="/mnt/shared-storage-user/puyuan/code/OpenEBM"
+    CONDA_ENV_PATH="${CONDA_ENV_PATH:-${OPENEBM_HOME_DEFAULT}/conda_envs/ebt}"
+    conda activate "${CONDA_ENV_PATH}"
+    export LD_LIBRARY_PATH="${CONDA_ENV_PATH}/lib:${LD_LIBRARY_PATH}"
 fi
 
 ### 路径配置 ###
@@ -22,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NOVA_HOME="${NOVA_HOME:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
 TRAIN_SCRIPT="${NOVA_HOME}/openebm/elm/train.py"
 
-NANOCHAT_HOME="/mnt/shared-storage-user/luyudong/nanochat"
+NANOCHAT_HOME="${NOVA_HOME}/data"
 
 # 进入工作目录
 cd "${NOVA_HOME}"
@@ -39,7 +41,7 @@ export MODEL_SIZE="d26"
 
 ### 环境变量 ###
 HOME="${NANOCHAT_HOME}"
-export NANOCHAT_BASE_DIR="${HOME}/.cache/nanochat"
+export NANOCHAT_BASE_DIR="${HOME}"
 
 # PyTorch 内存优化
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"

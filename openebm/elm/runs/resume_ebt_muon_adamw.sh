@@ -20,8 +20,8 @@ export MODEL_SIZE="d26"
 RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-muon-adamw-0327_20260327_140553_2026-03-27_14-06-11_/e=epoch=0-s=step=55999-lr0.00025-bs4x8-muon_adamw-valid_loss=valid_loss=2.6877.ckpt"
 
 ### 环境变量 ###
-HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+HOME="${REPO_ROOT}/data"
+export NANOCHAT_BASE_DIR="$HOME"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"

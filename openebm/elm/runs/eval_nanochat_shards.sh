@@ -25,7 +25,7 @@ else
 fi
 echo "🐍 Python: $PYTHON ($($PYTHON --version 2>&1))"
 
-export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
+export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
 export OMP_NUM_THREADS=1
 export NANOCHAT_OFFLINE_MODE=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
@@ -35,7 +35,7 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 ################################################################################
 
 CKPT_PATH="${CKPT_PATH:-}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/data/tokenizer}"
 GPUS="${GPUS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 LIMIT_TEST_BATCHES="${LIMIT_TEST_BATCHES:-100}"

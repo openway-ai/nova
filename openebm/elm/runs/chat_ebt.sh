@@ -53,7 +53,7 @@ DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-
 DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-20260426/sft_train.v4/checkpoints/s=step=562-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.2264.ckpt"
 
 
-DEFAULT_TOKENIZER="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer"
+DEFAULT_TOKENIZER="/mnt/shared-storage-user/puyuan/code/OpenEBM/data/tokenizer"
 
 # 从环境变量读取配置
 CKPT_PATH="${CKPT_PATH:-$DEFAULT_CKPT}"
@@ -188,7 +188,7 @@ fi
 # 设置环境变量
 export NANOCHAT_OFFLINE_MODE=1
 export HF_HUB_OFFLINE=1
-export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
+export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 # 确保 pip-installed 的 nvidia cuBLAS 优先于系统库，避免版本不兼容导致 CUBLAS_STATUS_INVALID_VALUE

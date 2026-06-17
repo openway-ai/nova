@@ -20,11 +20,11 @@ export MODEL_SIZE="d26"
 # PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep9562_20260424_211606/s=step=12374-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7007.ckpt"
 
 # after sft_train c2048
-PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova-sft/nova/logs/ebt_runs/d26-ctx2048-20260422/sft_train/checkpoints/s=step=2984-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.5680.ckpt"
+PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-20260422/sft_train/checkpoints/s=step=2984-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=1.5680.ckpt"
 
 ### 环境变量 ###
-HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+HOME="/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
+export NANOCHAT_BASE_DIR="$HOME"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"

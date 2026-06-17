@@ -16,12 +16,11 @@
 set -euo pipefail
 
 # ---- Conda env ----
-# Use luyudong's ebt env (same one rjob uses) — local lixueyan/ebt is missing `lightning`.
-# Activate by absolute path; works whether the user has their own miniconda or not.
+# Activate the shared ebt env symlinked under this repository.
 # shellcheck disable=SC1091
 source /mnt/shared-storage-user/lixueyan/miniconda3/etc/profile.d/conda.sh
-conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
-export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH:-}"
+conda activate /mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt
+export LD_LIBRARY_PATH="/mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt/lib:${LD_LIBRARY_PATH:-}"
 
 # ---- WandB offline ----
 export WANDB_MODE=offline
@@ -29,10 +28,11 @@ export WANDB_MODE=offline
 # ---- Paths ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ELM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$ELM_DIR/../.." && pwd)"
 RUN_EBT="${SCRIPT_DIR}/run_ebt.sh"
 
-# Where tokenizer/tokenizer.pkl and base_data/shard_*.parquet actually live.
-export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/mnt/shared-storage-user/lixueyan/nar}"
+# Where tokenizer/tokenizer.pkl and local dataset shards live.
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-${REPO_ROOT}/data}"
 
 # 2 GPUs by default. --gpus -1 in run_ebt.sh asks PL to use all visible CUDA devices.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"

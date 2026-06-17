@@ -38,13 +38,13 @@ for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT']:
 
 os.environ['NANOCHAT_OFFLINE_MODE'] = '1'
 os.environ['HF_HUB_OFFLINE'] = '1'
-os.environ['NANOCHAT_BASE_DIR'] = "/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
+os.environ['NANOCHAT_BASE_DIR'] = "/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
 
 # ── 参数解析 ──
 parser = argparse.ArgumentParser(description='EBT Web Chat Server')
 parser.add_argument('-c', '--checkpoint', type=str, required=True, help='Checkpoint 路径')
 parser.add_argument('--tokenizer', type=str,
-                    default="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer",
+                    default="/mnt/shared-storage-user/puyuan/code/OpenEBM/data/tokenizer",
                     help='Tokenizer 路径')
 parser.add_argument('-t', '--temperature', type=float, default=0.8, help='默认温度')
 parser.add_argument('--top-p', type=float, default=0.9, help='默认 Top-P')

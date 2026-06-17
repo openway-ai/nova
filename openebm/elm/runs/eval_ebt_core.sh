@@ -17,8 +17,8 @@ export PYTHONPATH="${REPO_ROOT}/nanochat:${REPO_ROOT}:${PYTHONPATH:-}"
 # 环境配置
 # =============================================================================
 
-HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+HOME="/mnt/shared-storage-user/puyuan/code/OpenEBM/nanochat"
+export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
 export NANOCHAT_OFFLINE_MODE=1
 export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
@@ -72,7 +72,7 @@ TASK_SAMPLES="${TASK_SAMPLES:-}"
 # DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-24}"
 NUM_GPUS="${NUM_GPUS:--1}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/data/tokenizer}"
 DTYPE="${DTYPE:-bfloat16}"
 
 # 自动检测 GPU
@@ -142,7 +142,7 @@ echo ""
 
 if [ ! -d "$NANOCHAT_BASE_DIR/eval_bundle" ]; then
     echo "错误: 评估数据集 (eval_bundle) 不存在"
-    echo "请先运行: cd /mnt/shared-storage-user/puyuan/code/nanochat && bash runs/download_eval_bundle.sh"
+    echo "请先运行: cd /mnt/shared-storage-user/puyuan/code/OpenEBM/nanochat && bash runs/download_eval_bundle.sh"
     exit 1
 fi
 

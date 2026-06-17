@@ -15,7 +15,7 @@ WANDB_RUN="${WANDB_RUN:-scaling_${LABEL}}"
 EVAL_TOKENS=$((100 * 524288))  # ~100M tokens for final eval (default is ~10M)
 
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/mnt/shared-storage-user/puyuan/code/OpenEBM/data}"
 source .venv/bin/activate
 export PYTHONPATH="${PWD}/nanochat:${PWD}:${PYTHONPATH:-}"
 

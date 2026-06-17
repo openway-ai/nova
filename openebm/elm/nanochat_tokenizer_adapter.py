@@ -26,7 +26,7 @@ if 'nanochat.tokenizer' in sys.modules:
             print(f"[TokenizerAdapter] Removed {len(to_remove)} dummy modules: {to_remove}")
 
 # Add real nanochat path
-nanochat_path = "/mnt/shared-storage-user/puyuan/code/nanochat"
+nanochat_path = "/mnt/shared-storage-user/puyuan/code/OpenEBM/nanochat"
 if nanochat_path not in sys.path:
     sys.path.insert(0, nanochat_path)
 
@@ -48,7 +48,7 @@ class NanoChatTokenizerWrapper:
     This allows it to be used as a drop-in replacement in EBT code.
     """
 
-    def __init__(self, tokenizer_obj=None, tokenizer_dir="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer"):
+    def __init__(self, tokenizer_obj=None, tokenizer_dir="/mnt/shared-storage-user/puyuan/code/OpenEBM/data/tokenizer"):
         """
         Initialize wrapper with either an existing tokenizer object or by loading from directory.
 

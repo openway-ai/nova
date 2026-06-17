@@ -12,8 +12,8 @@ cd openebm/elm
 
 CONDA_ENV_NAME="nanochat"
 CONDA_ENV_PATH="/mnt/shared-storage-user/puyuan/conda_envs/nanochat"
-HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+HOME="/mnt/shared-storage-user/puyuan/code/OpenEBM/nanochat"
+export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
 export OMP_NUM_THREADS=1  # 避免多线程竞争
 export NANOCHAT_OFFLINE_MODE=1  # 离线模式，不尝试下载文件
 
@@ -30,8 +30,8 @@ GPUS="${GPUS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 LIMIT_TEST_BATCHES="${LIMIT_TEST_BATCHES:-100}"
 # 使用与训练一致的 tokenizer 路径
-# TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/EBT/gpt-neox-20b-tokenizer}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer}"
+# TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/data/tokenizer}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/data/tokenizer}"
 
 ################################################################################
 # 参数验证

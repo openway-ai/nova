@@ -39,7 +39,7 @@ if [ ! -f "$CKPT_PATH" ]; then
 fi
 
 # Tokenizer 路径
-export TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer}"
+export TOKENIZER_PATH="${TOKENIZER_PATH:-/mnt/shared-storage-user/puyuan/code/OpenEBM/data/tokenizer}"
 
 # GPU 和批量配置
 # GPUS=-1 表示自动检测所有可用 GPU

@@ -34,9 +34,9 @@ export MODEL_SIZE="d26"
 PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/nova/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep9562_20260424_211606/s=step=12374-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.7007.ckpt"
 
 ### 环境变量 (对齐 resume_ebt_muon_adamw.sh + Offline 支持) ###
-HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-export NANOCHAT_SFT_DATA_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/sft_data"
+HOME="/mnt/shared-storage-user/puyuan/code/OpenEBM/nanochat"
+export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
+export NANOCHAT_SFT_DATA_DIR="/mnt/shared-storage-user/puyuan/code/OpenEBM/data/sft_data"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"
@@ -158,7 +158,7 @@ if [ ${#MISSING_DATASETS[@]} -gt 0 ]; then
     done
     echo ""
     echo "请先在联网环境下载数据集:"
-    echo "  cd /mnt/shared-storage-user/puyuan/code/nanochat"
+    echo "  cd /mnt/shared-storage-user/puyuan/code/OpenEBM/nanochat"
     echo "  python runs/download_sft_datasets.py"
     echo ""
     echo "或设置环境变量指向已下载的数据集:"

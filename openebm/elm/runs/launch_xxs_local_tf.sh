@@ -10,8 +10,8 @@ set -euo pipefail
 # ---- Conda env (same as launch_xxs_local.sh) ----
 # shellcheck disable=SC1091
 source /mnt/shared-storage-user/lixueyan/miniconda3/etc/profile.d/conda.sh
-conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
-export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH:-}"
+conda activate /mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt
+export LD_LIBRARY_PATH="/mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt/lib:${LD_LIBRARY_PATH:-}"
 
 # ---- WandB offline ----
 export WANDB_MODE=offline
@@ -22,7 +22,7 @@ ELM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$ELM_DIR/../.." && pwd)"
 
 export PYTHONPATH="${REPO_ROOT}/nanochat:${REPO_ROOT}:${PYTHONPATH:-}"
-export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/mnt/shared-storage-user/lixueyan/nar}"
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-${REPO_ROOT}/data}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
 # ---- Run name (distinguishes from baseline in WandB / ckpt dirs) ----

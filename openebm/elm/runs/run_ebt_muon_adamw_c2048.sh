@@ -36,8 +36,8 @@ export MODEL_SIZE="d26"
 
 
 ### 环境变量 ###
-HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+HOME="/mnt/shared-storage-user/puyuan/code/OpenEBM/nanochat"
+export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
 
 # PyTorch 内存优化
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"

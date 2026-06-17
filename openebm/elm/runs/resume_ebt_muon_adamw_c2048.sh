@@ -9,6 +9,9 @@
 ################################################################################
 
 ### 基础配置 ###
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
 # EXP_ID 必须指定，指向原始 base_train 的实验目录
 # 例如: export EXP_ID="d26-ctx2048-muon_adamw-20260420-1843"
 export MODEL_NAME="ebt"
@@ -21,8 +24,8 @@ export MODEL_SIZE="d26"
 RESUME_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-ctx2048-notimeembed-exact-resume-fromstep4312_20260420_200104/s=step=9562-d26-ctx2048-lr0.00025-bs1x32-muon_adamw-valid_loss=valid_loss=2.8640.ckpt"
 
 ### 环境变量 ###
-HOME="/mnt/shared-storage-user/puyuan/code/nanochat"
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+HOME="${REPO_ROOT}/data"
+export NANOCHAT_BASE_DIR="$HOME"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export PYTHONUNBUFFERED=1
 

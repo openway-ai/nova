@@ -57,7 +57,11 @@ from openebm.elm.dataset_sft import generate_sft_dataloader
 class GSM8KDataset(torch.utils.data.Dataset):
     def __init__(self, hparams, split):
         self.hparams = hparams
-        local_dataset_path = "/mnt/shared-storage-user/puyuan/code/EBT/data/gsm8k_offline"
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        local_dataset_path = os.getenv(
+            "GSM8K_DATA_DIR",
+            os.path.join(repo_root, "data", "gsm8k_offline"),
+        )
 
         if os.path.exists(local_dataset_path):
             dataset = load_from_disk(local_dataset_path)

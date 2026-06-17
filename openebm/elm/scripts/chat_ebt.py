@@ -33,7 +33,7 @@ for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT']:
 # 设置离线模式
 os.environ['NANOCHAT_OFFLINE_MODE'] = '1'
 os.environ['HF_HUB_OFFLINE'] = '1'
-os.environ['NANOCHAT_BASE_DIR'] = "/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
+os.environ['NANOCHAT_BASE_DIR'] = "/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
 
 # 颜色代码
 class Colors:
@@ -456,7 +456,7 @@ def main():
                        default="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-stable_20260313_123203_2026-03-13_12-32-54_/last.ckpt",
                        help='Checkpoint 路径')
     parser.add_argument('--tokenizer', type=str,
-                       default="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer",
+                       default="/mnt/shared-storage-user/puyuan/code/OpenEBM/data/tokenizer",
                        help='Tokenizer 路径')
     parser.add_argument('-t', '--temperature', type=float, default=0.8,
                        help='生成温度 (默认: 0.8)')

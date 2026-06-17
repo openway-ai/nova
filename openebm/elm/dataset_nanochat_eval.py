@@ -38,7 +38,7 @@ class NanoChatShardEvalDataset(Dataset):
         context_length=256,
         shard_indices=[0, 15],
         max_samples_per_shard=50,
-        data_dir="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/base_data",
+        data_dir=None,
         enable_generation=True,
         generation_split_ratio=0.5,
         min_generation_length=64  # Minimum length for generation samples
@@ -47,6 +47,9 @@ class NanoChatShardEvalDataset(Dataset):
         self.context_length = context_length
         self.shard_indices = shard_indices
         self.max_samples_per_shard = max_samples_per_shard
+        if data_dir is None:
+            base_dir = os.environ.get("NANOCHAT_BASE_DIR", os.path.join(_PROJECT_ROOT, "data"))
+            data_dir = os.path.join(base_dir, "fineweb")
         self.data_dir = data_dir
         self.enable_generation = enable_generation
         self.generation_split_ratio = generation_split_ratio

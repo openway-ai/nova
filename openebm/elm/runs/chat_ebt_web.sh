@@ -31,7 +31,7 @@ DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints_cp/e
 DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260408_230436/periodic-s=step=2999-lr5e-05.ckpt"
 DEFAULT_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/ebt-d26-sft-0406-from0327-v2_20260408_230436/periodic-s=step=1499-lr5e-05.ckpt"
 
-DEFAULT_TOKENIZER="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/tokenizer"
+DEFAULT_TOKENIZER="/mnt/shared-storage-user/puyuan/code/OpenEBM/data/tokenizer"
 
 # 从环境变量读取配置
 CKPT_PATH="${CKPT_PATH:-$DEFAULT_CKPT}"
@@ -172,7 +172,7 @@ fi
 # 设置环境变量
 export NANOCHAT_OFFLINE_MODE=1
 export HF_HUB_OFFLINE=1
-export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
+export NANOCHAT_BASE_DIR="/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 # 清除分布式训练环境变量
