@@ -22,7 +22,7 @@ import torch
 import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
-from nanochat.dataset import list_parquet_files
+from nanochat.dataset import get_dataset_dir, list_parquet_files, normalize_base_train_dataset
 
 # Version tag for exact-resume state dicts (distinguishes from legacy checkpoints)
 EXACT_RESUME_STATE_VERSION = 1
@@ -42,6 +42,7 @@ class StatefulBestFitDataLoader:
         self, tokenizer, B, T, split, device="cuda",
         resume_state_dict=None, buffer_size=1000,
         tokenizer_threads=4, tokenizer_batch_size=128,
+        dataset_name="fineweb", data_dir=None,
     ):
         self.tokenizer = tokenizer
         self.B = B
@@ -51,6 +52,8 @@ class StatefulBestFitDataLoader:
         self.buffer_size = buffer_size
         self.tokenizer_threads = tokenizer_threads
         self.tokenizer_batch_size = tokenizer_batch_size
+        self.dataset_name = normalize_base_train_dataset(dataset_name)
+        self.data_dir = get_dataset_dir(dataset_name=self.dataset_name, data_dir=data_dir)
 
         self.bos_token = tokenizer.get_bos_token_id()
         self.row_capacity = T + 1
@@ -59,11 +62,18 @@ class StatefulBestFitDataLoader:
         self._ddp, self._ddp_rank, self._ddp_local_rank, self._ddp_world_size = get_dist_info()
 
         # Parquet file list (split-aware)
-        all_paths = list_parquet_files()
-        assert len(all_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
+        all_paths = list_parquet_files(data_dir=self.data_dir, dataset_name=self.dataset_name)
+        assert len(all_paths) != 0, (
+            f"No parquet files found for base_train_dataset={self.dataset_name!r} "
+            f"in {self.data_dir}. Run openebm/elm/scripts/prepare_base_train_dataset.py "
+            "on a networked cpu-worker first."
+        )
         self._parquet_paths = all_paths[:-1] if split == "train" else all_paths[-1:]
 
-        print(f"[DataLoader] Split='{split}': Using {len(self._parquet_paths)} parquet file(s)")
+        print(
+            f"[DataLoader] Dataset='{self.dataset_name}' dir='{self.data_dir}' "
+            f"Split='{split}': Using {len(self._parquet_paths)} parquet file(s)"
+        )
         if split == "train":
             print(f"[DataLoader] Training on files: {self._parquet_paths[0]} to {self._parquet_paths[-1]}")
         else:
@@ -96,6 +106,7 @@ class StatefulBestFitDataLoader:
             "epoch": self.next_epoch,
             "doc_batch_index": self.next_doc_batch_index,
             "doc_buffer": [list(doc) for doc in self.doc_buffer],  # deep copy
+            "dataset_name": self.dataset_name,
         }
 
     def lightweight_state_dict(self):
@@ -111,6 +122,7 @@ class StatefulBestFitDataLoader:
             "rg_idx": self.next_rg_idx,
             "epoch": self.next_epoch,
             "doc_batch_index": self.next_doc_batch_index,
+            "dataset_name": self.dataset_name,
         }
 
     def _apply_resume_state(self, state):
@@ -313,6 +325,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
+    dataset_name="fineweb", data_dir=None,
     buffer_size=1000
 ):
     """
@@ -324,6 +337,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         tokenizer=tokenizer, B=B, T=T, split=split, device=device,
         resume_state_dict=resume_state_dict, buffer_size=buffer_size,
         tokenizer_threads=tokenizer_threads, tokenizer_batch_size=tokenizer_batch_size,
+        dataset_name=dataset_name, data_dir=data_dir,
     )
     yield from loader
 

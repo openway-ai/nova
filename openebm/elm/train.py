@@ -16,7 +16,8 @@ except Exception:
     pass
 
 # 抑制 CUDA stream 不匹配警告（恢复训练时的已知问题）
-if hasattr(torch.autograd.graph, 'set_warn_on_accumulate_grad_stream_mismatch'):
+# 仅 torch >= 2.6 提供该 API；旧版本静默跳过。
+if hasattr(torch.autograd.graph, "set_warn_on_accumulate_grad_stream_mismatch"):
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 try:
@@ -46,6 +47,126 @@ def setup_wandb(args):
         wandb.define_metric("__init", hidden=True)
         return run
     return None
+
+
+def _bytes_to_gib(num_bytes):
+    return num_bytes / (1024 ** 3)
+
+
+def _checkpoint_file_size_gib(path):
+    if path and os.path.isfile(path):
+        return _bytes_to_gib(os.path.getsize(path))
+    return None
+
+
+def _largest_existing_checkpoint_gib(ckpt_dir):
+    if not os.path.isdir(ckpt_dir):
+        return None, None
+
+    largest_size = None
+    largest_path = None
+    for root, _, files in os.walk(ckpt_dir):
+        for filename in files:
+            if not filename.endswith(".ckpt"):
+                continue
+            path = os.path.join(root, filename)
+            try:
+                size_gib = _bytes_to_gib(os.path.getsize(path))
+            except OSError:
+                continue
+            if largest_size is None or size_gib > largest_size:
+                largest_size = size_gib
+                largest_path = path
+    return largest_size, largest_path
+
+
+def _estimate_checkpoint_size_gib(args, ckpt_dir, model_trainer):
+    candidates = []
+
+    existing_size_gib, existing_path = _largest_existing_checkpoint_gib(ckpt_dir)
+    if existing_size_gib is not None:
+        candidates.append((existing_size_gib, f"existing checkpoint: {existing_path}"))
+
+    for attr_name, label in (
+        ("finetuning_model_ckpt", "finetuning checkpoint"),
+        ("resume_training_ckpt", "resume checkpoint"),
+    ):
+        path = getattr(args, attr_name, "")
+        size_gib = _checkpoint_file_size_gib(path)
+        if size_gib is not None:
+            candidates.append((size_gib, f"{label}: {path}"))
+
+    if candidates:
+        return max(candidates, key=lambda item: item[0])
+
+    tensor_bytes = 0
+    for value in model_trainer.state_dict().values():
+        if torch.is_tensor(value):
+            tensor_bytes += value.numel() * value.element_size()
+
+    # Lightning checkpoints also carry optimizer/trainer state. Use a conservative
+    # multiplier when no real checkpoint file is available as a reference.
+    estimated_gib = max(_bytes_to_gib(tensor_bytes) * 4.0, 0.1)
+    return estimated_gib, "estimated from model state_dict"
+
+
+def _planned_checkpoint_slots(args, save_last):
+    slots = 0
+    details = []
+    warnings = []
+
+    if args.save_top_k_ckpts == -1:
+        slots += 1
+        details.append("top_k=all (preflight lower bound: 1)")
+        warnings.append("save_top_k_ckpts=-1 is unbounded, so exact checkpoint capacity cannot be guaranteed.")
+    elif args.save_top_k_ckpts > 0:
+        slots += args.save_top_k_ckpts
+        details.append(f"top_k={args.save_top_k_ckpts}")
+
+    if save_last:
+        slots += 1
+        details.append("last=1")
+
+    if args.save_periodic_steps > 0:
+        slots += 1
+        details.append(f"periodic=1 every {args.save_periodic_steps} steps")
+
+    return slots, details, warnings
+
+
+def preflight_checkpoint_disk(args, ckpt_dir, save_last, model_trainer, is_rank_zero_process):
+    if args.only_test:
+        return
+
+    checkpoint_slots, slot_details, warnings = _planned_checkpoint_slots(args, save_last)
+    if checkpoint_slots <= 0:
+        return
+
+    min_free_gib = max(0.0, float(args.checkpoint_min_free_gb))
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    free_gib = _bytes_to_gib(shutil.disk_usage(ckpt_dir).free)
+    ref_ckpt_gib, ref_source = _estimate_checkpoint_size_gib(args, ckpt_dir, model_trainer)
+    required_gib = checkpoint_slots * ref_ckpt_gib + min_free_gib
+
+    if is_rank_zero_process:
+        print("[Checkpoint Preflight]")
+        print(f"  dir: {ckpt_dir}")
+        print(f"  planned checkpoint slots: {checkpoint_slots} ({', '.join(slot_details)})")
+        print(f"  reference checkpoint size: {ref_ckpt_gib:.2f} GiB ({ref_source})")
+        print(f"  required free before training: {required_gib:.2f} GiB = {checkpoint_slots} * {ref_ckpt_gib:.2f} + reserve {min_free_gib:.2f}")
+        print(f"  current free: {free_gib:.2f} GiB")
+        for warning in warnings:
+            print(f"  warning: {warning}")
+
+    if free_gib < required_gib:
+        raise RuntimeError(
+            "Checkpoint disk preflight failed: "
+            f"current free space {free_gib:.2f} GiB is less than required {required_gib:.2f} GiB "
+            f"for {checkpoint_slots} checkpoint slots plus {min_free_gib:.2f} GiB reserve. "
+            f"checkpoint_dir={ckpt_dir}; reference={ref_source}. "
+            "Free disk space or reduce --save_top_k_ckpts/--save_periodic_steps before starting training."
+        )
 
 def main(args):
     # --disable_wandb is an alias for --no_wandb
@@ -212,8 +333,11 @@ def main(args):
     opt_name = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
     ckpt_dir = args.checkpoint_dir if args.checkpoint_dir else f"./logs/checkpoints/{args.run_name}"
     checkpoint_filename = f"s={{step}}-{args.model_size}-ctx{args.context_length}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
-    save_last = (args.save_periodic_steps <= 0)  # periodic 启用时不需要 last.ckpt，periodic 已覆盖 crash recovery
-    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=ckpt_dir, filename=checkpoint_filename, verbose=True, min_free_gb=50)
+    save_last = (args.save_periodic_steps <= 0 and args.save_top_k_ckpts != 0)  # save_top_k=0 means no checkpoint files
+    checkpoint_cleanup_on_low_space = not args.disable_checkpoint_cleanup_on_low_space
+    if args.checkpoint_preflight_required:
+        preflight_checkpoint_disk(args, ckpt_dir, save_last, model_trainer, is_rank_zero_process)
+    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=ckpt_dir, filename=checkpoint_filename, verbose=True, min_free_gb=args.checkpoint_min_free_gb, cleanup_on_low_space=checkpoint_cleanup_on_low_space)
 
     # 定期保存 checkpoint（不依赖 val_loss），防止 SFT 后期模型丢失
     periodic_checkpoint = None
@@ -225,7 +349,8 @@ def main(args):
             dirpath=ckpt_dir,
             filename=f"periodic-s={{step}}-{args.model_size}-ctx{args.context_length}",
             verbose=True,
-            min_free_gb=50
+            min_free_gb=args.checkpoint_min_free_gb,
+            cleanup_on_low_space=checkpoint_cleanup_on_low_space
         )
 
     for name, param in model_trainer.model.named_parameters():
@@ -490,12 +615,21 @@ if __name__ == '__main__':
     parser.add_argument("--mcmc_step_size_per_step",
         help="learn a separate mcmc_step_size (alpha) for each MCMC step index",
         action="store_true", default=False)
+    parser.add_argument("--mcmc_step_size_per_step_values", type=str, default="",
+        help="Comma-separated per-step alpha initial values when --mcmc_step_size_per_step is enabled. "
+             "Length must match --mcmc_num_steps, e.g. '50,300'. Empty means repeat --mcmc_step_size.")
+    parser.add_argument("--mcmc_step_size_per_step_learnable_mask", type=str, default="",
+        help="Comma-separated 0/1 per-step alpha learnable mask when --mcmc_step_size_per_step is enabled. "
+             "Length must match --mcmc_num_steps, e.g. '0,1' fixes alpha0 and learns alpha1. "
+             "Empty means all per-step alphas follow --mcmc_step_size_learnable.")
 
     parser.add_argument("--mcmc_step_size_lr_multiplier", help="learning rate multiplier for mcmc step size, so to get lr of mcmc step size take lr multiply by this value", type=float, default=5000.0)
 
     parser.add_argument("--randomize_mcmc_step_size_scale", help="randomize the value of mcmc_step_size by a factor specified, i.e. if is 2 will mult by 2 and div by 2 and thats the range to sample from uniformly", type=float, default=1)
     
     parser.add_argument("--mcmc_num_steps", help="number of MCMC steps, try 2-5, check data samples as well to see how many we need. NOTE if are using time embed or adaln is the number of energy landscapes", type=int, default=2)
+    parser.add_argument("--zero_mcmc_ce_only", action="store_true", default=False,
+        help="Strict K=0 ablation: require --mcmc_num_steps 0 and train only the TF-head CE path from the initial corrupted/free-embedding state, without energy-head forward, autograd.grad, or MCMC update.")
 
     parser.add_argument("--randomize_mcmc_num_steps", help="makes mcmc_num_steps random, each step at each landscape is repeated uniform(1, 1+randomize_mcmc_num_steps) times (unless randomize_mcmc_num_steps_min is set, then thats the min value). if ebt_type is default each landscape is the same, so it effectively just randomized mcmc_num_steps", type=int, default=0)
 
@@ -517,6 +651,45 @@ if __name__ == '__main__':
 
     parser.add_argument("--ebt_type", help="type of energy based transformer to use, inspired by DiT paper.", choices=["default", "time_embed", "adaln", "adaln_zero", "nanochat_d26"], type=str, default="default")
 
+    # TF (teacher-forced, Gemma-drafter-style) head — sits AFTER MCMC and consumes
+    # either trunk pred_hidden or the free-embedding MCMC state for CE logits. Some
+    # variants also use embed(input_ids[t]) as a first-layer anchor.
+    # See TF_HEAD_ARCHITECTURE.md §9 and openebm/elm/tf_head.py.
+    parser.add_argument("--use_tf_head", action="store_true", default=False,
+        help="Replace MCMC-derived CE with TF head on top of trunk pred_hidden. Default off.")
+    parser.add_argument("--tf_head_type", choices=["linear", "concat_direct_unembed", "transformer", "direct_unembed", "pre_update_hidden_unembed", "post_update_state_unembed"], type=str, default="transformer",
+        help="TF head variant. 'transformer' = L-block causal head (Gemma drafter). "
+             "'linear' = concat+project. "
+             "'concat_direct_unembed' = project concat(post-update trunk pred_hidden, prev_embed) directly. "
+             "'direct_unembed' = project post-update trunk pred_hidden directly. "
+             "'pre_update_hidden_unembed' = project the energy-forward pre-update trunk pred_hidden directly. "
+             "'post_update_state_unembed' = project the post-update free-embedding MCMC state directly.")
+    parser.add_argument("--tf_head_layers", type=int, default=1,
+        help="Number of causal AR blocks in the transformer head (L=1 is empirical sweet spot).")
+    parser.add_argument("--tf_head_n_heads", type=int, default=0,
+        help="Attention heads inside TF head block; 0 inherits trunk's multiheaded_attention_heads.")
+    parser.add_argument("--tf_head_ffn_mult", type=float, default=4.0,
+        help="FFN expansion factor inside TF head transformer block.")
+    # Free embedding MCMC: iterate in D-dim embedding space directly (instead of V-dim logit).
+    # Skips the softmax + matmul(embeddings.weight) conversion at trunk input. Requires
+    # --use_tf_head (TF head provides the discrete CE supervision; without it the D-dim iterate
+    # has no decode path). See blockwise_free_embedding_optimizations_2026-06-01.md.
+    parser.add_argument("--free_embedding_mcmc", action="store_true", default=False,
+        help="Run MCMC in D-dim free embedding space instead of V-dim logit space. Requires --use_tf_head.")
+    parser.add_argument("--free_embed_noise_scale", type=float, default=1.0,
+        help="Multiplier on initial corruption noise when free_embedding_mcmc=True (doc §4 noise rescaling). "
+             "Higher = harder denoising = forces model to use context.")
+    parser.add_argument("--post_update_state_use_rmsnorm", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed only: apply RMSNorm to z_{i+1} before Linear(D,V).")
+    parser.add_argument("--post_update_state_concat_zi", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed only: decode concat(z_i, z_{i+1}) with Linear(2D,V).")
+    parser.add_argument("--post_update_state_concat_prev_embed", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed only: decode concat(z_{i+1}, embed(input_ids)) with Linear(2D,V).")
+    parser.add_argument("--post_update_state_detach_prev_embed", action="store_true", default=False,
+        help="For post_update_state_unembed + concat_prev_embed only: detach embed(input_ids) before TF-head CE.")
+    parser.add_argument("--post_update_state_tf_head_adamw", action="store_true", default=False,
+        help="For tf_head_type=post_update_state_unembed with --optimizer muon_adamw: put TF-head matrix params in AdamW instead of Muon.")
+
     parser.add_argument("--use_ve", help="启用 Value Embedding (VE)，为交替层添加可学习的值嵌入", action="store_true", default=False)
 
     parser.add_argument("--use_mcmc_time_embed", action="store_true", default=False,
@@ -529,6 +702,9 @@ if __name__ == '__main__':
     parser.add_argument("--ebt_act_func", help="activation function to use for energy based transformer, NOTE is only supported for ebt_time_embed. silu (default from llama2) worked best", type=str, default="silu")
 
     parser.add_argument("--truncate_mcmc", help="truncate mcmc and only use final step of loss to calculate, for S2 models", action="store_true", default=False)
+    parser.add_argument("--truncate_mcmc_per_step_ce", action="store_true", default=False,
+        help="Use S2-style truncated MCMC gradients while still averaging CE over all supervised MCMC steps. "
+             "Requires --truncate_mcmc; useful to isolate final-only CE from create_graph truncation.")
 
     parser.add_argument("--mcmc_replay_buffer", help="enables a replay buffer for MCMC, particularly S2 models", action="store_true", default=False)
 
@@ -763,6 +939,17 @@ if __name__ == '__main__':
         choices=["fixed", "three_phase"],
         default="fixed",
     )
+    parser.add_argument(
+        "--base_train_dataset",
+        help="local base pretraining corpus used by the nanochat parquet dataloader",
+        choices=["fineweb", "climbmix", "dclm"],
+        default=os.environ.get("BASE_TRAIN_DATASET", os.environ.get("NANOCHAT_BASE_TRAIN_DATASET", "fineweb")),
+    )
+    parser.add_argument(
+        "--base_train_data_dir",
+        help="optional override for the local parquet directory of --base_train_dataset",
+        default=os.environ.get("BASE_TRAIN_DATA_DIR", ""),
+    )
     
     parser.add_argument("--dataset_dir", help="dataset base directory", default="")
 
@@ -923,6 +1110,15 @@ if __name__ == '__main__':
 
     parser.add_argument("--save_periodic_steps", type=int, default=0,
         help="Save checkpoint every N training steps regardless of val_loss (0=disabled). Useful for SFT where val_loss may rise while task performance improves.")
+
+    parser.add_argument("--checkpoint_min_free_gb", type=float, default=10.0,
+        help="Minimum free disk space in GiB to reserve before saving a checkpoint.")
+
+    parser.add_argument("--checkpoint_preflight_required", action="store_true", default=False,
+        help="Before training, fail if the checkpoint directory cannot hold the configured checkpoint count plus the free-space reserve.")
+
+    parser.add_argument("--disable_checkpoint_cleanup_on_low_space", action="store_true", default=False,
+        help="Disable automatic deletion of old checkpoints when free disk space is below --checkpoint_min_free_gb.")
 
     #PRECISION#########################################################################
 
