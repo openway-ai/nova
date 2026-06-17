@@ -88,7 +88,7 @@ openebm/elm/scripts/sudoku_compare/
 - `transformers`：加载 tokenizer 和可选 transformers backend。
 - `vllm`：默认 LLM 推理 backend。
 - `tqdm`：进度条。
-- `flashinfer-python`、`flashinfer-cubin`：默认 FlashInfer attention backend。
+- `flashinfer-python`、`flashinfer-cubin`：非 MLA 模型默认 FlashInfer attention backend。
 - `nvidia-smi`：可选，用于 GPU 数量检测 fallback。
 - OpenEBM 项目自身模块，尤其是 `openebm.elm.scripts.eval_sudoku_samples`。
 
@@ -97,6 +97,7 @@ openebm/elm/scripts/sudoku_compare/
 ```bash
 LLM_BACKEND=vllm
 ATTENTION_BACKEND=FLASHINFER
+R1_ATTENTION_BACKEND=auto
 FLASHINFER_DISABLE_VERSION_CHECK=1
 FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer
 VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -278,8 +279,11 @@ DeepSeek-R1 示例：
   --thinking disable \
   --resume \
   --enforce-eager \
-  --attention-backend FLASHINFER
+  --attention-backend auto
 ```
+
+DeepSeek-R1 使用 MLA attention，不要强制使用非 MLA 的 `FLASHINFER`。保持
+`auto` 时 vLLM 会在当前 CUDA 平台上选择可用的 MLA backend。
 
 使用本地自定义 Hugging Face 模型路径：
 
@@ -368,6 +372,7 @@ deepseek_r1_0528 /mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/m
 runs/sudoku_compare/
   logs/<RUN_ID>/
     INDEX.md
+    console.log
     run_env.txt
     status.tsv
     *.cmd
@@ -485,6 +490,7 @@ PYTHON=<统一 Python>
 EBM_PYTHON=<EBM Python>
 LLM_PYTHON=<LLM Python>
 REPORT_PYTHON=<报告 Python>
+CAPTURE_CONSOLE_LOG=1      # 写入 logs/<RUN_ID>/console.log；设 0 可关闭
 ```
 
 LLM 推理相关：
@@ -492,14 +498,21 @@ LLM 推理相关：
 ```text
 LLM_BACKEND=vllm
 ATTENTION_BACKEND=FLASHINFER
+R1_ATTENTION_BACKEND=auto
 ENFORCE_EAGER=1
 THINKING=disable
+SYSTEM_PROMPT=             # 可选；覆盖 eval_llm_sudoku.py 默认 system prompt
+ANSWER_FORMAT=grid         # grid 或 flat81；flat81 要求 81 位行优先数字
+R1_ANSWER_FORMAT=          # 可选；只覆盖 DeepSeek-R1，例如 flat81
+STRUCTURED_REGEX=          # 可选；传给 vLLM structured_outputs.regex
+R1_STRUCTURED_REGEX=       # 可选；只约束 DeepSeek-R1，例如 '[1-9]{81}'
 TEMPERATURE=0
 TOP_P=1.0
 MAX_TOKENS=<覆盖所有模型组>
 SMALL_MAX_TOKENS=2048
 QWEN27_MAX_TOKENS=4096
 R1_MAX_TOKENS=8192
+R1_GPU_MEMORY_UTILIZATION=0.85
 TRACE_LOG=full
 TRACE_LOG_CHARS=50000
 RESPONSE_LOG=truncated
@@ -526,4 +539,5 @@ R1_TP=min(GPU_COUNT,8)
 - 分阶段模式中，LLM 每轮传入累计范围并依赖 `--resume` 只补新样本；EBM 优先复用已有结果，缺失时才累计运行。
 - EBM 多卡评估日志中的 tqdm 是 rank0 本地 shard 进度，不等于全局 test 样本总数。
 - 若 FlashInfer 版本检查导致 import 报错，可保持默认 `FLASHINFER_DISABLE_VERSION_CHECK=1`。
+- DeepSeek-R1 默认 `R1_GPU_MEMORY_UTILIZATION=0.85`，用于给 warmup/all-reduce 临时显存留出余量。若机器空闲且确认稳定，可手动调高。
 - 若需要降低长推理模型耗时，可以调低 `QWEN27_MAX_TOKENS` 或 `R1_MAX_TOKENS`，但这可能影响最终答案输出。

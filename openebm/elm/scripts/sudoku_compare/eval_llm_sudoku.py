@@ -121,7 +121,21 @@ SUDOKU_FEW_SHOTS = [
 ]
 
 
-def build_user_prompt(puzzle_text: str) -> str:
+def format_solution_for_prompt(solution_text: str, answer_format: str) -> str:
+    if answer_format == "flat81":
+        return "".join(ch for ch in solution_text if ch.isdigit())
+    return solution_text
+
+
+def build_user_prompt(puzzle_text: str, answer_format: str) -> str:
+    if answer_format == "flat81":
+        return (
+            "Solve this Sudoku puzzle. 0 denotes an empty cell.\n"
+            "Return exactly 81 digits in row-major order, using only digits 1-9.\n"
+            "Do not include spaces, newlines, labels, or explanations.\n\n"
+            f"Puzzle:\n{puzzle_text}\n\n"
+            "Final answer:"
+        )
     return (
         "Solve this Sudoku puzzle. 0 denotes an empty cell.\n"
         "Return only the completed grid as 9 lines of 9 digits, separated by spaces.\n"
@@ -131,12 +145,22 @@ def build_user_prompt(puzzle_text: str) -> str:
     )
 
 
-def build_messages(puzzle_text: str, few_shot: int, system_prompt: str) -> List[Dict[str, str]]:
+def build_messages(
+    puzzle_text: str,
+    few_shot: int,
+    system_prompt: str,
+    answer_format: str,
+) -> List[Dict[str, str]]:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
     for shot_puzzle, shot_solution in SUDOKU_FEW_SHOTS[: max(0, few_shot)]:
-        messages.append({"role": "user", "content": build_user_prompt(shot_puzzle)})
-        messages.append({"role": "assistant", "content": shot_solution})
-    messages.append({"role": "user", "content": build_user_prompt(puzzle_text)})
+        messages.append({"role": "user", "content": build_user_prompt(shot_puzzle, answer_format)})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": format_solution_for_prompt(shot_solution, answer_format),
+            }
+        )
+    messages.append({"role": "user", "content": build_user_prompt(puzzle_text, answer_format)})
     return messages
 
 
@@ -220,6 +244,10 @@ class VLLMRunner:
             "temperature": args.temperature,
             "top_p": args.top_p,
         }
+        if args.structured_regex:
+            from vllm.sampling_params import StructuredOutputsParams
+
+            sampling_kwargs["structured_outputs"] = StructuredOutputsParams(regex=args.structured_regex)
         try:
             self.sampling_params = SamplingParams(**sampling_kwargs, seed=args.seed)
         except TypeError:
@@ -665,6 +693,7 @@ def evaluate_one_model(
             "top_p": args.top_p,
             "seed": args.seed,
             "few_shot": args.few_shot,
+            "answer_format": args.answer_format,
             "thinking": args.thinking,
             "use_chat_template": args.use_chat_template,
             "save_prompts": args.save_prompts,
@@ -672,6 +701,7 @@ def evaluate_one_model(
             "response_log_chars": args.response_log_chars,
             "trace_log": args.trace_log,
             "trace_log_chars": args.trace_log_chars,
+            "structured_regex": args.structured_regex,
         },
         "vllm": {
             "attention_backend": args.attention_backend,
@@ -758,7 +788,12 @@ def evaluate_one_model(
             for idx in batch_indices:
                 puzzle, solution = sample_boards(samples[idx])
                 puzzle_text = format_board(puzzle, blank=args.blank)
-                messages = build_messages(puzzle_text, args.few_shot, args.system_prompt)
+                messages = build_messages(
+                    puzzle_text,
+                    args.few_shot,
+                    args.system_prompt,
+                    args.answer_format,
+                )
                 prompt = render_prompt(
                     runner.tokenizer,
                     messages,
@@ -963,8 +998,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--few-shot", type=int, default=0, choices=[0, 1, 2])
     parser.add_argument("--blank", choices=["0", "."], default="0")
+    parser.add_argument(
+        "--answer-format",
+        choices=["grid", "flat81"],
+        default="grid",
+        help="Prompted answer format. flat81 asks for exactly 81 row-major digits.",
+    )
     parser.add_argument("--thinking", choices=["auto", "enable", "disable"], default="auto")
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
+    parser.add_argument(
+        "--structured-regex",
+        default=None,
+        help=(
+            "vLLM structured-output regex. For Sudoku final-answer-only runs, "
+            "a useful value is '[1-9]{81}'."
+        ),
+    )
     parser.add_argument("--save-prompts", action="store_true", help="Store full rendered prompts in JSONL.")
     parser.add_argument(
         "--response-log",
@@ -1064,6 +1113,8 @@ def main() -> None:
         raise SystemExit("--data-parallel-size must be > 0")
     if args.data_parallel_size_local is not None and args.data_parallel_size_local <= 0:
         raise SystemExit("--data-parallel-size-local must be > 0")
+    if args.structured_regex and args.backend != "vllm":
+        raise SystemExit("--structured-regex requires --backend vllm")
     if args.backend == "vllm" and args.data_parallel_size > 1:
         if args.distributed_executor_backend != "external_launcher":
             raise SystemExit(

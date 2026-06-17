@@ -8,6 +8,7 @@ set -euo pipefail
 #   PYTHON=/path/to/python RESULTS_ROOT=/path/to/out bash run_all_sudoku_compare.sh
 #   EBM_PYTHON=/path/to/python LLM_PYTHON=/path/to/python bash run_all_sudoku_compare.sh
 #   ENFORCE_EAGER=0 ATTENTION_BACKEND=FLASH_ATTN bash run_all_sudoku_compare.sh
+#   R1_ATTENTION_BACKEND=FLASHMLA bash run_all_sudoku_compare.sh
 #   LLM_BACKEND=transformers RUN_R1=0 RUN_QWEN27=0 NUM_SAMPLES=1 bash run_all_sudoku_compare.sh
 #
 # NUM_SAMPLES=-1 means full test split. Any non-negative value runs a smoke subset.
@@ -150,9 +151,12 @@ RUN_OUTPUT_ROOT="${RUN_OUTPUT_ROOT:-${RESULTS_ROOT}/outputs/${RUN_ID}}"
 EBM_OUT_DIR="${EBM_OUT_DIR:-${RUN_OUTPUT_ROOT}/ebm}"
 LLM_OUT_DIR="${LLM_OUT_DIR:-${RUN_OUTPUT_ROOT}/llm}"
 REPORT_OUT_DIR="${REPORT_OUT_DIR:-${RUN_OUTPUT_ROOT}/reports}"
+STAGED_EVAL_PY="${STAGED_EVAL_PY:-${REPO_ROOT}/openebm/elm/scripts/sudoku_compare/staged_eval.py}"
 LOG_ROOT="${LOG_ROOT:-${RESULTS_ROOT}/logs}"
 LOG_DIR="${LOG_DIR:-${LOG_ROOT}/${RUN_ID}}"
 STATUS_LOG="${STATUS_LOG:-${LOG_DIR}/status.tsv}"
+CONSOLE_LOG="${CONSOLE_LOG:-${LOG_DIR}/console.log}"
+CAPTURE_CONSOLE_LOG="${CAPTURE_CONSOLE_LOG:-1}"
 LOG_NAME_PREFIX="${LOG_NAME_PREFIX:-}"
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib}"
 export MPLCONFIGDIR
@@ -202,6 +206,9 @@ TRACE_LOG_CHARS="${TRACE_LOG_CHARS:-50000}"
 CASE_EXAMPLES_PER_TYPE="${CASE_EXAMPLES_PER_TYPE:-5}"
 SAVE_PROMPTS="${SAVE_PROMPTS:-0}"
 THINKING="${THINKING:-disable}"
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
+ANSWER_FORMAT="${ANSWER_FORMAT:-grid}"
+STRUCTURED_REGEX="${STRUCTURED_REGEX:-}"
 LLM_BACKEND="${LLM_BACKEND:-vllm}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
@@ -210,7 +217,19 @@ DISTRIBUTED_EXECUTOR_BACKEND="${DISTRIBUTED_EXECUTOR_BACKEND:-}"
 # Match the known-good smoke-test runtime defaults. FlashInfer is enabled by
 # default through vLLM's explicit attention_config path; eager mode remains
 # separate and avoids the current torch.compile API mismatch in nanochat.
+# DeepSeek-R1 uses MLA attention, so it must not inherit the generic
+# non-MLA FLASHINFER backend. Leave it on vLLM auto-selection unless an
+# R1-specific backend is explicitly requested.
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-${VLLM_ATTENTION_BACKEND:-FLASHINFER}}"
+SMALL_ATTENTION_BACKEND="${SMALL_ATTENTION_BACKEND:-${ATTENTION_BACKEND}}"
+QWEN27_ATTENTION_BACKEND="${QWEN27_ATTENTION_BACKEND:-${ATTENTION_BACKEND}}"
+R1_ATTENTION_BACKEND="${R1_ATTENTION_BACKEND:-${DEEPSEEK_ATTENTION_BACKEND:-auto}}"
+SMALL_STRUCTURED_REGEX="${SMALL_STRUCTURED_REGEX:-${STRUCTURED_REGEX}}"
+QWEN27_STRUCTURED_REGEX="${QWEN27_STRUCTURED_REGEX:-${STRUCTURED_REGEX}}"
+R1_STRUCTURED_REGEX="${R1_STRUCTURED_REGEX:-${STRUCTURED_REGEX}}"
+SMALL_ANSWER_FORMAT="${SMALL_ANSWER_FORMAT:-${ANSWER_FORMAT}}"
+QWEN27_ANSWER_FORMAT="${QWEN27_ANSWER_FORMAT:-${ANSWER_FORMAT}}"
+R1_ANSWER_FORMAT="${R1_ANSWER_FORMAT:-${ANSWER_FORMAT}}"
 export ATTENTION_BACKEND
 unset VLLM_ATTENTION_BACKEND
 export FLASHINFER_DISABLE_VERSION_CHECK="${FLASHINFER_DISABLE_VERSION_CHECK:-1}"
@@ -329,7 +348,10 @@ else
 fi
 R1_DP="${R1_DP:-1}"
 R1_MAX_MODEL_LEN="${R1_MAX_MODEL_LEN:-32768}"
-R1_GPU_MEMORY_UTILIZATION="${R1_GPU_MEMORY_UTILIZATION:-0.95}"
+# DeepSeek-R1 FP8 weights already use roughly 80 GiB/GPU on 8x H200.
+# vLLM's KV-cache reservation at 0.95 leaves too little transient headroom
+# for warmup/all-reduce buffers, while batch=1 only needs modest concurrency.
+R1_GPU_MEMORY_UTILIZATION="${R1_GPU_MEMORY_UTILIZATION:-0.85}"
 R1_PARALLEL_STRATEGY="${R1_PARALLEL_STRATEGY:-tensor_parallel}"
 
 if [[ "${GPU_COUNT}" -gt 0 ]]; then
@@ -354,7 +376,16 @@ ln -sfn "${EBM_OUT_DIR}" "${RESULTS_ROOT}/latest_ebm"
 ln -sfn "${LLM_OUT_DIR}" "${RESULTS_ROOT}/latest_llm"
 ln -sfn "${REPORT_OUT_DIR}" "${RESULTS_ROOT}/latest_reports"
 printf "timestamp\tstage\tevent\trc\tlog\tcmd\n" > "${STATUS_LOG}"
+if [[ "${CAPTURE_CONSOLE_LOG}" == "1" ]]; then
+  touch "${CONSOLE_LOG}"
+  exec > >(tee -a "${CONSOLE_LOG}") 2>&1
+  echo "[run_all_sudoku_compare] console log: ${CONSOLE_LOG}"
+fi
 cd "${REPO_ROOT}"
+case ":${PYTHONPATH:-}:" in
+  *":${REPO_ROOT}:"*) ;;
+  *) export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" ;;
+esac
 
 write_run_metadata() {
   {
@@ -365,8 +396,12 @@ write_run_metadata() {
     echo "EBM_OUT_DIR=${EBM_OUT_DIR}"
     echo "LLM_OUT_DIR=${LLM_OUT_DIR}"
     echo "REPORT_OUT_DIR=${REPORT_OUT_DIR}"
+    echo "STAGED_EVAL_PY=${STAGED_EVAL_PY}"
     echo "LOG_DIR=${LOG_DIR}"
     echo "STATUS_LOG=${STATUS_LOG}"
+    echo "CONSOLE_LOG=${CONSOLE_LOG}"
+    echo "CAPTURE_CONSOLE_LOG=${CAPTURE_CONSOLE_LOG}"
+    echo "PYTHONPATH=${PYTHONPATH:-}"
     echo "EBM_PYTHON=${EBM_PYTHON}"
     echo "LLM_PYTHON=${LLM_PYTHON}"
     echo "REPORT_PYTHON=${REPORT_PYTHON}"
@@ -419,6 +454,18 @@ write_run_metadata() {
     echo "R1_TP=${R1_TP}"
     echo "R1_DP=${R1_DP}"
     echo "R1_PARALLEL_STRATEGY=${R1_PARALLEL_STRATEGY}"
+    echo "SMALL_ATTENTION_BACKEND=${SMALL_ATTENTION_BACKEND}"
+    echo "QWEN27_ATTENTION_BACKEND=${QWEN27_ATTENTION_BACKEND}"
+    echo "R1_ATTENTION_BACKEND=${R1_ATTENTION_BACKEND}"
+    echo "SYSTEM_PROMPT=${SYSTEM_PROMPT}"
+    echo "ANSWER_FORMAT=${ANSWER_FORMAT}"
+    echo "SMALL_ANSWER_FORMAT=${SMALL_ANSWER_FORMAT}"
+    echo "QWEN27_ANSWER_FORMAT=${QWEN27_ANSWER_FORMAT}"
+    echo "R1_ANSWER_FORMAT=${R1_ANSWER_FORMAT}"
+    echo "STRUCTURED_REGEX=${STRUCTURED_REGEX}"
+    echo "SMALL_STRUCTURED_REGEX=${SMALL_STRUCTURED_REGEX}"
+    echo "QWEN27_STRUCTURED_REGEX=${QWEN27_STRUCTURED_REGEX}"
+    echo "R1_STRUCTURED_REGEX=${R1_STRUCTURED_REGEX}"
     echo "TRACE_LOG=${TRACE_LOG}"
     echo "TRACE_LOG_CHARS=${TRACE_LOG_CHARS}"
     echo "CASE_EXAMPLES_PER_TYPE=${CASE_EXAMPLES_PER_TYPE}"
@@ -448,6 +495,7 @@ write_run_index() {
     echo
     echo "## Directories"
     echo "- logs: ${LOG_DIR}"
+    echo "- console: ${CONSOLE_LOG}"
     echo "- outputs: ${RUN_OUTPUT_ROOT}"
     echo "- ebm: ${EBM_OUT_DIR}"
     echo "- llm: ${LLM_OUT_DIR}"
@@ -462,6 +510,7 @@ write_run_index() {
     echo
     echo "## Trace Files"
     echo "- run_env.txt: resolved configuration"
+    echo "- console.log: full launcher stdout/stderr transcript from setup onward"
     echo "- status.tsv: stage start/finish events"
     echo "- *.cmd: exact commands"
     echo "- *.log: command output"
@@ -566,6 +615,38 @@ PY
   } 2>&1 | tee "${log_path}"
 }
 
+verify_sudoku_compare_helpers() {
+  local log_path="${LOG_DIR}/verify_sudoku_compare_helpers.log"
+  {
+    echo "[verify:sudoku_compare_helpers] python=${REPORT_PYTHON}"
+    echo "[verify:sudoku_compare_helpers] repo_root=${REPO_ROOT}"
+    echo "[verify:sudoku_compare_helpers] staged_eval=${STAGED_EVAL_PY}"
+    echo "[verify:sudoku_compare_helpers] PYTHONPATH=${PYTHONPATH:-}"
+    "${REPORT_PYTHON}" - <<PY
+from pathlib import Path
+import importlib.util
+import sys
+
+repo = Path("${REPO_ROOT}").resolve()
+staged_eval = Path("${STAGED_EVAL_PY}").resolve()
+print("cwd", Path.cwd())
+print("sys.path[:5]", sys.path[:5])
+if not staged_eval.is_file():
+    raise SystemExit(f"staged_eval.py not found: {staged_eval}")
+spec = importlib.util.spec_from_file_location("sudoku_compare_staged_eval_preflight", staged_eval)
+if spec is None or spec.loader is None:
+    raise SystemExit(f"cannot load staged_eval.py spec: {staged_eval}")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+import openebm
+print("openebm", Path(openebm.__file__).resolve())
+print("staged_eval", staged_eval)
+if repo not in Path(openebm.__file__).resolve().parents:
+    raise SystemExit(f"openebm resolved outside REPO_ROOT: {openebm.__file__}")
+PY
+  } 2>&1 | tee "${log_path}"
+}
+
 run_cmd_log() {
   local name="$1"
   shift
@@ -635,8 +716,13 @@ append_num_samples_args() {
   fi
 }
 
+run_staged_eval() {
+  "${REPORT_PYTHON}" "${STAGED_EVAL_PY}" "$@"
+}
+
 append_common_llm_args() {
   local -n out_ref=$1
+  local attention_backend="${2:-${ATTENTION_BACKEND}}"
   out_ref+=(
     --data-dir "${DATA_DIR}"
     --out-dir "${LLM_OUT_DIR}"
@@ -653,6 +739,9 @@ append_common_llm_args() {
     --case-examples-per-type "${CASE_EXAMPLES_PER_TYPE}"
   )
   append_num_samples_args "$1"
+  if [[ -n "${SYSTEM_PROMPT}" ]]; then
+    out_ref+=(--system-prompt "${SYSTEM_PROMPT}")
+  fi
   if [[ "${SAVE_PROMPTS}" == "1" ]]; then
     out_ref+=(--save-prompts)
   fi
@@ -664,8 +753,8 @@ append_common_llm_args() {
   if [[ "${LLM_BACKEND}" == "vllm" && "${ENFORCE_EAGER}" == "1" ]]; then
     out_ref+=(--enforce-eager)
   fi
-  if [[ "${LLM_BACKEND}" == "vllm" && -n "${ATTENTION_BACKEND:-}" ]]; then
-    out_ref+=(--attention-backend "${ATTENTION_BACKEND}")
+  if [[ "${LLM_BACKEND}" == "vllm" && -n "${attention_backend:-}" ]]; then
+    out_ref+=(--attention-backend "${attention_backend}")
   fi
   if [[ "${LLM_BACKEND}" == "vllm" && -n "${DISTRIBUTED_EXECUTOR_BACKEND:-}" ]]; then
     out_ref+=(--distributed-executor-backend "${DISTRIBUTED_EXECUTOR_BACKEND}")
@@ -695,6 +784,9 @@ run_llm_group() {
   local parallel_strategy="${9:-manual}"
   local assigned_gpus="${10:-__all__}"
   local run_summary_name="${11:-run_summary.json}"
+  local attention_backend="${12:-${ATTENTION_BACKEND}}"
+  local structured_regex="${13:-${STRUCTURED_REGEX}}"
+  local answer_format="${14:-${ANSWER_FORMAT}}"
   local actual_assigned_gpus="${GPU_IDS}"
 
   read -r -a model_array <<< "${models_string}"
@@ -706,7 +798,8 @@ run_llm_group() {
   cmd+=("${LLM_PYTHON}" -m openebm.elm.scripts.sudoku_compare.eval_llm_sudoku)
   cmd+=(--models "${model_array[@]}")
   cmd+=(--run-summary-name "${run_summary_name}")
-  append_common_llm_args cmd
+  append_common_llm_args cmd "${attention_backend}"
+  cmd+=(--answer-format "${answer_format}")
   cmd+=(
     --max-tokens "${max_tokens}"
     --batch-size "${batch_size}"
@@ -720,6 +813,9 @@ run_llm_group() {
   fi
   if [[ -n "${gpu_memory_utilization}" ]]; then
     cmd+=(--gpu-memory-utilization "${gpu_memory_utilization}")
+  fi
+  if [[ -n "${structured_regex}" ]]; then
+    cmd+=(--structured-regex "${structured_regex}")
   fi
   run_cmd_log "${LOG_NAME_PREFIX}${log_name}" "${cmd[@]}"
 }
@@ -742,11 +838,11 @@ run_small_models() {
       gpu="$(gpu_id_at "${GPU_IDS}" "${idx}")"
       if [[ -z "${gpu}" ]]; then
         echo "[run_all_sudoku_compare] WARNING: missing GPU id for ${model}; falling back to sequential small-model run" >&2
-        run_llm_group llm_small "${SMALL_MODELS}" "${SMALL_MAX_TOKENS}" "${SMALL_BATCH_SIZE}" "${SMALL_TP}" "${SMALL_DP}" "${SMALL_MAX_MODEL_LEN}" "${SMALL_GPU_MEMORY_UTILIZATION}" "${SMALL_PARALLEL_STRATEGY}" "__all__"
+        run_llm_group llm_small "${SMALL_MODELS}" "${SMALL_MAX_TOKENS}" "${SMALL_BATCH_SIZE}" "${SMALL_TP}" "${SMALL_DP}" "${SMALL_MAX_MODEL_LEN}" "${SMALL_GPU_MEMORY_UTILIZATION}" "${SMALL_PARALLEL_STRATEGY}" "__all__" "run_summary.json" "${SMALL_ATTENTION_BACKEND}" "${SMALL_STRUCTURED_REGEX}" "${SMALL_ANSWER_FORMAT}"
         return
       fi
       (
-        run_llm_group "llm_small_${model}" "${model}" "${SMALL_MAX_TOKENS}" "${SMALL_BATCH_SIZE}" "${SMALL_TP}" "${SMALL_DP}" "${SMALL_MAX_MODEL_LEN}" "${SMALL_GPU_MEMORY_UTILIZATION}" "model_parallel_process_gpu_${gpu}" "${gpu}" "run_summary_${model}.json"
+        run_llm_group "llm_small_${model}" "${model}" "${SMALL_MAX_TOKENS}" "${SMALL_BATCH_SIZE}" "${SMALL_TP}" "${SMALL_DP}" "${SMALL_MAX_MODEL_LEN}" "${SMALL_GPU_MEMORY_UTILIZATION}" "model_parallel_process_gpu_${gpu}" "${gpu}" "run_summary_${model}.json" "${SMALL_ATTENTION_BACKEND}" "${SMALL_STRUCTURED_REGEX}" "${SMALL_ANSWER_FORMAT}"
       ) &
       pids+=("$!")
       idx=$((idx + 1))
@@ -763,7 +859,7 @@ run_small_models() {
       exit "${rc}"
     fi
   else
-    run_llm_group llm_small "${SMALL_MODELS}" "${SMALL_MAX_TOKENS}" "${SMALL_BATCH_SIZE}" "${SMALL_TP}" "${SMALL_DP}" "${SMALL_MAX_MODEL_LEN}" "${SMALL_GPU_MEMORY_UTILIZATION}" "${SMALL_PARALLEL_STRATEGY}" "__all__"
+    run_llm_group llm_small "${SMALL_MODELS}" "${SMALL_MAX_TOKENS}" "${SMALL_BATCH_SIZE}" "${SMALL_TP}" "${SMALL_DP}" "${SMALL_MAX_MODEL_LEN}" "${SMALL_GPU_MEMORY_UTILIZATION}" "${SMALL_PARALLEL_STRATEGY}" "__all__" "run_summary.json" "${SMALL_ATTENTION_BACKEND}" "${SMALL_STRUCTURED_REGEX}" "${SMALL_ANSWER_FORMAT}"
   fi
 }
 
@@ -794,7 +890,7 @@ PY
 }
 
 get_test_total() {
-  "${REPORT_PYTHON}" -m openebm.elm.scripts.sudoku_compare.staged_eval total \
+  run_staged_eval total \
     --data-dir "${DATA_DIR}" \
     --split test
 }
@@ -863,10 +959,10 @@ run_llms_current_range() {
     run_small_models
   fi
   if [[ "${RUN_QWEN27}" == "1" ]]; then
-    run_llm_group llm_qwen27 "${QWEN27_MODEL}" "${QWEN27_MAX_TOKENS}" "${QWEN27_BATCH_SIZE}" "${QWEN27_TP}" "${QWEN27_DP}" "${QWEN27_MAX_MODEL_LEN}" "${QWEN27_GPU_MEMORY_UTILIZATION}" "${QWEN27_PARALLEL_STRATEGY}" "__all__" "run_summary_${QWEN27_MODEL}.json"
+    run_llm_group llm_qwen27 "${QWEN27_MODEL}" "${QWEN27_MAX_TOKENS}" "${QWEN27_BATCH_SIZE}" "${QWEN27_TP}" "${QWEN27_DP}" "${QWEN27_MAX_MODEL_LEN}" "${QWEN27_GPU_MEMORY_UTILIZATION}" "${QWEN27_PARALLEL_STRATEGY}" "__all__" "run_summary_${QWEN27_MODEL}.json" "${QWEN27_ATTENTION_BACKEND}" "${QWEN27_STRUCTURED_REGEX}" "${QWEN27_ANSWER_FORMAT}"
   fi
   if [[ "${RUN_R1}" == "1" ]]; then
-    run_llm_group llm_r1 "${R1_MODEL}" "${R1_MAX_TOKENS}" "${R1_BATCH_SIZE}" "${R1_TP}" "${R1_DP}" "${R1_MAX_MODEL_LEN}" "${R1_GPU_MEMORY_UTILIZATION}" "${R1_PARALLEL_STRATEGY}" "__all__" "run_summary_${R1_MODEL}.json"
+    run_llm_group llm_r1 "${R1_MODEL}" "${R1_MAX_TOKENS}" "${R1_BATCH_SIZE}" "${R1_TP}" "${R1_DP}" "${R1_MAX_MODEL_LEN}" "${R1_GPU_MEMORY_UTILIZATION}" "${R1_PARALLEL_STRATEGY}" "__all__" "run_summary_${R1_MODEL}.json" "${R1_ATTENTION_BACKEND}" "${R1_STRUCTURED_REGEX}" "${R1_ANSWER_FORMAT}"
   fi
 }
 
@@ -903,21 +999,30 @@ stage_manifest_event() {
   if [[ -n "${models_string}" ]]; then
     read -r -a models <<< "${models_string}"
   fi
-  "${REPORT_PYTHON}" -m openebm.elm.scripts.sudoku_compare.staged_eval stage-event \
-    --manifest "${RUN_OUTPUT_ROOT}/staged_manifest.json" \
-    --run-id "${RUN_ID}" \
-    --stage-size "${STAGE_SIZE}" \
-    --start-index "${START_INDEX}" \
-    --target-total "${STAGED_TARGET_TOTAL:-0}" \
-    --total-test "${STAGED_TOTAL_TEST:-0}" \
-    --stage-index "${stage_idx}" \
-    --stage-start "${stage_start}" \
-    --stage-end "${stage_end}" \
-    --event "${event}" \
-    --phase "${phase}" \
-    --status "${status}" \
-    --models "${models[@]}" \
-    --log "${log_path}"
+  local manifest_log="${LOG_DIR}/${LOG_NAME_PREFIX}stage_manifest.log"
+  local rc=0
+  set +e
+  {
+    echo "[run_all_sudoku_compare] manifest stage=${stage_idx} event=${event} phase=${phase} status=${status} models=${models_string}"
+    run_staged_eval stage-event \
+      --manifest "${RUN_OUTPUT_ROOT}/staged_manifest.json" \
+      --run-id "${RUN_ID}" \
+      --stage-size "${STAGE_SIZE}" \
+      --start-index "${START_INDEX}" \
+      --target-total "${STAGED_TARGET_TOTAL:-0}" \
+      --total-test "${STAGED_TOTAL_TEST:-0}" \
+      --stage-index "${stage_idx}" \
+      --stage-start "${stage_start}" \
+      --stage-end "${stage_end}" \
+      --event "${event}" \
+      --phase "${phase}" \
+      --status "${status}" \
+      --models "${models[@]}" \
+      --log "${log_path}"
+  } 2>&1 | tee -a "${manifest_log}"
+  rc=${PIPESTATUS[0]}
+  set -e
+  return "${rc}"
 }
 
 ebm_source_candidates() {
@@ -961,7 +1066,7 @@ try_materialize_ebm_view() {
     return 1
   fi
   run_cmd_log_allow_fail "${LOG_NAME_PREFIX}ebm_materialize" \
-    "${REPORT_PYTHON}" -m openebm.elm.scripts.sudoku_compare.staged_eval materialize-ebm \
+    "${REPORT_PYTHON}" "${STAGED_EVAL_PY}" materialize-ebm \
     --source-dirs "${candidates[@]}" \
     --out-dir "${EBM_OUT_DIR}" \
     --start-index "${START_INDEX}" \
@@ -980,7 +1085,7 @@ run_stage_reports() {
   local -a order=()
   read -r -a order <<< "${STAGE_MODEL_ORDER:-${SMALL_MODELS} ${QWEN27_MODEL} ${R1_MODEL} EBM}"
   run_cmd_log "${LOG_NAME_PREFIX}stage_report" \
-    "${REPORT_PYTHON}" -m openebm.elm.scripts.sudoku_compare.staged_eval report \
+    "${REPORT_PYTHON}" "${STAGED_EVAL_PY}" report \
     --data-dir "${DATA_DIR}" \
     --out-dir "${REPORT_OUT_DIR}" \
     --ebm-dir "${EBM_OUT_DIR}" \
@@ -1052,12 +1157,12 @@ run_staged() {
     fi
     if [[ "${RUN_LLMS}" == "1" && "${RUN_QWEN27}" == "1" ]]; then
       stage_manifest_event "${stage_idx}" "${stage_start}" "${stage_end}" start llm_qwen27 running "${QWEN27_MODEL}"
-      run_llm_group llm_qwen27 "${QWEN27_MODEL}" "${QWEN27_MAX_TOKENS}" "${QWEN27_BATCH_SIZE}" "${QWEN27_TP}" "${QWEN27_DP}" "${QWEN27_MAX_MODEL_LEN}" "${QWEN27_GPU_MEMORY_UTILIZATION}" "${QWEN27_PARALLEL_STRATEGY}" "__all__" "run_summary_${QWEN27_MODEL}.json"
+      run_llm_group llm_qwen27 "${QWEN27_MODEL}" "${QWEN27_MAX_TOKENS}" "${QWEN27_BATCH_SIZE}" "${QWEN27_TP}" "${QWEN27_DP}" "${QWEN27_MAX_MODEL_LEN}" "${QWEN27_GPU_MEMORY_UTILIZATION}" "${QWEN27_PARALLEL_STRATEGY}" "__all__" "run_summary_${QWEN27_MODEL}.json" "${QWEN27_ATTENTION_BACKEND}" "${QWEN27_STRUCTURED_REGEX}" "${QWEN27_ANSWER_FORMAT}"
       stage_manifest_event "${stage_idx}" "${stage_start}" "${stage_end}" finish llm_qwen27 success "${QWEN27_MODEL}"
     fi
     if [[ "${RUN_LLMS}" == "1" && "${RUN_R1}" == "1" ]]; then
       stage_manifest_event "${stage_idx}" "${stage_start}" "${stage_end}" start llm_r1 running "${R1_MODEL}"
-      run_llm_group llm_r1 "${R1_MODEL}" "${R1_MAX_TOKENS}" "${R1_BATCH_SIZE}" "${R1_TP}" "${R1_DP}" "${R1_MAX_MODEL_LEN}" "${R1_GPU_MEMORY_UTILIZATION}" "${R1_PARALLEL_STRATEGY}" "__all__" "run_summary_${R1_MODEL}.json"
+      run_llm_group llm_r1 "${R1_MODEL}" "${R1_MAX_TOKENS}" "${R1_BATCH_SIZE}" "${R1_TP}" "${R1_DP}" "${R1_MAX_MODEL_LEN}" "${R1_GPU_MEMORY_UTILIZATION}" "${R1_PARALLEL_STRATEGY}" "__all__" "run_summary_${R1_MODEL}.json" "${R1_ATTENTION_BACKEND}" "${R1_STRUCTURED_REGEX}" "${R1_ANSWER_FORMAT}"
       stage_manifest_event "${stage_idx}" "${stage_start}" "${stage_end}" finish llm_r1 success "${R1_MODEL}"
     fi
 
@@ -1091,6 +1196,10 @@ echo "[run_all_sudoku_compare] stage_size=${STAGE_SIZE} num_samples=${NUM_SAMPLE
 echo "[run_all_sudoku_compare] small strategy=${SMALL_PARALLEL_STRATEGY} max_tokens=${SMALL_MAX_TOKENS} batch=${SMALL_BATCH_SIZE} tp=${SMALL_TP} dp=${SMALL_DP}"
 echo "[run_all_sudoku_compare] qwen27 strategy=${QWEN27_PARALLEL_STRATEGY} max_tokens=${QWEN27_MAX_TOKENS} batch=${QWEN27_BATCH_SIZE} tp=${QWEN27_TP} dp=${QWEN27_DP}"
 echo "[run_all_sudoku_compare] r1 strategy=${R1_PARALLEL_STRATEGY} max_tokens=${R1_MAX_TOKENS} batch=${R1_BATCH_SIZE} tp=${R1_TP} dp=${R1_DP}"
+echo "[run_all_sudoku_compare] attention backends: small=${SMALL_ATTENTION_BACKEND} qwen27=${QWEN27_ATTENTION_BACKEND} r1=${R1_ATTENTION_BACKEND}"
+echo "[run_all_sudoku_compare] answer format: small=${SMALL_ANSWER_FORMAT} qwen27=${QWEN27_ANSWER_FORMAT} r1=${R1_ANSWER_FORMAT}"
+echo "[run_all_sudoku_compare] structured regex: small=${SMALL_STRUCTURED_REGEX:-<none>} qwen27=${QWEN27_STRUCTURED_REGEX:-<none>} r1=${R1_STRUCTURED_REGEX:-<none>}"
+verify_sudoku_compare_helpers
 repair_setuptools_if_needed "${LLM_PYTHON}"
 if [[ "${VERIFY_ENV}" == "1" && "${DRY_RUN}" != "1" ]]; then
   verify_python_env ebm "${EBM_PYTHON}"

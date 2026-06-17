@@ -98,11 +98,12 @@ DISTRIBUTED_EXECUTOR_BACKEND="${DISTRIBUTED_EXECUTOR_BACKEND:-}"
 DRY_RUN="${DRY_RUN:-0}"
 VERIFY_ENV="${VERIFY_ENV:-1}"
 
-# Use FlashInfer by default. The local flashinfer-python/flashinfer-cubin wheels
-# are release-compatible but may differ by a .post suffix, and FlashInfer's
-# strict import check treats that as a mismatch, so keep the bypass on by
-# default for this shared env.
+# Use FlashInfer by default for non-MLA models. DeepSeek-R1 uses MLA attention,
+# so it must not inherit the generic non-MLA FLASHINFER backend.
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-${VLLM_ATTENTION_BACKEND:-FLASHINFER}}"
+SMALL_ATTENTION_BACKEND="${SMALL_ATTENTION_BACKEND:-${ATTENTION_BACKEND}}"
+QWEN27_ATTENTION_BACKEND="${QWEN27_ATTENTION_BACKEND:-${ATTENTION_BACKEND}}"
+R1_ATTENTION_BACKEND="${R1_ATTENTION_BACKEND:-${DEEPSEEK_ATTENTION_BACKEND:-auto}}"
 export ATTENTION_BACKEND
 unset VLLM_ATTENTION_BACKEND
 export FLASHINFER_DISABLE_VERSION_CHECK="${FLASHINFER_DISABLE_VERSION_CHECK:-1}"
@@ -209,7 +210,9 @@ else
 fi
 R1_DP="${R1_DP:-1}"
 R1_MAX_MODEL_LEN="${R1_MAX_MODEL_LEN:-32768}"
-R1_GPU_MEMORY_UTILIZATION="${R1_GPU_MEMORY_UTILIZATION:-0.95}"
+# Keep headroom for DeepSeek-R1 warmup/all-reduce buffers after FP8 weights
+# and KV cache are allocated.
+R1_GPU_MEMORY_UTILIZATION="${R1_GPU_MEMORY_UTILIZATION:-0.85}"
 R1_PARALLEL_STRATEGY="${R1_PARALLEL_STRATEGY:-tensor_parallel_smoke}"
 
 if [[ "${GPU_COUNT}" -gt 0 ]]; then
@@ -263,6 +266,9 @@ write_run_metadata() {
     echo "R1_TP=${R1_TP}"
     echo "R1_DP=${R1_DP}"
     echo "R1_PARALLEL_STRATEGY=${R1_PARALLEL_STRATEGY}"
+    echo "SMALL_ATTENTION_BACKEND=${SMALL_ATTENTION_BACKEND}"
+    echo "QWEN27_ATTENTION_BACKEND=${QWEN27_ATTENTION_BACKEND}"
+    echo "R1_ATTENTION_BACKEND=${R1_ATTENTION_BACKEND}"
     echo "LLM_BACKEND=${LLM_BACKEND}"
     echo "ENFORCE_EAGER=${ENFORCE_EAGER}"
     echo "DISTRIBUTED_EXECUTOR_BACKEND=${DISTRIBUTED_EXECUTOR_BACKEND}"
@@ -389,6 +395,7 @@ run_cmd_log() {
 
 append_common_args() {
   local -n out_ref=$1
+  local attention_backend="${2:-${ATTENTION_BACKEND}}"
   out_ref+=(
     --data-dir "${DATA_DIR}"
     --out-dir "${OUT_DIR}"
@@ -417,8 +424,8 @@ append_common_args() {
   if [[ "${LLM_BACKEND}" == "vllm" && "${ENFORCE_EAGER}" == "1" ]]; then
     out_ref+=(--enforce-eager)
   fi
-  if [[ "${LLM_BACKEND}" == "vllm" && -n "${ATTENTION_BACKEND:-}" ]]; then
-    out_ref+=(--attention-backend "${ATTENTION_BACKEND}")
+  if [[ "${LLM_BACKEND}" == "vllm" && -n "${attention_backend:-}" ]]; then
+    out_ref+=(--attention-backend "${attention_backend}")
   fi
   if [[ "${LLM_BACKEND}" == "vllm" && -n "${DISTRIBUTED_EXECUTOR_BACKEND:-}" ]]; then
     out_ref+=(--distributed-executor-backend "${DISTRIBUTED_EXECUTOR_BACKEND}")
@@ -435,12 +442,13 @@ run_model_group() {
   local max_model_len="$7"
   local gpu_memory_utilization="$8"
   local parallel_strategy="$9"
+  local attention_backend="${10:-${ATTENTION_BACKEND}}"
 
   read -r -a model_array <<< "${models_string}"
   local cmd=("${PYTHON_BIN}" -m openebm.elm.scripts.sudoku_compare.eval_llm_sudoku)
   cmd+=(--models "${model_array[@]}")
   cmd+=(--run-summary-name "run_summary_${log_name}.json")
-  append_common_args cmd
+  append_common_args cmd "${attention_backend}"
   cmd+=(
     --max-tokens "${max_tokens}"
     --batch-size "${batch_size}"
@@ -466,19 +474,20 @@ echo "[smoke_one_sample_each_llm] gpu_count=${GPU_COUNT} gpu_ids=${GPU_IDS:-<non
 echo "[smoke_one_sample_each_llm] small strategy=${SMALL_PARALLEL_STRATEGY} max_tokens=${SMALL_MAX_TOKENS} batch=${SMALL_BATCH_SIZE} tp=${SMALL_TP} dp=${SMALL_DP}"
 echo "[smoke_one_sample_each_llm] qwen27 strategy=${QWEN27_PARALLEL_STRATEGY} max_tokens=${QWEN27_MAX_TOKENS} batch=${QWEN27_BATCH_SIZE} tp=${QWEN27_TP} dp=${QWEN27_DP}"
 echo "[smoke_one_sample_each_llm] r1 strategy=${R1_PARALLEL_STRATEGY} max_tokens=${R1_MAX_TOKENS} batch=${R1_BATCH_SIZE} tp=${R1_TP} dp=${R1_DP}"
+echo "[smoke_one_sample_each_llm] attention backends: small=${SMALL_ATTENTION_BACKEND} qwen27=${QWEN27_ATTENTION_BACKEND} r1=${R1_ATTENTION_BACKEND}"
 verify_env
 
 if [[ "${RUN_SMALL}" == "1" ]]; then
   read -r -a small_model_array <<< "${SMALL_MODELS}"
   for model in "${small_model_array[@]}"; do
-    run_model_group "${model}" "${model}" "${SMALL_MAX_TOKENS}" "${SMALL_BATCH_SIZE}" "${SMALL_TP}" "${SMALL_DP}" "${SMALL_MAX_MODEL_LEN}" "${SMALL_GPU_MEMORY_UTILIZATION}" "${SMALL_PARALLEL_STRATEGY}"
+    run_model_group "${model}" "${model}" "${SMALL_MAX_TOKENS}" "${SMALL_BATCH_SIZE}" "${SMALL_TP}" "${SMALL_DP}" "${SMALL_MAX_MODEL_LEN}" "${SMALL_GPU_MEMORY_UTILIZATION}" "${SMALL_PARALLEL_STRATEGY}" "${SMALL_ATTENTION_BACKEND}"
   done
 fi
 if [[ "${RUN_QWEN27}" == "1" ]]; then
-  run_model_group "${QWEN27_MODEL}" "${QWEN27_MODEL}" "${QWEN27_MAX_TOKENS}" "${QWEN27_BATCH_SIZE}" "${QWEN27_TP}" "${QWEN27_DP}" "${QWEN27_MAX_MODEL_LEN}" "${QWEN27_GPU_MEMORY_UTILIZATION}" "${QWEN27_PARALLEL_STRATEGY}"
+  run_model_group "${QWEN27_MODEL}" "${QWEN27_MODEL}" "${QWEN27_MAX_TOKENS}" "${QWEN27_BATCH_SIZE}" "${QWEN27_TP}" "${QWEN27_DP}" "${QWEN27_MAX_MODEL_LEN}" "${QWEN27_GPU_MEMORY_UTILIZATION}" "${QWEN27_PARALLEL_STRATEGY}" "${QWEN27_ATTENTION_BACKEND}"
 fi
 if [[ "${RUN_R1}" == "1" ]]; then
-  run_model_group "${R1_MODEL}" "${R1_MODEL}" "${R1_MAX_TOKENS}" "${R1_BATCH_SIZE}" "${R1_TP}" "${R1_DP}" "${R1_MAX_MODEL_LEN}" "${R1_GPU_MEMORY_UTILIZATION}" "${R1_PARALLEL_STRATEGY}"
+  run_model_group "${R1_MODEL}" "${R1_MODEL}" "${R1_MAX_TOKENS}" "${R1_BATCH_SIZE}" "${R1_TP}" "${R1_DP}" "${R1_MAX_MODEL_LEN}" "${R1_GPU_MEMORY_UTILIZATION}" "${R1_PARALLEL_STRATEGY}" "${R1_ATTENTION_BACKEND}"
 fi
 
 if [[ "${DRY_RUN}" != "1" ]]; then
