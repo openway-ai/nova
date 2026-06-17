@@ -21,8 +21,9 @@ rjob submit \
   --host-network=false \
   --image=registry.h.pjlab.org.cn/ailab-rlinfra-rlinfra_gpu/easyr1:lightrft-20260119 \
   --mount=gpfs://gpfs1/puyuan:/mnt/shared-storage-user/puyuan \
+  --mount=gpfs://gpfs1/luyudong:/mnt/shared-storage-user/luyudong \
   -e DISTRIBUTED_JOB=true \
   --custom-resources brainpp.cn/fuse=1 \
   --custom-resources rdma/mlnx_shared=8 \
   --custom-resources mellanox.com/mlnx_rdma=1 \
-  -- bash -exc "/mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/runs/rjob/run_ebt_1node_8gpu.sh"
+  -- bash -exc "/mnt/shared-storage-user/luyudong/nova/nova/ebt/runs/rjob/run_ebt_1node_8gpu.sh"

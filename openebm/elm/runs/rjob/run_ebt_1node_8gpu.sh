@@ -12,8 +12,8 @@
 # Conda 环境激活（仅远程集群需要，本地调试可跳过）
 if [[ -f /root/miniconda3/etc/profile.d/conda.sh ]]; then
     source /root/miniconda3/etc/profile.d/conda.sh
-    conda activate /mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt
-    export LD_LIBRARY_PATH="/mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt/lib:${LD_LIBRARY_PATH}"
+    conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
+    export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH}"
 fi
 
 ### 路径配置 ###
@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NOVA_HOME="${NOVA_HOME:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
 TRAIN_SCRIPT="${NOVA_HOME}/openebm/elm/train.py"
 
-NANOCHAT_HOME="/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
+NANOCHAT_HOME="/mnt/shared-storage-user/luyudong/nanochat"
 
 # 进入工作目录
 cd "${NOVA_HOME}"

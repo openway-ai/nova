@@ -10,8 +10,8 @@ set -euo pipefail
 if [[ -f /root/miniconda3/etc/profile.d/conda.sh ]]; then
     # shellcheck disable=SC1091
     source /root/miniconda3/etc/profile.d/conda.sh
-    conda activate /mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt
-    export LD_LIBRARY_PATH="/mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt/lib:${LD_LIBRARY_PATH:-}"
+    conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
+    export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH:-}"
 else
     echo "[launcher-direct] missing conda init: /root/miniconda3/etc/profile.d/conda.sh" >&2
     exit 1
@@ -26,7 +26,7 @@ ELM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$ELM_DIR/../.." && pwd)"
 
 export PYTHONPATH="${REPO_ROOT}/nanochat:${REPO_ROOT}:${PYTHONPATH:-}"
-export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/mnt/shared-storage-user/puyuan/code/OpenEBM/data/.cache/nanochat}"
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/mnt/shared-storage-user/luyudong/nanochat/.cache/nanochat}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 
 # ---- Run name ----
