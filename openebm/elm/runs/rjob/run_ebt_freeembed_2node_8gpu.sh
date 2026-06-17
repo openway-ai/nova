@@ -18,15 +18,17 @@
 # Conda 环境激活（仅远程集群需要，本地调试可跳过）
 if [[ -f /root/miniconda3/etc/profile.d/conda.sh ]]; then
     source /root/miniconda3/etc/profile.d/conda.sh
-    conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
-    export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH}"
+    OPENEBM_HOME_DEFAULT="/mnt/shared-storage-user/puyuan/code/OpenEBM"
+    CONDA_ENV_PATH="${CONDA_ENV_PATH:-${OPENEBM_HOME_DEFAULT}/conda_envs/ebt}"
+    conda activate "${CONDA_ENV_PATH}"
+    export LD_LIBRARY_PATH="${CONDA_ENV_PATH}/lib:${LD_LIBRARY_PATH}"
 fi
 
 ### 路径配置 ###
 # 自动推导 NOVA_HOME：基于本脚本所在位置向上 4 级到 nova 根目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NOVA_HOME="${NOVA_HOME:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
-NANOCHAT_HOME="/mnt/shared-storage-user/luyudong/nanochat"
+NANOCHAT_HOME="${NOVA_HOME}/data"
 TRAIN_SCRIPT="${NOVA_HOME}/openebm/elm/train.py"
 
 # 进入工作目录
@@ -36,14 +38,26 @@ cd "${NOVA_HOME}"
 export PYTHONPATH="${NOVA_HOME}:${PYTHONPATH}"
 
 ### 基础配置 ###
-RUN_PREFIX="s2-step1-learnablealpha-init300-freeembed-direct-2node-8gpu-bf16mixed"
+RUN_PREFIX="s2-step1-learnablealpha-init300-freeembed-direct-2node-8gpu-bf16mixed-test0617"
 
 export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
 
 ### 环境变量 ###
-HOME="${NANOCHAT_HOME}"
-export NANOCHAT_BASE_DIR="${HOME}/.cache/nanochat"
+HOME="${NOVA_HOME}"
+export NANOCHAT_BASE_DIR="${NANOCHAT_HOME}"
+export HF_HOME="${NOVA_HOME}/data/hf_home"
+export HF_DATASETS_CACHE="${NOVA_HOME}/data/hf_datasets_cache"
+
+BASE_TRAIN_DATASET="${base_train_dataset:-${BASE_TRAIN_DATASET:-fineweb}}"
+case "${BASE_TRAIN_DATASET}" in
+    fineweb|climbmix|dclm) ;;
+    *)
+        echo "Unsupported base_train_dataset=${BASE_TRAIN_DATASET}; expected fineweb, climbmix, or dclm" >&2
+        exit 2
+        ;;
+esac
+BASE_TRAIN_DATA_DIR="${BASE_TRAIN_DATA_DIR:-${NOVA_HOME}/data/${BASE_TRAIN_DATASET}}"
 
 # PyTorch 内存优化
 export PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.6"
@@ -246,6 +260,9 @@ echo "TF_HEAD_LAYERS: ${TF_HEAD_LAYERS}"
 echo "TF_HEAD_N_HEADS: ${TF_HEAD_N_HEADS}"
 echo "TF_HEAD_FFN_MULT: ${TF_HEAD_FFN_MULT}"
 echo "FREE_EMBED_NOISE_SCALE: ${FREE_EMBED_NOISE_SCALE}"
+echo "BASE_TRAIN_DATASET: ${BASE_TRAIN_DATASET}"
+echo "BASE_TRAIN_DATA_DIR: ${BASE_TRAIN_DATA_DIR}"
+echo "NANOCHAT_BASE_DIR: ${NANOCHAT_BASE_DIR}"
 
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
@@ -293,6 +310,8 @@ torchrun \
   --warm_up_base_lr_divider "${WARM_UP_BASE_LR_DIVIDER}" \
   \
   --dataset_name "nanochat" \
+  --base_train_dataset "${BASE_TRAIN_DATASET}" \
+  --base_train_data_dir "${BASE_TRAIN_DATA_DIR}" \
   --val_check_interval "${VAL_CHECK_INTERVAL}" \
   --limit_val_batches "${LIMIT_VAL_BATCHES}" \
   --val_sanity 1 \
