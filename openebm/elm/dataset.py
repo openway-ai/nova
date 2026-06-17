@@ -23,6 +23,8 @@ class IterableDataset(_IterableDataset):
         max_iter,
         device="cuda",
         resume_state_dict=None,
+        base_train_dataset="fineweb",
+        base_train_data_dir=None,
     ):
         super().__init__()
 
@@ -33,6 +35,8 @@ class IterableDataset(_IterableDataset):
         self.max_iter = max_iter
         self.device = device
         self.resume_state_dict = resume_state_dict
+        self.base_train_dataset = base_train_dataset
+        self.base_train_data_dir = base_train_data_dir
         self.batch_idx = 0
         self.last_state_dict = None  # 最新的 dataloader 位置，用于 checkpoint 恢复
         self._stateful_loader = None  # holds StatefulBestFitDataLoader instance
@@ -45,6 +49,8 @@ class IterableDataset(_IterableDataset):
             split=self.split,
             device=self.device,
             resume_state_dict=self.resume_state_dict,
+            dataset_name=self.base_train_dataset,
+            data_dir=self.base_train_data_dir,
         )
         for inputs, targets, state_dict in self._stateful_loader:
             self.last_state_dict = state_dict
@@ -60,7 +66,17 @@ class IterableDataset(_IterableDataset):
         return self.max_iter
 
 
-def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device, resume_state_dict=None):
+def generate_dataloader(
+    tokenizer,
+    batch_size,
+    max_len,
+    max_iter,
+    split,
+    device,
+    resume_state_dict=None,
+    base_train_dataset="fineweb",
+    base_train_data_dir=None,
+):
 
     dataset = IterableDataset(
         tokenizer=tokenizer,
@@ -70,6 +86,8 @@ def generate_dataloader(tokenizer, batch_size, max_len, max_iter, split, device,
         max_iter=max_iter,
         device=device,
         resume_state_dict=resume_state_dict,
+        base_train_dataset=base_train_dataset,
+        base_train_data_dir=base_train_data_dir,
     )
 
     dataloader = DataLoader(

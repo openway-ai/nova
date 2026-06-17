@@ -3,7 +3,7 @@ import torch
 from openebm.elm.dataset_sft import _build_sft_inputs_and_targets
 
 # Validation on 2026-06-02: this helper-level SFT mask test passed via direct
-# function invocation in /mnt/shared-storage-user/luyudong/conda_envs/ebt/bin/python
+# function invocation in /mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt/bin/python
 # and printed targeted_tests_ok. Full SFTDataLoader smoke testing was not used
 # for this lightweight check because it initializes NanoChat/HF task mixtures
 # and currently tries to create a dataset cache lock in the shared offline data

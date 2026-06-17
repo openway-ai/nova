@@ -26,8 +26,8 @@ TRAIN_SCRIPT="${NOVA_HOME}/openebm/elm/train.py"
 
 if [[ -f /root/miniconda3/etc/profile.d/conda.sh ]]; then
     source /root/miniconda3/etc/profile.d/conda.sh
-    conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
-    export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH}"
+    conda activate /mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt
+    export LD_LIBRARY_PATH="/mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt/lib:${LD_LIBRARY_PATH}"
 fi
 
 cd "${NOVA_HOME}"
@@ -49,13 +49,13 @@ export MODEL_SIZE="d26"
 ################################################################################
 
 # Keep this explicit to avoid accidentally SFT-ing from a different base checkpoint.
-PRETRAIN_CKPT="/mnt/shared-storage-user/luyudong/nova/logs/checkpoints/s2-fixedalpha397-2node-8gpu-bf16mixed_0522_0702_d26_ctx2048_bs512_lr0.0012_2nodes_8gpus/s=step=6999-d26-ctx2048-lr0.0012-bs1x32-muon_adamw-valid_loss=valid_loss=2.5550.ckpt"
+PRETRAIN_CKPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/checkpoints/s2-fixedalpha397-2node-8gpu-bf16mixed_0522_0702_d26_ctx2048_bs512_lr0.0012_2nodes_8gpus/s=step=6999-d26-ctx2048-lr0.0012-bs1x32-muon_adamw-valid_loss=valid_loss=2.5550.ckpt"
 
 ################################################################################
 # Environment
 ################################################################################
 
-HOME="/mnt/shared-storage-user/luyudong/nanochat"
+HOME="/mnt/shared-storage-user/puyuan/code/OpenEBM/data"
 export NANOCHAT_BASE_DIR="${HOME}/.cache/nanochat"
 export NANOCHAT_SFT_DATA_DIR="${NANOCHAT_SFT_DATA_DIR:-/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/sft_data}"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"

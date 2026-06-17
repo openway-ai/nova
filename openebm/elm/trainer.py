@@ -1927,6 +1927,9 @@ class ModelTrainer(LightningModule):
     def  train_dataloader(self):
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
+        base_train_dataset = getattr(self.hparams, 'base_train_dataset', 'fineweb')
+        base_train_data_dir = getattr(self.hparams, 'base_train_data_dir', '')
+        base_train_data_dir = base_train_data_dir or None
 
         # 从 checkpoint 恢复的 dataloader 位置（只用一次）
         resume_state = getattr(self, '_dataloader_resume_state', None)
@@ -1967,6 +1970,8 @@ class ModelTrainer(LightningModule):
                 split="train",
                 device=self.device,
                 resume_state_dict=resume_state,
+                base_train_dataset=base_train_dataset,
+                base_train_data_dir=base_train_data_dir,
             )
         return train_dataloader
 
@@ -1980,6 +1985,9 @@ class ModelTrainer(LightningModule):
 
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
+        base_train_dataset = getattr(self.hparams, 'base_train_dataset', 'fineweb')
+        base_train_data_dir = getattr(self.hparams, 'base_train_data_dir', '')
+        base_train_data_dir = base_train_data_dir or None
 
         if getattr(self.hparams, 'dataset_name', 'nanochat') == 'nanochat_sft':
             _sft_trainer_debug(
@@ -2014,6 +2022,8 @@ class ModelTrainer(LightningModule):
                 split="val",
                 device=self.device,
                 resume_state_dict=None,
+                base_train_dataset=base_train_dataset,
+                base_train_data_dir=base_train_data_dir,
             )
 
         return val_dataloader

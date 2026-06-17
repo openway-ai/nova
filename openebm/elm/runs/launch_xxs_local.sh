@@ -20,8 +20,8 @@ set -euo pipefail
 # Activate by absolute path; works whether the user has their own miniconda or not.
 # shellcheck disable=SC1091
 source /mnt/shared-storage-user/lixueyan/miniconda3/etc/profile.d/conda.sh
-conda activate /mnt/shared-storage-user/luyudong/conda_envs/ebt
-export LD_LIBRARY_PATH="/mnt/shared-storage-user/luyudong/conda_envs/ebt/lib:${LD_LIBRARY_PATH:-}"
+conda activate /mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt
+export LD_LIBRARY_PATH="/mnt/shared-storage-user/puyuan/code/OpenEBM/conda_envs/ebt/lib:${LD_LIBRARY_PATH:-}"
 
 # ---- WandB offline ----
 export WANDB_MODE=offline
