@@ -6,7 +6,11 @@ SFT 可通过 cleanup_on_low_space=False 禁止自动清理。
 import os
 import shutil
 from pathlib import Path
-from lightning.pytorch.callbacks import ModelCheckpoint
+
+try:
+    from lightning.pytorch.callbacks import ModelCheckpoint
+except ImportError:
+    from pytorch_lightning.callbacks import ModelCheckpoint
 
 
 class DiskAwareCheckpoint(ModelCheckpoint):

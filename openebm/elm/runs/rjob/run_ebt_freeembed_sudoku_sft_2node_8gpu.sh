@@ -11,13 +11,29 @@
 
 set -e
 
+OPENEBM_HOME_DEFAULT="/mnt/shared-storage-user/puyuan/code/OpenEBM"
+CONDA_ENV_PATH="${CONDA_ENV_PATH:-/mnt/shared-storage-user/puyuan/conda_envs/nanochat}"
+PYTHON_BIN="${PYTHON_BIN:-${CONDA_ENV_PATH}/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV_PATH}/bin/torchrun}"
+
 if [[ -f /root/miniconda3/etc/profile.d/conda.sh ]]; then
     source /root/miniconda3/etc/profile.d/conda.sh
-    OPENEBM_HOME_DEFAULT="/mnt/shared-storage-user/puyuan/code/OpenEBM"
-    CONDA_ENV_PATH="${CONDA_ENV_PATH:-${OPENEBM_HOME_DEFAULT}/conda_envs/ebt}"
-    conda activate "${CONDA_ENV_PATH}"
-    export LD_LIBRARY_PATH="${CONDA_ENV_PATH}/lib:${LD_LIBRARY_PATH:-}"
+    if ! conda activate "${CONDA_ENV_PATH}"; then
+        echo "Warning: conda activate failed for ${CONDA_ENV_PATH}; continuing with explicit python/torchrun paths." >&2
+    fi
 fi
+
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+    echo "Python not found or not executable: ${PYTHON_BIN}" >&2
+    exit 1
+fi
+if [[ ! -x "${TORCHRUN_BIN}" ]]; then
+    echo "torchrun not found or not executable: ${TORCHRUN_BIN}" >&2
+    exit 1
+fi
+
+export PATH="${CONDA_ENV_PATH}/bin:${PATH}"
+export LD_LIBRARY_PATH="${CONDA_ENV_PATH}/lib:${LD_LIBRARY_PATH:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NOVA_HOME="${NOVA_HOME:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
@@ -32,8 +48,10 @@ export NANOCHAT_BASE_DIR="${NOVA_HOME}/data"
 export NANOCHAT_SFT_DATA_DIR="${NOVA_HOME}/data/sft_data"
 export HF_HOME="${NOVA_HOME}/data/hf_home"
 export HF_DATASETS_CACHE="${NOVA_HOME}/data/hf_datasets_cache"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.6}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
+mkdir -p "${MPLCONFIGDIR}"
 
 # GPU workers are offline. All datasets/checkpoints must already be visible on
 # shared storage before this script starts.
@@ -204,6 +222,9 @@ echo "NANOCHAT_BASE_DIR:     ${NANOCHAT_BASE_DIR}"
 echo "NANOCHAT_SFT_DATA_DIR: ${NANOCHAT_SFT_DATA_DIR}"
 echo "SUDOKU_DATA_DIR_V2:    ${SUDOKU_DATA_DIR_V2}"
 echo "PRETRAIN_CKPT:         ${PRETRAIN_CKPT}"
+echo "CONDA_ENV_PATH:        ${CONDA_ENV_PATH}"
+echo "PYTHON_BIN:            ${PYTHON_BIN}"
+echo "TORCHRUN_BIN:          ${TORCHRUN_BIN}"
 echo "EXP_DIR:               ${EXP_DIR}"
 echo "EXP_CKPT_DIR:          ${EXP_CKPT_DIR}"
 echo "LOG_FILE:              ${LOG_FILE}"
@@ -220,6 +241,26 @@ if [[ ! -f "${PRETRAIN_CKPT}" ]]; then
     echo "Checkpoint not found: ${PRETRAIN_CKPT}" >&2
     exit 1
 fi
+
+"${PYTHON_BIN}" - <<'PY_PREFLIGHT'
+import sys
+import torch
+import wandb
+
+try:
+    import lightning as pl
+    pl_name = "lightning"
+except ImportError:
+    import pytorch_lightning as pl
+    pl_name = "pytorch_lightning"
+
+import openebm.elm.train
+
+print(
+    f"Python preflight ok: {sys.executable} | "
+    f"torch={torch.__version__} | {pl_name}={pl.__version__}"
+)
+PY_PREFLIGHT
 
 echo ""
 echo "=== Training config ==="
@@ -244,7 +285,7 @@ export NCCL_IB_RETRY_CNT="${NCCL_IB_RETRY_CNT:-20}"
 
 set +e
 
-torchrun \
+"${TORCHRUN_BIN}" \
   --nnodes="${NUM_NODES}" \
   --nproc_per_node="${GPUS_PER_NODE}" \
   --rdzv_backend=c10d \
