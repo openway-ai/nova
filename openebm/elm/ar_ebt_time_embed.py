@@ -391,6 +391,9 @@ class Attention(nn.Module):
         self.time_offset = 2 if args.use_mcmc_time_embed else 1
         self.rope_use_complex_fp32 = getattr(args, 'float_precision', '') != "bf16-true"
         self.use_sdpa_attention = args.use_sdpa_attention
+        # Keep the persisted buffer shape compatible with older checkpoints.
+        # Full-window or shifted layouts that need more positions are handled
+        # dynamically in forward below.
         self.register_buffer('superdiag_rows', torch.arange(args.max_seq_len - 1))
         self.register_buffer('superdiag_cols', torch.arange(self.time_offset, args.max_seq_len + self.time_offset - 1))
         # self.wq = ColumnParallelLinear(
@@ -579,8 +582,16 @@ class Attention(nn.Module):
             # bs, n, s-1 ; this calcs attn score of next preds with themselves, is like grabbing diag of matmul
             
             seq_len_minus_1 = scores_p.shape[2]
-            superdiag_rows = self.superdiag_rows[:seq_len_minus_1]
-            superdiag_cols = self.superdiag_cols[:seq_len_minus_1]
+            if seq_len_minus_1 <= self.superdiag_rows.numel():
+                superdiag_rows = self.superdiag_rows[:seq_len_minus_1]
+                superdiag_cols = self.superdiag_cols[:seq_len_minus_1]
+            else:
+                superdiag_rows = torch.arange(seq_len_minus_1, device=scores_p.device)
+                superdiag_cols = torch.arange(
+                    self.time_offset,
+                    self.time_offset + seq_len_minus_1,
+                    device=scores_p.device,
+                )
       
             # first remove superdiagonal values so doesnt use attention to future tokens--prevents leakage of probability mass
             zero_superdiag = torch.zeros_like(insertion_superdiagonal, dtype=scores_p.dtype, device=scores_p.device) # for zeroing out superdiag since dont want to include in matmul, do this in differentiable way
@@ -821,8 +832,10 @@ class EBTTimeConcat(nn.Module):
         else:
             raise ValueError(f"Invalid ebt_norm value: {params.ebt_norm}")
 
+        # Candidate tokens use the next-token RoPE slot (pos t+1). Allocate one
+        # extra position so a full context window can still rotate candidates.
         freqs_cos, freqs_sin = precompute_freqs_cis(
-            self.params.dim // self.params.n_heads, self.params.max_seq_len
+            self.params.dim // self.params.n_heads, self.params.max_seq_len + 1
         )
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
@@ -874,7 +887,8 @@ class EBTTimeConcat(nn.Module):
             seqlen = (seqlen+3) // 2 # passed in seqlen is 2(S-1)+1+1(time) so add 3 div 2 = S+1
         else:
             seqlen = (seqlen+2) // 2 # passed in seqlen is 2(S-1) so add 2 div 2 = S
-        # 动态扩展 freqs_cos/freqs_sin 如果需要的长度超过预计算的长度
+        # `seqlen` is derived from the interleaved real/candidate layout and
+        # already includes the candidate next-token RoPE slot.
         required_length = start_pos + seqlen
         if required_length > self.freqs_cos.shape[0]:
             new_cos, new_sin = precompute_freqs_cis(

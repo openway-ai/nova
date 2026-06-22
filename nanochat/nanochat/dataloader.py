@@ -181,6 +181,14 @@ class StatefulBestFitDataLoader:
         rg = pf.read_row_group(rg_idx)
         return rg.column('text').to_pylist()
 
+    def _rank_row_group_start(self, num_row_groups):
+        """Return this rank's first row group, wrapping when shards are tiny."""
+        return self._ddp_rank % num_row_groups
+
+    def _row_group_stride(self, num_row_groups):
+        """Stride over row groups without leaving high ranks data-starved."""
+        return min(self._ddp_world_size, num_row_groups)
+
     def _doc_batch_iter(self):
         """
         Infinite iterator yielding (text_batch, pq_idx, rg_idx, epoch).
@@ -199,6 +207,10 @@ class StatefulBestFitDataLoader:
             while pq_idx < len(self._parquet_paths):
                 filepath = self._parquet_paths[pq_idx]
                 pf = pq.ParquetFile(filepath)
+                if pf.num_row_groups == 0:
+                    pq_idx += 1
+                    continue
+                rg_stride = self._row_group_stride(pf.num_row_groups)
 
                 # Determine starting rg_idx
                 if first_pass and pq_idx == self.next_pq_idx:
@@ -210,16 +222,21 @@ class StatefulBestFitDataLoader:
                             base_idx += 1
                             rg_idx = base_idx * self._ddp_world_size + self._ddp_rank
                             if rg_idx >= pf.num_row_groups:
-                                pq_idx += 1
-                                continue
+                                if pf.num_row_groups < self._ddp_world_size:
+                                    rg_idx = self._rank_row_group_start(pf.num_row_groups)
+                                else:
+                                    pq_idx += 1
+                                    continue
                             self._legacy_rg_idx = None
                         else:
-                            rg_idx = self._ddp_rank
+                            rg_idx = self._rank_row_group_start(pf.num_row_groups)
                     else:
                         # Exact resume: start at saved rg_idx
                         rg_idx = self.next_rg_idx
+                        if rg_idx >= pf.num_row_groups:
+                            rg_idx = self._rank_row_group_start(pf.num_row_groups)
                 else:
-                    rg_idx = self._ddp_rank
+                    rg_idx = self._rank_row_group_start(pf.num_row_groups)
 
                 skip_doc_batches = self.next_doc_batch_index if (first_pass and pq_idx == self.next_pq_idx and rg_idx == self.next_rg_idx) else 0
 
@@ -240,7 +257,7 @@ class StatefulBestFitDataLoader:
                         self.next_epoch = epoch
                         self.next_doc_batch_index = doc_batch_index
                         yield text_sub, pq_idx, rg_idx, epoch
-                    rg_idx += self._ddp_world_size
+                    rg_idx += rg_stride
                 pq_idx += 1
             first_pass = False
             epoch += 1
