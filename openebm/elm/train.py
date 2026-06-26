@@ -34,7 +34,7 @@ except ImportError:
     from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 from openebm.elm import logger as text_logger
-from openebm.elm.disk_aware_checkpoint import DiskAwareCheckpoint
+from openebm.elm.disk_aware_checkpoint import DiskAwareCheckpoint, DiskAwareFinalCheckpoint
 from openebm.elm.eval import nlp_eval_acc
 from openebm.elm.trainer import ModelTrainer
 from openebm.elm.utils import init_wandb_watch, model_sizes
@@ -110,18 +110,32 @@ def _estimate_checkpoint_size_gib(args, ckpt_dir, model_trainer):
     return estimated_gib, "estimated from model state_dict"
 
 
-def _planned_checkpoint_slots(args, save_last):
+def _final_checkpoint_enabled(args):
+    return args.save_top_k_ckpts != 0 and not args.disable_final_checkpoint
+
+
+def _effective_top_k(args, final_checkpoint_enabled):
+    if final_checkpoint_enabled and args.save_top_k_ckpts > 0:
+        return max(args.save_top_k_ckpts - 1, 0)
+    return args.save_top_k_ckpts
+
+
+def _planned_checkpoint_slots(args, save_last, final_checkpoint_enabled, effective_top_k):
     slots = 0
     details = []
     warnings = []
 
-    if args.save_top_k_ckpts == -1:
+    if effective_top_k == -1:
         slots += 1
         details.append("top_k=all (preflight lower bound: 1)")
         warnings.append("save_top_k_ckpts=-1 is unbounded, so exact checkpoint capacity cannot be guaranteed.")
-    elif args.save_top_k_ckpts > 0:
-        slots += args.save_top_k_ckpts
-        details.append(f"top_k={args.save_top_k_ckpts}")
+    elif effective_top_k > 0:
+        slots += effective_top_k
+        details.append(f"top_k={effective_top_k}")
+
+    if final_checkpoint_enabled:
+        slots += 1
+        details.append("final=1")
 
     if save_last:
         slots += 1
@@ -134,11 +148,24 @@ def _planned_checkpoint_slots(args, save_last):
     return slots, details, warnings
 
 
-def preflight_checkpoint_disk(args, ckpt_dir, save_last, model_trainer, is_rank_zero_process):
+def preflight_checkpoint_disk(
+    args,
+    ckpt_dir,
+    save_last,
+    model_trainer,
+    is_rank_zero_process,
+    final_checkpoint_enabled,
+    effective_top_k,
+):
     if args.only_test:
         return
 
-    checkpoint_slots, slot_details, warnings = _planned_checkpoint_slots(args, save_last)
+    checkpoint_slots, slot_details, warnings = _planned_checkpoint_slots(
+        args,
+        save_last,
+        final_checkpoint_enabled,
+        effective_top_k,
+    )
     if checkpoint_slots <= 0:
         return
 
@@ -333,11 +360,25 @@ def main(args):
     opt_name = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
     ckpt_dir = args.checkpoint_dir if args.checkpoint_dir else f"./logs/checkpoints/{args.run_name}"
     checkpoint_filename = f"s={{step}}-{args.model_size}-ctx{args.context_length}-lr{args.peak_learning_rate}-bs{args.batch_size_per_device}x{args.accumulate_grad_batches}-{opt_name}-{args.checkpoint_monitor_string}={{{args.checkpoint_monitor_string}:.4f}}"
-    save_last = (args.save_periodic_steps <= 0 and args.save_top_k_ckpts != 0)  # save_top_k=0 means no checkpoint files
+    final_checkpoint_enabled = _final_checkpoint_enabled(args)
+    effective_top_k = _effective_top_k(args, final_checkpoint_enabled)
+    save_last = (
+        not final_checkpoint_enabled
+        and args.save_periodic_steps <= 0
+        and args.save_top_k_ckpts != 0
+    )  # save_top_k=0 means no checkpoint files
     checkpoint_cleanup_on_low_space = not args.disable_checkpoint_cleanup_on_low_space
     if args.checkpoint_preflight_required:
-        preflight_checkpoint_disk(args, ckpt_dir, save_last, model_trainer, is_rank_zero_process)
-    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=args.save_top_k_ckpts, save_last = save_last, dirpath=ckpt_dir, filename=checkpoint_filename, verbose=True, min_free_gb=args.checkpoint_min_free_gb, cleanup_on_low_space=checkpoint_cleanup_on_low_space)
+        preflight_checkpoint_disk(
+            args,
+            ckpt_dir,
+            save_last,
+            model_trainer,
+            is_rank_zero_process,
+            final_checkpoint_enabled,
+            effective_top_k,
+        )
+    checkpoint_callback = DiskAwareCheckpoint(monitor=args.checkpoint_monitor_string, mode = args.checkpoint_monitor_mode, save_top_k=effective_top_k, save_last = save_last, dirpath=ckpt_dir, filename=checkpoint_filename, verbose=True, min_free_gb=args.checkpoint_min_free_gb, cleanup_on_low_space=checkpoint_cleanup_on_low_space)
 
     # 定期保存 checkpoint（不依赖 val_loss），防止 SFT 后期模型丢失
     periodic_checkpoint = None
@@ -353,24 +394,46 @@ def main(args):
             cleanup_on_low_space=checkpoint_cleanup_on_low_space
         )
 
+    final_checkpoint = None
+    if final_checkpoint_enabled:
+        final_checkpoint = DiskAwareFinalCheckpoint(
+            dirpath=ckpt_dir,
+            model_size=args.model_size,
+            context_length=args.context_length,
+            save_top_k=args.save_top_k_ckpts,
+            monitor=args.checkpoint_monitor_string,
+            mode=args.checkpoint_monitor_mode,
+            min_free_gb=args.checkpoint_min_free_gb,
+            cleanup_on_low_space=checkpoint_cleanup_on_low_space,
+        )
+
     for name, param in model_trainer.model.named_parameters():
         if not param.requires_grad:
             print(f"Non-trainable parameters: {name} with shape {param.shape}")
     
     if not args.only_test: #training and testing (if testing selected) as per usual
         print("$$$$$$$$$$  STARTED TRAINING  $$$$$$$$$$")
-        trainer = set_trainer(args, wandb_logger, checkpoint_callback, periodic_checkpoint=periodic_checkpoint)
+        trainer = set_trainer(
+            args,
+            wandb_logger,
+            checkpoint_callback,
+            periodic_checkpoint=periodic_checkpoint,
+            final_checkpoint=final_checkpoint,
+        )
         resume_training_ckpt = None if args.resume_training_ckpt == "" else args.resume_training_ckpt
         trainer.fit(model_trainer, ckpt_path=resume_training_ckpt, weights_only=False)
         
         if args.run_testing_after_training:
-            args.only_test_model_ckpt = checkpoint_callback.best_model_path
+            test_model_path = checkpoint_callback.best_model_path
+            if not test_model_path and final_checkpoint is not None:
+                test_model_path = final_checkpoint.final_model_path
+            args.only_test_model_ckpt = test_model_path
             best_model = ModelTrainer.load_from_checkpoint(
-                checkpoint_callback.best_model_path, 
+                test_model_path,
                 hparams=args
             )
             clear_cache()
-            print(f"best model path that will be used during testing {checkpoint_callback.best_model_path}")
+            print(f"model path that will be used during testing {test_model_path}")
             print("$$$$$$$$$$  STARTED TESTING AFTER TRAINING  $$$$$$$$$$")
             raise NotImplementedError("need to test this with newer PL")
             # test_trainer = L.Trainer(logger=wandb_logger,devices=1,num_nodes=1) NOTE tested this code does not work gets stuck, see thread, TODO test with newer PL
@@ -428,7 +491,7 @@ def main(args):
         else:
             raise NotImplementedError(f"no post test evaluation setup for this modality: {args.modality} yet")
 
-def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", periodic_checkpoint=None):
+def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", periodic_checkpoint=None, final_checkpoint=None):
     torch.autograd.set_detect_anomaly(args.detect_anomaly) #NOTE seems pl detect anomaly is not working so manually set it here
 
     if args.find_unused_parameters or args.distributed_strategy == "ddp":
@@ -449,7 +512,11 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
         args.val_check_interval = int(args.val_check_interval)
     # val_check_interval = args.val_check_interval if args.val_check_interval == 1.0 else args.val_check_interval * args.accumulate_grad_batches  #NOTE the reason we mult by args.accumulate_grad_batches is because of this bug https://github.com/Lightning-AI/pytorch-lightning/issues/12205
     limit_test_batches = args.limit_test_batches if args.limit_test_batches == 1 else args.limit_test_batches * args.accumulate_grad_batches
-    callbacks = [checkpoint_callback] + ([periodic_checkpoint] if periodic_checkpoint else [])
+    callbacks = [checkpoint_callback]
+    if periodic_checkpoint:
+        callbacks.append(periodic_checkpoint)
+    if final_checkpoint:
+        callbacks.append(final_checkpoint)
     if args.log_model_archi:
         callbacks.append(ModelSummary(max_depth=2))
 
@@ -1056,6 +1123,9 @@ if __name__ == '__main__':
 
     parser.add_argument("--save_periodic_steps", type=int, default=0,
         help="Save checkpoint every N training steps regardless of val_loss (0=disabled). Useful for SFT where val_loss may rise while task performance improves.")
+
+    parser.add_argument("--disable_final_checkpoint", action="store_true", default=False,
+        help="Disable saving a final checkpoint at normal train end. By default, final counts against --save_top_k_ckpts.")
 
     parser.add_argument("--checkpoint_min_free_gb", type=float, default=10.0,
         help="Minimum free disk space in GiB to reserve before saving a checkpoint.")
