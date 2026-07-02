@@ -474,3 +474,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running` | heartbeat 到 step 74；step 65 reward_mean `0.0881`，reward_std `0.0088`，step 70 reward_mean `0.1322`，reward_std `0.1024`，nan_grad_params `0` | 仍有非零 shaped reward，无崩溃；exact answer 尚未稳定提升。 |
 
 当前结论：Sudoku local skip 逻辑修复有效。下一轮继续看 step 5/10 是否正常更新，并最终验证 step 25 附近 all-zero rollout 是否被全局 skip 或局部 zero，而不再执行 KL-only 更新。
+
+### 2026-07-02 23:48 +0800
+
+第十七轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running` | 当前 train.log 最新仍为 step 0：`global_skip=False`、`skip_rank_count=1`、loss `1.59e-7`、reward_mean `1.5721`；尚未刷出 step 0 `backward_done` 或 step 5 | 未见崩溃/异常关键字；考虑到前序 run 也存在长时间反向与日志刷盘延迟，暂不判断卡死。下一轮继续看 `backward_done`、step 5，以及是否出现 NaN/RuntimeError。 |
+| GSM8K RL | `Running` | step 65 reward_mean `0.0881`、reward_std `0.0088`；step 70 reward_mean `0.1322`、reward_std `0.1024`；nan_grad_params `0` | 运行健康但 exact answer 仍未稳定提升；继续监控，不重启。 |
+
+当前结论：Sudoku 第三版仍处于运行态，local skip 首轮验证有效，但尚未产生新的 step 日志；继续等待下一轮。
