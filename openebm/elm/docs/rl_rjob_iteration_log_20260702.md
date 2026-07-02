@@ -89,3 +89,40 @@
    - 为 skip consensus 增加跨 rank reason 统计：`global_skip_reasons` 和 `global_skip_rank_count`，避免后续只看到模糊的 `ddp_consensus`。
 
 下一轮：提交修复后重新提交 Sudoku/GSM8K rjob，观察 skipped step 是否能快速进入下一步，以及全局 skip 的真实原因分布。
+
+### 2026-07-02 19:28 +0800
+
+第二轮修复提交：`db24d33 fix(rl): make skipped ddp steps cheap`。
+
+重新提交 rjob：
+
+| 任务 | exp_id | rjob metadata | 初始状态 |
+| --- | --- | --- | --- |
+| Sudoku RL | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-192731` | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-1-424ae` | `Running` |
+| GSM8K RL | `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-192741` | `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-19-22e90` | `Inqueue/STARTING` |
+
+下一轮：重点确认 Sudoku step 0 后是否能进入 step 1；若仍卡住，则说明 cheap placeholder 仍未解决 DDP skip 路径，需要进一步审查 DDP unused-parameter/optimizer hook 交互。
+
+### 2026-07-02 19:35 +0800
+
+第三轮结果：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | step 0 后停滞，已停止 | step 0 reward_mean `1.5927`，reward_std `0.4041`，unique_ratio `0.8333`；`global_skip_rank_count=1`，`global_skip_reasons=['degenerate_group_rate', 'low_reward_std']` | TF-head 与 reward 正常；问题集中在 hard skip 的 DDP 自动优化路径。 |
+| GSM8K RL | `Inqueue/STARTING`，已停止 | 尚未启动 | 跟随 Sudoku 修复后重提。 |
+
+根因更新：cheap placeholder 仍没有让 step 0 后进入 `optimizer_step_skipped` 或 step 1。说明当前 Lightning DDP automatic optimization 下，hard skip 分支本身不可靠；即使只挂一个参数，仍可能卡在 backward/DDP reducer 路径。由于 degenerate group 的 advantage 已经在 trainer 内置零，硬跳过不是当前优化版训练的必要条件。
+
+处理动作：
+
+1. 停止第三轮 rjob：
+   - Sudoku：`d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-1-424ae`。
+   - GSM8K：`d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-19-22e90`。
+2. 将优化版训练脚本的 hard skip 改为 opt-in：
+   - `SKIP_DEGENERATE_THRESHOLD=1.01`
+   - `MIN_REWARD_STD_TO_UPDATE=0.0`
+   - `MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE=0.0`
+3. 保留 skip health logging、degenerate advantage 置零、以及 `skip_consensus` 配置，后续若要重新启用 hard skip 需要先单独验证 DDP skip 路径。
+
+下一轮：提交配置修复后重启 Sudoku/GSM8K，重点确认 Sudoku 是否能在 step 0 后进入 step 1，并观察真实 loss/grad/energy 指标。

@@ -90,9 +90,12 @@ ADAMW_SCALAR_LR="${ADAMW_SCALAR_LR:--1}"                  # <=0 => LEARNING_RATE
 ADAMW_OTHER_LR="${ADAMW_OTHER_LR:--1}"                    # <=0 => LEARNING_RATE
 ADVANTAGE_NORM="${ADVANTAGE_NORM:-group_mean_global_std}"  # batch-wide std prevents tiny intra-group std blow-ups
 GLOBAL_STD_MIN="${GLOBAL_STD_MIN:-0.2}"
-SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.5}"
-MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-0.01}"
-MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.3}"
+# Hard-skipping DDP automatic optimization is fragile: skipped steps can stall
+# before the optimizer hook. Degenerate groups already get zero advantages, so
+# keep hard skip opt-in while logging all health metrics.
+SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-1.01}"
+MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-0.0}"
+MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.0}"
 SKIP_CONSENSUS="${SKIP_CONSENSUS:-any}"      # stability-first: any bad rank skips the global step
 
 # MAX_STEPS="${MAX_STEPS:-160}"                # analyzed run peaked at 60-120 and degraded around 150-190
