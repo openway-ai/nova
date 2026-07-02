@@ -658,3 +658,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 144 `training_step_start`；step 140 reward_mean `0.1496`，reward_std `0.0305`，parse_rate `1.0`，answer_acc `0.0`，grad_norm `0.033253`，nan_params `0` | 运行稳定，shaped reward 保持非零；不触发修复或重启。 |
 
 当前结论：继续跑。Sudoku 当前还不能判定已收敛，但已经不是早前 reward 全零或 ckpt 加载失败类问题；下一轮重点等待 step 50/55 的完整 reward、KL、skip_rank_count 和 grad_norm。
+
+### 2026-07-03 02:41 +0800
+
+第三十三轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 到 step 54 `skip_consensus_start`，`local_skip=0.0`，`unique_ratio=1.0`；主日志仍未补齐 step 50/55 完整指标，最新完整有效指标仍为 step 40，step 45 仍为单 rank `LOCAL_ZERO` 记录 | 训练继续推进，当前 rank 已非 skip；没有 global skip、NaN 或硬错误。由于完整指标未刷新，本轮不改变策略，继续等待后续落盘指标。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 148 `training_step_start`；最新完整指标仍为 step 140：reward_mean `0.1496`，reward_std `0.0305`，parse_rate `1.0`，answer_acc `0.0`，nan_params `0` | 运行稳定；继续观察。 |
+
+当前结论：不修复、不重启。Sudoku 的完整指标落盘继续滞后，但 heartbeat 和 rjob 状态均正常；下一轮继续等待 step 50/55 完整指标，必要时再用 rjob stdout 交叉验证。
