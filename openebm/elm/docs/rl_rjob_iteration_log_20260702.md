@@ -787,3 +787,12 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL conservative | `Running`，heartbeat 到 step 22 `generate_start` | step 15 backward 已落盘：grad_norm `2.0873`，max_grad `0.5392`，nan_params `0`。step 20 `rl_events.jsonl` 恢复强有效信号：reward_mean `1.5471`，reward_std `0.4485`，blank_accuracy `0.3591`，constraint_validity `0.2009`，full_solve `0.0`，`ref_energy_kl=7.62e-5`，unique_completion_ratio `1.0`。 | 保守重启目前有效抑制了上一轮的高 KL/高 grad 振荡：step 0/10/20 都有 blank/validity 信号，step 5/15 是 clue-only 波动，但 KL 仍很低，grad_norm 约 `2`，无 NaN/Inf。当前不重启；继续观察 step 25/30 是否保持低 KL 并周期性恢复有效 Sudoku reward。 |
 | GSM8K RL | `Running`，heartbeat 到 step 202 `training_step_start` | 最新已确认 step 199 backward：grad_norm `0.3704`，nan_grad_params `0`。 | 继续运行；不重启。 |
+
+### 2026-07-03 05:36 +0800
+
+第四十五轮异常分析与修复：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL conservative | 已停止 rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-conservati-2422b` | step 25 出现新型坏 batch：reward_mean `0.0041`，reward_std `0.0143`，format `0.0041`，clue/blank/validity/full_solve 全为 `0`，zero_frac `0.9167`，entropy `2.4063`，`ref_energy_kl=0.01653`，unique_completion_ratio `1.0`。由于 reward_std 非零且 unique ratio 正常，现有 `low_reward_std`/`degenerate_group_rate`/unique guards 没有拦截。 | 根因是 skip-degen 只覆盖零方差/重复输出，未覆盖“几乎全 malformed 但仍有微小方差”的低质量 rollout，导致高 KL 的无效更新。修复：新增默认关闭的 `min_reward_mean_to_update` 与 `min_reward_format_to_update` guard；Sudoku rjob 默认设为 `0.5` 和 `0.25`，GSM8K 默认不启用。 |
+| GSM8K RL | `Running`，heartbeat 到 step 210 `training_step_start` | 本轮不变更 GSM8K。 | 继续运行；不重启。 |

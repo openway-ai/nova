@@ -294,6 +294,10 @@ class EBMGRPOTrainer(LightningModule):
         skip_thr = getattr(self.config, "skip_degenerate_threshold", 1.01)
         min_reward_std = getattr(self.config, "min_reward_std_to_update", 0.0)
         min_unique_ratio = getattr(self.config, "min_unique_completion_ratio_to_update", 0.0)
+        min_reward_mean = getattr(self.config, "min_reward_mean_to_update", 0.0)
+        min_reward_format = getattr(self.config, "min_reward_format_to_update", 0.0)
+        reward_components = gen_data.get("reward_components", {})
+        format_score = reward_components.get("format", None)
         skip_reasons = []
         if gen_data["degenerate_rate"] > skip_thr:
             skip_reasons.append("degenerate_group_rate")
@@ -301,10 +305,24 @@ class EBMGRPOTrainer(LightningModule):
             skip_reasons.append("low_reward_std")
         if min_unique_ratio > 0.0 and unique_ratio_for_skip < min_unique_ratio:
             skip_reasons.append("low_unique_completion_ratio")
+        if min_reward_mean > 0.0 and gen_data.get("reward_mean", 0.0) < min_reward_mean:
+            skip_reasons.append("low_reward_mean")
+        if (
+            min_reward_format > 0.0
+            and format_score is not None
+            and float(format_score) < min_reward_format
+        ):
+            skip_reasons.append("low_reward_format")
         local_skip = float(bool(skip_reasons))
         import torch.distributed as dist
         consensus_t0 = time.time()
-        reason_keys = ("degenerate_group_rate", "low_reward_std", "low_unique_completion_ratio")
+        reason_keys = (
+            "degenerate_group_rate",
+            "low_reward_std",
+            "low_unique_completion_ratio",
+            "low_reward_mean",
+            "low_reward_format",
+        )
         reason_counts = torch.tensor(
             [1.0 if reason in skip_reasons else 0.0 for reason in reason_keys],
             device=self.device,

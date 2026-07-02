@@ -120,6 +120,10 @@ def parse_args():
                         help="Skip update when rollout reward std is below this value.")
     parser.add_argument("--min_unique_completion_ratio_to_update", type=float, default=0.0,
                         help="Optional diversity guard; 0 disables update skipping by unique ratio.")
+    parser.add_argument("--min_reward_mean_to_update", type=float, default=0.0,
+                        help="Optional quality guard; 0 disables update skipping by reward mean.")
+    parser.add_argument("--min_reward_format_to_update", type=float, default=0.0,
+                        help="Optional quality guard; 0 disables update skipping by format score.")
     parser.add_argument(
         "--skip_consensus",
         type=str,
@@ -305,6 +309,8 @@ def main():
         skip_degenerate_threshold=args.skip_degenerate_threshold,
         min_reward_std_to_update=args.min_reward_std_to_update,
         min_unique_completion_ratio_to_update=args.min_unique_completion_ratio_to_update,
+        min_reward_mean_to_update=args.min_reward_mean_to_update,
+        min_reward_format_to_update=args.min_reward_format_to_update,
         skip_consensus=args.skip_consensus,
         rl_optimizer=args.rl_optimizer,
         muon_lr=args.muon_lr,
