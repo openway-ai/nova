@@ -90,11 +90,11 @@ ADAMW_SCALAR_LR="${ADAMW_SCALAR_LR:--1}"                  # <=0 => LEARNING_RATE
 ADAMW_OTHER_LR="${ADAMW_OTHER_LR:--1}"                    # <=0 => LEARNING_RATE
 ADVANTAGE_NORM="${ADVANTAGE_NORM:-group_mean_global_std}"  # batch-wide std prevents tiny intra-group std blow-ups
 GLOBAL_STD_MIN="${GLOBAL_STD_MIN:-0.2}"
-# Hard-skipping DDP automatic optimization is fragile: skipped steps can stall
-# before the optimizer hook. Degenerate groups already get zero advantages, so
-# keep hard skip opt-in while logging all health metrics.
-SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-1.01}"
-MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-0.0}"
+# Skip rollout batches with no usable reward signal. The trainer returns a
+# graph-attached zero loss and clears every grad to None before optimizer.step,
+# so Muon/AdamW/weight_decay do not move parameters on skipped steps.
+SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.9}"
+MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-1e-4}"
 MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.0}"
 SKIP_CONSENSUS="${SKIP_CONSENSUS:-any}"      # stability-first: any bad rank skips the global step
 
