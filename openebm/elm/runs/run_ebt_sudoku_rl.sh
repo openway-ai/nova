@@ -71,20 +71,23 @@ CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-4e-4}"
 BETA="${BETA:-1.0}"                         # stronger anchor after zero-reward/high-KL rollout
 ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
 ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
-LEARNING_RATE="${LEARNING_RATE:-2e-7}"       # AdamW base/fallback LR; Muon matrices use MUON_LR
+# 2026-07-03 conservative restart: the 20260702-233012 fusion run repeatedly
+# oscillated from usable Sudoku reward to format/clue-only batches with high
+# pre-clip grad_norm, so shrink both AdamW and Muon update scales by default.
+LEARNING_RATE="${LEARNING_RATE:-1e-7}"       # AdamW base/fallback LR; Muon matrices use MUON_LR
 # RL_LOSS_TYPE="energy_reinforce"  # removes 1/|y| dilution
 RL_LOSS_TYPE="${RL_LOSS_TYPE:-energy_gspo}"
 
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
-MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.01}"
+MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.005}"
 WARMUP_STEPS="${WARMUP_STEPS:-20}"
 
 # ── Optimizer (v3 P0+P1+muon) ─────────────────────────────────────────────────
 # adamw      : v3 P0 multi-group AdamW (transformer/v2e/scalar/other split LR)
 # muon_adamw : Muon for transformer matrices + AdamW for the rest (matches SFT)
 RL_OPTIMIZER="${RL_OPTIMIZER:-muon_adamw}"  # SFT-validated hybrid optimizer: Muon matrices + AdamW lanes
-MUON_LR="${MUON_LR:-5e-5}"                  # Muon peak LR for transformer matrices; scheduler scales it after warmup
+MUON_LR="${MUON_LR:-1e-5}"                  # Muon peak LR for transformer matrices; scheduler scales it after warmup
 ADAMW_VOCAB_TO_EMBED_LR="${ADAMW_VOCAB_TO_EMBED_LR:--1}"  # <=0 => LEARNING_RATE * 0.5
 ADAMW_SCALAR_LR="${ADAMW_SCALAR_LR:--1}"                  # <=0 => LEARNING_RATE * 2.0
 ADAMW_OTHER_LR="${ADAMW_OTHER_LR:--1}"                    # <=0 => LEARNING_RATE

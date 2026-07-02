@@ -49,11 +49,14 @@ MAX_STEPS="${MAX_STEPS:-1000}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-100}"
 LOG_INTERVAL="${LOG_INTERVAL:-5}"
 SAVE_TOP_K="${SAVE_TOP_K:-2}"
-LEARNING_RATE="${LEARNING_RATE:-2e-7}"
-MUON_LR="${MUON_LR:-5e-5}"
+# Conservative restart defaults after the 20260702-233012 run oscillated between
+# usable blank/validity reward and format/clue-only batches with high pre-clip
+# grad_norm at steps 50/55/60/65/75.
+LEARNING_RATE="${LEARNING_RATE:-1e-7}"
+MUON_LR="${MUON_LR:-1e-5}"
 BETA="${BETA:-1.0}"
 GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
-MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.01}"
+MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.005}"
 ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
 ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
 SKIP_CONSENSUS="${SKIP_CONSENSUS:-local}"

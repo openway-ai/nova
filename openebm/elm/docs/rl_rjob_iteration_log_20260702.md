@@ -724,3 +724,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | rjob 控制面确认 `Running`；heartbeat 到 step 167 `training_step_start`。step 160 完整落盘：reward_mean `0.1772`，reward_std `0.0680`，parse_rate `1.0`，answer_acc `0.0`，`ref_energy_kl=2.53e-05`，grad_norm `0.1435`，nan_params `0` | 运行健康，shaped reward 非零；不重启。 |
 
 当前结论：继续跑一轮。Sudoku 已不是日志/同步卡死问题，而是优化振荡；下一轮根据 step75/80 是否继续恢复来决定是否进入保守重启分支。
+
+### 2026-07-03 04:01 +0800
+
+第三十九轮监控与修复：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | heartbeat 到 step 77 `generate_start`，rjob 控制面在当前沙箱内因 DNS 受限暂不能查询；本地产物仍持续更新到 03:59 | step 70 恢复有效信号：reward_mean `1.2687`，blank_accuracy `0.2037`，constraint_validity `0.1020`，`ref_energy_kl=0.004878`，grad_norm `2.5365`。step 75 再次退化为 format/clue-only：reward_mean `0.8673`，reward_std `0.0557`，blank_accuracy/constraint_validity/full_solve 均为 `0`，`ref_energy_kl=0.0080`，`skip_rank_count=1/8`。此前 step 50/55 也出现同类退化，step 60/65 出现高 pre-clip grad_norm `25.2073`/`15.1815`。 | 根因判断不是 checkpoint 加载失败，也不是 DDP 全局 skip：SFT checkpoint 已加载，step 40/60/70 均能恢复 blank/validity 信号；当前主要是 RL 更新尺度偏激导致采样/优化振荡。决定停止当前 Sudoku rjob，并以更保守默认重启：`LEARNING_RATE=1e-7`、`MUON_LR=1e-5`、`MAX_GRAD_PER_PARAM=0.005`，保持 `skip_consensus=local` 与 skip-degen 保护。 |
+| GSM8K RL | heartbeat 到 step 175 `training_step_start`，运行中 | 最新完整 step 165/170：reward_mean `0.2432`/`0.1161`，reward_std 非零，parse_rate `1.0`，answer_acc 仍不稳定但无 NaN/Inf，grad_norm 约 `0.13` 量级 | GSM8K 仍健康运行，不停止、不重启。 |
+
+修复动作：收紧 Sudoku RL 默认学习率、Muon LR 和单参数梯度上限；新增 rank0 `logs/rl_events.jsonl` 指标旁路落盘，避免 stdout/train.log 延迟影响后续监控判断。下一步停止旧 Sudoku rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb`，提交保守版新 rjob。

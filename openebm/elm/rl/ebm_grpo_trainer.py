@@ -150,7 +150,16 @@ class EBMGRPOTrainer(LightningModule):
             "step": int(step),
             **self._json_safe(payload),
         }
-        print("[GRPO-JSON] " + json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        print("[GRPO-JSON] " + line, flush=True)
+        try:
+            out_dir = self._heartbeat_dir()
+            os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
+            with open(os.path.join(out_dir, "logs", "rl_events.jsonl"), "a") as f:
+                f.write(line + "\n")
+                f.flush()
+        except Exception:
+            pass
 
     def _heartbeat_dir(self) -> str:
         return (
