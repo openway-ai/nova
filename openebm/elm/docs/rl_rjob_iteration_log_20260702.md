@@ -222,3 +222,33 @@ GSM8K 根因：checkpoint 加载没有 `NoneType`、missing/unexpected key 或 T
 - 小样例检查：正确答案仍高分，错误但接近的答案获得比远错答案更高的 shaping 分。
 
 下一轮：提交修复后重新提交 GSM8K rjob；Sudoku 保持当前 rjob 运行并继续监控。
+
+### 2026-07-02 20:29 +0800
+
+GSM8K 修复提交与重启：
+
+| 项目 | 值 |
+| --- | --- |
+| 修复提交 | `2a0970e fix(rl): shape gsm8k numeric rewards` |
+| 旧 GSM8K rjob | `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-19-df33f`，已确认 `Stopped` |
+| 新 GSM8K exp_id | `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-202911` |
+| 新 GSM8K rjob metadata | `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` |
+| 预期报告路径 | `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-202911/sft_train/analysis_report.md` |
+
+下一轮：确认新 GSM8K 是否启动，并检查 step 0 reward_std/advantage_var 是否从 0 恢复；继续监控当前 Sudoku rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-1-d8096`。
+
+### 2026-07-02 20:40 +0800
+
+第五轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running` | heartbeat 到 step 18 `generate_start`；step 10: reward_mean `1.4768`，reward_std `0.3290`，unique_ratio `1.0`，ref_energy_kl `0.001346`，grad_norm `25.378`，nan_grad_params `0`；step 15: reward_mean `0.8458`，reward_std `0.0722`，unique_ratio `1.0`，loss `0.02159` | reward 非零、无 NaN/Inf、未卡 DDP；但 step 15 reward_std 偏低且 reward_mean 下探，需要继续观察是否只是 prompt 波动还是开始退化。 |
+| GSM8K RL | `Running`，新 rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | step 0: reward_mean `0.1800`，reward_std `0.0404`，advantage_var `0.0357`，degenerate_group_rate `0.0`，unique_ratio `1.0`，parse_rate `1.0`，answer_acc `0.0`，answer_proximity `0.1300` | reward shaping 修复生效：旧 run 的 `reward_std=0`、`advantage_var=0`、`degenerate_group_rate=1.0` 已恢复为非零学习信号。 |
+
+当前结论：
+
+- GSM8K 的异常已从“无学习信号”修到“有 shaped reward 方差”；下一步需要看 answer_acc/format 是否随训练改善。
+- Sudoku 仍未收敛，`full_solve=0.0`；目前没有加载或 DDP 崩溃问题，下一步重点观察 reward_std 是否继续收缩、reward_mean 是否持续下行。
+
+下一轮：继续默认 10 分钟监控；若 Sudoku 连续多个 logging step reward_std 接近 0 或 reward_mean 持续低位，则优先考虑提高采样温度/多样性、调弱过强更新或增加 reward/format 稳定项。
