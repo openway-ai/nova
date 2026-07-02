@@ -713,3 +713,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 161 `training_step_start`，时间戳 `03:27:56`；最新完整指标仍为 step 155：reward_mean `0.1996`，reward_std `0.0887`，parse_rate `1.0`，answer_acc `0.0` | 运行健康；不重启。 |
 
 当前结论：Sudoku 不做 stop/restart。需要继续监控日志落盘是否恢复；如果后续 heartbeat 继续推进但长期没有 step65/70 指标，优先补充或修复指标落盘路径，而不是立即调训练超参。
+
+### 2026-07-03 03:41 +0800
+
+第三十八轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | rjob 控制面确认 `Running`；heartbeat 到 step 71 `skip_consensus_start`，`local_skip=0.0`，`unique_ratio=0.5833`，时间戳 `03:40:44`。主日志恢复落盘：step 60 完整 JSON/grad 落盘，reward_mean `1.3960`，blank_accuracy `0.2606`，constraint_validity `0.1632`，`ref_energy_kl=0.009722`，grad_norm `25.2073`，nan_params `0`；step 65 本 rank `LOCAL_ZERO`，reward `0`，`skip_rank_count=3/8`，grad_norm `15.1815`，nan_params `0`；step 70 rollout 恢复非零 reward_mean `1.2687`，reward_std `0.4893`，`skip_rank_count=3/8`，完整 GRPO/JSON 尚未落盘 | 日志落盘恢复，step66 卡住已排除。当前主要异常是 Sudoku 训练继续振荡：有效 reward 与本地退化交替出现，且 step60/65 预裁剪 grad_norm 偏高。由于 step70 恢复非零 reward，本轮暂不重启；若 step75/80 再退化或高 grad_norm 持续，优先停旧任务并用更保守学习率/梯度约束重启。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | rjob 控制面确认 `Running`；heartbeat 到 step 167 `training_step_start`。step 160 完整落盘：reward_mean `0.1772`，reward_std `0.0680`，parse_rate `1.0`，answer_acc `0.0`，`ref_energy_kl=2.53e-05`，grad_norm `0.1435`，nan_params `0` | 运行健康，shaped reward 非零；不重启。 |
+
+当前结论：继续跑一轮。Sudoku 已不是日志/同步卡死问题，而是优化振荡；下一轮根据 step75/80 是否继续恢复来决定是否进入保守重启分支。
