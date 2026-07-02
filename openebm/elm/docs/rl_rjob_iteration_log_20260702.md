@@ -760,3 +760,12 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL conservative | `Running`，heartbeat 到 step 6 `generate_start` | step 5 `rl_events.jsonl`：reward_mean `0.9253`，reward_std `0.1394`，format `0.5`，clue_preservation `0.4253`，blank_accuracy `0.0`，constraint_validity `0.0`，full_solve `0.0`，`ref_energy_kl=3.08e-7`，unique_completion_ratio `0.9167`，degenerate_group_rate `0.0`。 | step 5 是 clue-only 早期波动，但不同于上一轮后期退化：reward_std 非零、不是 zero collapse，KL 仍接近 0，rjob 与 heartbeat 正常推进。因此本轮不重启，继续看 step 10 是否恢复 blank/validity，以及后续 grad_norm 是否落盘。 |
 | GSM8K RL | `Running`，heartbeat 到 step 187 `training_step_start` | 最新可见 step 175：reward_mean `0.1497`，reward_std `0.0919`，parse_rate `1.0`，answer_acc `0.0`，`ref_energy_kl=0.00416`，grad_norm `0.3365`，nan_params `0`。 | 仍健康推进；不重启。 |
+
+### 2026-07-03 04:45 +0800
+
+第四十二轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL conservative | `Running`，heartbeat 到 step 11 `local_zero_update` | step 5 backward 已落盘：grad_norm `2.3079`，max_grad `0.5618`，nan_params `0`。step 10 `rl_events.jsonl` 恢复有效 Sudoku 信号：reward_mean `1.3564`，reward_std `0.3795`，blank_accuracy `0.1892`，constraint_validity `0.1904`，full_solve `0.0`，`ref_energy_kl=3.72e-6`，unique_completion_ratio `1.0`。step 11 当前 rank 触发 `local_zero_update`，reward_mean/std 为 `0`。 | step 10 证明 step 5 的 clue-only 是 batch 波动而非连续 collapse；KL 保持极低，grad_norm 远低于上一轮 step50/60 的高峰。step 11 是局部退化，由 `skip_consensus=local` 防护隔离；不重启，继续观察 step 15/20 是否维持低 KL 和周期性恢复。 |
+| GSM8K RL | `Running`，heartbeat 到 step 195 `skip_consensus_start` | local_skip `0`，unique_ratio `1.0`；最新完整指标仍显示 reward_std 非零、无 NaN。 | 继续运行；不重启。 |
