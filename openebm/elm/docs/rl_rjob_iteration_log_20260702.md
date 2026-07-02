@@ -325,3 +325,83 @@ Sudoku 保守版重启：
 | 预期报告路径 | `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-214231/sft_train/analysis_report.md` |
 
 下一轮：确认新 Sudoku rjob 是否启动，并重点检查 step 0/5 是否避免全零 reward、高 KL 和高梯度脉冲。
+
+### 2026-07-02 21:47 +0800
+
+第九轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，新 rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-0fa37` | heartbeat 到 step 0 `skip_consensus_start`，`local_skip=0.0`、`unique_ratio=0.75`；训练日志仍停留在初始化/数据加载 stdout，尚未刷出 `rollout_ready` 或 `GRPO-JSON` | 新任务已进入首轮 rollout/skip 判断，不是启动失败；还没有足够指标判断 reward 趋势，需要继续等待 step 0 完整日志。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | 最新完整指标仍为 step 25: reward_mean `0.1861`，reward_std `0.2575`，answer_acc `0.125`，exact_match `0.0938`，degenerate `0.0`，nan_grad_params `0`; heartbeat 到 step 34 `training_step_start` | 运行健康，未复现 reward_std 为 0 的退化；继续观察 answer_acc/format 是否稳定提升。 |
+
+当前结论：GSM8K 修复有效且继续运行；Sudoku 保守版已启动并进入 step 0，但完整 reward/KL/梯度指标尚未落盘，下一轮继续等待 `loss_ready` 和 `GRPO-JSON`。
+
+### 2026-07-02 21:50 +0800
+
+第十轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running` | step 0: reward_mean `1.5721`，reward_std `0.4567`，range `[0.966, 1.921]`，advantage_var `0.9167`，zero_frac `0.0`，degenerate_group_rate `0.0`，unique_ratio `0.75`，ref_energy_kl `0.0`，completion_len_mean `166.3`；heartbeat 进入 step 1 `generate_start` | 保守化超参避免了旧 run step 25 的全零 reward、全退化 rollout、高 KL 组合；但目前只是首个 logging step，尚不能判断收敛趋势。 |
+| GSM8K RL | `Running` | step 30: reward_mean `0.1081`，reward_std `0.0553`，parse_rate `0.875`，answer_acc `0.0`，degenerate `0.0`，nan_grad_params `0`; step 35 已到 `loss_ready`，reward_mean `0.1594`，reward_std `0.0590`，unique_ratio `1.0` | reward 方差仍非零，没有回到旧异常；answer_acc 仍不稳定，需要继续观察。 |
+
+当前结论：两个任务都未出现崩溃或 DDP skip；Sudoku 已从 collapse-like 状态恢复到可训练的非零 reward 分布。下一轮重点看 Sudoku step 5/10 是否保持 reward_std 和 KL 稳定。
+
+### 2026-07-02 22:21 +0800
+
+第十一轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running` | step 5: reward_mean `0.9253`，reward_std `0.1394`，range `[0.483, 0.966]`，advantage_var `0.4451`，zero_frac `0.0`，degenerate_group_rate `0.0`，unique_ratio `0.9167`，ref_energy_kl `1.1e-6`，grad_norm `7.2531`，max_param_grad `2.1642`，nan_grad_params `0`; heartbeat 已进入 step 11 `generate_start` | 未复现旧 run 的全零 reward/high-KL/high-grad collapse；但相较 step 0，blank_accuracy 和 constraint_validity 降到 `0`，reward 主要来自 format+clue，需继续观察 step 10/15 是否恢复或持续退化。 |
+| GSM8K RL | `Running` | step 40: reward_mean `0.1902`，reward_std `0.0457`，answer_proximity `0.1402`，parse_rate `1.0`，answer_acc `0.0`，degenerate `0.0`，grad_norm `0.0102`，nan_grad_params `0` | reward shaping 继续提供非零学习信号；exact answer 不稳定，暂不重启。 |
+
+当前结论：Sudoku 保守化修复使训练摆脱全零 reward 崩塌，但仍未显示收敛趋势；当前主要风险是 reward 退回 format/clue 的浅层信号。下一轮看 step 10/15，如 `blank_accuracy=0` 和 `validity=0` 持续存在且 reward_std 收缩，再考虑加强 Sudoku reward/采样约束或进一步降低更新强度。
+
+### 2026-07-02 22:45 +0800
+
+第十二轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running` | step 10: reward_mean `1.4172`，reward_std `0.3656`，blank_accuracy `0.2169`，constraint_validity `0.2188`，unique_ratio `1.0`，ref_energy_kl `8.09e-5`，grad_norm `23.4006`，nan_grad_params `0`; step 15: reward_mean `0.8667`，reward_std `0.0615`，blank_accuracy `0.0`，constraint_validity `0.0`，unique_ratio `1.0`; heartbeat 到 step 17 `generate_start` | 当前不是全零 collapse，也不是收敛；有效棋盘信号在 step 10 恢复、step 15 又回落，说明策略仍在浅层 format/clue reward 和有效填空 reward 之间波动。grad 有脉冲但低于旧 run step 25 的崩塌强度，暂不重启。 |
+| GSM8K RL | `Running` | step 50: reward_mean `0.1919`，reward_std `0.0382`，parse_rate `1.0`，answer_acc `0.0`; step 45: grad_norm `0.0120`，nan_grad_params `0` | shaped reward 稳定非零；exact answer 仍未稳定提升，暂不重启。 |
+
+当前结论：两个 rjob 都在运行。Sudoku 保守版尚未收敛，但也没有复现之前全零 reward/高 KL 失控。下一轮继续看 step 20/25；若再次出现 `zero_frac=1` 或 `degenerate=1`，立即停机修复；若只是长期停在 format/clue reward，后续优化重点转向 Sudoku reward shaping 和生成约束。
+
+### 2026-07-02 22:58 +0800
+
+第十三轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running` | heartbeat 到 step 22 `generate_start`；最新完整落盘 step 20: reward_mean `1.5944`，reward_std `0.4007`，range `[0.962, 2.152]`，blank_accuracy `0.373`，constraint_validity `0.231`，clue_preservation `0.490`，format `0.500`，degenerate `0.0`，unique_ratio `1.0`，ref_energy_kl `0.00147`，loss `0.00147` | step 20 从 step 15 的浅层 format/clue reward 回升，说明保守化重启暂未复现旧 run 的全零 reward/rollout collapse；但尚未越过旧异常最关键的 step 25，继续监控。 |
+| GSM8K RL | `Running` | heartbeat 到 step 57；step 55: reward_mean `0.0552`，reward_std `0.0147`，parse_rate `1.0`，answer_acc `0.0`，answer_proximity `0.005`，partial_credit `0.050`，zero_frac `0.0`，degenerate `0.0`，unique_ratio `1.0` | shaped reward 仍非零且 rollout 未退化，但这一轮回落到主要依赖 partial_credit 的弱信号；暂不判断为崩溃，继续看后续是否恢复到 step 40/50 的 `0.19` 附近。 |
+
+当前结论：没有触发重启条件。Sudoku reward 仍在波动但不是全零，GSM8K 也没有 NaN、skip 或 reward_std 归零。下一轮重点检查 Sudoku step 25 是否安全通过，以及 GSM8K exact/answer_proximity 是否持续下滑。
+
+### 2026-07-02 23:16 +0800
+
+第十四轮监控与修复：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | step 25 复现退化，旧 rjob 已停止：`d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-0fa37` | step 25: reward_mean `0.0`，reward_std `0.0`，zero_frac `1.0`，advantage_var `0.0`，degenerate_group_rate `1.0`，ref_energy_kl `0.5587`，loss `0.5587`，format/clue/blank/validity 全为 `0.0`；但 `skip_consensus_start` 中 `local_skip=0.0` | 根因不是 checkpoint 加载，而是 Sudoku 脚本把 `SKIP_DEGENERATE_THRESHOLD=1.01`、`MIN_REWARD_STD_TO_UPDATE=0.0`，等于关闭了 hard skip；all-zero rollout 被允许进入 KL-only 更新，产生高 KL loss 且没有任务 reward 信号。 |
+| GSM8K RL | `Running`，继续保留 | step 60: reward_mean `0.2254`，reward_std `0.0559`，answer_proximity `0.1754`，parse_rate `1.0`，answer_acc `0.0`，degenerate `0.0`，nan_grad_params `0` | shaped reward 从 step 55 低点恢复，未触发重启条件。 |
+
+修复动作：
+
+1. `openebm/elm/runs/run_ebt_sudoku_rl.sh`
+   - 恢复 `SKIP_DEGENERATE_THRESHOLD=0.9`。
+   - 恢复 `MIN_REWARD_STD_TO_UPDATE=1e-4`。
+   - 更新注释：skip 分支会返回 graph-attached zero loss，并在 optimizer hook 中将所有 grad 置为 `None`，避免 Muon/AdamW/weight_decay 更新参数。
+2. `openebm/elm/runs/rjob/run_sudoku_rl_optimized_rjob.sh`
+   - 同步上述默认值与注释，确保 rjob 默认启用 all-zero / zero-variance rollout guard。
+
+验证：
+
+- `bash -n openebm/elm/runs/run_ebt_sudoku_rl.sh`
+- `bash -n openebm/elm/runs/rjob/run_sudoku_rl_optimized_rjob.sh`
+
+下一轮：提交并推送修复后，重新提交 Sudoku rjob；新 run 的关键判据是 step 25 类似坏 batch 应打印 `SKIPPED` / `skipped_step=1.0`，且不能出现 KL-only 参数更新。

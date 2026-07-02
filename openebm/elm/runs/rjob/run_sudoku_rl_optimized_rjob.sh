@@ -57,10 +57,11 @@ MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.01}"
 ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
 ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
 SKIP_CONSENSUS="${SKIP_CONSENSUS:-any}"
-# Hard skip is opt-in for optimized DDP rjobs. Degenerate groups already receive
-# zero advantages, while hard-skipping can stall automatic optimization.
-SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-1.01}"
-MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-0.0}"
+# Skip all-zero / zero-variance rollout batches before they become KL-only
+# updates. The trainer clears grads to None on skipped steps, making this safe
+# for Muon+AdamW and avoiding weight_decay drift.
+SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.9}"
+MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-1e-4}"
 MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.0}"
 TRAJ_LOG_INTERVAL="${TRAJ_LOG_INTERVAL:-25}"
 ANALYZE_AFTER_TRAIN="${ANALYZE_AFTER_TRAIN:-1}"
