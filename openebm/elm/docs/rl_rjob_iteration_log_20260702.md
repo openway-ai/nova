@@ -735,3 +735,10 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | heartbeat 到 step 175 `training_step_start`，运行中 | 最新完整 step 165/170：reward_mean `0.2432`/`0.1161`，reward_std 非零，parse_rate `1.0`，answer_acc 仍不稳定但无 NaN/Inf，grad_norm 约 `0.13` 量级 | GSM8K 仍健康运行，不停止、不重启。 |
 
 修复动作：收紧 Sudoku RL 默认学习率、Muon LR 和单参数梯度上限；新增 rank0 `logs/rl_events.jsonl` 指标旁路落盘，避免 stdout/train.log 延迟影响后续监控判断。下一步停止旧 Sudoku rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb`，提交保守版新 rjob。
+
+重启动作：
+
+- 已停止旧 Sudoku rjob：`d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb`，控制面状态 `Stopped`。
+- 已推送修复 commit：`2cf9e1f3d2eed565abbd2b838a653686d8ff9779`。
+- 已提交新 Sudoku rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-conservati-2422b`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-conservative-20260703-0403`，04:03 控制面状态 `Starting`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-conservative-20260703-0403/`。
+- GSM8K rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` 保持 `Running`，本轮未重启，原因是最新指标健康且本次保守超参改动只针对 Sudoku。
