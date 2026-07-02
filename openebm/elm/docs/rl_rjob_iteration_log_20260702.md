@@ -278,3 +278,36 @@ GSM8K 修复提交与重启：
 当前结论：两个任务均正常运行。Sudoku 仍未收敛但没有持续退化证据；GSM8K 的 reward shaping 修复稳定生效。
 
 下一轮：继续观察 Sudoku step 25/30 与 GSM8K step 15/20；如 GSM8K answer_acc 长期为 0，后续优化优先级为 prompt 格式约束、专用 GSM8K SFT ckpt、以及更强的 format reward。
+
+### 2026-07-02 21:40 +0800
+
+第八轮监控与 Sudoku 保守化修复：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | 旧 rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-1-d8096` 已停止 | step 25: reward_mean `0.0`，reward_std `0.0`，zero_frac `1.0`，degenerate_group_rate `1.0`，format/clue/blank/validity 全为 `0`，ref_energy_kl `1.7803`，loss `0.8901`，grad_norm `79.066`，max_param_grad `24.696`，nan_grad_params `0` | 出现明显 collapse-like rollout 和高 KL/高梯度脉冲；不再继续使用该超参组合。 |
+| GSM8K RL | `Running` | step 25: reward_mean `0.1861`，reward_std `0.2575`，answer_acc `0.125`，exact_match `0.0938`，degenerate `0.0`，nan_grad_params `0` | GSM8K reward shaping 生效并开始出现正确答案样本，继续运行。 |
+
+Sudoku 根因判断：不是 checkpoint/TF-head 加载问题，也不是 DDP skip 卡死；模型在当前 Sudoku RL 超参下出现了采样分布漂移，表现为 completion 到达最大长度、完全不可解析、能量相对 reference 大幅偏移。`MUON_LR=2e-4`、`LEARNING_RATE=5e-7`、`BETA=0.5` 对当前 RL 阶段偏激进。
+
+修复动作：
+
+1. `openebm/elm/runs/run_ebt_sudoku_rl.sh`
+   - `TEMPERATURE`: `0.70 -> 0.60`
+   - `TOP_P`: `0.80 -> 0.75`
+   - `LEARNING_RATE`: `5e-7 -> 2e-7`
+   - `MUON_LR`: `2e-4 -> 5e-5`
+   - `BETA`: `0.5 -> 1.0`
+   - `MAX_GRAD_PER_PARAM`: `0.02 -> 0.01`
+   - `TRAJ_LOG_INTERVAL`: `50 -> 25`，便于捕获退化样本。
+2. `openebm/elm/runs/rjob/run_sudoku_rl_optimized_rjob.sh`
+   - 同步上述默认值。
+   - 显式传递 `GRADIENT_CLIP_VAL`、`MAX_GRAD_PER_PARAM`、`TRAJ_LOG_INTERVAL` 到 rjob 环境与 metadata。
+
+验证：
+
+- `bash -n openebm/elm/runs/run_ebt_sudoku_rl.sh`
+- `bash -n openebm/elm/runs/rjob/run_sudoku_rl_optimized_rjob.sh`
+- `git diff --check` 对上述脚本通过。
+
+下一轮：提交修复后重提 Sudoku rjob；GSM8K 保持当前 rjob 运行。
