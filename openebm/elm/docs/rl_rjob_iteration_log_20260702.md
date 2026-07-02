@@ -43,7 +43,26 @@
 
 ### 重启前待执行
 
-1. 静态校验：`py_compile` 与 `bash -n`。
-2. 停止旧 GSM8K rjob：`d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-18-2d801`。
-3. 提交新的 Sudoku/GSM8K rjob。
+1. 静态校验：`py_compile` 与 `bash -n`。已完成。
+2. 停止旧 GSM8K rjob：`d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-18-2d801`。已确认 `Stopped`。
+3. 提交新的 Sudoku/GSM8K rjob。已提交：
+
+| 任务 | exp_id | rjob metadata | 初始状态 |
+| --- | --- | --- | --- |
+| Sudoku RL | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-191349` | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-1-ba472` | `Inqueue/STARTING` |
+| GSM8K RL | `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-191400` | `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-19-546f5` | `Inqueue/STARTING` |
+
 4. 每轮监控追加记录：时间戳、rjob 状态、最新 step、reward/loss/KL/energy/skip/degenerate/NaN 指标、趋势判断与下一步动作。
+
+## 监控记录
+
+### 2026-07-02 19:14 +0800
+
+| 任务 | rjob 状态 | 日志/指标状态 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Inqueue/STARTING` | 产物目录尚未生成 | 等待资源分配与容器启动。 |
+| GSM8K RL | `Inqueue/STARTING` | 产物目录尚未生成 | 等待资源分配与容器启动。 |
+
+调度事件：两个任务均显示 `0/2060 nodes are unavailable: 2053 task node selector does not match node labels, 7 Insufficient cpu`。当前不是训练代码异常。
+
+下一轮：约 10 分钟后检查 rjob 状态、`logs/train.log`、`heartbeat.json` 和最新 `[GRPO-JSON]` 指标。
