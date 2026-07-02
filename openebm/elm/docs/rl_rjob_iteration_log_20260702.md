@@ -463,3 +463,14 @@ Sudoku local-skip 修复版重启：
 | 预期报告路径 | `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-233012/sft_train/sudoku_rl_analysis_report.md` |
 
 下一轮：确认新 rjob 进入 `Running`，检查 hparams 中 `skip_consensus=local`，并读取 step 0 是否从 `global_skip=True` 变为可正常更新。
+
+### 2026-07-02 23:37 +0800
+
+第十六轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | step 0: reward_mean `1.5721`，reward_std `0.4567`，blank_accuracy `0.3846`，constraint_validity `0.1990`，unique_ratio `0.75`；`skip_consensus_done`: `skip_consensus=local`，`skip_rank_count=1`，`global_skip=False`，`world_size=8`; 后续正常 `loss_ready`，loss `1.59e-7`，`skipped_step=0.0` | 二次修复通过启动验证：单个坏 rank 不再导致全局 skip，健康 rank 的有效 reward 信号继续进入训练；坏 rank 会按 local 模式零贡献，避免 KL-only 更新。 |
+| GSM8K RL | `Running` | heartbeat 到 step 74；step 65 reward_mean `0.0881`，reward_std `0.0088`，step 70 reward_mean `0.1322`，reward_std `0.1024`，nan_grad_params `0` | 仍有非零 shaped reward，无崩溃；exact answer 尚未稳定提升。 |
+
+当前结论：Sudoku local skip 逻辑修复有效。下一轮继续看 step 5/10 是否正常更新，并最终验证 step 25 附近 all-zero rollout 是否被全局 skip 或局部 zero，而不再执行 KL-only 更新。
