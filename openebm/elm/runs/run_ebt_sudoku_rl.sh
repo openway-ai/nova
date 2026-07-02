@@ -59,8 +59,8 @@ NUM_GENERATIONS="${NUM_GENERATIONS:-12}"            # keep enough group variance
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-210}"     # 9x9 board ≤162 chars; tail tokens add noise
 
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-192}"
-TEMPERATURE="${TEMPERATURE:-0.70}"                  # slightly lower after late-run format/clue degradation
-TOP_P="${TOP_P:-0.80}"
+TEMPERATURE="${TEMPERATURE:-0.60}"                  # conservative after high-entropy zero-reward rollout
+TOP_P="${TOP_P:-0.75}"
 GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-6}" # sub-batch for generation (VRAM management)
 
 NUM_ITERATIONS="${NUM_ITERATIONS:-1}"              # legacy loss recomputation; keep 1 when using GSPO_UPDATE_EPOCHS
@@ -68,23 +68,23 @@ GSPO_UPDATE_EPOCHS="${GSPO_UPDATE_EPOCHS:-1}"  # keep 1 by default; previous 2-e
 EPSILON="${EPSILON:-0.2}"                   # PPO clip range (only used by energy_gspo)
 CLIP_RATIO_LOW="${CLIP_RATIO_LOW:-3e-4}"    # verl GSPO sequence-ratio clip
 CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-4e-4}"
-BETA="${BETA:-0.5}"                         # stronger anchor after clue-preservation drift in long run
+BETA="${BETA:-1.0}"                         # stronger anchor after zero-reward/high-KL rollout
 ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
 ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
-LEARNING_RATE="${LEARNING_RATE:-5e-7}"       # AdamW base/fallback LR; Muon matrices use MUON_LR
+LEARNING_RATE="${LEARNING_RATE:-2e-7}"       # AdamW base/fallback LR; Muon matrices use MUON_LR
 # RL_LOSS_TYPE="energy_reinforce"  # removes 1/|y| dilution
 RL_LOSS_TYPE="${RL_LOSS_TYPE:-energy_gspo}"
 
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
-MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.02}"
+MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.01}"
 WARMUP_STEPS="${WARMUP_STEPS:-20}"
 
 # ── Optimizer (v3 P0+P1+muon) ─────────────────────────────────────────────────
 # adamw      : v3 P0 multi-group AdamW (transformer/v2e/scalar/other split LR)
 # muon_adamw : Muon for transformer matrices + AdamW for the rest (matches SFT)
 RL_OPTIMIZER="${RL_OPTIMIZER:-muon_adamw}"  # SFT-validated hybrid optimizer: Muon matrices + AdamW lanes
-MUON_LR="${MUON_LR:-2e-4}"                  # Muon peak LR for transformer matrices; scheduler scales it after warmup
+MUON_LR="${MUON_LR:-5e-5}"                  # Muon peak LR for transformer matrices; scheduler scales it after warmup
 ADAMW_VOCAB_TO_EMBED_LR="${ADAMW_VOCAB_TO_EMBED_LR:--1}"  # <=0 => LEARNING_RATE * 0.5
 ADAMW_SCALAR_LR="${ADAMW_SCALAR_LR:--1}"                  # <=0 => LEARNING_RATE * 2.0
 ADAMW_OTHER_LR="${ADAMW_OTHER_LR:--1}"                    # <=0 => LEARNING_RATE
@@ -106,7 +106,7 @@ LOG_INTERVAL="${LOG_INTERVAL:-5}"
 SAVE_TOP_K="${SAVE_TOP_K:-2}"
 SEED="${SEED:-42}"
 
-TRAJ_LOG_INTERVAL="${TRAJ_LOG_INTERVAL:-50}"
+TRAJ_LOG_INTERVAL="${TRAJ_LOG_INTERVAL:-25}"
 TRAJ_NUM_SAMPLES="${TRAJ_NUM_SAMPLES:-4}"
 COLLAPSE_CHECK_WINDOW="${COLLAPSE_CHECK_WINDOW:-2}"
 
