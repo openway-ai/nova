@@ -742,3 +742,12 @@ Sudoku local-skip 修复版重启：
 - 已推送修复 commit：`2cf9e1f3d2eed565abbd2b838a653686d8ff9779`。
 - 已提交新 Sudoku rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-conservati-2422b`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-conservative-20260703-0403`，04:03 控制面状态 `Starting`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-conservative-20260703-0403/`。
 - GSM8K rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` 保持 `Running`，本轮未重启，原因是最新指标健康且本次保守超参改动只针对 Sudoku。
+
+### 2026-07-03 04:09 +0800
+
+第四十轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL conservative | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-conservati-2422b`，heartbeat 到 step 1 `generate_start` | 启动配置确认：commit `2cf9e1f3d2eed565abbd2b838a653686d8ff9779`，SFT ckpt 为 20260625 freeembed step 2999，日志显示 `Renamed 576 compiled/eager transformer keys to transformer.*` 且 8 rank `Model loaded successfully`；保守超参生效：`learning_rate=1e-7`、`muon_lr=1e-5`、`max_grad_per_param=0.005`。step 0 `rl_events.jsonl` 已落盘：reward_mean `1.5721`，reward_std `0.4567`，blank_accuracy `0.3846`，constraint_validity `0.1990`，full_solve `0.0`，`ref_energy_kl=0.0`，unique_completion_ratio `0.75`。 | 新任务启动健康，checkpoint remap 正常，首步没有全零、clue-only 或 NaN/Inf 迹象。新增 `rl_events.jsonl` 旁路落盘有效。继续观察 step 5/10 是否维持 blank/validity 信号，以及 pre-clip grad_norm 是否低于上一轮高峰。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 178 `training_step_start` | 继续健康推进，本轮不重启。 |
