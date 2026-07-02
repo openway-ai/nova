@@ -871,3 +871,12 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL local-log1 | `Running`，heartbeat 到 step 10 `generate_start` | `rl_events.jsonl` 到 step 9，共 10 条事件。last5 平均 reward `1.6856`、blank_accuracy `0.4042`、constraint_validity `0.1945`、full_solve `0.1200`，本 rank `LOCAL_ZERO=1/5`，max `ref_energy_kl=3.64e-6`。step 9 是高分低方差 local-zero：reward_mean `3.0`、blank_accuracy `1.0`、constraint_validity `0.4`、full_solve `0.6`、reward_std `0`、unique_completion_ratio `0.5`。 | step 9 不是 reward 崩塌，而是 GRPO 组内方差为 0/重复输出导致没有优势信号，走 local-zero 防护合理。总体 reward 和 full_solve 信号优于早先坏 run，KL 与梯度风险仍低；继续观察重复高分 local-zero 是否频繁化。 |
 | GSM8K RL | `Running`，heartbeat 到 step 243 `skip_consensus_start` | local_skip `0`，unique_ratio `1.0`；控制面仍 `Running`。 | 健康运行，继续保留。 |
+
+### 2026-07-03 06:59 +0800
+
+第五十一轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL local-log1 | `Running`，heartbeat 到 step 13 `generate_start` | `rl_events.jsonl` 到 step 12，共 13 条事件。last5 平均 reward `1.4903`、blank_accuracy `0.3769`、constraint_validity `0.2047`、full_solve `0.1200`，`LOCAL_ZERO=2/5`，max `ref_energy_kl=3.77e-6`。step 11 是低质 local-zero：reward_mean `0`、std `0`；step 12 恢复正常有效更新：reward_mean `1.5136`、blank_accuracy `0.3319`、constraint_validity `0.1991`。 | local-zero 频率需要继续关注，但不是连续退化；健康更新仍在出现，KL 低、无 NaN/Inf，控制面正常。暂不改代码/不重启，继续观察到 step 20。 |
+| GSM8K RL | `Running`，heartbeat 到 step 249 `training_step_start` | 控制面 `Running`，训练仍推进。 | 健康运行，继续保留。 |
