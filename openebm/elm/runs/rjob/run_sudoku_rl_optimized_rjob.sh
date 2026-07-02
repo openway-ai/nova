@@ -59,7 +59,7 @@ GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
 MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.005}"
 ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
 ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
-SKIP_CONSENSUS="${SKIP_CONSENSUS:-local}"
+SKIP_CONSENSUS="${SKIP_CONSENSUS:-any}"
 # Skip all-zero / zero-variance rollout batches before they become KL-only
 # updates. The trainer clears grads to None on skipped steps, making this safe
 # for Muon+AdamW and avoiding weight_decay drift.
