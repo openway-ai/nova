@@ -669,3 +669,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 148 `training_step_start`；最新完整指标仍为 step 140：reward_mean `0.1496`，reward_std `0.0305`，parse_rate `1.0`，answer_acc `0.0`，nan_params `0` | 运行稳定；继续观察。 |
 
 当前结论：不修复、不重启。Sudoku 的完整指标落盘继续滞后，但 heartbeat 和 rjob 状态均正常；下一轮继续等待 step 50/55 完整指标。已尝试用 `rjob logs` 交叉验证 stdout，但日志接口出现 SSL EOF/握手卡住并被手动中断；该现象属于 rjob 日志服务访问问题，不是训练进程错误。
+
+### 2026-07-03 02:55 +0800
+
+第三十四轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 到 step 59 `generate_start`；`heartbeat.json` 更新时间 `02:54:58`，`train.log` 更新时间 `02:42:09`。step 50 完整落盘：reward_mean `0.8889`，reward_std `0.0511`，blank_accuracy `0.0`，constraint_validity `0.0`，full_solve `0.0`，`ref_energy_kl=0.00933`，grad_norm `17.0025`，nan_params `0`；step 45 为单 rank `LOCAL_ZERO`，grad_norm `6.1482`，nan_params `0` | 训练仍活跃且没有 hard error，但 reward 又从 step 40 的有效 blank/validity 信号退回到 format/clue-only；同时 KL 回到 `1e-2` 量级、grad_norm 明显升高。这更像优化/采样振荡，而不是 ckpt 加载或全局 skip 问题。暂不立即重启，等待 step 55/60 再确认是否持续退化。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 149 `backward_done`，grad_norm `0.066421`，max_grad `0.060072`，nan_grad_params `0`；`train.log` 仍停在 step 140 完整指标 | 运行稳定；不触发修复或重启。 |
+
+当前结论：继续跑一轮，但 Sudoku 已进入黄色观察状态。若 step 55/60 仍然 blank_accuracy/constraint_validity 为 0，且 `ref_energy_kl` 或 grad_norm 继续偏高，则优先采用保守调参重启：降低 Muon/AdamW 学习率或加强 KL/梯度约束，而不是先改核心算法。
