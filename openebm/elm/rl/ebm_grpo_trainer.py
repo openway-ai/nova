@@ -185,6 +185,19 @@ class EBMGRPOTrainer(LightningModule):
             details = " ".join(f"{k}={v}" for k, v in record.items() if k not in ("ts", "phase"))
             print(f"[RL-PHASE] {phase} {details}", flush=True)
 
+    def _zero_placeholder_loss(self):
+        """Cheap graph-attached zero loss for skipped DDP steps.
+
+        DDP runs with find_unused_parameters=True in the RL scripts, so a single
+        used parameter is enough to keep the graph attached while unused
+        parameters are marked ready by DDP. Touching every trainable parameter
+        makes a skipped step as expensive as a full backward/all-reduce.
+        """
+        for p in self.model.parameters():
+            if p.requires_grad:
+                return p.reshape(-1)[0] * 0.0
+        return torch.zeros((), device=self.device, requires_grad=True)
+
     def _reward_component_short_names(self, components):
         short = {
             "format": "fmt",
@@ -245,8 +258,8 @@ class EBMGRPOTrainer(LightningModule):
         # Lightning forbids returning None under DDP. Instead we:
         #   1. all-reduce the per-rank skip decision so every rank takes the
         #      same branch (avoids DDP collective mismatch / hang),
-        #   2. on agreement, return a graph-attached placeholder loss whose
-        #      gradient is identically zero,
+        #   2. on agreement, return a cheap graph-attached placeholder loss
+        #      whose gradient is identically zero,
         #   3. set self._skip_optim_step so on_before_optimizer_step clears
         #      every p.grad to None — AdamW's per-param branch is
         #      `if p.grad is None: continue`, which truly skips the update
@@ -266,6 +279,12 @@ class EBMGRPOTrainer(LightningModule):
         local_skip = float(bool(skip_reasons))
         import torch.distributed as dist
         consensus_t0 = time.time()
+        reason_keys = ("degenerate_group_rate", "low_reward_std", "low_unique_completion_ratio")
+        reason_counts = torch.tensor(
+            [1.0 if reason in skip_reasons else 0.0 for reason in reason_keys],
+            device=self.device,
+        )
+        skip_rank_count = torch.tensor([local_skip], device=self.device)
         self._log_phase(
             "skip_consensus_start",
             local_skip=local_skip,
@@ -274,6 +293,8 @@ class EBMGRPOTrainer(LightningModule):
         )
         if dist.is_available() and dist.is_initialized():
             flag = torch.tensor([local_skip], device=self.device)
+            dist.all_reduce(reason_counts, op=dist.ReduceOp.SUM)
+            dist.all_reduce(skip_rank_count, op=dist.ReduceOp.SUM)
             if getattr(self.config, "skip_consensus", "all") == "any":
                 # Stability-first mode: if any rank sees a bad rollout, skip the
                 # optimizer step on all ranks to avoid one poisoned shard moving
@@ -286,10 +307,16 @@ class EBMGRPOTrainer(LightningModule):
             global_skip = flag.item() > 0.5
         else:
             global_skip = local_skip > 0.5
+        global_skip_reasons = [
+            reason for reason, count in zip(reason_keys, reason_counts.detach().cpu().tolist())
+            if count > 0.5
+        ]
         self._log_phase(
             "skip_consensus_done",
             elapsed_s=round(time.time() - consensus_t0, 3),
             global_skip=bool(global_skip),
+            skip_rank_count=int(skip_rank_count.detach().cpu().item()),
+            global_skip_reasons=global_skip_reasons,
         )
 
         self.log("stability/reward_std_too_low", float("low_reward_std" in skip_reasons))
@@ -298,6 +325,7 @@ class EBMGRPOTrainer(LightningModule):
         self._skip_optim_step = global_skip
 
         if global_skip:
+            reported_skip_reasons = global_skip_reasons or skip_reasons
             self.log("stability/skipped_step", 1.0)
             self.log("stability/degenerate_group_rate", gen_data["degenerate_rate"])
             self.log("train/reward_mean", gen_data["reward_mean"], prog_bar=True)
@@ -305,7 +333,7 @@ class EBMGRPOTrainer(LightningModule):
             if step % self.config.log_interval == 0:
                 if self._is_rank0():
                     print(
-                        f"[GRPO] step={step} SKIPPED reason={','.join(skip_reasons) or 'ddp_consensus'} "
+                        f"[GRPO] step={step} SKIPPED reason={','.join(reported_skip_reasons) or 'ddp_consensus'} "
                         f"degen={gen_data['degenerate_rate']:.2f} "
                         f"reward={gen_data['reward_mean']:.3f}±{gen_data['reward_std']:.3f} "
                         f"uniq={unique_ratio_for_skip:.2f}",
@@ -330,24 +358,18 @@ class EBMGRPOTrainer(LightningModule):
                         "unique_completion_ratio": unique_ratio_for_skip,
                         "degenerate_group_rate": gen_data.get("degenerate_rate", 0.0),
                         "skipped_step": 1.0,
-                        "skip_reasons": skip_reasons,
+                        "skip_reasons": reported_skip_reasons,
+                        "local_skip_reasons": skip_reasons,
+                        "global_skip_rank_count": int(skip_rank_count.detach().cpu().item()),
                     },
                 })
-            # Placeholder loss: every trainable parameter contributes a
-            # zero-valued term so DDP's backward all-reduce covers them all
-            # (required when find_unused_parameters=True with no real grad).
-            placeholder = sum(
-                (p * 0.0).sum()
-                for p in self.model.parameters()
-                if p.requires_grad
-            )
-            return placeholder
+            return self._zero_placeholder_loss()
         self.log("stability/skipped_step", 0.0)
 
         if self._manual_gspo_updates:
             total_loss, total_metrics = self._manual_gspo_rollout_updates(gen_data)
             if total_loss is None:
-                return sum((p * 0.0).sum() for p in self.model.parameters() if p.requires_grad)
+                return self._zero_placeholder_loss()
             self.log("train/gspo_update_epochs", float(self.config.gspo_update_epochs))
         else:
             # ── Phase 2: Policy Update (with grad) ───────────────────────────
@@ -389,7 +411,7 @@ class EBMGRPOTrainer(LightningModule):
                     "unique_completion_ratio": unique_ratio_for_skip,
                 },
             })
-            return sum((p * 0.0).sum() for p in self.model.parameters() if p.requires_grad)
+            return self._zero_placeholder_loss()
         self.log("stability/nonfinite_loss", 0.0)
 
         # ── Logging ───────────────────────────────────────────────────────────
@@ -1160,11 +1182,8 @@ class EBMGRPOTrainer(LightningModule):
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(local_bad, op=dist.ReduceOp.MAX)
         if local_bad.item() > 0.5:
-            placeholder = sum(
-                (p * 0.0).sum() for p in self.model.parameters() if p.requires_grad
-            )
             self.log("stability/skipped_step", 1.0)
-            return placeholder, {"policy_loss": 0.0, "kl": 0.0, "clip_ratio": 0.0}
+            return self._zero_placeholder_loss(), {"policy_loss": 0.0, "kl": 0.0, "clip_ratio": 0.0}
         self.log("stability/skipped_step", 0.0)
 
         ratio = torch.exp(current_logps - old_logps)

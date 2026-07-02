@@ -66,3 +66,26 @@
 调度事件：两个任务均显示 `0/2060 nodes are unavailable: 2053 task node selector does not match node labels, 7 Insufficient cpu`。当前不是训练代码异常。
 
 下一轮：约 10 分钟后检查 rjob 状态、`logs/train.log`、`heartbeat.json` 和最新 `[GRPO-JSON]` 指标。
+
+### 2026-07-02 19:21 +0800
+
+| 任务 | rjob 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running` | step 0 rollout 成功；reward_mean `1.5927`，reward_std `0.4041`，unique_ratio `0.8333`，degenerate `0.0`，first sample `parse_ok=True`、clue_accuracy `1.0`、blank_accuracy_frac `0.6154`、full_solve `0.0` | TF-head logits 修复有效，已越过旧的 `NoneType` 崩溃，reward 不再全 0。 |
+| GSM8K RL | `Inqueue/STARTING` | 尚未启动 | 继续等待资源。 |
+
+异常：Sudoku step 0 被 `ddp_consensus` 跳过。rank0 本地 `skip_reasons=[]`，但 `skip_consensus=any` 表示任一 rank 触发 skip 都会全局跳过。step 0 后约 3 分钟未进入 step 1，train.log 不再更新。
+
+根因判断：当前 skip 分支的 placeholder loss 对所有 trainable 参数构造 `(p * 0.0).sum()`，一次被跳过的 step 也会触发约 973M trainable 参数的零梯度 backward/DDP 同步。该设计保证 DDP 图完整，但对 skip 频繁的 RL 初期代价过高，表现为 step 0 后长时间停在 zero-backward/optimizer 阶段。
+
+处理动作：
+
+1. 停止当前 rjob：
+   - Sudoku：`d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-1-ba472`，已确认 `Stopped`。
+   - GSM8K：`d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-19-546f5`，已确认 `Stopped`。
+2. 修复 `openebm/elm/rl/ebm_grpo_trainer.py`：
+   - 新增 `_zero_placeholder_loss()`，跳过 step 时只挂一个 trainable 参数构造零 loss。
+   - 保留 `find_unused_parameters=True` 的 DDP 行为，让未用参数由 DDP unused-parameter 路径处理。
+   - 为 skip consensus 增加跨 rank reason 统计：`global_skip_reasons` 和 `global_skip_rank_count`，避免后续只看到模糊的 `ddp_consensus`。
+
+下一轮：提交修复后重新提交 Sudoku/GSM8K rjob，观察 skipped step 是否能快速进入下一步，以及全局 skip 的真实原因分布。
