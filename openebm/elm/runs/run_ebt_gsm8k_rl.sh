@@ -106,8 +106,10 @@ ADAMW_SCALAR_LR="${ADAMW_SCALAR_LR:--1}"                  # <=0 => LEARNING_RATE
 ADAMW_OTHER_LR="${ADAMW_OTHER_LR:--1}"                    # <=0 => LEARNING_RATE
 ADVANTAGE_NORM="${ADVANTAGE_NORM:-group_mean_global_std}"
 GLOBAL_STD_MIN="${GLOBAL_STD_MIN:-0.2}"
-SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.85}"
-MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-0.01}"
+# Hard-skipping DDP automatic optimization is fragile: skipped steps can stall
+# before the optimizer hook. Keep hard skip opt-in while logging health metrics.
+SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-1.01}"
+MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-0.0}"
 MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.0}"
 
 MAX_STEPS="${MAX_STEPS:-500}"                # first validate parse/format/reward before long run
