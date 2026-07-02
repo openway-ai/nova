@@ -691,3 +691,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 150 `skip_consensus_done`，`global_skip=false`，`skip_rank_count=0`；最新完整指标 step 140：reward_mean `0.1496`，reward_std `0.0305`，parse_rate `1.0`，answer_acc `0.0`，grad_norm `0.033253`，nan_params `0` | 运行健康，shaped reward 非零；无需重启。 |
 
 当前结论：不重启。Sudoku 当前处于黄色观察状态：已有恢复迹象，但 KL 与 grad_norm 仍有振荡。如果 step 65/70 再次回到 blank_accuracy/constraint_validity 长期为 0，或出现高 KL/高 grad_norm 连续叠加，则优先停掉当前 Sudoku rjob 并用更保守学习率/梯度约束重启；GSM8K 保持现有运行。
+
+### 2026-07-03 03:22 +0800
+
+第三十六轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | rjob 控制面确认 `Running`；heartbeat 到 step 66 `skip_consensus_start`，`local_skip=0.0`，`unique_ratio=1.0`，时间戳 `03:22:15`。主 `train.log` 和 `rjob logs` 均仍只落到 step 60，`train.log` mtime 仍为 `03:01:25`；step 60 最新完整指标仍为 reward_mean `1.396`，blank_accuracy `0.261`，constraint_validity `0.163`，`ref_energy_kl≈0.0097` | 进程仍在更新 heartbeat，不能判定为崩溃；但主日志明显落后，并且 heartbeat 当前停在 skip-consensus 入口。若下一轮 heartbeat 长时间不推进或停在同一 phase，需要按潜在 DDP collective 卡住处理；若 heartbeat/日志恢复，则继续观察 reward。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | rjob 控制面确认 `Running`；heartbeat 到 step 158 `training_step_start`。step 150 完整落盘：reward_mean `0.1846`，reward_std `0.2553`，parse_rate `0.875`，answer_acc `0.125`，grad_norm `0.0912`，nan_params `0`；step 155 已显示 reward_mean `0.1996`，reward_std `0.0887`，parse_rate `1.0`，answer_acc `0.0` | GSM8K 继续健康运行，shaped reward 非零且未见 NaN/Inf；不重启。 |
+
+当前结论：暂不停止 Sudoku，但把它从“黄色观察”升级为“同步点观察”。根因候选不是 ckpt 加载，而是训练进程在 step 66 前后可能存在 DDP collective 慢/卡或日志缓冲严重滞后；下一轮以 heartbeat 是否离开 `skip_consensus_start` 为首要判断依据。
