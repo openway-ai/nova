@@ -129,12 +129,30 @@ def get_per_token_logps(model, input_ids, prompt_length, learning=False):
     targets = input_ids[:, 1:]
 
     with torch.set_grad_enabled(learning), torch.amp.autocast('cuda', enabled=False):
-        predicted_distributions, _ = model.forward(
-            model_input, start_pos=0, learning=learning,
-            return_raw_logits=True, no_randomness=True,
-        )
+        if getattr(model, "use_tf_head", False):
+            _, _, predicted_pred_hiddens = model.forward(
+                model_input,
+                start_pos=0,
+                learning=learning,
+                return_raw_logits=True,
+                no_randomness=True,
+                return_pred_hiddens=True,
+            )
+            if not predicted_pred_hiddens or predicted_pred_hiddens[-1] is None:
+                raise RuntimeError("TF-head logprob path did not receive final predicted hidden states.")
+            prev_embed = model.embeddings(model_input)
+            if getattr(model, "post_update_state_detach_prev_embed", False):
+                prev_embed = prev_embed.detach()
+            final_logits = model.tf_head(predicted_pred_hiddens[-1], prev_embed)
+        else:
+            predicted_distributions, _ = model.forward(
+                model_input, start_pos=0, learning=learning,
+                return_raw_logits=True, no_randomness=True,
+            )
+            final_logits = predicted_distributions[-1]
+            if final_logits is None:
+                raise RuntimeError("Logprob path produced None logits.")
 
-    final_logits = predicted_distributions[-1]
     flat_logits = final_logits.reshape(-1, final_logits.shape[-1]).clamp(-100.0, 100.0)
     flat_targets = targets.reshape(-1)
     per_token_loss = F.cross_entropy(flat_logits, flat_targets, reduction='none')

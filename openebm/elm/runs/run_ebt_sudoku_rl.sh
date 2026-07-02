@@ -313,7 +313,7 @@ echo "[开始 RL 训练]"
 echo "================================================================================"
 echo ""
 
-set -e
+set +e
 
 torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     -m openebm.elm.rl.train_rl_sudoku \
@@ -376,8 +376,10 @@ if [ $TRAIN_EXIT_CODE -eq 0 ]; then
 else
     echo -e "\033[0;31m✗ Sudoku RL (GRPO) 训练异常退出 (exit code: $TRAIN_EXIT_CODE)\033[0m"
 fi
+exit "$TRAIN_EXIT_CODE"
 
 } 2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush() }' | tee -a "${LOG_FILE}"
+TRAIN_EXIT_CODE=${PIPESTATUS[0]}
 
 echo ""
 echo "日志已保存到: ${LOG_FILE}"
@@ -387,3 +389,5 @@ if [ "${ANALYZE_AFTER_TRAIN:-1}" = "1" ] && [ -f "${SCRIPT_DIR}/../scripts/analy
     echo "正在生成 RL 分析报告..."
     python "${SCRIPT_DIR}/../scripts/analyze_rl_run.py" "${EXP_SFT_DIR}" || true
 fi
+
+exit "$TRAIN_EXIT_CODE"
