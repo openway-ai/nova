@@ -170,7 +170,6 @@ def load_sft_model_and_tokenizer(checkpoint_path):
         tokenizer: nanochat tokenizer
         hparams: the model's hyperparameters
     """
-    from openebm.elm.trainer import ModelTrainer
     from nanochat.tokenizer import get_tokenizer
 
     print(f"Loading SFT checkpoint: {checkpoint_path}")
@@ -237,6 +236,15 @@ def load_sft_model_and_tokenizer(checkpoint_path):
 
     missing, unexpected = model.load_state_dict(model_state, strict=False)
     if unexpected:
+        critical_prefixes = ("transformer.", "tf_head.", "vocab_to_embed.", "embeddings.", "alpha")
+        critical_unexpected = [key for key in unexpected if key.startswith(critical_prefixes)]
+        if critical_unexpected:
+            sample = critical_unexpected[:10]
+            raise RuntimeError(
+                f"SFT checkpoint contains {len(critical_unexpected)} unexpected trainable keys "
+                f"that would be ignored: {sample}. Refusing to continue with a partially "
+                f"loaded model. Check architecture hparams and key rewriting."
+            )
         print(f"  WARNING: {len(unexpected)} unexpected keys (ignored): {unexpected[:5]}...")
     if missing:
         # Hard-fail: missing keys mean part of the model is randomly initialised,

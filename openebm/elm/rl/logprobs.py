@@ -33,19 +33,23 @@ def compute_sequence_energy(model, input_ids, prompt_length, completion_mask=Non
 
     real_embeddings = model.embeddings(model_input)
 
-    one_hot_targets = F.one_hot(targets, model.vocab_size).float()
-
-    if getattr(model.hparams, 'vocab_to_embed_uses_prob_dist', False):
-        predicted_embeddings = torch.matmul(one_hot_targets, model.embeddings.weight)
+    if getattr(model, "use_free_embedding_mcmc", False):
+        predicted_tokens = model.embeddings(targets)
+        predicted_embeddings = predicted_tokens
     else:
-        predicted_embeddings = model.vocab_to_embed(one_hot_targets)
+        one_hot_targets = F.one_hot(targets, model.vocab_size).float()
+        predicted_tokens = one_hot_targets
+        if getattr(model.hparams, 'vocab_to_embed_uses_prob_dist', False):
+            predicted_embeddings = torch.matmul(one_hot_targets, model.embeddings.weight)
+        else:
+            predicted_embeddings = model.vocab_to_embed(one_hot_targets)
 
     all_embeddings = torch.cat([real_embeddings.detach(), predicted_embeddings], dim=1)
 
     transformer = getattr(model, 'transformer_eager', model.transformer)
     energy_preds = transformer(
         all_embeddings, start_pos=0, mcmc_step=0,
-        real_token_ids=model_input, predicted_tokens=one_hot_targets,
+        real_token_ids=model_input, predicted_tokens=predicted_tokens,
     )
 
     # ── Debug: log transformer output shape and stats (first call only) ──
