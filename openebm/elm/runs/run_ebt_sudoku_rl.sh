@@ -47,8 +47,8 @@ export HF_HUB_OFFLINE=1
 # Sudoku V2 数据缓存目录
 export SUDOKU_DATA_DIR_V2="${SUDOKU_DATA_DIR_V2:-/mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/data/sudoku_cache_v2}"
 
-# RL 实验 ID
-export EXP_ID="d26-ctx2048-sudoku-rl-gspo-$(date +%Y%m%d)"
+# RL 实验 ID。允许 rjob/复现实验通过环境变量固定输出目录；默认行为保持不变。
+export EXP_ID="${EXP_ID:-d26-ctx2048-sudoku-rl-gspo-$(date +%Y%m%d)}"
 # export EXP_ID="d26-ctx2048-sudoku-rl-reinforce-$(date +%Y%m%d)"
 
 ################################################################################
