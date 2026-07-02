@@ -581,3 +581,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 115 `training_step_start`；step 105 reward_mean `0.2589`，reward_std `0.2243`，answer_acc `0.125`，nan_params `0`；step 110 reward_mean `0.1318`，reward_std `0.0673`，answer_acc `0.0`，loss `1.81e-6`，grad_norm `0.0299`，nan_params `0` | 运行健康，shaped reward 保持非零；exact/answer_acc 继续波动。 |
 
 当前结论：不重启。Sudoku 的保护逻辑已经挡住旧的 all-zero / KL-only 路径；下一轮继续看 step 30 backward 和 step 35/40 指标，判断局部退化是否恢复或扩大。
+
+### 2026-07-03 01:33 +0800
+
+第二十六轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 到 step 35 `skip_consensus_start`，`local_skip=0.0`，`skip_reasons=[]`，`unique_ratio=1.0`，时间戳 `2026-07-03 01:32:12`；主 `train.log` 仍停在 step 30 的 `skip_consensus_done`，step 30 full backward 尚未落盘 | 局部退化没有继续扩散到 step 35：当前 rank 已恢复非退化 rollout。由于 rjob 仍运行且没有 global skip / NaN / RuntimeError，继续放跑；下一轮等待 step 35 完整 reward 和 backward。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 118 `training_step_start`；step 110 reward_mean `0.1318`，reward_std `0.0673`，answer_acc `0.0`，loss `1.81e-6`，grad_norm `0.0299`，nan_params `0` | 运行健康，继续保留。 |
+
+当前结论：本轮不做代码改动或重启。Sudoku local-zero 保护已经验证有效，且 step 35 有恢复迹象；继续监控更长趋势。
