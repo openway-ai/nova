@@ -504,3 +504,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，heartbeat 到 step 82 | step 75: reward_mean `0.1230`，reward_std `0.0703`，parse_rate `1.0`，answer_acc `0.0`，nan_grad_params `0` | 运行健康但 exact answer 仍无稳定提升；继续观察。 |
 
 当前结论：Sudoku 第三版已通过 step 0/5 的 local-skip 和梯度健康检查。下一轮继续等待 step 10/15，最终重点验证 step 25 是否避免 KL-only collapse。
+
+### 2026-07-03 00:15 +0800
+
+第十九轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 从 step 11 `generate_start` 推进到 step 12 `skip_consensus_start`，时间戳 `2026-07-03 00:14:38`，`local_skip=0.0`，`unique_ratio=0.8333`；`train.log` 仍只完整落盘到 step 5 | 不是训练 hang；当前问题是主 `train.log` 落盘滞后/未继续刷新，短期以 heartbeat 判断进度。step 12 本地没有触发 skip，说明这一批仍有可训练信号；继续等待下一个完整 log_interval 指标。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 91；最新完整指标仍为 step 85：reward_mean `0.1125`，reward_std `0.0607`，parse_rate `1.0`，answer_acc `0.0`，nan_grad_params `0`；step 80 曾出现 answer_acc `0.125` | 运行健康，无 NaN/崩溃；GSM8K shaped reward 非零但 exact answer 尚未稳定提升。 |
+
+当前结论：Sudoku 第三版仍在向前推进，local-skip 修复没有引入新的启动异常。下一轮继续等 step 15/20/25 附近的完整指标，重点确认是否再次出现 all-zero reward、KL-only loss 或全局跳步过高。
