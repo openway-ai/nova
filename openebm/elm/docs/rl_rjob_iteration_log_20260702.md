@@ -668,4 +668,4 @@ Sudoku local-skip 修复版重启：
 | Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 到 step 54 `skip_consensus_start`，`local_skip=0.0`，`unique_ratio=1.0`；主日志仍未补齐 step 50/55 完整指标，最新完整有效指标仍为 step 40，step 45 仍为单 rank `LOCAL_ZERO` 记录 | 训练继续推进，当前 rank 已非 skip；没有 global skip、NaN 或硬错误。由于完整指标未刷新，本轮不改变策略，继续等待后续落盘指标。 |
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 148 `training_step_start`；最新完整指标仍为 step 140：reward_mean `0.1496`，reward_std `0.0305`，parse_rate `1.0`，answer_acc `0.0`，nan_params `0` | 运行稳定；继续观察。 |
 
-当前结论：不修复、不重启。Sudoku 的完整指标落盘继续滞后，但 heartbeat 和 rjob 状态均正常；下一轮继续等待 step 50/55 完整指标，必要时再用 rjob stdout 交叉验证。
+当前结论：不修复、不重启。Sudoku 的完整指标落盘继续滞后，但 heartbeat 和 rjob 状态均正常；下一轮继续等待 step 50/55 完整指标。已尝试用 `rjob logs` 交叉验证 stdout，但日志接口出现 SSL EOF/握手卡住并被手动中断；该现象属于 rjob 日志服务访问问题，不是训练进程错误。
