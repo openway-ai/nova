@@ -104,7 +104,7 @@ MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-
 # (reward_mean≈0.004, format≈0.004, ref_energy_kl≈1.65e-2).
 MIN_REWARD_MEAN_TO_UPDATE="${MIN_REWARD_MEAN_TO_UPDATE:-0.5}"
 MIN_REWARD_FORMAT_TO_UPDATE="${MIN_REWARD_FORMAT_TO_UPDATE:-0.25}"
-SKIP_CONSENSUS="${SKIP_CONSENSUS:-any}"      # stability-first: any bad DDP rank skips the global update
+SKIP_CONSENSUS="${SKIP_CONSENSUS:-local}"    # DDP-safe: bad ranks zero out; all-bad batches skip globally
 
 # MAX_STEPS="${MAX_STEPS:-160}"                # analyzed run peaked at 60-120 and degraded around 150-190
 MAX_STEPS="${MAX_STEPS:-1000}"                # analyzed run peaked at 60-120 and degraded around 150-190
