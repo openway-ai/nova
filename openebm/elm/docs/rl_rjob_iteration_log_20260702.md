@@ -252,3 +252,29 @@ GSM8K 修复提交与重启：
 - Sudoku 仍未收敛，`full_solve=0.0`；目前没有加载或 DDP 崩溃问题，下一步重点观察 reward_std 是否继续收缩、reward_mean 是否持续下行。
 
 下一轮：继续默认 10 分钟监控；若 Sudoku 连续多个 logging step reward_std 接近 0 或 reward_mean 持续低位，则优先考虑提高采样温度/多样性、调弱过强更新或增加 reward/format 稳定项。
+
+### 2026-07-02 20:52 +0800
+
+第六轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running` | heartbeat 到 step 21 `generate_start`；step 20: reward_mean `1.5496`，reward_std `0.4808`，range `[0.923, 2.134]`，unique_ratio `0.9167`，loss `0.00292`，nan_grad_params 上一记录为 `0` | step 20 从 step 15 的低点恢复，暂无持续塌缩证据；继续观察。 |
+| GSM8K RL | `Running` | heartbeat 到 step 10 `training_step_start`；step 5: reward_mean `0.1378`，reward_std `0.0417`，range `[0.086, 0.193]`，answer_proximity `0.088`，parse_rate `1.0`，answer_acc `0.0`，degenerate `0.0`，grad_norm step 0 为 `0.0120` | shaped reward 继续提供非零方差；GSM8K 仍没有 exact answer 改善，但已不再是全零 advantage。 |
+
+当前结论：两个任务均运行中，没有 `Traceback`、NaN/Inf、DDP 停滞或 reward 全零。Sudoku 尚未收敛，GSM8K 仍处于 shaped reward 初期。
+
+下一轮：继续看 Sudoku step 25/30 和 GSM8K step 10/15；若 GSM8K 长期只有 proximity 而 answer_acc/format 不动，下一步考虑 prompt 格式强化或专用 GSM8K SFT ckpt。
+
+### 2026-07-02 21:03 +0800
+
+第七轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running` | heartbeat 到 step 24 `skip_consensus_start`，`local_skip=0.0`、`unique_ratio=1.0`；最近完整指标仍为 step 20: reward_mean `1.5496`，reward_std `0.4808` | rjob 活跃且未触发 skip；等待 step 25/30 完整指标。 |
+| GSM8K RL | `Running` | heartbeat 到 step 14 `skip_consensus_start`；step 10: reward_mean `0.1150`，reward_std `0.0855`，advantage_var `0.1599`，format `0.025`，answer_proximity `0.0400`，answer_acc `0.0`，degenerate `0.0`，grad_norm `0.0167`，nan_grad_params `0` | reward 方差继续非零，且 format 开始有少量信号；仍未出现 exact answer 提升。 |
+
+当前结论：两个任务均正常运行。Sudoku 仍未收敛但没有持续退化证据；GSM8K 的 reward shaping 修复稳定生效。
+
+下一轮：继续观察 Sudoku step 25/30 与 GSM8K step 15/20；如 GSM8K answer_acc 长期为 0，后续优化优先级为 prompt 格式约束、专用 GSM8K SFT ckpt、以及更强的 format reward。
