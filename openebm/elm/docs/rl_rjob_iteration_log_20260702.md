@@ -778,3 +778,12 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL conservative | `Running`，heartbeat 到 step 16 `old_energy_start` | step 10 backward 已落盘：grad_norm `1.9803`，max_grad `0.4588`，nan_params `0`。step 15 `rl_events.jsonl`：reward_mean `0.8583`，reward_std `0.0557`，blank_accuracy `0.0`，constraint_validity `0.0`，full_solve `0.0`，`ref_energy_kl=1.31e-5`，unique_completion_ratio `1.0`，skip_rank_count `1/8`，global_skip `False`。 | step 15 再次 clue-only，但 KL 仍低、reward_std 非零、没有 global skip 或 NaN；当前更像低 KL 下的 batch/采样波动，不是上一轮高 KL/高 grad 振荡。继续看 step 20 是否恢复 blank/validity；本轮不重启。 |
 | GSM8K RL | `Running`，heartbeat 到 step 199 `backward_done` | grad_norm `0.3704`，max_grad `0.3630`，nan_grad_params `0`。 | 继续运行；不重启。 |
+
+### 2026-07-03 05:19 +0800
+
+第四十四轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL conservative | `Running`，heartbeat 到 step 22 `generate_start` | step 15 backward 已落盘：grad_norm `2.0873`，max_grad `0.5392`，nan_params `0`。step 20 `rl_events.jsonl` 恢复强有效信号：reward_mean `1.5471`，reward_std `0.4485`，blank_accuracy `0.3591`，constraint_validity `0.2009`，full_solve `0.0`，`ref_energy_kl=7.62e-5`，unique_completion_ratio `1.0`。 | 保守重启目前有效抑制了上一轮的高 KL/高 grad 振荡：step 0/10/20 都有 blank/validity 信号，step 5/15 是 clue-only 波动，但 KL 仍很低，grad_norm 约 `2`，无 NaN/Inf。当前不重启；继续观察 step 25/30 是否保持低 KL 并周期性恢复有效 Sudoku reward。 |
+| GSM8K RL | `Running`，heartbeat 到 step 202 `training_step_start` | 最新已确认 step 199 backward：grad_norm `0.3704`，nan_grad_params `0`。 | 继续运行；不重启。 |
