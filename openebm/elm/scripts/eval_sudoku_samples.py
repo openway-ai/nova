@@ -967,6 +967,8 @@ def _run_eval(args, rank: int, world_size: int):
 
     t_all_start = time.time()
     rolling_c, rolling_t = 0, 0
+    sample_error_logs = 0
+    max_sample_error_logs = 5
 
     for (split_name, i) in iterable:
         if getattr(args, 'resume', False) and i in done[split_name]:
@@ -986,6 +988,7 @@ def _run_eval(args, rank: int, world_size: int):
             )
         except Exception as e:
             # Record a failed sample but keep going.
+            tb = traceback.format_exc()
             res = {
                 'puzzle_text': '', 'solution_text': '', 'response': f'<error: {e}>',
                 'pred': None, 'correct': 0, 'total': 81,
@@ -997,9 +1000,14 @@ def _run_eval(args, rank: int, world_size: int):
                 'prompt_used': '',
                 'puzzle_format': 'grid', 'solution_format': 'unknown',
                 'elapsed_s': 0.0, 'tokens_generated': 0,
+                'error_type': type(e).__name__,
+                'error': str(e),
             }
             if rank == 0:
                 print(f"[eval_sudoku_samples] sample error split={split_name} idx={i}: {e}")
+                if sample_error_logs < max_sample_error_logs:
+                    print(f"[eval_sudoku_samples] sample traceback split={split_name} idx={i}:\n{tb}")
+                sample_error_logs += 1
 
         # Stream to per-rank shard.
         if structured:
@@ -1023,6 +1031,9 @@ def _run_eval(args, rank: int, world_size: int):
                 'tokens_generated': res['tokens_generated'],
                 'response': res['response'], 'pred': res['pred'],
             }
+            if res.get('error') is not None:
+                obj['error_type'] = res.get('error_type')
+                obj['error'] = res.get('error')
             try:
                 shard_fps[split_name].write(json.dumps(obj, ensure_ascii=False) + '\n')
             except Exception as e:
