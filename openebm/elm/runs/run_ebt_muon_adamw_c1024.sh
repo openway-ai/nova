@@ -33,8 +33,16 @@ export MODEL_NAME="ebt"
 export MODEL_SIZE="d26"
 
 ### 环境变量 ###
-HOME="/mnt/shared-storage-user/puyuan/nanochat"
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+# Keep nanochat cache aligned with the prepared tokenizer/base_data location.
+# The previous /mnt/shared-storage-user/puyuan/nanochat path does not contain
+# tokenizer/tokenizer.pkl on the worker nodes.
+NANOCHAT_HOME="${NANOCHAT_HOME:-/mnt/shared-storage-user/puyuan/code/nanochat}"
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-${NANOCHAT_HOME}/.cache/nanochat}"
+if [ ! -f "${NANOCHAT_BASE_DIR}/tokenizer/tokenizer.pkl" ] || [ ! -f "${NANOCHAT_BASE_DIR}/tokenizer/token_bytes.pt" ]; then
+    echo "ERROR: nanochat tokenizer cache is missing under ${NANOCHAT_BASE_DIR}/tokenizer" >&2
+    echo "Expected tokenizer.pkl and token_bytes.pt. Set NANOCHAT_BASE_DIR to a prepared nanochat cache." >&2
+    exit 1
+fi
 
 # PyTorch 内存优化
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
@@ -44,7 +52,9 @@ export WANDB_API_KEY="Your WandB API Key"
 export WANDB_MODE="offline"
 
 mkdir -p logs/slurm/nlp/
-module purge
+if command -v module >/dev/null 2>&1; then
+    module purge
+fi
 
 # EBT 特定参数
 MCMC_STEP_SIZE=500.0
@@ -157,11 +167,125 @@ SAVE_TOP_K=2
 ################################################################################
 OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.0 --warmdown_ratio 0.5 --final_lr_frac 0.0 --optimizer muon_adamw --muon_lr 0.02 --muon_momentum 0.95 --muon_ns_steps 5 --muon_beta2 0.95 --adamw_embedding_lr 0.3 --adamw_vocab_to_embed_lr 0.01 --adamw_scalar_lr 0.04 --adamw_dmodel_lr_scaling"
 
+################################################################################
+# MCMC 梯度模式
+################################################################################
+# 默认不传，保持当前 second_order EBT 训练目标。
+# 启用 FSDP/ZeRO-3 友好的一阶 surrogate:
+#   MCMC_GRADIENT_MODE=first_order_cd TRAIN_ENGINE=fsdp2 bash ...
+MCMC_GRADIENT_FLAGS=""
+if [ -n "${MCMC_GRADIENT_MODE:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --mcmc_gradient_mode ${MCMC_GRADIENT_MODE}"
+fi
+if [ -n "${FIRST_ORDER_CD_LOSS_COEFF:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_loss_coeff ${FIRST_ORDER_CD_LOSS_COEFF}"
+fi
+if [ -n "${FIRST_ORDER_CD_LOSS_TYPE:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_loss_type ${FIRST_ORDER_CD_LOSS_TYPE}"
+fi
+if [ -n "${FIRST_ORDER_CD_MARGIN:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_cd_margin ${FIRST_ORDER_CD_MARGIN}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_COEFF:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_coeff ${FIRST_ORDER_LOCAL_CD_COEFF}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_NUM_PAIRS:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_num_pairs ${FIRST_ORDER_LOCAL_CD_NUM_PAIRS}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_PAIR_STRIDE:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_pair_stride ${FIRST_ORDER_LOCAL_CD_PAIR_STRIDE}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_LOSS_TYPE:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_loss_type ${FIRST_ORDER_LOCAL_CD_LOSS_TYPE}"
+fi
+if [ -n "${FIRST_ORDER_LOCAL_CD_MARGIN:-}" ]; then
+    MCMC_GRADIENT_FLAGS="${MCMC_GRADIENT_FLAGS} --first_order_local_cd_margin ${FIRST_ORDER_LOCAL_CD_MARGIN}"
+fi
 
 ################################################################################
 # torch.compile 配置
 ################################################################################
 COMPILE_FLAGS="--compile_model --compile_mode transformer_only"
+
+################################################################################
+# 可选训练引擎配置
+################################################################################
+# 默认不传任何 engine flags，保持当前 Lightning/DDP 行为。
+# 启用示例:
+#   TRAIN_ENGINE=fsdp2 bash openebm/elm/runs/run_ebt_muon_adamw_c1024.sh
+#   TRAIN_ENGINE=zero-2 bash openebm/elm/runs/run_ebt_muon_adamw_c1024.sh
+TRAIN_ENGINE="${TRAIN_ENGINE:-lightning_ddp}"
+ENGINE_FLAGS=""
+if [ "${TRAIN_ENGINE}" = "fsdp2" ]; then
+    # FSDP2 MVP: 避免 torch.compile + create_graph=True 的高阶 autograd 风险。
+    COMPILE_FLAGS="${FSDP_COMPILE_FLAGS:-}"
+    ENGINE_FLAGS="--train_engine fsdp2 \
+--fsdp_sharding_strategy ${FSDP_SHARDING_STRATEGY:-full_shard} \
+--fsdp_activation_checkpointing ${FSDP_ACTIVATION_CHECKPOINTING:-off} \
+--fsdp_mixed_precision ${FSDP_MIXED_PRECISION:-bf16} \
+--fsdp_state_dict_type ${FSDP_STATE_DICT_TYPE:-sharded} \
+--fsdp_wrap_policy ${FSDP_WRAP_POLICY:-transformer_block} \
+--fsdp_reshard_after_forward ${FSDP_RESHARD_AFTER_FORWARD:-false} \
+--fsdp_muon_dtensor_policy ${FSDP_MUON_DTENSOR_POLICY:-adamw} \
+--fsdp_force_truncate_mcmc"
+    if [ "${FSDP_CPU_OFFLOAD:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_cpu_offload"
+    fi
+    if [ "${FSDP_ALLOW_MUON_ADAMW:-1}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_allow_muon_adamw"
+    fi
+    if [ "${FSDP_FIRST_ORDER_MCMC_DEBUG:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --fsdp_first_order_mcmc_debug"
+    fi
+elif [ "${TRAIN_ENGINE}" = "zero-1" ] || [ "${TRAIN_ENGINE}" = "zero-2" ] || [ "${TRAIN_ENGINE}" = "zero-3" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero1" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero2" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero3" ]; then
+    # ZeRO-1/2 reduce optimizer/gradient memory but do not shard activations or
+    # the retained create_graph=True MCMC graph. Keep the default ZeRO test path
+    # conservative; override with ZERO_COMPILE_FLAGS or ZERO_FORCE_TRUNCATE_MCMC=0
+    # only for explicit memory experiments.
+    COMPILE_FLAGS="${ZERO_COMPILE_FLAGS:-}"
+    ENGINE_FLAGS="--train_engine ${TRAIN_ENGINE}"
+    if [ -n "${DEEPSPEED_REPO_PATH:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --deepspeed_repo_path ${DEEPSPEED_REPO_PATH}"
+    fi
+    if [ -n "${ZERO_CONFIG:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_config ${ZERO_CONFIG}"
+    fi
+    if [ "${ZERO_CPU_OFFLOAD_OPTIMIZER:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_cpu_offload_optimizer"
+    fi
+    if [ "${ZERO_CPU_OFFLOAD_PARAMETERS:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_cpu_offload_parameters"
+    fi
+    if [ "${TRAIN_ENGINE}" = "zero-3" ] || [ "${TRAIN_ENGINE}" = "deepspeed-zero3" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero3_param_dtype ${ZERO3_PARAM_DTYPE:-fp32}"
+    fi
+    if [ "${ZERO_CONTIGUOUS_GRADIENTS:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_contiguous_gradients"
+    fi
+    if [ "${ZERO_FORCE_TRUNCATE_MCMC:-1}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_force_truncate_mcmc"
+    fi
+    if [ "${ZERO_DISABLE_COMPILE:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_disable_compile"
+    fi
+    if [ "${ZERO_ALLOW_COMPILE:-0}" = "1" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allow_compile"
+    fi
+    if [ -n "${ZERO_MUON_POLICY:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_muon_policy ${ZERO_MUON_POLICY}"
+    fi
+    if [ -n "${ZERO3_MUON_POLICY:-}" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero3_muon_policy ${ZERO3_MUON_POLICY}"
+    fi
+    if [ "${ZERO_ALLGATHER_BUCKET_SIZE:-0}" != "0" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_allgather_bucket_size ${ZERO_ALLGATHER_BUCKET_SIZE}"
+    fi
+    if [ "${ZERO_REDUCE_BUCKET_SIZE:-0}" != "0" ]; then
+        ENGINE_FLAGS="${ENGINE_FLAGS} --zero_reduce_bucket_size ${ZERO_REDUCE_BUCKET_SIZE}"
+    fi
+elif [ "${TRAIN_ENGINE}" != "lightning_ddp" ]; then
+    ENGINE_FLAGS="--train_engine ${TRAIN_ENGINE}"
+fi
 
 ################################################################################
 # WandB 配置 (训练参数)
@@ -290,11 +414,11 @@ echo ""
 echo -e "${CYAN}▶ 学习率配置${NC}"
 print_separator "─" 60
 print_kv "Peak LR (Base)" "${PEAK_LR}"
-local alpha_lr=$(awk "BEGIN {printf \"%.4f\", ${PEAK_LR} * ${MCMC_STEP_SIZE_LR_MULTIPLIER}}")
+alpha_lr=$(awk "BEGIN {printf \"%.4f\", ${PEAK_LR} * ${MCMC_STEP_SIZE_LR_MULTIPLIER}}")
 print_kv "Alpha Effective LR" "${BOLD}${alpha_lr}${NC} (=${PEAK_LR}×${MCMC_STEP_SIZE_LR_MULTIPLIER})"
 print_kv "Warmup Steps" "${WARM_UP_STEPS} (5%)"
 print_kv "Min LR Scale" "${MIN_LR_SCALE}"
-local final_lr=$(awk "BEGIN {printf \"%.8f\", ${PEAK_LR}/${MIN_LR_SCALE}}")
+final_lr=$(awk "BEGIN {printf \"%.8f\", ${PEAK_LR}/${MIN_LR_SCALE}}")
 print_kv "Final LR" "${final_lr}"
 
 echo ""
@@ -331,7 +455,9 @@ echo "  3. Alpha LR 仍由 MCMC_STEP_SIZE_LR_MULTIPLIER × PEAK_LR 控制 (EBT �
 echo "  4. 监控关键指标: train_loss, Alpha_MCMC, Global_LR"
 
 echo ""
-read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
+if [ "${DRY_RUN:-0}" != "1" ]; then
+    read -p "按 Enter 开始训练，或 Ctrl+C 取消..."
+fi
 
 ################################################################################
 # 写入日志头
@@ -392,7 +518,9 @@ Max Steps:                ${MAX_STEPS}
 Total Tokens:             ${total_tokens_b}
 
 Option Flags:             ${OPTION_FLAGS:-"None (Baseline)"}
+MCMC Gradient Flags:      ${MCMC_GRADIENT_FLAGS:-"None (second_order default)"}
 Compile Flags:            ${COMPILE_FLAGS:-"None"}
+Engine Flags:             ${ENGINE_FLAGS:-"None (Lightning/DDP default)"}
 
 ================================================================================
 [训练输出]
@@ -412,6 +540,15 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 echo ""
 print_header "开始训练"
 echo ""
+
+if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo "[DRY_RUN] Skipping torchrun launch."
+    echo "[DRY_RUN] Engine Flags: ${ENGINE_FLAGS:-None}"
+    echo "[DRY_RUN] MCMC Gradient Flags: ${MCMC_GRADIENT_FLAGS:-None}"
+    echo "[DRY_RUN] Float Precision: ${FLOAT_PRECISION}"
+    echo "[DRY_RUN] Effective Optimizer: $(short_optimizer_tag)"
+    exit 0
+fi
 
 set +e
 torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/train.py \
@@ -451,7 +588,6 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --warm_up_base_lr_divider ${WARM_UP_BASE_LR_DIVIDER} \
 \
 --dataset_name "nanochat" \
---num_workers ${NUM_WORKERS} \
 --val_check_interval ${VAL_CHECK_INTERVAL} \
 --limit_val_batches ${LIMIT_VAL_BATCHES} \
 --val_sanity 1 \
@@ -464,6 +600,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /mnt/shared-storage-user/puyu
 --save_periodic_steps 1000 \
 --float_precision bf16-mixed \
 ${WANDB_FLAGS} \
+${ENGINE_FLAGS} \
+${MCMC_GRADIENT_FLAGS} \
 ${OPTION_FLAGS} \
 ${COMPILE_FLAGS}
 
@@ -489,8 +627,8 @@ else
         echo -e "${YELLOW}⚠ 检测到 OOM - 建议减小 DEVICE_BATCH_SIZE${NC}"
     fi
 
-    if grep -q "nan\|NaN\|inf\|Inf" "${LOG_FILE}" 2>/dev/null | head -5; then
-        echo -e "${YELLOW}⚠ 检测到 NaN/Inf - 可能需要进一步降低学习率${NC}"
+    if grep -Eiq "(^|[^[:alnum:]_])nan([^[:alnum:]_]|$)|(train_)?loss:[[:space:]]*(nan|inf)|valid_loss:[[:space:]]*(nan|inf)" "${LOG_FILE}" 2>/dev/null; then
+        echo -e "${YELLOW}⚠ 检测到 loss NaN/Inf - 可能需要进一步降低学习率${NC}"
     fi
 fi
 
