@@ -537,3 +537,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，heartbeat 到 step 99 `backward_done` | heartbeat: grad_norm `0.019538`，max_grad `0.016206`，nan_grad_params `0`；最新完整指标 step 90 reward_mean `0.1469`，reward_std `0.0756`，parse_rate `1.0`，answer_acc `0.0` | 运行稳定；exact answer 仍未形成持续提升。 |
 
 当前结论：本轮无需修复或重启。下一轮继续等待 Sudoku step 20/25 完整指标，验证旧退化点是否被保护逻辑覆盖。
+
+### 2026-07-03 00:49 +0800
+
+第二十二轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，heartbeat 到 step 23 `generate_start` | step 20: reward_mean `1.5944`，reward_std `0.4007`，blank_accuracy `0.373`，constraint_validity `0.231`，zero_frac 未见异常，`skip_rank_count=0`，`global_skip=False`，loss `0.002059`，主要来自 `ref_energy_kl=0.0021`，ratio/clip 仍为 `0`，nan_params 未见异常 | step 20 reward 和 blank/validity 信号恢复，且没有 skip/NaN/崩溃。KL 较 step 10/15 增大但当前仍是小量级，先继续观察，不重启。尚未到 step 25 关键回归点。 |
+| GSM8K RL | `Running`，heartbeat 仍为 step 99 `backward_done` | heartbeat: grad_norm `0.019538`，max_grad `0.016206`，nan_grad_params `0`；最新完整指标 step 90 reward_mean `0.1469`，reward_std `0.0756`，answer_acc `0.0` | 运行稳定；没有新的异常信号。 |
+
+当前结论：本轮无需修复或重启。下一轮继续等待 Sudoku step 25 完整指标，重点确认是否避免旧的 all-zero / KL-only collapse。
