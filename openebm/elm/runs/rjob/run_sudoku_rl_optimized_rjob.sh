@@ -47,7 +47,7 @@ GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-6}"
 RL_LOSS_TYPE="${RL_LOSS_TYPE:-energy_gspo}"
 MAX_STEPS="${MAX_STEPS:-1000}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-100}"
-LOG_INTERVAL="${LOG_INTERVAL:-5}"
+LOG_INTERVAL="${LOG_INTERVAL:-1}"
 SAVE_TOP_K="${SAVE_TOP_K:-2}"
 # Conservative restart defaults after the 20260702-233012 run oscillated between
 # usable blank/validity reward and format/clue-only batches with high pre-clip
@@ -59,7 +59,7 @@ GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
 MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.005}"
 ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
 ENERGY_KL_HUBER_DELTA="${ENERGY_KL_HUBER_DELTA:-0.5}"
-SKIP_CONSENSUS="${SKIP_CONSENSUS:-any}"
+SKIP_CONSENSUS="${SKIP_CONSENSUS:-local}"
 # Skip all-zero / zero-variance rollout batches before they become KL-only
 # updates. The trainer clears grads to None on skipped steps, making this safe
 # for Muon+AdamW and avoiding weight_decay drift.

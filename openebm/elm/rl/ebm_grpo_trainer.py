@@ -391,39 +391,39 @@ class EBMGRPOTrainer(LightningModule):
             self.log("stability/degenerate_group_rate", gen_data["degenerate_rate"])
             self.log("train/reward_mean", gen_data["reward_mean"], prog_bar=True)
             step = self.global_step
-            if step % self.config.log_interval == 0:
-                if self._is_rank0():
-                    print(
-                        f"[GRPO] step={step} SKIPPED reason={','.join(reported_skip_reasons) or 'ddp_consensus'} "
-                        f"degen={gen_data['degenerate_rate']:.2f} "
-                        f"reward={gen_data['reward_mean']:.3f}±{gen_data['reward_std']:.3f} "
-                        f"uniq={unique_ratio_for_skip:.2f}",
-                        flush=True,
-                    )
-                self._log_json_event("rl_step", step, {
-                    "loss": {
-                        "total": 0.0,
-                        "policy": 0.0,
-                        "ref_energy_kl": 0.0,
-                        "clip_ratio": 0.0,
-                    },
-                    "reward": {
-                        "mean": gen_data["reward_mean"],
-                        "std": gen_data["reward_std"],
-                        "var": gen_data.get("reward_var", 0.0),
-                        "advantage_var": gen_data.get("advantage_var", 0.0),
-                        "components": gen_data.get("reward_components", {}),
-                    },
-                    "rollout": {
-                        "completion_len_mean": gen_data.get("avg_completion_length", 0.0),
-                        "unique_completion_ratio": unique_ratio_for_skip,
-                        "degenerate_group_rate": gen_data.get("degenerate_rate", 0.0),
-                        "skipped_step": 1.0,
-                        "skip_reasons": reported_skip_reasons,
-                        "local_skip_reasons": skip_reasons,
-                        "global_skip_rank_count": int(skip_rank_count.detach().cpu().item()),
-                    },
-                })
+            if self._is_rank0():
+                print(
+                    f"[GRPO] step={step} SKIPPED reason={','.join(reported_skip_reasons) or 'ddp_consensus'} "
+                    f"degen={gen_data['degenerate_rate']:.2f} "
+                    f"reward={gen_data['reward_mean']:.3f}±{gen_data['reward_std']:.3f} "
+                    f"uniq={unique_ratio_for_skip:.2f}",
+                    flush=True,
+                )
+            self._log_json_event("rl_step", step, {
+                "loss": {
+                    "total": 0.0,
+                    "policy": 0.0,
+                    "ref_energy_kl": 0.0,
+                    "clip_ratio": 0.0,
+                },
+                "reward": {
+                    "mean": gen_data["reward_mean"],
+                    "std": gen_data["reward_std"],
+                    "var": gen_data.get("reward_var", 0.0),
+                    "advantage_var": gen_data.get("advantage_var", 0.0),
+                    "components": gen_data.get("reward_components", {}),
+                },
+                "rollout": {
+                    "completion_len_mean": gen_data.get("avg_completion_length", 0.0),
+                    "unique_completion_ratio": unique_ratio_for_skip,
+                    "degenerate_group_rate": gen_data.get("degenerate_rate", 0.0),
+                    "skipped_step": 1.0,
+                    "skip_reasons": reported_skip_reasons,
+                    "local_skip_reasons": skip_reasons,
+                    "global_skip_rank_count": int(skip_rank_count.detach().cpu().item()),
+                    "skip_consensus": skip_consensus,
+                },
+            })
             return self._zero_placeholder_loss()
         self.log("stability/skipped_step", 0.0)
 
@@ -438,39 +438,39 @@ class EBMGRPOTrainer(LightningModule):
                 reward_mean=round(float(gen_data["reward_mean"]), 4),
                 reward_std=round(float(gen_data["reward_std"]), 4),
             )
-            if step % self.config.log_interval == 0:
-                if self._is_rank0():
-                    print(
-                        f"[GRPO] step={step} LOCAL_ZERO reason={','.join(skip_reasons) or 'bad_local_rollout'} "
-                        f"degen={gen_data['degenerate_rate']:.2f} "
-                        f"reward={gen_data['reward_mean']:.3f}±{gen_data['reward_std']:.3f} "
-                        f"uniq={unique_ratio_for_skip:.2f}",
-                        flush=True,
-                    )
-                self._log_json_event("rl_step", step, {
-                    "loss": {
-                        "total": 0.0,
-                        "policy": 0.0,
-                        "ref_energy_kl": 0.0,
-                        "clip_ratio": 0.0,
-                    },
-                    "reward": {
-                        "mean": gen_data["reward_mean"],
-                        "std": gen_data["reward_std"],
-                        "var": gen_data.get("reward_var", 0.0),
-                        "advantage_var": gen_data.get("advantage_var", 0.0),
-                        "components": gen_data.get("reward_components", {}),
-                    },
-                    "rollout": {
-                        "completion_len_mean": gen_data.get("avg_completion_length", 0.0),
-                        "unique_completion_ratio": unique_ratio_for_skip,
-                        "degenerate_group_rate": gen_data.get("degenerate_rate", 0.0),
-                        "skipped_step": 0.0,
-                        "local_zero_update": 1.0,
-                        "skip_reasons": skip_reasons,
-                        "global_skip_rank_count": int(skip_rank_count.detach().cpu().item()),
-                    },
-                })
+            if self._is_rank0():
+                print(
+                    f"[GRPO] step={step} LOCAL_ZERO reason={','.join(skip_reasons) or 'bad_local_rollout'} "
+                    f"degen={gen_data['degenerate_rate']:.2f} "
+                    f"reward={gen_data['reward_mean']:.3f}±{gen_data['reward_std']:.3f} "
+                    f"uniq={unique_ratio_for_skip:.2f}",
+                    flush=True,
+                )
+            self._log_json_event("rl_step", step, {
+                "loss": {
+                    "total": 0.0,
+                    "policy": 0.0,
+                    "ref_energy_kl": 0.0,
+                    "clip_ratio": 0.0,
+                },
+                "reward": {
+                    "mean": gen_data["reward_mean"],
+                    "std": gen_data["reward_std"],
+                    "var": gen_data.get("reward_var", 0.0),
+                    "advantage_var": gen_data.get("advantage_var", 0.0),
+                    "components": gen_data.get("reward_components", {}),
+                },
+                "rollout": {
+                    "completion_len_mean": gen_data.get("avg_completion_length", 0.0),
+                    "unique_completion_ratio": unique_ratio_for_skip,
+                    "degenerate_group_rate": gen_data.get("degenerate_rate", 0.0),
+                    "skipped_step": 0.0,
+                    "local_zero_update": 1.0,
+                    "skip_reasons": skip_reasons,
+                    "global_skip_rank_count": int(skip_rank_count.detach().cpu().item()),
+                    "skip_consensus": skip_consensus,
+                },
+            })
             return self._zero_full_graph_loss(gen_data)
         self.log("stability/local_zero_update", 0.0)
 

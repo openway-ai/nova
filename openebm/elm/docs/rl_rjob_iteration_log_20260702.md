@@ -813,3 +813,26 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，不重启 | heartbeat 到 step 213 `training_step_start`；近期 step 200/205/210 reward_mean 分别约 `0.2843`、`0.1984`、`0.1765`，reward_std 非零，parse_rate `1.0`，grad_norm 约 `0.38-0.52`，nan_params `0`。 | 仍健康推进；本轮修复只针对 Sudoku skip consensus 默认值，GSM8K 继续运行。 |
 
 修复动作：完成 `skip_consensus=any` 默认值同步，并通过 `py_compile`、`bash -n` 与 diff 检查。下一步提交并推送修复，停止 guarded Sudoku rjob 后提交新 rjob。
+
+重启动作：
+
+- 修复 commit：`39f30bc1d96eafc0ece10babd8bdc6805064cfb2`，已推送到远端 `dev-openebm-sudoku-rl-fsdp2-merge`。
+- 已停止旧 Sudoku guarded rjob：`d26-ctx2048-sudoku-rl-fsdp2-merge-guarded-20-a82c6`，05:47 控制面状态 `Stopped`。
+- 已提交新 Sudoku rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-any-202607-2b60a`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-any-20260703-0547`，05:47 控制面状态 `Starting/RUNNING`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-any-20260703-0547/`。
+- GSM8K rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` 保持 `Running`。
+
+### 2026-07-03 06:10 +0800
+
+第四十七轮异常分析与修复：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL any-consensus | 已停止 rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-any-202607-2b60a` | step 0：rank0 reward_mean `1.5721`、blank_accuracy `0.3846`、constraint_validity `0.1990`、local_skip `0`，但 `skip_rank_count=1/8`，`any` 触发 global skip。step 5：rank0 reward_mean `0.9253`、format `0.5`、local_skip `0`，同样因 `skip_rank_count=1/8` 被 global skip。 | 根因是 `skip_consensus=any` 在 8 rank、每 rank 一个 prompt 的设置中过于保守；单个 rank 的低质量 rollout 会丢弃其他健康 rank 的有效更新，导致有效更新率显著下降。回到 DDP-safe `local`：坏 rank 贡献 zero full-graph loss，健康 rank 继续更新；只有 all-bad 才全局跳过。 |
+| GSM8K RL | `Running`，不重启 | heartbeat 到 step 224 `loss_ready`，loss `0.00330`，此前 skip 为 0、无 NaN/Inf。 | 健康运行，继续保留。 |
+
+修复动作：
+
+- 将 `EBMGRPOConfig`、`run_ebt_sudoku_rl.sh`、`run_sudoku_rl_optimized_rjob.sh` 的默认 `skip_consensus` 恢复为 `local`，并在注释中标明这是 DDP-safe hybrid 策略。
+- 将 Sudoku optimized rjob 默认 `LOG_INTERVAL` 调为 `1`，便于逐 step 监控。
+- 修改 trainer：global skip 与 local-zero 事件不再受 `LOG_INTERVAL` 限制，逐 step 写入 `logs/rl_events.jsonl`，避免后续监控盲区。
+- 已通过 `py_compile`、`bash -n`、`git diff --check`。
