@@ -30,6 +30,7 @@ import torch
 from torch.utils.data import IterableDataset
 
 from nanochat.common import get_dist_info
+from openebm.elm.rl.data_sharding import build_rank_worker_indices
 
 # ── Default data paths ────────────────────────────────────────────────────────
 _HF_CACHE_ROOT_DEFAULT = os.path.join(
@@ -226,15 +227,21 @@ class GSM8KRLPromptDataset(IterableDataset):
         is_ddp, rank, local_rank, world_size = get_dist_info()
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
 
         seed = self._seed + rank * 1000 + worker_id
-        rng = np.random.default_rng(seed)
         py_rng = random.Random(seed)
 
-        indices = list(range(len(self.samples)))
-        rng.shuffle(indices)
-
+        epoch = 0
         while True:
+            indices = build_rank_worker_indices(
+                len(self.samples),
+                rank=rank,
+                world_size=world_size,
+                worker_id=worker_id,
+                num_workers=num_workers,
+                seed=self._seed + epoch,
+            )
             for idx in indices:
                 sample = self.samples[idx]
                 question = sample["question"]
@@ -258,8 +265,7 @@ class GSM8KRLPromptDataset(IterableDataset):
                     "answer": sample["answer"],
                     "chain_of_thought": sample["chain_of_thought"],
                 }
-
-            rng.shuffle(indices)
+            epoch += 1
 
 
 def collate_gsm8k_prompts(batch, tokenizer, max_prompt_length: int):

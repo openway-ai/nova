@@ -30,6 +30,7 @@ except ImportError:
 
 from openebm.elm.rl.ebm_grpo_config import EBMGRPOConfig
 from openebm.elm.rl.logprobs import get_per_token_logps, compute_sequence_energy
+from openebm.elm.rl.optimizer_utils import make_skip_missing_grad_muon_adamw
 from openebm.elm.rl.rewards import compute_sudoku_rewards, compute_sudoku_rewards_detailed
 from openebm.elm.rl.rollout import generate_completions
 from openebm.elm.rl.sudoku_dataset_rl import SudokuRLPromptDataset, collate_rl_prompts
@@ -487,7 +488,7 @@ class EBMGRPOTrainer(LightningModule):
                     "log_ratio_abs_max": total_metrics.get("log_ratio_abs_max"),
                     "log_ratio_clamp_rate": total_metrics.get("log_ratio_clamp_rate"),
                     "effective_clip_rate": total_metrics.get("effective_clip_rate"),
-                    "old_policy_energy_drift": total_metrics.get("old_policy_energy_drift", total_metrics.get("energy_ppo_kl")),
+                    "old_policy_energy_drift": total_metrics.get("old_policy_energy_drift"),
                     "clip_ratio_low": total_metrics.get("clip_ratio_low"),
                     "clip_ratio_high": total_metrics.get("clip_ratio_high"),
                 },
@@ -1458,26 +1459,9 @@ class EBMGRPOTrainer(LightningModule):
                 weight_decay=self.config.weight_decay,
             ))
 
-        # PL closure compatibility (mirrors trainer.py:1562 PLMuonAdamW).
-        # Also guards against None grads in Muon groups: skip-degen sets every
-        # p.grad = None to halt the optimizer step, but nanochat's _step_muon
-        # does `torch.stack([p.grad for p in params])` which crashes on None.
-        # We zero-fill missing grads so Muon stacks zeros (effectively a no-op).
-        class PLMuonAdamW(MuonAdamW):
-            @torch.no_grad()
-            def step(self, closure=None):
-                if closure is not None:
-                    with torch.enable_grad():
-                        closure()
-                for g in self.param_groups:
-                    if g.get('kind') != 'muon':
-                        continue
-                    if any(p.grad is None for p in g['params']):
-                        for p in g['params']:
-                            if p.grad is None:
-                                p.grad = torch.zeros_like(p)
-                super().step()
-
+        # Muon stacks grads by shape, so missing-grad groups must be skipped as
+        # groups. Zero-fill is not a no-op under Muon momentum/weight decay.
+        PLMuonAdamW = make_skip_missing_grad_muon_adamw(MuonAdamW)
         optimizer = PLMuonAdamW(param_groups)
         for g in optimizer.param_groups:
             g['initial_lr'] = g['lr']

@@ -123,7 +123,7 @@ def parse_args():
     parser.add_argument(
         "--skip_consensus",
         type=str,
-        default="all",
+        default="any",
         choices=["all", "any"],
         help="'all': skip only if every DDP rank reports a bad rollout; "
              "'any': skip if any rank reports a bad rollout.",
@@ -213,24 +213,27 @@ def load_sft_model_and_tokenizer(checkpoint_path):
     # Load state dict (handle "model." from Lightning + "_orig_mod." from torch.compile)
     state_dict = ckpt["state_dict"]
     model_state = {}
-    n_renamed_eager = 0
+    n_renamed_transformer_keys = 0
     for key, val in state_dict.items():
         clean_key = key
         if clean_key.startswith("model."):
             clean_key = clean_key[6:]
         if clean_key.startswith("_orig_mod."):
             clean_key = clean_key[10:]
+        if clean_key.startswith("transformer._orig_mod."):
+            clean_key = "transformer." + clean_key[len("transformer._orig_mod."):]
+            n_renamed_transformer_keys += 1
         # Compat: SFT ckpts trained with use_sdpa_attention=True (older runs)
         # store transformer params under `transformer_eager.*`. Current
         # EBT_NLP build always names it `self.transformer`.
         if clean_key.startswith("transformer_eager."):
             clean_key = "transformer." + clean_key[len("transformer_eager."):]
-            n_renamed_eager += 1
+            n_renamed_transformer_keys += 1
         if clean_key in model_state:
             continue
         model_state[clean_key] = val
-    if n_renamed_eager > 0:
-        print(f"  Renamed {n_renamed_eager} `transformer_eager.*` keys to `transformer.*`")
+    if n_renamed_transformer_keys > 0:
+        print(f"  Renamed {n_renamed_transformer_keys} compiled/eager transformer keys to `transformer.*`")
 
     missing, unexpected = model.load_state_dict(model_state, strict=False)
     if unexpected:
