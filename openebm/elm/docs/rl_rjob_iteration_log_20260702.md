@@ -570,3 +570,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 110 `training_step_start`；最新完整指标 step 105 reward_mean `0.2589`，reward_std `0.2243`，answer_acc `0.125`，loss `2.11e-6`，nan_params 未见异常 | 运行健康，继续保留；exact/answer_acc 仍是波动而非稳定提升。 |
 
 当前结论：本轮不做代码改动或重启。下一轮继续等待 Sudoku step 25/30 的完整指标；若 heartbeat 停止更新或日志出现 NaN/RuntimeError/all-zero KL-only 更新，再进入修复分支。
+
+### 2026-07-03 01:26 +0800
+
+第二十五轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 到 step 33 `generate_start`；`train.log` 已补刷到 step 30 前半段。step 20 完整 backward: reward_mean `1.5944`，reward_std `0.4007`，grad_norm `10.5686`，nan_params `0`。step 25 本地 rank reward_mean `0.0`、reward_std `0.0`，触发 `local_zero_update=True`，`skip_rank_count=3/8`，`ref_energy_kl=0.0`，`total=0.0`，随后 backward grad_norm `7.2055`、nan_params `0`；step 30 同样在本地 rank 触发 `local_zero_update=True`，`skip_rank_count=3/8`，后续完整 backward 尚未落盘 | 旧问题点回归验证通过：all-zero rollout 没有再形成 KL-only 更新，而是被 local-zero 保护；健康 rank 仍可通过 DDP all-reduce 贡献梯度。当前不是 checkpoint 加载问题，也不是全局 reward=0 collapse，但局部 rank 连续退化仍需继续观察，若 skip_rank_count 扩大或长期持续，需要考虑调低生成退化风险或加强 reward/采样设置。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 115 `training_step_start`；step 105 reward_mean `0.2589`，reward_std `0.2243`，answer_acc `0.125`，nan_params `0`；step 110 reward_mean `0.1318`，reward_std `0.0673`，answer_acc `0.0`，loss `1.81e-6`，grad_norm `0.0299`，nan_params `0` | 运行健康，shaped reward 保持非零；exact/answer_acc 继续波动。 |
+
+当前结论：不重启。Sudoku 的保护逻辑已经挡住旧的 all-zero / KL-only 路径；下一轮继续看 step 30 backward 和 step 35/40 指标，判断局部退化是否恢复或扩大。
