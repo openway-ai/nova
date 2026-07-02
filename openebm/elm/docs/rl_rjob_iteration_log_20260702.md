@@ -851,3 +851,5 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL local-log1 | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-local-log1-fb84f` | 启动配置确认：commit `20c93ac5198ff6eddb30019091e117ff65a426ed`，`skip_consensus=local`，`LOG_INTERVAL=1`，SFT checkpoint remap 正常。step 0：reward_mean `1.5721`，reward_std `0.4567`，blank_accuracy `0.3846`，constraint_validity `0.1990`，full_solve `0.0`，`global_skip=False`，`skip_rank_count=1/8`，grad_norm `1.9447`，nan_grad_params `0`。 | 修复生效：坏 rank 被隔离但没有丢弃健康 rank 的更新；checkpoint 与 reward 均正常。继续观察 step 1-5 的逐步 JSON，重点看 local-zero 是否逐步落盘、KL 是否维持低位、reward 是否恢复/提升。 |
 | GSM8K RL | `Running` | heartbeat 到 step 229 `skip_consensus_start`，local_skip `0`，unique_ratio `1.0`。 | 健康运行，继续保留。 |
+
+补充到 step 5：`rl_events.jsonl` 已逐 step 落盘。step 0/2/4 有有效 blank/validity 信号，reward_mean 分别为 `1.5721`、`1.5905`、`1.3218`；step 2 出现 `full_solve=0.05`；step 1 是 `LOCAL_ZERO`，`skip_rank_count=5/8`；step 3/5 为 clue-only 低方差更新，reward_mean `0.9091`/`0.9253`。`ref_energy_kl` 仍在 `0` 到 `2.78e-7` 范围，尚无 KL 漂移、NaN/Inf 或 reward 崩塌。
