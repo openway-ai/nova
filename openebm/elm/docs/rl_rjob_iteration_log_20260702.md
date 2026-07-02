@@ -880,3 +880,12 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL local-log1 | `Running`，heartbeat 到 step 13 `generate_start` | `rl_events.jsonl` 到 step 12，共 13 条事件。last5 平均 reward `1.4903`、blank_accuracy `0.3769`、constraint_validity `0.2047`、full_solve `0.1200`，`LOCAL_ZERO=2/5`，max `ref_energy_kl=3.77e-6`。step 11 是低质 local-zero：reward_mean `0`、std `0`；step 12 恢复正常有效更新：reward_mean `1.5136`、blank_accuracy `0.3319`、constraint_validity `0.1991`。 | local-zero 频率需要继续关注，但不是连续退化；健康更新仍在出现，KL 低、无 NaN/Inf，控制面正常。暂不改代码/不重启，继续观察到 step 20。 |
 | GSM8K RL | `Running`，heartbeat 到 step 249 `training_step_start` | 控制面 `Running`，训练仍推进。 | 健康运行，继续保留。 |
+
+### 2026-07-03 07:10 +0800
+
+第五十二轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL local-log1 | `Running`，heartbeat 到 step 16 `generate_start` | `rl_events.jsonl` 到 step 15，共 16 条事件。last10 平均 reward `1.4633`、blank_accuracy `0.3365`、constraint_validity `0.1747`、full_solve `0.0850`，`LOCAL_ZERO=2/10`，max `ref_energy_kl=2.89e-5`。step 14 是正向高分更新：reward_mean `2.0535`、blank_accuracy `0.5883`、constraint_validity `0.2421`、full_solve `0.25`；step 15 为 clue-only 低方差更新：reward_mean `0.8583`、blank/validity `0`。 | 当前波动仍在可接受范围：有效 Sudoku reward 周期性出现，local-zero 未连续化，KL 低于 `1e-4`，无 NaN/Inf。继续观察 step 20；不重启。 |
+| GSM8K RL | `Running`，heartbeat 到 step 249 `backward_done` | grad_norm `0.5627`，max_grad `0.5520`，nan_grad_params `0`。 | 健康运行，继续保留。 |
