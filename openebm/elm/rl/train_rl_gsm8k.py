@@ -42,7 +42,7 @@ class EBMGRPOTrainerGSM8K(EBMGRPOTrainer):
     Replaces:
       - Dataset: SudokuRLPromptDataset → GSM8KRLPromptDataset
       - Reward:  compute_sudoku_rewards_detailed → compute_gsm8k_rewards_detailed
-      - Reward components logged: format / exact_match / partial_credit / length_penalty
+      - Reward components logged: format / exact_match / answer_proximity / partial_credit
     """
 
     def __init__(self, config: EBMGRPOConfig, model, tokenizer,
@@ -56,7 +56,7 @@ class EBMGRPOTrainerGSM8K(EBMGRPOTrainer):
     # ── Reward computation (override) ─────────────────────────────────────────
 
     def _compute_rewards(self, completion_texts, batch_meta):
-        """GSM8K reward: exact_match + format + partial + length_penalty."""
+        """GSM8K reward: exact_match + proximity + format + partial."""
         answers = batch_meta["answers"]
         # Expand answers to match num_generations
         num_prompts = len(answers)
@@ -161,7 +161,7 @@ class EBMGRPOTrainerGSM8K(EBMGRPOTrainer):
 
         avg_comp_len = completion_masks.sum(dim=1).float().mean().item()
         reward_components = {}
-        for key in ["format", "exact_match", "partial_credit", "length_penalty"]:
+        for key in ["format", "exact_match", "answer_proximity", "partial_credit", "length_penalty"]:
             vals = [d.get(key, 0.0) for d in reward_details]
             reward_components[key] = sum(vals) / max(len(vals), 1)
         parsed_vals = [1.0 if d.get("parsed_answer") is not None else 0.0 for d in reward_details]
@@ -186,9 +186,14 @@ class EBMGRPOTrainerGSM8K(EBMGRPOTrainer):
             "advantages": advantages,
             "reward_mean": rewards.mean().item(),
             "reward_std": rewards.std().item(),
+            "reward_min": rewards.min().item(),
+            "reward_max": rewards.max().item(),
+            "reward_zero_frac": (rewards == 0).float().mean().item(),
             "reward_var": reward_var,
             "advantage_var": advantage_var,
             "avg_completion_length": avg_comp_len,
+            "response_len_mean": avg_comp_len,
+            "response_len_max": completion_masks.sum(dim=1).float().max().item(),
             "reward_components": reward_components,
             "degenerate_rate": degenerate_rate,
             # Raw arrays carried through for parent trajectory logging and collapse detection.
