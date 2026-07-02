@@ -284,6 +284,7 @@ class SudokuSFTV2IterableDataset(_IterableDataset):
         self.resume_state_dict = resume_state_dict
         self._resume_state_locked = self._can_restore(resume_state_dict)
         self.last_state_dict = None
+        self.last_batch_meta = {}
         self._runtime_initialized = False
         # v2 新增：训练时开启增强，验证时关闭（确保 valid_loss 可比较）
         self.augment = augment and (split == "train")
@@ -427,6 +428,15 @@ class SudokuSFTV2IterableDataset(_IterableDataset):
         else:
             self._initialize_fresh_state(ddp_rank, ddp_world_size)
 
+        def _bucket_name_for_sample(sample_idx):
+            sample = self.samples[sample_idx]
+            puzzle = np.asarray(sample["puzzle"], dtype=np.int64)
+            given = int((puzzle != 0).sum())
+            for name, lo, hi in self.DIFFICULTY_BUCKETS:
+                if lo <= given <= hi:
+                    return name, given
+            return "out_of_bucket", given
+
         def pick_sample_index():
             """v3: difficulty-aware bucket sampling on train; uniform-cursor on val/test."""
             if (
@@ -442,16 +452,21 @@ class SudokuSFTV2IterableDataset(_IterableDataset):
                     idxs, ws = zip(*non_empty)
                     bi = self._py_rng.choices(idxs, weights=ws, k=1)[0]
                     bucket_arr = self._bucket_indices[bi]
-                    # Stride by ddp_world_size into the bucket so different ranks see
-                    # different samples (cheap pseudo-distribution).
-                    stride_pos = (self.cursor // max(ddp_world_size, 1)) % len(bucket_arr)
-                    return int(bucket_arr[stride_pos])
+                    # Random-with-replacement within the selected bucket. This avoids
+                    # deterministic bucket-local ordering when hard buckets are heavily
+                    # oversampled; rank-dependent RNG seeds keep DDP ranks diverse.
+                    pos = int(self._np_rng.integers(0, len(bucket_arr)))
+                    sample_idx = int(bucket_arr[pos])
+                    name, given = _bucket_name_for_sample(sample_idx)
+                    return sample_idx, name, given
             # default: legacy linear cursor over the whole pool
-            return self.cursor % dataset_size
+            sample_idx = self.cursor % dataset_size
+            name, given = _bucket_name_for_sample(sample_idx)
+            return sample_idx, name, given
 
         def refill_buffer():
             while len(self.conv_buffer) < self.buffer_size:
-                sample_idx = pick_sample_index()
+                sample_idx, bucket_name, given_count = pick_sample_index()
                 sample = self.samples[sample_idx]
                 puzzle = sample["puzzle"]
                 solution = sample["solution"]
@@ -460,26 +475,34 @@ class SudokuSFTV2IterableDataset(_IterableDataset):
                 conversation, meta = board_to_conversation_v2(
                     puzzle, solution, rng=self._py_rng,
                 )
+                meta = dict(meta)
+                meta.update({
+                    "difficulty_bucket": bucket_name,
+                    "given_count": given_count,
+                    "blank_weight_applied": False,
+                    "blank_weight_eligible": (
+                        self.blank_loss_weight != 1.0
+                        and single_digit_token_ids is not None
+                        and meta.get("solution_format") == "grid"
+                    ),
+                })
                 ids, mask = self.tokenizer.render_conversation(conversation)
 
                 # v3: build per-token blank-weight list only when K != 1.0.
                 blank_weights = None
-                if (
-                    self.blank_loss_weight != 1.0
-                    and single_digit_token_ids is not None
-                    and meta.get("solution_format") == "grid"  # safe-aligned format only
-                ):
+                if meta["blank_weight_eligible"]:
                     blank_weights = self._compute_blank_weights(
                         ids=ids, mask=mask, puzzle=puzzle,
                         digit_token_ids=single_digit_token_ids,
                     )
+                    meta["blank_weight_applied"] = blank_weights is not None
 
                 self.cursor += ddp_world_size
                 if self.cursor >= dataset_size:
                     self.cursor = self.cursor % dataset_size
                     self.epoch += 1
                 if len(ids) <= self.row_capacity:
-                    self.conv_buffer.append((ids, blank_weights))
+                    self.conv_buffer.append((ids, blank_weights, meta))
 
         emit_weights = (self.blank_loss_weight != 1.0)
 
@@ -490,6 +513,15 @@ class SudokuSFTV2IterableDataset(_IterableDataset):
             rows = []
             row_lengths = []
             row_weights = [] if emit_weights else None
+            batch_meta = {
+                "num_conversations": 0,
+                "difficulty_bucket_counts": {name: 0 for name, _, _ in self.DIFFICULTY_BUCKETS},
+                "puzzle_format_counts": {fmt: 0 for fmt in PUZZLE_FORMATS},
+                "solution_format_counts": {fmt: 0 for fmt in PUZZLE_FORMATS},
+                "blank_weight_eligible": 0,
+                "blank_weight_applied": 0,
+                "given_count_sum": 0,
+            }
 
             for _ in range(self.B):
                 row = []
@@ -502,16 +534,37 @@ class SudokuSFTV2IterableDataset(_IterableDataset):
 
                     best_idx = -1
                     best_len = 0
-                    for i, (conv_ids, _bw) in enumerate(self.conv_buffer):
+                    for i, item in enumerate(self.conv_buffer):
+                        conv_ids = item[0]
                         conv_len = len(conv_ids)
                         if conv_len <= remaining and conv_len > best_len:
                             best_idx = i
                             best_len = conv_len
 
                     if best_idx >= 0:
-                        conv_ids, conv_w = self.conv_buffer.pop(best_idx)
+                        item = self.conv_buffer.pop(best_idx)
+                        if len(item) == 2:
+                            # Backward-compatible with dataloader states saved before
+                            # batch metadata was added.
+                            conv_ids, conv_w = item
+                            conv_meta = {}
+                        else:
+                            conv_ids, conv_w, conv_meta = item
                         start = len(row)
                         row.extend(conv_ids)
+                        batch_meta["num_conversations"] += 1
+                        bucket = conv_meta.get("difficulty_bucket")
+                        if bucket in batch_meta["difficulty_bucket_counts"]:
+                            batch_meta["difficulty_bucket_counts"][bucket] += 1
+                        puzzle_fmt = conv_meta.get("puzzle_format")
+                        if puzzle_fmt in batch_meta["puzzle_format_counts"]:
+                            batch_meta["puzzle_format_counts"][puzzle_fmt] += 1
+                        solution_fmt = conv_meta.get("solution_format")
+                        if solution_fmt in batch_meta["solution_format_counts"]:
+                            batch_meta["solution_format_counts"][solution_fmt] += 1
+                        batch_meta["blank_weight_eligible"] += int(bool(conv_meta.get("blank_weight_eligible")))
+                        batch_meta["blank_weight_applied"] += int(bool(conv_meta.get("blank_weight_applied")))
+                        batch_meta["given_count_sum"] += int(conv_meta.get("given_count", 0))
                         if emit_weights and row_w is not None:
                             if conv_w is None:
                                 # Conversation came in without a blank-mask (e.g. flat
@@ -544,6 +597,12 @@ class SudokuSFTV2IterableDataset(_IterableDataset):
                     targets[i, content_len - 1:] = -1
 
             self.it += 1
+            n_conv = max(int(batch_meta["num_conversations"]), 1)
+            batch_meta["mean_given_count"] = batch_meta["given_count_sum"] / n_conv
+            batch_meta["blank_weight_apply_rate"] = (
+                batch_meta["blank_weight_applied"] / max(batch_meta["blank_weight_eligible"], 1)
+            )
+            self.last_batch_meta = batch_meta
             self.last_state_dict = self._build_state_dict(copy_buffer=False)
 
             if emit_weights:
