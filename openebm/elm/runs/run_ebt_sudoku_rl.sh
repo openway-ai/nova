@@ -99,6 +99,11 @@ GLOBAL_STD_MIN="${GLOBAL_STD_MIN:-0.2}"
 SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.9}"
 MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-1e-4}"
 MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.0}"
+# Skip nearly malformed rollout batches that still have nonzero reward std.
+# The 20260703 conservative run hit such a batch at step 25
+# (reward_mean≈0.004, format≈0.004, ref_energy_kl≈1.65e-2).
+MIN_REWARD_MEAN_TO_UPDATE="${MIN_REWARD_MEAN_TO_UPDATE:-0.5}"
+MIN_REWARD_FORMAT_TO_UPDATE="${MIN_REWARD_FORMAT_TO_UPDATE:-0.25}"
 SKIP_CONSENSUS="${SKIP_CONSENSUS:-local}"    # bad ranks zero out; all-bad batches skip globally
 
 # MAX_STEPS="${MAX_STEPS:-160}"                # analyzed run peaked at 60-120 and degraded around 150-190
@@ -209,6 +214,8 @@ exp_save_hparams "${EXP_SFT_DIR}" \
     "skip_degenerate_threshold=${SKIP_DEGENERATE_THRESHOLD}" \
     "min_reward_std_to_update=${MIN_REWARD_STD_TO_UPDATE}" \
     "min_unique_completion_ratio_to_update=${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE}" \
+    "min_reward_mean_to_update=${MIN_REWARD_MEAN_TO_UPDATE}" \
+    "min_reward_format_to_update=${MIN_REWARD_FORMAT_TO_UPDATE}" \
     "skip_consensus=${SKIP_CONSENSUS}" \
     "rl_loss_type=${RL_LOSS_TYPE}" \
     "top_p=${TOP_P}" \
@@ -298,6 +305,8 @@ cat << LOG_HEADER > "${LOG_FILE}"
 #   max_steps=${MAX_STEPS}
 #   traj_dir=${TRAJ_OUTPUT_DIR}/trajectories
 #   skip_consensus=${SKIP_CONSENSUS}
+#   min_reward_mean_to_update=${MIN_REWARD_MEAN_TO_UPDATE}
+#   min_reward_format_to_update=${MIN_REWARD_FORMAT_TO_UPDATE}
 #   heartbeat=${TRAJ_OUTPUT_DIR}/logs/heartbeat.json
 ################################################################################
 
@@ -354,6 +363,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} \
     --skip_degenerate_threshold ${SKIP_DEGENERATE_THRESHOLD} \
     --min_reward_std_to_update ${MIN_REWARD_STD_TO_UPDATE} \
     --min_unique_completion_ratio_to_update ${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE} \
+    --min_reward_mean_to_update ${MIN_REWARD_MEAN_TO_UPDATE} \
+    --min_reward_format_to_update ${MIN_REWARD_FORMAT_TO_UPDATE} \
     --skip_consensus ${SKIP_CONSENSUS} \
     --max_steps ${MAX_STEPS} \
     --val_check_interval ${VAL_CHECK_INTERVAL} \

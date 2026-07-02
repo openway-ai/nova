@@ -103,6 +103,15 @@ class EBMGRPOConfig:
     ratio is below this threshold. Keep 0.0 by default so low diversity is
     logged first and used as a manual diagnostic before enforcing the guard."""
 
+    min_reward_mean_to_update: float = 0.0
+    """Optional quality guard. When >0, skip updates whose rollout mean reward
+    is below this threshold. Useful for task runs where nearly malformed
+    rollouts can still have nonzero std and therefore evade the std guard."""
+
+    min_reward_format_to_update: float = 0.0
+    """Optional quality guard. When >0 and the reward exposes a `format`
+    component, skip updates whose mean format score is below this threshold."""
+
     skip_consensus: str = "local"
     """DDP skip consensus mode:
     - 'all': skip only when every rank reports a bad rollout.
