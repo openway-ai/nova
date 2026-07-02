@@ -680,3 +680,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 149 `backward_done`，grad_norm `0.066421`，max_grad `0.060072`，nan_grad_params `0`；`train.log` 仍停在 step 140 完整指标 | 运行稳定；不触发修复或重启。 |
 
 当前结论：继续跑一轮，但 Sudoku 已进入黄色观察状态。若 step 55/60 仍然 blank_accuracy/constraint_validity 为 0，且 `ref_energy_kl` 或 grad_norm 继续偏高，则优先采用保守调参重启：降低 Muon/AdamW 学习率或加强 KL/梯度约束，而不是先改核心算法。
+
+### 2026-07-03 03:06 +0800
+
+第三十五轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 到 step 62 `skip_consensus_start`，`local_skip=0.0`，`skip_reasons=[]`，`unique_ratio=1.0`。step 55 完整落盘：reward_mean `0.8920`，reward_std `0.0431`，blank_accuracy `0.0`，constraint_validity `0.0`，full_solve `0.0`，`ref_energy_kl=0.005793`，grad_norm `7.0118`，nan_params `0`；step 60 日志行已显示 reward_mean `1.396`，reward_std `0.475`，blank_accuracy `0.261`，constraint_validity `0.163`，full_solve `0.0`，`ref_energy_kl≈0.0097`，`skip_rank_count=0`，但完整 JSON/backward 记录尚待下一轮确认 | step 55 仍是 format/clue-only 退化，但 step 60 恢复了 blank/validity 信号，说明当前不是 ckpt 加载失败或全局 skip 崩溃；更像采样/优化振荡。暂不停止，继续观察 step 65/70 是否维持有效 Sudoku 指标。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 150 `skip_consensus_done`，`global_skip=false`，`skip_rank_count=0`；最新完整指标 step 140：reward_mean `0.1496`，reward_std `0.0305`，parse_rate `1.0`，answer_acc `0.0`，grad_norm `0.033253`，nan_params `0` | 运行健康，shaped reward 非零；无需重启。 |
+
+当前结论：不重启。Sudoku 当前处于黄色观察状态：已有恢复迹象，但 KL 与 grad_norm 仍有振荡。如果 step 65/70 再次回到 blank_accuracy/constraint_validity 长期为 0，或出现高 KL/高 grad_norm 连续叠加，则优先停掉当前 Sudoku rjob 并用更保守学习率/梯度约束重启；GSM8K 保持现有运行。
