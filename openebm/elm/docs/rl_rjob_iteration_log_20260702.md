@@ -796,3 +796,9 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL conservative | 已停止 rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-conservati-2422b` | step 25 出现新型坏 batch：reward_mean `0.0041`，reward_std `0.0143`，format `0.0041`，clue/blank/validity/full_solve 全为 `0`，zero_frac `0.9167`，entropy `2.4063`，`ref_energy_kl=0.01653`，unique_completion_ratio `1.0`。由于 reward_std 非零且 unique ratio 正常，现有 `low_reward_std`/`degenerate_group_rate`/unique guards 没有拦截。 | 根因是 skip-degen 只覆盖零方差/重复输出，未覆盖“几乎全 malformed 但仍有微小方差”的低质量 rollout，导致高 KL 的无效更新。修复：新增默认关闭的 `min_reward_mean_to_update` 与 `min_reward_format_to_update` guard；Sudoku rjob 默认设为 `0.5` 和 `0.25`，GSM8K 默认不启用。 |
 | GSM8K RL | `Running`，heartbeat 到 step 210 `training_step_start` | 本轮不变更 GSM8K。 | 继续运行；不重启。 |
+
+重启动作：
+
+- 修复 commit：`ee8bb369918303029ca196a862165da02741aba2`。
+- 新 Sudoku rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-guarded-20-a82c6`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-guarded-20260703-0539`，05:39 控制面状态 `Starting`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-guarded-20260703-0539/`。
+- GSM8K rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` 保持 `Running`。
