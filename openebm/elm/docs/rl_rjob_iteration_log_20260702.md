@@ -625,3 +625,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 132 `skip_consensus_start`，`local_skip=0.0`，`skip_reasons=[]`，`unique_ratio=1.0`；step 125 reward_mean `0.1005`，reward_std `0.0443`，answer_acc `0.0`，nan_params 未见异常 | 运行健康，shaped reward 保持非零；exact answer 仍未形成稳定提升，但未触发重启条件。 |
 
 当前结论：不重启。继续等待 Sudoku step 40/45/50 的完整指标；若后续 KL 继续升高且 blank_accuracy/constraint_validity 长期为 0，再考虑保守调低学习率或 KL/采样配置并重启新一轮 Sudoku rjob。
+
+### 2026-07-03 02:08 +0800
+
+第三十轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 到 step 45 `generate_start`；主 `train.log` 完整指标仍刷到 step 35，step 40 已到 `old_energy_start` 但完整 reward/loss/backward 尚未落盘；rjob 状态为 `Running` | 训练仍推进，未见 NaN/RuntimeError/global skip。当前只是日志落盘延迟，不能据此判断 hang 或失败；继续等待 step 40/45 完整指标。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 133 `skip_consensus_start`，`local_skip=0.0`，`unique_ratio=1.0`；完整指标仍到 step 125：reward_mean `0.1005`，reward_std `0.0443`，answer_acc `0.0`，nan_params 未见异常 | 运行健康；无需干预。 |
+
+当前结论：本轮不做代码改动或重启。下一轮按 10 分钟节奏继续检查 Sudoku step 40/45 是否落盘，以及 GSM8K 是否保持非零 shaped reward。
