@@ -448,3 +448,18 @@ Sudoku skip-guard 修复版重启：
 - `python -m py_compile openebm/elm/rl/ebm_grpo_trainer.py openebm/elm/rl/ebm_grpo_config.py openebm/elm/rl/train_rl_sudoku.py`
 
 下一轮：提交并推送二次修复，重新提交 Sudoku rjob；新 run 预期 step 0 不应因为单个坏 rank 整步 skip，日志中应看到 `skip_consensus=local`，`global_skip=False`，并继续走正常 loss/backward。
+
+### 2026-07-02 23:30 +0800
+
+Sudoku local-skip 修复版重启：
+
+| 项目 | 值 |
+| --- | --- |
+| 修复提交 | `418599c fix(rl): localize sudoku skip consensus` |
+| 旧 Sudoku rjob | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-fb2b4`，已确认 `Stopped` |
+| 新 Sudoku exp_id | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-233012` |
+| 新 Sudoku rjob metadata | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` |
+| 提交时状态 | `Inqueue` / replica `STARTING` |
+| 预期报告路径 | `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-233012/sft_train/sudoku_rl_analysis_report.md` |
+
+下一轮：确认新 rjob 进入 `Running`，检查 hparams 中 `skip_consensus=local`，并读取 step 0 是否从 `global_skip=True` 变为可正常更新。
