@@ -603,3 +603,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 123 `training_step_start`；step 115 reward_mean `0.0741`，reward_std `0.0406`，parse_rate `0.875`，answer_acc `0.0`；step 120 reward_mean `0.1313`，reward_std `0.0602`，parse_rate `1.0`，answer_acc `0.0`，nan_params 未见异常 | 运行健康，reward 波动但非零；不触发重启。 |
 
 当前结论：继续监控。Sudoku 当前主要是可观测性延迟，尚未出现新的训练崩溃或全局退化证据。
+
+### 2026-07-03 01:55 +0800
+
+第二十八轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 到 step 41 `skip_consensus_start`，`local_skip=0.0`，`unique_ratio=0.5833`；日志已补刷：step 30 触发 `LOCAL_ZERO`，`skip_rank_count=3/8`，`ref_energy_kl=0.0`，`total=0.0`，backward grad_norm `2.5484`，nan_params `0`；step 35 恢复非零 reward_mean `0.8861`、reward_std `0.0300`，`skip_rank_count=1/8`，`global_skip=False`，blank_accuracy `0.0`，constraint_validity `0.0`，`ref_energy_kl=0.0103`，grad_norm `5.3559`，nan_params `0` | local-zero 保护持续有效，且 step 35 从本地退化恢复为非零 reward；但当前 reward 仍主要来自 format/clue，尚未恢复 blank/validity 信号。KL 较前面增大到 `1e-2` 量级，需要继续看是否导致后续退化或 reward 改善。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 128 `training_step_start`；step 120 reward_mean `0.1313`，reward_std `0.0602`，answer_acc `0.0`，grad_norm `0.0222`，nan_params `0`；step 125 reward_mean `0.1005`，reward_std `0.0443`，answer_acc `0.0`，nan_params `0` | 运行健康，shaped reward 保持非零；没有重启条件。 |
+
+当前结论：不重启。Sudoku 旧 collapse 路径已被修复，但是否能继续提升到 blank/validity 维度仍待观察；下一轮重点看 step 40/45 是否恢复有效 Sudoku 指标，以及 KL 是否继续升高。
