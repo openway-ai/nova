@@ -311,3 +311,17 @@ Sudoku 根因判断：不是 checkpoint/TF-head 加载问题，也不是 DDP ski
 - `git diff --check` 对上述脚本通过。
 
 下一轮：提交修复后重提 Sudoku rjob；GSM8K 保持当前 rjob 运行。
+
+### 2026-07-02 21:42 +0800
+
+Sudoku 保守版重启：
+
+| 项目 | 值 |
+| --- | --- |
+| 修复提交 | `4cd3a4a fix(rl): make sudoku rjob more conservative` |
+| 旧 Sudoku rjob | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-1-d8096`，已确认 `Stopped` |
+| 新 Sudoku exp_id | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-214231` |
+| 新 Sudoku rjob metadata | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-0fa37` |
+| 预期报告路径 | `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-214231/sft_train/analysis_report.md` |
+
+下一轮：确认新 Sudoku rjob 是否启动，并重点检查 step 0/5 是否避免全零 reward、高 KL 和高梯度脉冲。
