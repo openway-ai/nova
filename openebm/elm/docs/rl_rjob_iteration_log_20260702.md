@@ -802,3 +802,14 @@ Sudoku local-skip 修复版重启：
 - 修复 commit：`ee8bb369918303029ca196a862165da02741aba2`。
 - 新 Sudoku rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-guarded-20-a82c6`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-guarded-20260703-0539`，05:39 控制面状态 `Starting`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-guarded-20260703-0539/`。
 - GSM8K rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` 保持 `Running`。
+
+### 2026-07-03 05:45 +0800
+
+第四十六轮异常分析与修复：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL guarded | `Running`，准备停止并重启为 DDP `any` consensus | rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-guarded-20-a82c6` 已确认使用 commit `ee8bb369918303029ca196a862165da02741aba2`，hparams 含 `min_reward_mean_to_update=0.5`、`min_reward_format_to_update=0.25`。checkpoint 加载正常：日志显示 `Renamed 576 compiled/eager transformer keys to transformer.*`，8 rank `Model loaded successfully`。step 0 首条样本健康：`parse_ok=True`、clue 全保留、blank_accuracy `0.6154`、constraint_validity `0.3051`，heartbeat 到 `skip_consensus_start`，local skip reasons 为空。 | 当前不是 checkpoint 加载失败或 reward 全零问题。但发现 Sudoku 默认仍为 `skip_consensus=local`，未完全落实 review 中“任一 rank 出问题即全局跳过”的稳定性策略。根因是 rjob/run script 默认值仍覆盖为 `local`。修复：将 `EBMGRPOConfig`、`run_ebt_sudoku_rl.sh`、`run_sudoku_rl_optimized_rjob.sh` 的默认 `skip_consensus` 改为 `any`，下一轮重启 Sudoku；GSM8K 不受影响。 |
+| GSM8K RL | `Running`，不重启 | heartbeat 到 step 213 `training_step_start`；近期 step 200/205/210 reward_mean 分别约 `0.2843`、`0.1984`、`0.1765`，reward_std 非零，parse_rate `1.0`，grad_norm 约 `0.38-0.52`，nan_params `0`。 | 仍健康推进；本轮修复只针对 Sudoku skip consensus 默认值，GSM8K 继续运行。 |
+
+修复动作：完成 `skip_consensus=any` 默认值同步，并通过 `py_compile`、`bash -n` 与 diff 检查。下一步提交并推送修复，停止 guarded Sudoku rjob 后提交新 rjob。

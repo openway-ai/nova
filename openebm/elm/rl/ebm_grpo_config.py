@@ -112,11 +112,11 @@ class EBMGRPOConfig:
     """Optional quality guard. When >0 and the reward exposes a `format`
     component, skip updates whose mean format score is below this threshold."""
 
-    skip_consensus: str = "local"
+    skip_consensus: str = "any"
     """DDP skip consensus mode:
     - 'all': skip only when every rank reports a bad rollout.
-    - 'any': skip if any rank reports a bad rollout. More conservative and
-      can be too strict with one prompt per rank.
+    - 'any': skip if any rank reports a bad rollout. Stability-first default
+      for DDP so no rank contributes a poisoned rollout to the shared update.
     - 'local': skip the whole step only if every rank is bad; otherwise bad
       ranks contribute a zero full-graph loss while healthy ranks update."""
 
