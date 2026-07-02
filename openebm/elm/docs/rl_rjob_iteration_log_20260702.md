@@ -702,3 +702,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | rjob 控制面确认 `Running`；heartbeat 到 step 158 `training_step_start`。step 150 完整落盘：reward_mean `0.1846`，reward_std `0.2553`，parse_rate `0.875`，answer_acc `0.125`，grad_norm `0.0912`，nan_params `0`；step 155 已显示 reward_mean `0.1996`，reward_std `0.0887`，parse_rate `1.0`，answer_acc `0.0` | GSM8K 继续健康运行，shaped reward 非零且未见 NaN/Inf；不重启。 |
 
 当前结论：暂不停止 Sudoku，但把它从“黄色观察”升级为“同步点观察”。根因候选不是 ckpt 加载，而是训练进程在 step 66 前后可能存在 DDP collective 慢/卡或日志缓冲严重滞后；下一轮以 heartbeat 是否离开 `skip_consensus_start` 为首要判断依据。
+
+### 2026-07-03 03:29 +0800
+
+第三十七轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 已从 step 66 `skip_consensus_start` 推进到 step 68 `generate_start`，时间戳 `03:27:04`；`_log_phase` 代码确认 heartbeat 只由 rank0 写入，因此不是其他 rank 覆盖。主 `train.log` 仍停在 step 60，mtime `03:01:25`，可用最新 reward 指标仍为 step 60 | step66 同步点卡死基本排除；当前主要问题是 stdout/`train.log` 落盘滞后，导致 step65 之后缺少完整 reward/KL/grad 指标。训练仍在推进，暂不重启；继续观察 heartbeat 和是否恢复指标落盘。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 161 `training_step_start`，时间戳 `03:27:56`；最新完整指标仍为 step 155：reward_mean `0.1996`，reward_std `0.0887`，parse_rate `1.0`，answer_acc `0.0` | 运行健康；不重启。 |
+
+当前结论：Sudoku 不做 stop/restart。需要继续监控日志落盘是否恢复；如果后续 heartbeat 继续推进但长期没有 step65/70 指标，优先补充或修复指标落盘路径，而不是立即调训练超参。
