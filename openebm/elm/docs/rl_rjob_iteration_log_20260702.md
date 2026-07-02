@@ -592,3 +592,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 118 `training_step_start`；step 110 reward_mean `0.1318`，reward_std `0.0673`，answer_acc `0.0`，loss `1.81e-6`，grad_norm `0.0299`，nan_params `0` | 运行健康，继续保留。 |
 
 当前结论：本轮不做代码改动或重启。Sudoku local-zero 保护已经验证有效，且 step 35 有恢复迹象；继续监控更长趋势。
+
+### 2026-07-03 01:44 +0800
+
+第二十七轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 到 step 38 `generate_start`，时间戳 `2026-07-03 01:40:49`；主 `train.log` 修改时间仍停在 `2026-07-03 01:16:59`，最新完整可读内容仍到 step 30 的 `skip_consensus_done`，未落盘 step 35 完整 reward/backward | 训练仍在推进，但主日志继续明显滞后。由于 rjob 仍 `Running`，heartbeat 持续更新，且上一轮 step 35 heartbeat 显示 `local_skip=0.0`，当前不判断 hang，也不重启；继续等待完整指标。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 123 `training_step_start`；step 115 reward_mean `0.0741`，reward_std `0.0406`，parse_rate `0.875`，answer_acc `0.0`；step 120 reward_mean `0.1313`，reward_std `0.0602`，parse_rate `1.0`，answer_acc `0.0`，nan_params 未见异常 | 运行健康，reward 波动但非零；不触发重启。 |
+
+当前结论：继续监控。Sudoku 当前主要是可观测性延迟，尚未出现新的训练崩溃或全局退化证据。
