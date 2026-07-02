@@ -21,6 +21,7 @@ from openebm.elm.data.sudoku_dataset_v2 import (
     _load_sudoku_split_v2,
     augment_board,
 )
+from openebm.elm.rl.data_sharding import build_rank_worker_indices
 
 
 class SudokuRLPromptDataset(IterableDataset):
@@ -90,12 +91,16 @@ class SudokuRLPromptDataset(IterableDataset):
         rng = np.random.default_rng(seed)
         py_rng = random.Random(seed)
 
-        # Shard samples across ranks
-        indices = list(range(len(self.samples)))
-        # Shuffle deterministically
-        rng.shuffle(indices)
-
+        epoch = 0
         while True:
+            indices = build_rank_worker_indices(
+                len(self.samples),
+                rank=rank,
+                world_size=world_size,
+                worker_id=worker_id,
+                num_workers=num_workers,
+                seed=self._seed + epoch,
+            )
             for idx in indices:
                 sample = self.samples[idx]
                 # Get puzzle and solution from sample (both are 9x9 nested lists)
@@ -152,9 +157,7 @@ class SudokuRLPromptDataset(IterableDataset):
                     "difficulty": difficulty,
                     "num_givens": num_givens,
                 }
-
-            # Reshuffle for next epoch
-            rng.shuffle(indices)
+            epoch += 1
 
     def _format_chat_prompt(self, user_content: str) -> str:
         """Deprecated: kept only for diagnostic comparisons. Do NOT use for RL prompts —

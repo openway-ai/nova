@@ -46,8 +46,10 @@ GRAD_RE = re.compile(
 )
 EXT_RE = re.compile(
     r"\[GRPO-EXT\]\s+step=(?P<step>\d+).*?ratio_mean=(?P<ratio_mean>-?[0-9.eE+-]+).*?"
-    r"log_ratio_abs_max=(?P<log_ratio_abs_max>-?[0-9.eE+-]+).*?clamp_rate=(?P<clamp_rate>-?[0-9.eE+-]+).*?"
-    r"effective_clip=(?P<effective_clip>-?[0-9.eE+-]+).*?energy_ppo_kl=(?P<energy_ppo_kl>-?[0-9.eE+-]+).*?"
+    r"log_ratio_abs_max=(?P<log_ratio_abs_max>-?[0-9.eE+-]+).*?"
+    r"clip_frac=(?P<clip_frac>-?[0-9.eE+-]+).*?"
+    r"effective_clip=(?P<effective_clip>-?[0-9.eE+-]+).*?"
+    r"old_policy_energy_drift=(?P<old_policy_energy_drift>-?[0-9.eE+-]+).*?"
     r"reinforce_surrogate=(?P<reinforce_surrogate>-?[0-9.eE+-]+)"
 )
 CKPT_RE = re.compile(r"step=(?:step=)?(?P<step>\d+).*?reward=(?:val/reward_mean=)?(?P<reward>-?[0-9.]+)")
@@ -188,9 +190,7 @@ def parse_log(log_path: Path, run_dir: Path) -> Analysis:
                     ref_energy_drift = to_float(
                         energy.get("ref_energy_drift", energy.get("drift", energy.get("energy_drift")))
                     )
-                    old_policy_energy_drift = to_float(
-                        energy.get("old_policy_energy_drift", energy.get("energy_ppo_kl"))
-                    )
+                    old_policy_energy_drift = to_float(energy.get("old_policy_energy_drift"))
                     rec.update({
                         "loss": to_float(loss.get("total")),
                         "policy_loss": to_float(loss.get("policy", loss.get("policy_loss"))),
@@ -209,10 +209,9 @@ def parse_log(log_path: Path, run_dir: Path) -> Analysis:
                         "ref_energy_drift": ref_energy_drift,
                         "energy_drift": ref_energy_drift,
                         "old_policy_energy_drift": old_policy_energy_drift,
-                        "energy_ppo_kl": old_policy_energy_drift,
                         "ratio_mean": to_float(energy.get("ratio_mean")),
                         "log_ratio_abs_max": to_float(energy.get("log_ratio_abs_max")),
-                        "clamp_rate": to_float(energy.get("log_ratio_clamp_rate")),
+                        "log_ratio_clamp_rate": to_float(energy.get("log_ratio_clamp_rate")),
                         "effective_clip": to_float(energy.get("effective_clip_rate", energy.get("clip_ratio"))),
                         "reinforce_surrogate": to_float(loss.get("reinforce_surrogate")),
                         "grad_norm": to_float(grad.get("grad_norm_before_clip")),
@@ -252,7 +251,6 @@ def parse_log(log_path: Path, run_dir: Path) -> Analysis:
                             for k, v in m.groupdict().items():
                                 if k != "step":
                                     rec[k] = to_float(v)
-                            rec["old_policy_energy_drift"] = rec.get("energy_ppo_kl")
                         elif "[GRPO-EXT]" in line:
                             m_step = re.search(r"step=(\d+)", line)
                             if m_step:
@@ -268,8 +266,6 @@ def parse_log(log_path: Path, run_dir: Path) -> Analysis:
                                     rec["ref_energy_kl"] = rec["kl_proxy"]
                                 if "energy_drift" in rec and "ref_energy_drift" not in rec:
                                     rec["ref_energy_drift"] = rec["energy_drift"]
-                                if "energy_ppo_kl" in rec and "old_policy_energy_drift" not in rec:
-                                    rec["old_policy_energy_drift"] = rec["energy_ppo_kl"]
             if rec is not None:
                 a.records.append({k: v for k, v in rec.items() if v is not None})
 
@@ -307,8 +303,8 @@ def _record_priority(record: Dict[str, Any], key: str) -> Tuple[int, int]:
         "loss", "policy_loss", "ref_energy_kl", "kl_proxy",
         "energy_mean", "old_energy_mean",
         "ref_energy_drift", "energy_drift",
-        "old_policy_energy_drift", "energy_ppo_kl",
-        "ratio_mean", "log_ratio_abs_max", "clamp_rate",
+        "old_policy_energy_drift",
+        "ratio_mean", "log_ratio_abs_max", "log_ratio_clamp_rate",
         "effective_clip", "reinforce_surrogate",
     }
     grad_keys = {"grad_norm", "max_param_grad", "nan_params"}
@@ -382,7 +378,7 @@ def aggregate(records: List[Dict[str, Any]]) -> Tuple[List[int], Dict[str, List[
         if "ref_energy_drift" in step_values:
             step_values.pop("energy_drift", None)
         if "old_policy_energy_drift" in step_values:
-            step_values.pop("energy_ppo_kl", None)
+            step_values.pop("clip_frac", None)
 
     steps = sorted(numeric)
     keys = sorted({k for by in numeric.values() for k in by})
@@ -517,7 +513,7 @@ def plot_metrics(path: Path, title: str, steps: List[int], series: Dict[str, Lis
     for k, label in [("grad_norm", "grad_norm"), ("max_param_grad", "max_param_grad")]:
         plot_line(ax, steps, series, k, label)
     ax2 = ax.twinx()
-    for k, label, style in [("ratio_mean", "ratio_mean", "--"), ("clamp_rate", "clamp_rate", "--")]:
+    for k, label, style in [("ratio_mean", "ratio_mean", "--"), ("log_ratio_clamp_rate", "log_ratio_clamp_rate", "--")]:
         plot_line(ax2, steps, series, k, label, linestyle="--")
     ax.set_title("Optimization / energy")
     ax.set_xlabel("step")
@@ -536,7 +532,7 @@ def plot_stability(path: Path, title: str, steps: List[int], series: Dict[str, L
     fig.suptitle(title + " stability", fontsize=14)
     specs = [
         ("Reference energy drift", ["ref_energy_drift", "energy_mean", "old_energy_mean"]),
-        ("Old-policy ratio / clipping", ["ratio_mean", "log_ratio_abs_max", "clamp_rate", "effective_clip", "old_policy_energy_drift"]),
+        ("Old-policy ratio / clipping", ["ratio_mean", "log_ratio_abs_max", "log_ratio_clamp_rate", "effective_clip", "old_policy_energy_drift"]),
         ("Grad health", ["grad_norm", "max_param_grad", "nan_params"]),
         ("Rollout health", ["comp_len", "unique_ratio", "degen", "advantage_var"]),
     ]
@@ -590,7 +586,7 @@ def plot_overview(path: Path, title: str, steps: List[int], series: Dict[str, Li
     plot_line(ax, steps, series, "max_param_grad", "max_param_grad")
     ax2 = ax.twinx()
     plot_line(ax2, steps, series, "ratio_mean", "ratio_mean", linestyle="--")
-    plot_line(ax2, steps, series, "clamp_rate", "clamp_rate", linestyle="--")
+    plot_line(ax2, steps, series, "log_ratio_clamp_rate", "log_ratio_clamp_rate", linestyle="--")
     ax.set_title("Optimization / energy")
     ax.set_xlabel("step")
     ax.grid(True, alpha=0.5)
@@ -605,7 +601,7 @@ def plot_overview(path: Path, title: str, steps: List[int], series: Dict[str, Li
     setup_axis(ax, "Reference energy drift")
 
     ax = axes[2][1]
-    for k in ["ratio_mean", "log_ratio_abs_max", "clamp_rate", "effective_clip", "old_policy_energy_drift"]:
+    for k in ["ratio_mean", "log_ratio_abs_max", "log_ratio_clamp_rate", "effective_clip", "old_policy_energy_drift"]:
         plot_line(ax, steps, series, k)
     setup_axis(ax, "Old-policy ratio / clipping")
 
@@ -695,7 +691,7 @@ def write_report(path: Path, a: Analysis, steps: List[int], series: Dict[str, Li
         ("collapse step", collapse_step),
         ("last grad_norm", last_value(series, "grad_norm")),
         ("last ratio_mean", last_value(series, "ratio_mean")),
-        ("last clamp_rate", last_value(series, "clamp_rate")),
+        ("last log_ratio_clamp_rate", last_value(series, "log_ratio_clamp_rate")),
         ("last ref_energy_drift", last_value(series, "ref_energy_drift")),
         ("last ref_energy_kl", last_value(series, "ref_energy_kl")),
         ("last old_policy_energy_drift", last_value(series, "old_policy_energy_drift")),
@@ -726,7 +722,7 @@ def write_report(path: Path, a: Analysis, steps: List[int], series: Dict[str, Li
         lines.append("- No major parsed anomaly found.")
     if collapse_step is not None:
         lines.append("- The run should not be continued from late checkpoints after collapse; prefer the best early checkpoint or restart from SFT with safer hyperparameters.")
-    if last_value(series, "effective_clip") == 0 or (last_value(series, "clamp_rate") == 0):
+    if last_value(series, "effective_clip") == 0 or (last_value(series, "log_ratio_clamp_rate") == 0):
         lines.append("- GSPO/PPO clipping rarely activates; ratio-based trust region is not constraining this run.")
     if (last_value(series, "ref_energy_drift") or 0) < -0.5:
         lines.append("- Reference energy drift is strongly negative, suggesting the policy can become over-confident relative to the SFT reference without sufficient anchoring.")

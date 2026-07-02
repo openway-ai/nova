@@ -103,7 +103,7 @@ class EBMGRPOConfig:
     ratio is below this threshold. Keep 0.0 by default so low diversity is
     logged first and used as a manual diagnostic before enforcing the guard."""
 
-    skip_consensus: str = "all"
+    skip_consensus: str = "any"
     """DDP skip consensus mode:
     - 'all': skip only when every rank reports a bad rollout.
     - 'any': skip if any rank reports a bad rollout. More conservative and
