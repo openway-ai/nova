@@ -559,3 +559,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 107 `training_step_start`；step 100 reward_mean `0.0648`，reward_std `0.0452`，parse_rate `0.875`，answer_acc `0.0`；step 105 reward_mean `0.2589`，reward_std `0.2243`，answer_acc `0.125`；nan_params `0` | 运行健康，shaped reward 保持非零并偶发正确答案；exact/answer_acc 仍波动较大，暂不作为重启条件。 |
 
 当前结论：两个 rjob 均继续运行。Sudoku 需要继续等待 step 25/30 完整日志，以确认旧退化点的回归验证结果；GSM8K 暂无需要干预的错误。
+
+### 2026-07-03 01:15 +0800
+
+第二十四轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 到 step 30 `generate_start`，时间戳 `2026-07-03 01:13:21`；`sft_train/logs/train.log` 修改时间仍为 `2026-07-03 00:42:17`，完整指标仍停在 step 20；`rjob logs` 尾部同样没有比 step 20 更新的 GRPO 指标 | 训练进度和主指标日志存在明显解耦/延迟。由于 heartbeat 仍推进且 rjob 为 `Running`，暂不判断 hang，也不重启。旧 step 25 退化点已在时间线上被越过，但仍缺完整 reward/std/skip 指标确认。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 110 `training_step_start`；最新完整指标 step 105 reward_mean `0.2589`，reward_std `0.2243`，answer_acc `0.125`，loss `2.11e-6`，nan_params 未见异常 | 运行健康，继续保留；exact/answer_acc 仍是波动而非稳定提升。 |
+
+当前结论：本轮不做代码改动或重启。下一轮继续等待 Sudoku step 25/30 的完整指标；若 heartbeat 停止更新或日志出现 NaN/RuntimeError/all-zero KL-only 更新，再进入修复分支。
