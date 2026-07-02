@@ -13,6 +13,7 @@ from openebm.elm.utils import setup_ebt, init_whole_model_weights
 from openebm.elm.utils import MLP, Memory_Augmented_MLP, Memory_Gating_MLP, mask_q_tokens
 from openebm.elm.replay_buffer import CausalReplayBuffer
 from openebm.elm.metrics import calculate_bpb_score
+from openebm.elm.tf_head import build_tf_head
 
 import ipdb
 
@@ -68,6 +69,47 @@ class EBT_NLP(LightningModule):
             init_whole_model_weights(self.vocab_to_embed, self.hparams.weight_initialization_method, weight_initialization_gain=self.hparams.weight_initialization_gain)
 
         self.transformer = setup_ebt(self.hparams)
+
+        # Optional teacher-forced decoder used by free-embedding/direct-unembed
+        # SFT checkpoints. Without this module those checkpoints silently drop
+        # `tf_head.*` weights and generation degrades to random text.
+        self.use_tf_head = bool(getattr(self.hparams, "use_tf_head", False))
+        self.use_pre_update_hidden_unembed = getattr(self.hparams, "tf_head_type", "") == "pre_update_hidden_unembed"
+        self.use_post_update_state_unembed = getattr(self.hparams, "tf_head_type", "") == "post_update_state_unembed"
+        self.post_update_state_use_rmsnorm = bool(getattr(self.hparams, "post_update_state_use_rmsnorm", False))
+        self.post_update_state_concat_zi = bool(getattr(self.hparams, "post_update_state_concat_zi", False))
+        self.post_update_state_concat_prev_embed = bool(getattr(self.hparams, "post_update_state_concat_prev_embed", False))
+        self.post_update_state_detach_prev_embed = bool(getattr(self.hparams, "post_update_state_detach_prev_embed", False))
+        self.truncate_mcmc_per_step_ce = bool(getattr(self.hparams, "truncate_mcmc_per_step_ce", False))
+        if self.truncate_mcmc_per_step_ce and not self.hparams.truncate_mcmc:
+            raise ValueError("--truncate_mcmc_per_step_ce requires --truncate_mcmc.")
+        if (
+            self.post_update_state_use_rmsnorm
+            or self.post_update_state_concat_zi
+            or self.post_update_state_concat_prev_embed
+            or self.post_update_state_detach_prev_embed
+        ) and not self.use_post_update_state_unembed:
+            raise ValueError(
+                "post_update_state_* options only apply when "
+                "--tf_head_type post_update_state_unembed."
+            )
+        if self.post_update_state_concat_zi and self.post_update_state_concat_prev_embed:
+            raise ValueError(
+                "--post_update_state_concat_zi and --post_update_state_concat_prev_embed "
+                "are mutually exclusive."
+            )
+        if self.post_update_state_detach_prev_embed and not self.post_update_state_concat_prev_embed:
+            raise ValueError(
+                "--post_update_state_detach_prev_embed requires "
+                "--post_update_state_concat_prev_embed."
+            )
+        if self.use_tf_head:
+            self.tf_head = build_tf_head(self.hparams)
+            init_whole_model_weights(
+                self.tf_head,
+                self.hparams.weight_initialization_method,
+                weight_initialization_gain=self.hparams.weight_initialization_gain,
+            )
         
         self.finished_warming_up = False
 
@@ -76,6 +118,17 @@ class EBT_NLP(LightningModule):
             replay_buffer_max_size = self.hparams.mcmc_replay_buffer_size
             self.replay_buffer_samples = self.hparams.batch_size_per_device * self.hparams.mcmc_replay_buffer_sample_bs_percent
             self.replay_buffer = CausalReplayBuffer(max_size=replay_buffer_max_size, sample_size=self.replay_buffer_samples)
+
+        self.use_free_embedding_mcmc = bool(getattr(self.hparams, "free_embedding_mcmc", False))
+        if self.use_free_embedding_mcmc:
+            if not self.use_tf_head:
+                raise ValueError("--free_embedding_mcmc requires --use_tf_head.")
+            if self.mcmc_replay_buffer:
+                raise ValueError("--free_embedding_mcmc is incompatible with mcmc_replay_buffer.")
+        if self.use_tf_head and self.use_post_update_state_unembed and not self.use_free_embedding_mcmc:
+            raise ValueError(
+                "--tf_head_type post_update_state_unembed requires --free_embedding_mcmc."
+            )
 
         self._alpha_debug_step = 0  # counter for alpha diagnostic prints
         # Per-forward NaN flag for GRPO cross-rank sync.
@@ -146,23 +199,39 @@ class EBT_NLP(LightningModule):
         high = alpha * scale
         return low + torch.rand_like(expanded_alpha) * (high - low)
 
+    def _logits_to_pred_embeddings(self, predicted_tokens):
+        """Convert V-dim post-update logits/probs to D-dim trunk inputs."""
+        if self.hparams.normalize_initial_condition:
+            if getattr(self.hparams, 'float_precision', '') == "bf16-true":
+                predicted_tokens = self.softmax(predicted_tokens)
+            else:
+                predicted_tokens = self.softmax(predicted_tokens.float()).to(predicted_tokens.dtype)
+            if self.hparams.vocab_to_embed_uses_prob_dist:
+                return torch.matmul(predicted_tokens, self.embeddings.weight)
+            return self.vocab_to_embed(predicted_tokens)
+        return self.vocab_to_embed(predicted_tokens)
+
     @torch.compiler.disable
     def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps,
                       langevin_dynamics_noise_std, alpha, start_pos, learning, return_raw_logits,
-                      real_token_ids=None):
+                      real_token_ids=None, compute_pred_hidden=False):
         batch_size = predicted_tokens.shape[0]
         seq_length = predicted_tokens.shape[1]
         
+        # State dim is V in the legacy logit-MCMC path and D in free-embedding
+        # MCMC. Keep the last dim dynamic so freeembed checkpoints can run.
         if self.hparams.no_mcmc_detach:
-            predicted_tokens.requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
+            predicted_tokens.requires_grad_().reshape(batch_size, seq_length, -1)
         else: # default, do detach
-            predicted_tokens = predicted_tokens.detach().requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
+            predicted_tokens = predicted_tokens.detach().requires_grad_().reshape(batch_size, seq_length, -1)
 
         if self.hparams.langevin_dynamics_noise != 0:
             ld_noise = torch.randn_like(predicted_tokens.detach()) * langevin_dynamics_noise_std # langevin dynamics
             predicted_tokens = predicted_tokens + ld_noise
 
-        if self.hparams.normalize_initial_condition:
+        if self.use_free_embedding_mcmc:
+            predicted_embeddings = predicted_tokens
+        elif self.hparams.normalize_initial_condition:
             if getattr(self.hparams, 'float_precision', '') == "bf16-true":
                 if self.hparams.normalize_initial_condition_only_first_step:
                     if mcmc_step == 0:
@@ -188,13 +257,28 @@ class EBT_NLP(LightningModule):
         # create_graph=True 的 autograd.grad 与 compiled graph 不兼容
         # 所以若 transformer 已被 torch.compile 编译，MCMC 中需要用 eager 版本
         transformer = getattr(self, 'transformer_eager', self.transformer)
-        energy_preds = transformer(
-            all_embeddings,
-            start_pos=start_pos,
-            mcmc_step=mcmc_step,
-            real_token_ids=real_token_ids,
-            predicted_tokens=predicted_tokens,
-        ) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
+        pred_hidden_step = None
+        pre_update_state_for_head = None
+        if compute_pred_hidden and self.use_post_update_state_unembed and self.post_update_state_concat_zi:
+            pre_update_state_for_head = predicted_tokens
+        use_pre_update_hidden = compute_pred_hidden and self.use_pre_update_hidden_unembed
+        if use_pre_update_hidden:
+            energy_preds, pred_hidden_step = transformer(
+                all_embeddings,
+                start_pos=start_pos,
+                mcmc_step=mcmc_step,
+                real_token_ids=real_token_ids,
+                predicted_tokens=predicted_tokens,
+                return_pred_hidden=True,
+            )
+        else:
+            energy_preds = transformer(
+                all_embeddings,
+                start_pos=start_pos,
+                mcmc_step=mcmc_step,
+                real_token_ids=real_token_ids,
+                predicted_tokens=predicted_tokens,
+            ) # is B, 2*S, D; checked and there are no in place ops; mcmc_step only applies to when using certain types of ebt
         energy_preds = energy_preds.reshape(-1, 1)
         
         with torch.amp.autocast(device_type='cuda', enabled=False):
@@ -250,11 +334,23 @@ class EBT_NLP(LightningModule):
                 predicted_tokens_grad = torch.zeros_like(predicted_tokens)
             elif self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
                 if i == (num_mcmc_steps - 1):
-                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=create_graph_for_mcmc)[0]
+                    predicted_tokens_grad = torch.autograd.grad(
+                        [energy_f32.sum()], [predicted_tokens],
+                        create_graph=create_graph_for_mcmc,
+                        retain_graph=create_graph_for_mcmc or (learning and use_pre_update_hidden),
+                    )[0]
                 else:
-                    predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=False)[0]
+                    predicted_tokens_grad = torch.autograd.grad(
+                        [energy_f32.sum()], [predicted_tokens],
+                        create_graph=False,
+                        retain_graph=learning and use_pre_update_hidden,
+                    )[0]
             else:
-                predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=create_graph_for_mcmc)[0]
+                predicted_tokens_grad = torch.autograd.grad(
+                    [energy_f32.sum()], [predicted_tokens],
+                    create_graph=create_graph_for_mcmc,
+                    retain_graph=create_graph_for_mcmc or (learning and use_pre_update_hidden),
+                )[0]
         # predicted_tokens_grad has shape B, S, V
         
         if self.hparams.clamp_futures_grad:
@@ -294,6 +390,27 @@ class EBT_NLP(LightningModule):
         if self.hparams.sharpen_predicted_distribution != 0.0:
             predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
 
+        if compute_pred_hidden and self.use_post_update_state_unembed:
+            if self.post_update_state_concat_zi:
+                pred_hidden_step = (predicted_tokens, pre_update_state_for_head)
+            else:
+                pred_hidden_step = predicted_tokens
+
+        if compute_pred_hidden and pred_hidden_step is None:
+            if self.use_free_embedding_mcmc:
+                post_pred_embeddings = predicted_tokens
+            else:
+                post_pred_embeddings = self._logits_to_pred_embeddings(predicted_tokens)
+            post_all_embeddings = torch.cat((real_embeddings_input.detach(), post_pred_embeddings), dim=1)
+            _, pred_hidden_step = transformer(
+                post_all_embeddings,
+                start_pos=start_pos,
+                mcmc_step=mcmc_step,
+                real_token_ids=real_token_ids,
+                predicted_tokens=predicted_tokens,
+                return_pred_hidden=True,
+            )
+
         # Defensive: sanitize any residual NaN/Inf in predicted_tokens before
         # returning raw logits. Prevents NaN cascading to softmax → multinomial.
         if return_raw_logits and not torch.isfinite(predicted_tokens).all():
@@ -301,16 +418,19 @@ class EBT_NLP(LightningModule):
                 predicted_tokens, nan=0.0, posinf=100.0, neginf=-100.0
             )
 
-        if return_raw_logits:
+        if self.use_free_embedding_mcmc:
+            predicted_tokens_for_loss = None
+        elif return_raw_logits:
             predicted_tokens_for_loss = predicted_tokens # BS, S, V
         else:
             predicted_tokens_for_loss = self.log_softmax(predicted_tokens).reshape(-1, self.vocab_size) # BS*S, V
             
-        return predicted_tokens, energy_preds, predicted_tokens_for_loss
+        return predicted_tokens, energy_preds, predicted_tokens_for_loss, pred_hidden_step
 
-    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
+    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True, return_pred_hiddens = False): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
         predicted_distributions = []
         predicted_energies = []
+        predicted_pred_hiddens = []
 
         # [DEBUG-RL] Reset per-forward NaN flag.
         self._fwd_had_nan_energy = False
@@ -400,33 +520,41 @@ class EBT_NLP(LightningModule):
 
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
+                compute_pred_hidden = return_pred_hiddens
+                if return_pred_hiddens and self.hparams.truncate_mcmc and not self.truncate_mcmc_per_step_ce:
+                    compute_pred_hidden = i == (len(mcmc_steps) - 1)
                 if isinstance(self.alpha, nn.ParameterList):
                     step_alpha = self._sanitize_alpha_param(self.alpha[mcmc_step], mcmc_step)
                     step_alpha = self._maybe_randomize_alpha(step_alpha, batch_size, seq_length, no_randomness)
                 else:
                     step_alpha = alpha
 
-                predicted_tokens, energy_preds, predicted_tokens_for_loss = self._mcmc_step_excluded(
+                predicted_tokens, energy_preds, predicted_tokens_for_loss, pred_hidden_step = self._mcmc_step_excluded(
                     predicted_tokens, real_embeddings_input, mcmc_step, i, len(mcmc_steps),
                     langevin_dynamics_noise_std, step_alpha, start_pos, learning, return_raw_logits,
-                    real_token_ids=x
+                    real_token_ids=x, compute_pred_hidden=compute_pred_hidden,
                 )
                 if getattr(self.hparams, "mcmc_gradient_mode", "second_order") in {"first_order_cd", "first_order_nce", "proposal_aware_nce"}:
                     # These first-order objectives recompute positive and
                     # negative energies below. Keep only detached sampler
                     # outputs here so MCMC does not retain transformer graphs.
                     predicted_energies.append(energy_preds.detach())
-                    predicted_distributions.append(predicted_tokens_for_loss.detach())
+                    predicted_distributions.append(None if predicted_tokens_for_loss is None else predicted_tokens_for_loss.detach())
                 else:
                     predicted_energies.append(energy_preds)
                     predicted_distributions.append(predicted_tokens_for_loss)
-                del energy_preds, predicted_tokens_for_loss  # release references to help GC
+                if return_pred_hiddens:
+                    predicted_pred_hiddens.append(pred_hidden_step)
+                del energy_preds, predicted_tokens_for_loss, pred_hidden_step  # release references to help GC
 
+        if return_pred_hiddens:
+            return predicted_distributions, predicted_energies, predicted_pred_hiddens
         return predicted_distributions, predicted_energies
 
     def forward_loss_wrapper(self, x, phase="train", token_bytes=None):
         no_randomness = False if phase == "train" else True
         learning = phase == "train"
+        predicted_pred_hiddens = None
         mcmc_gradient_mode = getattr(self.hparams, "mcmc_gradient_mode", "second_order")
         proposal_mode = getattr(self.hparams, "proposal_aware_nce_proposal", "uniform")
         proposal_aware_no_mcmc = (
@@ -484,16 +612,38 @@ class EBT_NLP(LightningModule):
             # all_tokens = x['input_ids'].squeeze(dim=1)
             all_tokens = x[0].squeeze(dim=0)
             input_ids, replay_buffer_logits, next_token_indices = self.replay_buffer.get_batch(all_tokens) # this automatically does indexing for input ids and next token indices while also passing back the logits
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness, learning = learning)
-            self.replay_buffer.update(all_tokens.detach(), predicted_distributions[-1].detach()) # update using the final predicted distributions
+            if self.use_tf_head:
+                predicted_distributions, predicted_energies, predicted_pred_hiddens = self(
+                    input_ids, return_raw_logits=True, replay_buffer_logits=replay_buffer_logits,
+                    no_randomness=no_randomness, learning=learning, return_pred_hiddens=True,
+                )
+            else:
+                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, replay_buffer_logits = replay_buffer_logits, no_randomness = no_randomness, learning = learning)
+            if predicted_distributions[-1] is not None:
+                self.replay_buffer.update(all_tokens.detach(), predicted_distributions[-1].detach()) # update using the final predicted distributions
         else:
             input_ids = x[0].squeeze(dim=0)
             next_token_indices = x[1].squeeze(dim=0)
-            predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness, learning = learning)
+            if self.use_tf_head:
+                predicted_distributions, predicted_energies, predicted_pred_hiddens = self(
+                    input_ids, return_raw_logits=True, no_randomness=no_randomness,
+                    learning=learning, return_pred_hiddens=True,
+                )
+            else:
+                predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness, learning = learning)
 
             # input_ids = x['input_ids'].squeeze(dim=1)[:, :-1]
             # predicted_distributions, predicted_energies = self(input_ids, return_raw_logits = True, no_randomness = no_randomness)
             # next_token_indices = x['input_ids'].squeeze(dim=1)[:, 1:] # squeeze was to remove 1 on 2nd dim
+
+        if self.use_tf_head:
+            prev_embed = self.embeddings(input_ids)
+            if self.post_update_state_detach_prev_embed:
+                prev_embed = prev_embed.detach()
+            predicted_distributions = [
+                None if pred_hidden_step is None else self.tf_head(pred_hidden_step, prev_embed)
+                for pred_hidden_step in predicted_pred_hiddens
+            ]
 
         dataset_name = getattr(self.hparams, 'dataset_name', '')
         if self.hparams.execution_mode == "finetune" and dataset_name != "nanochat_sft":
@@ -509,9 +659,12 @@ class EBT_NLP(LightningModule):
         # v3: flatten weights to (BS*S,) to match next_token_indices.
         flat_weights = None
         if token_loss_weights is not None:
+            first_distribution = next((pred for pred in predicted_distributions if pred is not None), None)
+            if first_distribution is None:
+                raise RuntimeError("No predicted distribution available for weighted CE.")
             flat_weights = token_loss_weights.reshape(-1).to(
                 device=next_token_indices.device,
-                dtype=predicted_distributions[0].dtype,
+                dtype=first_distribution.dtype,
             )
             # Zero-out positions corresponding to ignored targets so they don't bias the mean.
             flat_weights = flat_weights * (next_token_indices != -1).to(flat_weights.dtype)
@@ -519,6 +672,10 @@ class EBT_NLP(LightningModule):
         reconstruction_loss = 0
         total_mcmc_steps = len(predicted_energies) # in general this equals self.hparams.mcmc_num_steps, isnt in case of rand number
         for mcmc_step, (predicted_distribution, predicted_energy) in enumerate(zip(predicted_distributions, predicted_energies)):
+            if predicted_distribution is None:
+                if self.hparams.truncate_mcmc and mcmc_step != (total_mcmc_steps - 1):
+                    continue
+                raise RuntimeError("Missing predicted distribution for a supervised MCMC step.")
             if self.hparams.soften_target_prob_dist != 0.0:
                 if total_mcmc_steps <= 1:
                     label_smoothing = 0.0
@@ -687,13 +844,19 @@ class EBT_NLP(LightningModule):
                 embeddings.dtype,
             )
         predicted_tokens_device = embeddings.device
+        state_dim = self.hparams.embedding_dim if self.use_free_embedding_mcmc else self.vocab_size
+        noise_scale = self.hparams.gaussian_random_noise_scaling * (
+            float(getattr(self.hparams, "free_embed_noise_scale", 1.0))
+            if self.use_free_embedding_mcmc
+            else 1.0
+        )
 
         if self.hparams.denoising_initial_condition == "most_recent_embedding":
             raise NotImplementedError(f"most_recent_embedding denoising_initial_condition not supported for NLP yet")
         elif self.hparams.denoising_initial_condition == "random_noise":
-            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=predicted_tokens_dtype, device=predicted_tokens_device) * self.hparams.gaussian_random_noise_scaling
+            predicted_tokens = torch.randn(size=(embeddings.shape[0], embeddings.shape[1], state_dim), dtype=predicted_tokens_dtype, device=predicted_tokens_device) * noise_scale
         elif self.hparams.denoising_initial_condition == "zeros":
-            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], self.vocab_size), dtype=predicted_tokens_dtype, device=predicted_tokens_device)
+            predicted_tokens = torch.zeros(size=(embeddings.shape[0], embeddings.shape[1], state_dim), dtype=predicted_tokens_dtype, device=predicted_tokens_device)
         else:
             raise NotImplementedError(f"{self.hparams.denoising_initial_condition} denoising_initial_condition not yet supported")
         
