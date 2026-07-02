@@ -751,3 +751,12 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL conservative | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-conservati-2422b`，heartbeat 到 step 1 `generate_start` | 启动配置确认：commit `2cf9e1f3d2eed565abbd2b838a653686d8ff9779`，SFT ckpt 为 20260625 freeembed step 2999，日志显示 `Renamed 576 compiled/eager transformer keys to transformer.*` 且 8 rank `Model loaded successfully`；保守超参生效：`learning_rate=1e-7`、`muon_lr=1e-5`、`max_grad_per_param=0.005`。step 0 `rl_events.jsonl` 已落盘：reward_mean `1.5721`，reward_std `0.4567`，blank_accuracy `0.3846`，constraint_validity `0.1990`，full_solve `0.0`，`ref_energy_kl=0.0`，unique_completion_ratio `0.75`。 | 新任务启动健康，checkpoint remap 正常，首步没有全零、clue-only 或 NaN/Inf 迹象。新增 `rl_events.jsonl` 旁路落盘有效。继续观察 step 5/10 是否维持 blank/validity 信号，以及 pre-clip grad_norm 是否低于上一轮高峰。 |
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 178 `training_step_start` | 继续健康推进，本轮不重启。 |
+
+### 2026-07-03 04:26 +0800
+
+第四十一轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL conservative | `Running`，heartbeat 到 step 6 `generate_start` | step 5 `rl_events.jsonl`：reward_mean `0.9253`，reward_std `0.1394`，format `0.5`，clue_preservation `0.4253`，blank_accuracy `0.0`，constraint_validity `0.0`，full_solve `0.0`，`ref_energy_kl=3.08e-7`，unique_completion_ratio `0.9167`，degenerate_group_rate `0.0`。 | step 5 是 clue-only 早期波动，但不同于上一轮后期退化：reward_std 非零、不是 zero collapse，KL 仍接近 0，rjob 与 heartbeat 正常推进。因此本轮不重启，继续看 step 10 是否恢复 blank/validity，以及后续 grad_norm 是否落盘。 |
+| GSM8K RL | `Running`，heartbeat 到 step 187 `training_step_start` | 最新可见 step 175：reward_mean `0.1497`，reward_std `0.0919`，parse_rate `1.0`，answer_acc `0.0`，`ref_energy_kl=0.00416`，grad_norm `0.3365`，nan_params `0`。 | 仍健康推进；不重启。 |
