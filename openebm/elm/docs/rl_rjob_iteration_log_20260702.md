@@ -485,3 +485,11 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running` | step 65 reward_mean `0.0881`、reward_std `0.0088`；step 70 reward_mean `0.1322`、reward_std `0.1024`；nan_grad_params `0` | 运行健康但 exact answer 仍未稳定提升；继续监控，不重启。 |
 
 当前结论：Sudoku 第三版仍处于运行态，local skip 首轮验证有效，但尚未产生新的 step 日志；继续等待下一轮。
+
+### 2026-07-02 23:49 +0800
+
+第十七轮补充：
+
+- 纠正 heartbeat 路径：Sudoku 第三版 heartbeat 位于 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-233012/logs/heartbeat.json`，不是 `sft_train/logs/heartbeat.json`。
+- 正确 heartbeat 显示当前已到 step 5 `generate_start`，时间戳 `2026-07-02 23:48:18`。
+- 因此当前不是卡死，只是 `train.log` 尚未刷出 step 5 完整指标；下一轮继续等待 step 5 `rollout_ready/loss_ready/backward_done`。
