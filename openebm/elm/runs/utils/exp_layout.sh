@@ -208,6 +208,9 @@ exp_init_sft() {
     export EXP_CKPT_DIR="${stage_dir}/checkpoints"
     export EXP_LOG_FILE="${stage_dir}/logs/train.log"
     export EXP_WANDB_DIR="${stage_dir}/logs"
+    # Export actual stage dir so callers can pass it to exp_save_hparams /
+    # exp_save_status without re-deriving the v{N} suffix.
+    export EXP_SFT_DIR="${stage_dir}"
 
     mkdir -p "${stage_dir}/config"
     mkdir -p "${stage_dir}/checkpoints"

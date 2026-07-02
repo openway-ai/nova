@@ -120,17 +120,25 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 #   600 ≤ step < 2400                  → 0.85  (focus)
 #   step ≥ 2400                        → 0.7   (consolidation)
 # The retention guard then clips this around `valid_loss_sft` drift on each val tick.
+_V3_DEFAULT_PHASE1_STEPS = 600
+_V3_DEFAULT_PHASE2_STEPS = 2400
+_V3_DEFAULT_WARMUP_RATIO = 0.60
+_V3_DEFAULT_FOCUS_RATIO = 0.85
+_V3_DEFAULT_CONSOLIDATE_RATIO = 0.70
 _V3_RATIO_PHASES = [
-    {'lo': 0,    'hi': 600,   'ratio': 0.6},
-    {'lo': 600,  'hi': 2400,  'ratio': 0.85},
-    {'lo': 2400, 'hi': 10**9, 'ratio': 0.7},
+    {'lo': 0,    'hi': _V3_DEFAULT_PHASE1_STEPS, 'ratio': _V3_DEFAULT_WARMUP_RATIO},
+    {'lo': _V3_DEFAULT_PHASE1_STEPS, 'hi': _V3_DEFAULT_PHASE2_STEPS, 'ratio': _V3_DEFAULT_FOCUS_RATIO},
+    {'lo': _V3_DEFAULT_PHASE2_STEPS, 'hi': 10**9, 'ratio': _V3_DEFAULT_CONSOLIDATE_RATIO},
 ]
 # Difficulty bucket weights aligned with SudokuSFTV2IterableDataset.DIFFICULTY_BUCKETS
 # (hard 17-22, medium 23-28, easy 29-34). P5 in the v3 spec.
+_V3_DEFAULT_WARMUP_BUCKET_WEIGHTS = [0.33, 0.33, 0.34]
+_V3_DEFAULT_FOCUS_BUCKET_WEIGHTS = [0.55, 0.30, 0.15]
+_V3_DEFAULT_CONSOLIDATE_BUCKET_WEIGHTS = [0.40, 0.35, 0.25]
 _V3_DIFFICULTY_PHASES = [
-    {'lo': 0,    'hi': 600,   'weights': [0.33, 0.33, 0.34]},   # warmup uniform
-    {'lo': 600,  'hi': 2400,  'weights': [0.55, 0.30, 0.15]},   # focus on hard tail
-    {'lo': 2400, 'hi': 10**9, 'weights': [0.40, 0.35, 0.25]},   # consolidation
+    {'lo': 0,    'hi': _V3_DEFAULT_PHASE1_STEPS, 'weights': _V3_DEFAULT_WARMUP_BUCKET_WEIGHTS},   # warmup uniform
+    {'lo': _V3_DEFAULT_PHASE1_STEPS, 'hi': _V3_DEFAULT_PHASE2_STEPS, 'weights': _V3_DEFAULT_FOCUS_BUCKET_WEIGHTS},   # focus on hard tail
+    {'lo': _V3_DEFAULT_PHASE2_STEPS, 'hi': 10**9, 'weights': _V3_DEFAULT_CONSOLIDATE_BUCKET_WEIGHTS},   # consolidation
 ]
 # Retention guard (P4): SFT-loss target used to keep core SFT capability from drifting.
 # v2 baseline `valid_loss_sft` was 1.121 across the 0.4/0.6/0.8 sweep; we accept up to
@@ -185,6 +193,19 @@ class AdaptiveRatioCallback:
         self,
         ratio_schedule='three_phase_with_guard',
         difficulty_schedule='three_phase',
+        phase1_steps=_V3_DEFAULT_PHASE1_STEPS,
+        phase2_steps=_V3_DEFAULT_PHASE2_STEPS,
+        warmup_ratio=_V3_DEFAULT_WARMUP_RATIO,
+        focus_ratio=_V3_DEFAULT_FOCUS_RATIO,
+        consolidate_ratio=_V3_DEFAULT_CONSOLIDATE_RATIO,
+        sft_baseline=_V3_SFT_BASELINE,
+        sft_tolerance=_V3_SFT_TOLERANCE,
+        ratio_floor=_V3_RATIO_FLOOR,
+        ratio_ceil=_V3_RATIO_CEIL,
+        ratio_step=_V3_RATIO_STEP,
+        warmup_bucket_weights=None,
+        focus_bucket_weights=None,
+        consolidate_bucket_weights=None,
     ):
         try:
             from lightning.pytorch.callbacks import Callback as _LCB
@@ -195,6 +216,21 @@ class AdaptiveRatioCallback:
         AdaptiveRatioCallback._mixin_callback(self, _LCB)
         self.ratio_schedule = ratio_schedule
         self.difficulty_schedule = difficulty_schedule
+        self.phase1_steps = int(phase1_steps)
+        self.phase2_steps = int(phase2_steps)
+        if self.phase2_steps <= self.phase1_steps:
+            self.phase2_steps = self.phase1_steps + 1
+        self.warmup_ratio = float(warmup_ratio)
+        self.focus_ratio = float(focus_ratio)
+        self.consolidate_ratio = float(consolidate_ratio)
+        self.sft_baseline = float(sft_baseline)
+        self.sft_tolerance = float(sft_tolerance)
+        self.ratio_floor = float(ratio_floor)
+        self.ratio_ceil = float(ratio_ceil)
+        self.ratio_step = float(ratio_step)
+        self.warmup_bucket_weights = list(warmup_bucket_weights or _V3_DEFAULT_WARMUP_BUCKET_WEIGHTS)
+        self.focus_bucket_weights = list(focus_bucket_weights or _V3_DEFAULT_FOCUS_BUCKET_WEIGHTS)
+        self.consolidate_bucket_weights = list(consolidate_bucket_weights or _V3_DEFAULT_CONSOLIDATE_BUCKET_WEIGHTS)
         self._last_logged_step = -1
 
     @staticmethod
@@ -217,10 +253,20 @@ class AdaptiveRatioCallback:
         return ds
 
     def _phase_ratio(self, step):
-        return _v3_three_phase_value(step, _V3_RATIO_PHASES, default=0.6)
+        phases = [
+            {'lo': 0, 'hi': self.phase1_steps, 'ratio': self.warmup_ratio},
+            {'lo': self.phase1_steps, 'hi': self.phase2_steps, 'ratio': self.focus_ratio},
+            {'lo': self.phase2_steps, 'hi': 10**9, 'ratio': self.consolidate_ratio},
+        ]
+        return _v3_three_phase_value(step, phases, default=self.warmup_ratio)
 
     def _phase_bucket_weights(self, step):
-        return list(_v3_three_phase_value(step, _V3_DIFFICULTY_PHASES, default=[1, 1, 1]))
+        phases = [
+            {'lo': 0, 'hi': self.phase1_steps, 'weights': self.warmup_bucket_weights},
+            {'lo': self.phase1_steps, 'hi': self.phase2_steps, 'weights': self.focus_bucket_weights},
+            {'lo': self.phase2_steps, 'hi': 10**9, 'weights': self.consolidate_bucket_weights},
+        ]
+        return list(_v3_three_phase_value(step, phases, default=[1, 1, 1]))
 
     # ── Lightning hooks ────────────────────────────────────────────────
 
@@ -236,8 +282,8 @@ class AdaptiveRatioCallback:
             # of the schedule. We apply phase-on-transition edges; guard nudges live
             # in on_validation_epoch_end.
             current = float(ds.sudoku_ratio)
-            phase_lo = max(_V3_RATIO_FLOOR, base - 0.10)
-            phase_hi = min(_V3_RATIO_CEIL, base + 0.05)
+            phase_lo = max(self.ratio_floor, base - 0.10)
+            phase_hi = min(self.ratio_ceil, base + 0.05)
             if not (phase_lo <= current <= phase_hi):
                 ds.sudoku_ratio = float(base)
         elif self.ratio_schedule == 'fixed':
@@ -282,12 +328,12 @@ class AdaptiveRatioCallback:
             return
         if isinstance(sft_loss, torch.Tensor):
             sft_loss = sft_loss.detach().float().item()
-        delta = float(sft_loss) - _V3_SFT_BASELINE
+        delta = float(sft_loss) - self.sft_baseline
         before = float(ds.sudoku_ratio)
-        if delta > _V3_SFT_TOLERANCE:
-            new_r = max(_V3_RATIO_FLOOR, before - _V3_RATIO_STEP)
+        if delta > self.sft_tolerance:
+            new_r = max(self.ratio_floor, before - self.ratio_step)
         elif delta < 0.0:
-            new_r = min(_V3_RATIO_CEIL, before + _V3_RATIO_STEP)
+            new_r = min(self.ratio_ceil, before + self.ratio_step)
         else:
             new_r = before
         if abs(new_r - before) > 1e-6:
@@ -601,9 +647,65 @@ class ModelTrainer(LightningModule):
 
         else:
             eval_step_dict = self.eval_step(batch, "train")
+
+        eval_step_dict.update(self._get_sudoku_mixed_train_metrics())
         
         self.log_metrics(eval_step_dict, "train")
         return eval_step_dict['loss']   
+
+    def _get_sudoku_mixed_train_metrics(self):
+        """Expose Sudoku mixed-data curriculum health as normal train metrics.
+
+        These are intentionally scalar-only so they flow through the existing
+        `log_metrics(..., phase="train")` path and appear in logs/W&B without a
+        separate callback. The dataset keeps defaults diverse; these metrics just
+        make source mix, difficulty sampling, format mix, and blank-weight coverage
+        observable.
+        """
+        if getattr(self.hparams, 'dataset_name', '') != 'sudoku_mixed':
+            return {}
+        try:
+            train_dl = getattr(self.trainer, 'train_dataloader', None)
+            ds = getattr(train_dl, 'dataset', None)
+        except Exception:
+            return {}
+        if ds is None or not hasattr(ds, 'last_batch_source'):
+            return {}
+
+        source = getattr(ds, 'last_batch_source', None)
+        metrics = {
+            'sudoku_source_is_sudoku': 1.0 if source == 'sudoku' else 0.0,
+        }
+        if hasattr(ds, 'sudoku_ratio'):
+            metrics['sudoku_ratio_active_step'] = float(ds.sudoku_ratio)
+
+        sudoku_ds = getattr(ds, 'sudoku_ds', None)
+        bucket_weights = getattr(sudoku_ds, 'bucket_weights', None)
+        buckets = getattr(sudoku_ds, 'DIFFICULTY_BUCKETS', [])
+        if bucket_weights is not None and buckets:
+            for i, bucket in enumerate(buckets):
+                if i < len(bucket_weights):
+                    metrics[f'sudoku_bucket_weight_{bucket[0]}'] = float(bucket_weights[i])
+
+        if source != 'sudoku':
+            return metrics
+
+        meta = getattr(ds, 'last_batch_meta', {}) or {}
+        n_conv = max(int(meta.get('num_conversations', 0)), 1)
+        metrics['sudoku_batch_num_conversations'] = float(meta.get('num_conversations', 0))
+        metrics['sudoku_batch_mean_given_count'] = float(meta.get('mean_given_count', 0.0))
+        metrics['sudoku_blank_weight_apply_rate'] = float(meta.get('blank_weight_apply_rate', 0.0))
+        metrics['sudoku_blank_weight_eligible_frac'] = (
+            float(meta.get('blank_weight_eligible', 0)) / n_conv
+        )
+
+        for bucket_name, count in (meta.get('difficulty_bucket_counts', {}) or {}).items():
+            metrics[f'sudoku_batch_bucket_frac_{bucket_name}'] = float(count) / n_conv
+        for fmt, count in (meta.get('puzzle_format_counts', {}) or {}).items():
+            metrics[f'sudoku_batch_puzzle_format_frac_{fmt}'] = float(count) / n_conv
+        for fmt, count in (meta.get('solution_format_counts', {}) or {}).items():
+            metrics[f'sudoku_batch_solution_format_frac_{fmt}'] = float(count) / n_conv
+        return metrics
     
     def on_after_backward(self):
         if self.hparams.log_gradients:
@@ -968,6 +1070,7 @@ class ModelTrainer(LightningModule):
         buf = getattr(self, '_val_source_buf', None)
         if sources and buf:
             ratio = self._active_sudoku_ratio(default=0.6)
+            ratio = max(0.0, min(1.0, ratio))
             weights = {'sudoku': ratio, 'sft': 1.0 - ratio}
             balanced_weights = {'sudoku': 0.5, 'sft': 0.5}
             all_keys = set()
@@ -1029,6 +1132,7 @@ class ModelTrainer(LightningModule):
                         self.log(f"valid_loss_{src}", v, prog_bar=False, sync_dist=False)
 
             if mixed:
+                mixed['sudoku_ratio_eval_weight'] = ratio
                 self.log_metrics(mixed, "valid")
                 for k, v in mixed.items():
                     self._cache_valid_metric(k, v)
@@ -2164,6 +2268,7 @@ class ModelTrainer(LightningModule):
             blank_weight = float(getattr(self.hparams, 'sudoku_blank_loss_weight', 1.0))
             difficulty_sched = getattr(self.hparams, 'sudoku_difficulty_schedule', 'fixed')
             initial_bucket_weights = _v3_initial_bucket_weights(difficulty_sched)
+            dataset_seed = int(getattr(self.hparams, 'dataset_seed', -1))
             train_dataloader = generate_sudoku_mixed_dataloader(
                 tokenizer=tokenizer,
                 batch_size=self.hparams.batch_size_per_device,
@@ -2173,6 +2278,7 @@ class ModelTrainer(LightningModule):
                 device=self.device,
                 resume_state_dict=resume_state,
                 sudoku_ratio=getattr(self.hparams, 'sudoku_ratio', 0.6),
+                seed=None if dataset_seed < 0 else dataset_seed,
                 blank_loss_weight=blank_weight,
                 difficulty_bucket_weights=initial_bucket_weights,
             )

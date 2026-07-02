@@ -78,6 +78,20 @@ class EBT_NLP(LightningModule):
             self.replay_buffer = CausalReplayBuffer(max_size=replay_buffer_max_size, sample_size=self.replay_buffer_samples)
 
         self._alpha_debug_step = 0  # counter for alpha diagnostic prints
+        # Per-forward NaN flag for GRPO cross-rank sync.
+        self._fwd_had_nan_energy = False
+        if isinstance(self.alpha, nn.ParameterList):
+            self._alpha_init_values = [float(p.detach().item()) for p in self.alpha]
+            self._alpha_init_value = (
+                self._alpha_init_values[0]
+                if self._alpha_init_values
+                else float(self.hparams.mcmc_step_size)
+            )
+        else:
+            self._alpha_init_values = None
+            self._alpha_init_value = float(self.alpha.detach().item())
+
+        # DEBUGGING CODE ################################################################################################################################################
         if self.hparams.debug_unused_parameters:
             self.used_parameters = set()
             self.parameters_not_to_check = set() # dont check these since may be frozen or dont want them to update
@@ -90,8 +104,47 @@ class EBT_NLP(LightningModule):
         trainer is present, so overriding to() is insufficient.
         """
         result = super()._apply(fn)
-        result.alpha.data = result.alpha.data.to(dtype=torch.float32)
+        if isinstance(result.alpha, nn.ParameterList):
+            for alpha_param in result.alpha:
+                alpha_param.data = alpha_param.data.to(dtype=torch.float32)
+        else:
+            result.alpha.data = result.alpha.data.to(dtype=torch.float32)
         return result
+
+    def _alpha_init_for_step(self, step=0):
+        values = getattr(self, "_alpha_init_values", None)
+        if values:
+            return float(values[min(int(step), len(values) - 1)])
+        return float(getattr(self, "_alpha_init_value", self.hparams.mcmc_step_size))
+
+    def _alpha_debug_value(self):
+        if isinstance(self.alpha, nn.ParameterList):
+            alpha_params = list(self.alpha)
+            vals = [float(p.detach().float().item()) for p in alpha_params[:3]]
+            suffix = ",..." if len(self.alpha) > 3 else ""
+            return "[" + ",".join(f"{v:.6e}" for v in vals) + suffix + "]"
+        return f"{float(self.alpha.detach().float().item()):.6e}"
+
+    def _sanitize_alpha_param(self, alpha_param, step=0):
+        alpha = torch.clamp(alpha_param, min=0.0001).float()
+        if torch.isfinite(alpha).all():
+            return alpha
+        recovery = self._alpha_init_for_step(step)
+        with torch.no_grad():
+            alpha_param.fill_(recovery)
+        if not getattr(self, "_alpha_nan_warned", False):
+            print(f"[DBG-RL] WARNING: alpha step {step} was NaN/Inf, restored to {recovery}", flush=True)
+            self._alpha_nan_warned = True
+        return torch.tensor(recovery, device=alpha_param.device, dtype=torch.float32)
+
+    def _maybe_randomize_alpha(self, alpha, batch_size, seq_length, no_randomness):
+        if no_randomness or self.hparams.randomize_mcmc_step_size_scale == 1:
+            return alpha
+        expanded_alpha = alpha.expand(batch_size, seq_length, 1)
+        scale = self.hparams.randomize_mcmc_step_size_scale
+        low = alpha / scale
+        high = alpha * scale
+        return low + torch.rand_like(expanded_alpha) * (high - low)
 
     @torch.compiler.disable
     def _mcmc_step_excluded(self, predicted_tokens, real_embeddings_input, mcmc_step, i, num_mcmc_steps,
@@ -146,7 +199,50 @@ class EBT_NLP(LightningModule):
         
         with torch.amp.autocast(device_type='cuda', enabled=False):
             energy_f32 = energy_preds.float()
-            if self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
+            # Guard: if energy itself is NaN/Inf, skip gradient computation entirely
+            if torch.isnan(energy_f32).any() or torch.isinf(energy_f32).any():
+                import warnings, os as _os
+                self._fwd_had_nan_energy = True
+                _nan_count = getattr(self, '_dbg_nan_energy_count', 0)
+                if _nan_count < 5:
+                    _rank = _os.environ.get('LOCAL_RANK', '?')
+                    with torch.no_grad():
+                        _e = energy_f32
+                        nan_cnt = int(torch.isnan(_e).sum().item())
+                        inf_cnt = int(torch.isinf(_e).sum().item())
+                        finite_mask = torch.isfinite(_e)
+                        if finite_mask.any():
+                            _ef = _e[finite_mask]
+                            e_min = _ef.min().item()
+                            e_max = _ef.max().item()
+                            e_mean = _ef.mean().item()
+                        else:
+                            e_min = e_max = e_mean = float('nan')
+                        _pt = predicted_tokens.detach().float()
+                        pt_finite = torch.isfinite(_pt)
+                        if pt_finite.any():
+                            _ptf = _pt[pt_finite]
+                            pt_min = _ptf.min().item()
+                            pt_max = _ptf.max().item()
+                            pt_mean = _ptf.mean().item()
+                        else:
+                            pt_min = pt_max = pt_mean = float('nan')
+                        pt_nan = int(torch.isnan(_pt).sum().item())
+                        pt_inf = int(torch.isinf(_pt).sum().item())
+                        print(
+                            f"[DBG-RL][rank={_rank}] NaN-ENERGY step={mcmc_step} iter={i} "
+                            f"learning={learning} "
+                            f"energy: nan={nan_cnt}/{_e.numel()} inf={inf_cnt} "
+                            f"finite_range=[{e_min:.4e},{e_max:.4e}] mean={e_mean:.4e} | "
+                            f"predicted_tokens: shape={tuple(predicted_tokens.shape)} "
+                            f"nan={pt_nan} inf={pt_inf} "
+                            f"finite_range=[{pt_min:.4e},{pt_max:.4e}] mean={pt_mean:.4e} | "
+                            f"alpha={self._alpha_debug_value()}",
+                            flush=True,
+                        )
+                    self._dbg_nan_energy_count = _nan_count + 1
+                predicted_tokens_grad = torch.zeros_like(predicted_tokens)
+            elif self.hparams.truncate_mcmc:  #retain_graph defaults to create_graph value here; if learning is true then create_graph else dont (inference)
                 if i == (num_mcmc_steps - 1):
                     predicted_tokens_grad = torch.autograd.grad([energy_f32.sum()], [predicted_tokens], create_graph=learning)[0]
                 else:
@@ -160,17 +256,44 @@ class EBT_NLP(LightningModule):
             min_and_max = self.hparams.clamp_futures_grad_max_change / torch.clamp(_alpha_for_clamp.float(), min=0.0001)
             # predicted_tokens_grad = scale_clamp(predicted_tokens_grad, -min_and_max, min_and_max)
             predicted_tokens_grad = torch.clamp(predicted_tokens_grad, min = -min_and_max, max = min_and_max)
-            
+
         if torch.isnan(predicted_tokens_grad).any() or torch.isinf(predicted_tokens_grad).any():
-            raise ValueError("NaN or Inf gradients detected during MCMC.")
+            self._fwd_had_nan_energy = True
+            if learning:
+                import warnings, os as _os
+                bad_count = torch.isnan(predicted_tokens_grad).sum() + torch.isinf(predicted_tokens_grad).sum()
+                _rank = _os.environ.get('LOCAL_RANK', '?')
+                finite_grad = predicted_tokens_grad[torch.isfinite(predicted_tokens_grad)]
+                if finite_grad.numel() > 0:
+                    grad_min, grad_max = finite_grad.min().item(), finite_grad.max().item()
+                else:
+                    grad_min = grad_max = float('nan')
+                print(
+                    f"[DBG-RL][rank={_rank}] NaN-GRAD step={mcmc_step} iter={i} "
+                    f"bad={bad_count.item()}/{predicted_tokens_grad.numel()} "
+                    f"energy_range=[{energy_f32.min().item():.4e},{energy_f32.max().item():.4e}] "
+                    f"grad_finite_range=[{grad_min:.4e},{grad_max:.4e}]",
+                    flush=True,
+                )
+            predicted_tokens_grad = torch.where(
+                torch.isfinite(predicted_tokens_grad), predicted_tokens_grad,
+                torch.zeros_like(predicted_tokens_grad)
+            )
         
         predicted_tokens = predicted_tokens - alpha * predicted_tokens_grad # do this to tokens will be unnormalize prob dist convert to prob dist after
         
         if self.hparams.absolute_clamp != 0.0:
             predicted_tokens = torch.clamp(predicted_tokens, min = -self.hparams.absolute_clamp, max = self.hparams.absolute_clamp)
-        
+
         if self.hparams.sharpen_predicted_distribution != 0.0:
             predicted_tokens = predicted_tokens / self.hparams.sharpen_predicted_distribution
+
+        # Defensive: sanitize any residual NaN/Inf in predicted_tokens before
+        # returning raw logits. Prevents NaN cascading to softmax → multinomial.
+        if return_raw_logits and not torch.isfinite(predicted_tokens).all():
+            predicted_tokens = torch.nan_to_num(
+                predicted_tokens, nan=0.0, posinf=100.0, neginf=-100.0
+            )
 
         if return_raw_logits:
             predicted_tokens_for_loss = predicted_tokens # BS, S, V
@@ -183,22 +306,62 @@ class EBT_NLP(LightningModule):
         predicted_distributions = []
         predicted_energies = []
 
+        # [DEBUG-RL] Reset per-forward NaN flag.
+        self._fwd_had_nan_energy = False
+
         real_embeddings_input = self.embeddings(x)
         batch_size = x.shape[0]
         seq_length = x.shape[1]
-        
-        model_dtype = self.embeddings.weight.dtype
-        if not isinstance(self.alpha, nn.ParameterList):
-            alpha = torch.clamp(self.alpha, min=0.0001).float()
-            if not no_randomness and self.hparams.randomize_mcmc_step_size_scale != 1:
-                expanded_alpha = alpha.expand(batch_size, seq_length, 1)
 
-                scale = self.hparams.randomize_mcmc_step_size_scale
-                low = alpha / scale
-                high = alpha * scale
-                alpha = low + torch.rand_like(expanded_alpha) * (high - low)
+        # [DEBUG-RL] Optional forward stats. Disabled by default because RL
+        # rollout generation calls this on every rank and can flood train.log.
+        # Enable with DBG_RL_FORWARD=1; tune frequency with
+        # DBG_RL_FORWARD_INTERVAL (default: first call only).
+        import os as _os
+        _dbg_forward = _os.environ.get('DBG_RL_FORWARD', '0').lower() in ('1', 'true', 'yes')
+        _dbg_forward_interval = int(_os.environ.get('DBG_RL_FORWARD_INTERVAL', '0') or 0)
+        _dbg_forward_count = int(getattr(self, '_dbg_forward_count', 0))
+        self._dbg_forward_count = _dbg_forward_count + 1
+        _dbg_should_log = (
+            _dbg_forward
+            and (
+                (_dbg_forward_interval <= 0 and not getattr(self, '_dbg_logged_embed_stats', False))
+                or (_dbg_forward_interval > 0 and _dbg_forward_count % _dbg_forward_interval == 0)
+            )
+        )
+        if _dbg_should_log:
+            try:
+                _rank = _os.environ.get('LOCAL_RANK', '?')
+                with torch.no_grad():
+                    _e = real_embeddings_input.float()
+                    _x_min, _x_max = int(x.min().item()), int(x.max().item())
+                    print(
+                        f"[DBG-RL][rank={_rank}] embed stats: shape={tuple(_e.shape)} "
+                        f"min={_e.min().item():.4f} max={_e.max().item():.4f} "
+                        f"mean={_e.mean().item():.4f} std={_e.std().item():.4f} "
+                        f"any_nan={torch.isnan(_e).any().item()} any_inf={torch.isinf(_e).any().item()} "
+                        f"input_id_range=[{_x_min},{_x_max}] vocab_size={self.vocab_size}",
+                        flush=True,
+                    )
+                    print(
+                        f"[DBG-RL][rank={_rank}] alpha={self._alpha_debug_value()} "
+                        f"langevin_noise_std={self.langevin_dynamics_noise_std.item():.6e} "
+                        f"learning={learning} no_randomness={no_randomness} "
+                        f"return_raw_logits={return_raw_logits} "
+                        f"truncate_mcmc={getattr(self.hparams, 'truncate_mcmc', None)} "
+                        f"mcmc_num_steps={self.hparams.mcmc_num_steps}",
+                        flush=True,
+                    )
+                self._dbg_logged_embed_stats = True
+            except Exception as _e_dbg:
+                if _dbg_forward:
+                    print(f"[DBG-RL] embed stats logging failed: {_e_dbg}", flush=True)
+
+        if isinstance(self.alpha, nn.ParameterList):
+            alpha = None  # resolved per MCMC step below
         else:
-            alpha = None  # will be resolved per step below
+            alpha = self._sanitize_alpha_param(self.alpha)
+            alpha = self._maybe_randomize_alpha(alpha, batch_size, seq_length, no_randomness)
 
         langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
 
@@ -232,7 +395,8 @@ class EBT_NLP(LightningModule):
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
                 if isinstance(self.alpha, nn.ParameterList):
-                    step_alpha = torch.clamp(self.alpha[mcmc_step], min=0.0001)
+                    step_alpha = self._sanitize_alpha_param(self.alpha[mcmc_step], mcmc_step)
+                    step_alpha = self._maybe_randomize_alpha(step_alpha, batch_size, seq_length, no_randomness)
                 else:
                     step_alpha = alpha
 
