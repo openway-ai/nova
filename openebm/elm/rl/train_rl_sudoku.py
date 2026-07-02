@@ -123,10 +123,12 @@ def parse_args():
     parser.add_argument(
         "--skip_consensus",
         type=str,
-        default="any",
-        choices=["all", "any"],
+        default="local",
+        choices=["all", "any", "local"],
         help="'all': skip only if every DDP rank reports a bad rollout; "
-             "'any': skip if any rank reports a bad rollout.",
+             "'any': skip if any rank reports a bad rollout; "
+             "'local': bad ranks contribute zero full-graph loss while "
+             "healthy ranks keep updating.",
     )
 
     # Optimizer

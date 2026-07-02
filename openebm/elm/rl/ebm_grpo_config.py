@@ -103,11 +103,13 @@ class EBMGRPOConfig:
     ratio is below this threshold. Keep 0.0 by default so low diversity is
     logged first and used as a manual diagnostic before enforcing the guard."""
 
-    skip_consensus: str = "any"
+    skip_consensus: str = "local"
     """DDP skip consensus mode:
     - 'all': skip only when every rank reports a bad rollout.
     - 'any': skip if any rank reports a bad rollout. More conservative and
-      preferred for stability-first Sudoku RL runs."""
+      can be too strict with one prompt per rank.
+    - 'local': skip the whole step only if every rank is bad; otherwise bad
+      ranks contribute a zero full-graph loss while healthy ranks update."""
 
     # ── Optimization ──────────────────────────────────────────────────────────
     learning_rate: float = 1e-6
