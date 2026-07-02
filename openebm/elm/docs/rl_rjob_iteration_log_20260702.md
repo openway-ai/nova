@@ -405,3 +405,18 @@ Sudoku 保守版重启：
 - `bash -n openebm/elm/runs/rjob/run_sudoku_rl_optimized_rjob.sh`
 
 下一轮：提交并推送修复后，重新提交 Sudoku rjob；新 run 的关键判据是 step 25 类似坏 batch 应打印 `SKIPPED` / `skipped_step=1.0`，且不能出现 KL-only 参数更新。
+
+### 2026-07-02 23:19 +0800
+
+Sudoku skip-guard 修复版重启：
+
+| 项目 | 值 |
+| --- | --- |
+| 修复提交 | `59c3615 fix(rl): skip degenerate sudoku rollouts` |
+| 旧 Sudoku rjob | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-0fa37`，已确认 `Stopped` |
+| 新 Sudoku exp_id | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-231904` |
+| 新 Sudoku rjob metadata | `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-fb2b4` |
+| 提交时状态 | `Inqueue` / replica `STARTING` |
+| 预期报告路径 | `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-231904/sft_train/sudoku_rl_analysis_report.md` |
+
+下一轮：确认新 rjob 进入 `Running` 并开始写入 `train.log`；随后重点检查 step 25 附近是否触发 `skipped_step=1.0`，而不是再次执行 KL-only 更新。
