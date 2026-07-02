@@ -853,3 +853,12 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running` | heartbeat 到 step 229 `skip_consensus_start`，local_skip `0`，unique_ratio `1.0`。 | 健康运行，继续保留。 |
 
 补充到 step 5：`rl_events.jsonl` 已逐 step 落盘。step 0/2/4 有有效 blank/validity 信号，reward_mean 分别为 `1.5721`、`1.5905`、`1.3218`；step 2 出现 `full_solve=0.05`；step 1 是 `LOCAL_ZERO`，`skip_rank_count=5/8`；step 3/5 为 clue-only 低方差更新，reward_mean `0.9091`/`0.9253`。`ref_energy_kl` 仍在 `0` 到 `2.78e-7` 范围，尚无 KL 漂移、NaN/Inf 或 reward 崩塌。
+
+### 2026-07-03 06:42 +0800
+
+第四十九轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL local-log1 | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-local-log1-fb84f` | heartbeat 到 step 8 `generate_start`。`rl_events.jsonl` 到 step 7，共 8 条事件：平均 reward `1.1550`，非零 step 平均 reward `1.3200`，本 rank `LOCAL_ZERO` 为 `1/8`。step 6：reward_mean `1.8153`、blank_accuracy `0.5424`、constraint_validity `0.2793`、`ref_energy_kl=6.11e-7`；step 7：reward_mean `1.1056`、blank_accuracy `0.1148`、constraint_validity `0.0593`、`ref_energy_kl=1.38e-6`。 | 当前不是 checkpoint 加载失败或 reward 全零：SFT key remap 正常，rank0 多数 step 有有效 reward 与反传，KL 仍极低，无 NaN/Inf。`local` consensus 修复后，坏 rank 不再阻断健康 rank 更新；继续观察 step 10/20 趋势，不重启。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | 控制面 `Running`；最近 heartbeat 仍在训练推进。 | 健康运行，继续保留。 |
