@@ -836,3 +836,18 @@ Sudoku local-skip 修复版重启：
 - 将 Sudoku optimized rjob 默认 `LOG_INTERVAL` 调为 `1`，便于逐 step 监控。
 - 修改 trainer：global skip 与 local-zero 事件不再受 `LOG_INTERVAL` 限制，逐 step 写入 `logs/rl_events.jsonl`，避免后续监控盲区。
 - 已通过 `py_compile`、`bash -n`、`git diff --check`。
+
+重启动作：
+
+- 修复 commit：`20c93ac5198ff6eddb30019091e117ff65a426ed`，已推送到远端 `dev-openebm-sudoku-rl-fsdp2-merge`。
+- 已提交新 Sudoku rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-local-log1-fb84f`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-local-log1-20260703-0612`，06:12 控制面状态 `Inqueue/STARTING`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-local-log1-20260703-0612/`。
+- GSM8K rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` 保持 `Running`。
+
+### 2026-07-03 06:18 +0800
+
+第四十八轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL local-log1 | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-local-log1-fb84f` | 启动配置确认：commit `20c93ac5198ff6eddb30019091e117ff65a426ed`，`skip_consensus=local`，`LOG_INTERVAL=1`，SFT checkpoint remap 正常。step 0：reward_mean `1.5721`，reward_std `0.4567`，blank_accuracy `0.3846`，constraint_validity `0.1990`，full_solve `0.0`，`global_skip=False`，`skip_rank_count=1/8`，grad_norm `1.9447`，nan_grad_params `0`。 | 修复生效：坏 rank 被隔离但没有丢弃健康 rank 的更新；checkpoint 与 reward 均正常。继续观察 step 1-5 的逐步 JSON，重点看 local-zero 是否逐步落盘、KL 是否维持低位、reward 是否恢复/提升。 |
+| GSM8K RL | `Running` | heartbeat 到 step 229 `skip_consensus_start`，local_skip `0`，unique_ratio `1.0`。 | 健康运行，继续保留。 |
