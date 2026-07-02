@@ -18,6 +18,7 @@ import os
 import re
 from datasets import load_dataset
 from tasks.common import Task
+from tasks.local_datasets import load_arrow_cache
 
 
 GSM_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
@@ -41,6 +42,17 @@ class GSM8K(Task):
         super().__init__(**kwargs)
         assert subset in ["main", "socratic"], "GSM8K subset must be main|socratic"
         assert split in ["train", "test"], "GSM8K split must be train|test"
+
+        self.ds = load_arrow_cache(
+            "gsm8k",
+            {
+                "train": [f"**/{subset}/**/gsm8k-train.arrow"],
+                "test": [f"**/{subset}/**/gsm8k-test.arrow"],
+            },
+            split,
+        )
+        if self.ds is not None:
+            return
 
         # 支持离线数据集
         cache_dir = None

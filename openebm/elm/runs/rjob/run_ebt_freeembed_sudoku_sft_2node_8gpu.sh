@@ -44,8 +44,12 @@ cd "${NOVA_HOME}"
 
 export PYTHONPATH="${NOVA_HOME}/nanochat:${NOVA_HOME}:${PYTHONPATH:-}"
 export HOME="${NOVA_HOME}"
-export NANOCHAT_BASE_DIR="${NOVA_HOME}/data"
-export NANOCHAT_SFT_DATA_DIR="${NOVA_HOME}/data/sft_data"
+NANOCHAT_OFFLINE_BASE_DEFAULT="${NOVA_HOME}/data"
+if [[ -d "/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat/sft_data" ]]; then
+    NANOCHAT_OFFLINE_BASE_DEFAULT="/mnt/shared-storage-user/puyuan/code/nanochat/.cache/nanochat"
+fi
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-${NANOCHAT_OFFLINE_BASE_DEFAULT}}"
+export NANOCHAT_SFT_DATA_DIR="${NANOCHAT_SFT_DATA_DIR:-${NANOCHAT_BASE_DIR}/sft_data}"
 export HF_HOME="${NOVA_HOME}/data/hf_home"
 export HF_DATASETS_CACHE="${NOVA_HOME}/data/hf_datasets_cache"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib}"
@@ -101,6 +105,7 @@ TF_HEAD_LAYERS="${TF_HEAD_LAYERS:-1}"
 TF_HEAD_N_HEADS="${TF_HEAD_N_HEADS:-0}"
 TF_HEAD_FFN_MULT="${TF_HEAD_FFN_MULT:-4.0}"
 FREE_EMBED_NOISE_SCALE="${FREE_EMBED_NOISE_SCALE:-1.0}"
+FFN_DIM_MULTIPLIER="${FFN_DIM_MULTIPLIER:-2.67}"
 USE_SDPA_ATTENTION="${USE_SDPA_ATTENTION:-false}"
 
 ################################################################################
@@ -132,7 +137,6 @@ MAX_STEPS="${MAX_STEPS:-3000}"
 MAX_SCHEDULING_STEPS="${MAX_SCHEDULING_STEPS:-3000}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-200}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-25}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
 SAVE_TOP_K="${SAVE_TOP_K:-3}"
 
 OPTION_FLAGS="--dynamic_wd --linear_warmdown --warmup_ratio 0.05 --warmdown_ratio 0.2 --final_lr_frac 0.0 \
@@ -188,6 +192,7 @@ if [[ "${NODE_RANK}" == "0" ]]; then
         "randomize_mcmc_num_steps=${RANDOMIZE_MCMC_NUM_STEPS}" \
         "tf_head_type=${TF_HEAD_TYPE}" \
         "free_embedding_mcmc=true" \
+        "ffn_dim_multiplier=${FFN_DIM_MULTIPLIER}" \
         "pretrain_ckpt=${PRETRAIN_CKPT}" \
         "dataset=sudoku_mixed_v3" \
         "sudoku_ratio_initial=${SUDOKU_RATIO}" \
@@ -237,6 +242,18 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
     echo "Missing Sudoku V2 cache files in ${SUDOKU_DATA_DIR_V2}: ${MISSING[*]}" >&2
     exit 1
 fi
+
+SFT_MISSING=()
+[[ -z "$(find "${NANOCHAT_SFT_DATA_DIR}/smol-smoltalk" -name 'smol-smoltalk-train*.arrow' -print -quit 2>/dev/null)" ]] && SFT_MISSING+=("smol-smoltalk train")
+[[ -z "$(find "${NANOCHAT_SFT_DATA_DIR}/smol-smoltalk" -name 'smol-smoltalk-test.arrow' -print -quit 2>/dev/null)" ]] && SFT_MISSING+=("smol-smoltalk test")
+[[ -z "$(find "${NANOCHAT_SFT_DATA_DIR}/mmlu" -path '*/auxiliary_train/*' -name 'mmlu-train.arrow' -print -quit 2>/dev/null)" ]] && SFT_MISSING+=("mmlu auxiliary_train")
+[[ -z "$(find "${NANOCHAT_SFT_DATA_DIR}/mmlu" -path '*/all/*' -name 'mmlu-test.arrow' -print -quit 2>/dev/null)" ]] && SFT_MISSING+=("mmlu all test")
+[[ -z "$(find "${NANOCHAT_SFT_DATA_DIR}/gsm8k" -path '*/main/*' -name 'gsm8k-train.arrow' -print -quit 2>/dev/null)" ]] && SFT_MISSING+=("gsm8k train")
+[[ -z "$(find "${NANOCHAT_SFT_DATA_DIR}/gsm8k" -path '*/main/*' -name 'gsm8k-test.arrow' -print -quit 2>/dev/null)" ]] && SFT_MISSING+=("gsm8k test")
+if [[ ${#SFT_MISSING[@]} -gt 0 ]]; then
+    echo "Missing offline SFT cache files in ${NANOCHAT_SFT_DATA_DIR}: ${SFT_MISSING[*]}" >&2
+    exit 1
+fi
 if [[ ! -f "${PRETRAIN_CKPT}" ]]; then
     echo "Checkpoint not found: ${PRETRAIN_CKPT}" >&2
     exit 1
@@ -274,6 +291,7 @@ echo "MCMC step size init:        ${MCMC_STEP_SIZE}"
 echo "MCMC step size lr mult:     ${MCMC_STEP_SIZE_LR_MULTIPLIER}"
 echo "TF head type:               ${TF_HEAD_TYPE}"
 echo "Free embed noise scale:     ${FREE_EMBED_NOISE_SCALE}"
+echo "FFN dim multiplier:         ${FFN_DIM_MULTIPLIER}"
 echo "Peak LR:                    ${PEAK_LR}"
 echo "Max steps:                  ${MAX_STEPS}"
 echo "Val interval:               ${VAL_CHECK_INTERVAL}"
@@ -282,6 +300,10 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export NCCL_IB_TIMEOUT="${NCCL_IB_TIMEOUT:-60}"
 export NCCL_IB_RETRY_CNT="${NCCL_IB_RETRY_CNT:-20}"
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
+export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-1048576}"
 
 set +e
 
@@ -309,6 +331,7 @@ set +e
   --mcmc_num_steps "${MCMC_NUM_STEPS}" \
   --randomize_mcmc_num_steps "${RANDOMIZE_MCMC_NUM_STEPS}" \
   --context_length "${CONTEXT_LENGTH}" \
+  --ffn_dim_multiplier "${FFN_DIM_MULTIPLIER}" \
   --gpus "-1" \
   --peak_learning_rate "${PEAK_LR}" \
   --batch_size_per_device "${DEVICE_BATCH_SIZE}" \
@@ -324,7 +347,6 @@ set +e
   --sudoku_ratio_schedule "${SUDOKU_RATIO_SCHEDULE}" \
   --sudoku_difficulty_schedule "${SUDOKU_DIFFICULTY_SCHEDULE}" \
   --sudoku_blank_loss_weight "${SUDOKU_BLANK_LOSS_WEIGHT}" \
-  --num_workers "${NUM_WORKERS}" \
   --val_check_interval "${VAL_CHECK_INTERVAL}" \
   --limit_val_batches "${LIMIT_VAL_BATCHES}" \
   --val_sanity 1 \

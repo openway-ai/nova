@@ -128,7 +128,16 @@ class SudokuMixedIterableDataset(_IterableDataset):
 
     # ── State management ───────────────────────────────────────────────
 
-    def _build_state_dict(self):
+    def _child_state_dict(self, dataset, lightweight):
+        if not lightweight:
+            return dataset.state_dict()
+        if hasattr(dataset, "lightweight_state_dict"):
+            return dataset.lightweight_state_dict()
+        if hasattr(dataset, "get_dataloader_state"):
+            return dataset.get_dataloader_state()
+        return dataset.state_dict()
+
+    def _build_state_dict(self, lightweight=True):
         """Combine child states with our mix counter."""
         mix_rng_state = (
             self._mix_rng.getstate()
@@ -142,15 +151,21 @@ class SudokuMixedIterableDataset(_IterableDataset):
             "sudoku_ratio": self.sudoku_ratio,
             "mix_rng_state": mix_rng_state,
             "last_batch_source": self.last_batch_source,
-            "sudoku_state": self.sudoku_ds.state_dict(),
-            "sft_state": self.sft_ds.state_dict(),
+            "sudoku_state": self._child_state_dict(self.sudoku_ds, lightweight),
+            "sft_state": self._child_state_dict(self.sft_ds, lightweight),
         }
 
+    def lightweight_state_dict(self):
+        """Save mixed cursor state without serializing child prefetch buffers."""
+        return self._build_state_dict(lightweight=True)
+
     def get_dataloader_state(self):
-        return self._build_state_dict()
+        if self.last_state_dict is not None:
+            return self.last_state_dict
+        return self.lightweight_state_dict()
 
     def state_dict(self):
-        return self._build_state_dict()
+        return self._build_state_dict(lightweight=False)
 
     def load_state_dict(self, state_dict):
         if self._resume_state_locked and isinstance(self.resume_state_dict, dict):
@@ -224,7 +239,7 @@ class SudokuMixedIterableDataset(_IterableDataset):
 
             self.it += 1
             self.last_batch_source = chosen
-            self.last_state_dict = self._build_state_dict()
+            self.last_state_dict = self.lightweight_state_dict()
             yield batch
 
             if self.split != "train" and self.it >= self.max_iter:

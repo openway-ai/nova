@@ -222,6 +222,32 @@ class AdaptiveRatioCallback:
     def _phase_bucket_weights(self, step):
         return list(_v3_three_phase_value(step, _V3_DIFFICULTY_PHASES, default=[1, 1, 1]))
 
+    def _distributed_sft_loss(self, pl_module):
+        import torch.distributed as dist
+
+        device = getattr(pl_module, 'device', None)
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+        loss_tokens = torch.zeros((), device=device, dtype=torch.float32)
+        source_loss_buf = getattr(pl_module, '_val_source_loss_buf', {})
+        slot = source_loss_buf.get('sft') if isinstance(source_loss_buf, dict) else None
+        if isinstance(slot, dict) and 'sum' in slot and 'tokens' in slot:
+            loss_sum = slot['sum'].detach().to(device=device, dtype=torch.float32).clone()
+            loss_tokens = slot['tokens'].detach().to(device=device, dtype=torch.float32).clone()
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(loss_tokens, op=dist.ReduceOp.SUM)
+
+        if loss_tokens.item() <= 0:
+            return None
+        sft_loss = (loss_sum / loss_tokens).detach()
+        if not torch.isfinite(sft_loss):
+            return None
+        return float(sft_loss.item())
+
     # ── Lightning hooks ────────────────────────────────────────────────
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):  # type: ignore[override]
@@ -249,15 +275,16 @@ class AdaptiveRatioCallback:
                 sudoku_ds.bucket_weights = self._phase_bucket_weights(step)
         # 3. periodic log so the run.log shows the active schedule
         if step != self._last_logged_step and (step % 100 == 0):
-            try:
-                pl_module.log_metrics(
-                    {
-                        'sudoku_ratio_active': float(ds.sudoku_ratio),
-                    },
-                    'train',
+            if getattr(trainer, 'is_global_zero', True):
+                try:
+                    pl_module._cache_valid_metric('sudoku_ratio_active', float(ds.sudoku_ratio))
+                except Exception:
+                    pass
+                print(
+                    f"[AdaptiveRatioCallback] global_step={step} "
+                    f"sudoku_ratio_active={float(ds.sudoku_ratio):.2f}",
+                    flush=True,
                 )
-            except Exception:
-                pass
             self._last_logged_step = step
 
     def on_validation_epoch_end(self, trainer, pl_module):  # type: ignore[override]
@@ -266,23 +293,10 @@ class AdaptiveRatioCallback:
         ds = self._get_mixed_dataset(trainer)
         if ds is None:
             return
-        sft_loss = None
-        callback_metrics = getattr(trainer, 'callback_metrics', None)
-        if callback_metrics is not None:
-            try:
-                sft_loss = callback_metrics.get('valid_loss_sft')
-            except AttributeError:
-                pass
-        if sft_loss is None:
-            last_metrics = getattr(pl_module, '_last_valid_metrics', None)
-            if not last_metrics:
-                return
-            sft_loss = last_metrics.get('valid_loss_sft')
+        sft_loss = self._distributed_sft_loss(pl_module)
         if sft_loss is None:
             return
-        if isinstance(sft_loss, torch.Tensor):
-            sft_loss = sft_loss.detach().float().item()
-        delta = float(sft_loss) - _V3_SFT_BASELINE
+        delta = sft_loss - _V3_SFT_BASELINE
         before = float(ds.sudoku_ratio)
         if delta > _V3_SFT_TOLERANCE:
             new_r = max(_V3_RATIO_FLOOR, before - _V3_RATIO_STEP)
@@ -290,14 +304,23 @@ class AdaptiveRatioCallback:
             new_r = min(_V3_RATIO_CEIL, before + _V3_RATIO_STEP)
         else:
             new_r = before
+
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            device = getattr(pl_module, 'device', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+            new_r_tensor = torch.tensor(float(new_r), device=device, dtype=torch.float32)
+            dist.broadcast(new_r_tensor, src=0)
+            new_r = float(new_r_tensor.item())
+
         if abs(new_r - before) > 1e-6:
             ds.sudoku_ratio = float(new_r)
-            try:
-                pl_module.log_metrics({'sudoku_ratio_guard_adjusted': float(new_r)}, 'valid')
-            except Exception:
-                pass
-            print(f"[AdaptiveRatioCallback] valid_loss_sft={sft_loss:.4f} "
-                  f"(Δ={delta:+.4f}) → sudoku_ratio {before:.2f} → {new_r:.2f}")
+            if getattr(trainer, 'is_global_zero', True):
+                try:
+                    pl_module._cache_valid_metric('sudoku_ratio_guard_adjusted', float(new_r))
+                except Exception:
+                    pass
+                print(f"[AdaptiveRatioCallback] valid_loss_sft={sft_loss:.4f} "
+                      f"(Δ={delta:+.4f}) → sudoku_ratio {before:.2f} → {new_r:.2f}", flush=True)
 
 
 class ModelTrainer(LightningModule):
@@ -559,6 +582,45 @@ class ModelTrainer(LightningModule):
         def hook(grad):
             self.model.used_parameters.add(name)  # Adjusted to self.model.used_parameters
         return hook
+
+    def _model_connected_zero_loss(self, reference=None):
+        if isinstance(reference, torch.Tensor):
+            zero = reference.detach().new_zeros(())
+        else:
+            zero = torch.zeros((), device=self.device, dtype=torch.float32)
+
+        touched_any_param = False
+        for param in self.parameters():
+            if param.requires_grad and param.numel() > 0:
+                zero = zero + param.reshape(-1)[0] * 0.0
+                touched_any_param = True
+        if not touched_any_param:
+            zero = zero.requires_grad_()
+        return zero
+
+    def _distributed_any_flag(self, local_flag, device=None):
+        import torch.distributed as dist
+
+        if device is None:
+            device = self.device
+        flag = torch.tensor(1 if local_flag else 0, device=device, dtype=torch.int32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item())
+
+    def _nonfinite_exception(self, exc):
+        msg = str(exc).lower()
+        return any(token in msg for token in ("nan", "inf", "nonfinite", "non-finite"))
+
+    def _warn_nonfinite_train_batch(self, reason):
+        if self.trainer.is_global_zero:
+            count = getattr(self, '_nonfinite_train_batches', 0) + 1
+            self._nonfinite_train_batches = count
+            if count <= 5 or count % 50 == 0:
+                print(
+                    f"[NonFiniteGuard] skipped train batch at global_step={self.global_step}: {reason}",
+                    flush=True,
+                )
     
     @staticmethod
     def wandb_activation_hook(run, step):
@@ -586,21 +648,53 @@ class ModelTrainer(LightningModule):
         return hook
     
     def training_step(self, batch, batch_idx):
+        eval_step_dict = None
+        nonfinite_reason = None
         # Activation logging only when wandb_watch is on AND level is "all"
-        if not self.hparams.no_wandb and self.hparams.wandb_watch and getattr(self.hparams, 'wandb_watch_level', 'parameters') == 'all' and self.global_step % self.hparams.wandb_watch_log_freq == 0: # activation logging
-            hook_handles = []
-            hook_function = self.wandb_activation_hook(run=self.logger, step=self.global_step)
-            for module in self.model.modules():
-                if any(param.requires_grad for param in module.parameters(recurse=False)): # only do for unfrozen params that are training
-                    handle = module.register_forward_hook(hook_function)
-                    hook_handles.append(handle)
-            
-            eval_step_dict = self.eval_step(batch, "train")
-            for handle in hook_handles:
-                handle.remove()
+        try:
+            if not self.hparams.no_wandb and self.hparams.wandb_watch and getattr(self.hparams, 'wandb_watch_level', 'parameters') == 'all' and self.global_step % self.hparams.wandb_watch_log_freq == 0: # activation logging
+                hook_handles = []
+                hook_function = self.wandb_activation_hook(run=self.logger, step=self.global_step)
+                for module in self.model.modules():
+                    if any(param.requires_grad for param in module.parameters(recurse=False)): # only do for unfrozen params that are training
+                        handle = module.register_forward_hook(hook_function)
+                        hook_handles.append(handle)
 
+                try:
+                    eval_step_dict = self.eval_step(batch, "train")
+                finally:
+                    for handle in hook_handles:
+                        handle.remove()
+
+            else:
+                eval_step_dict = self.eval_step(batch, "train")
+        except (FloatingPointError, RuntimeError, ValueError) as exc:
+            if not self._nonfinite_exception(exc):
+                raise
+            nonfinite_reason = f"eval_step raised {type(exc).__name__}: {exc}"
+            eval_step_dict = {'loss': self._model_connected_zero_loss()}
+
+        loss = eval_step_dict['loss']
+        local_nonfinite = nonfinite_reason is not None
+        if isinstance(loss, torch.Tensor):
+            local_nonfinite = local_nonfinite or (not bool(torch.isfinite(loss.detach()).item()))
+        elif isinstance(loss, (int, float)):
+            local_nonfinite = local_nonfinite or (not torch.isfinite(torch.tensor(loss)).item())
+
+        if self._distributed_any_flag(local_nonfinite, loss.device if isinstance(loss, torch.Tensor) else self.device):
+            if nonfinite_reason is None:
+                nonfinite_reason = "non-finite loss on at least one rank"
+            self._warn_nonfinite_train_batch(nonfinite_reason)
+            safe_loss = self._model_connected_zero_loss(loss if isinstance(loss, torch.Tensor) else None)
+            eval_step_dict = {
+                key: (torch.nan_to_num(value.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+                      if isinstance(value, torch.Tensor) else value)
+                for key, value in eval_step_dict.items()
+            }
+            eval_step_dict['loss'] = safe_loss
+            eval_step_dict['nonfinite_batch_skipped'] = safe_loss.detach().new_tensor(1.0)
         else:
-            eval_step_dict = self.eval_step(batch, "train")
+            eval_step_dict['nonfinite_batch_skipped'] = loss.detach().new_tensor(0.0) if isinstance(loss, torch.Tensor) else torch.tensor(0.0, device=self.device)
         
         self.log_metrics(eval_step_dict, "train")
         return eval_step_dict['loss']   
@@ -679,17 +773,20 @@ class ModelTrainer(LightningModule):
     #         optimizer.update_epoch(self.current_epoch)
 
     def on_save_checkpoint(self, checkpoint):
-        # 保存 per-rank dataloader 位置 + RNG 状态到 checkpoint，用于精确续训
+        # 保存 per-rank dataloader 位置 + RNG 状态到 checkpoint，用于续训
         import torch.distributed as dist
         import random
 
-        # 1. 收集当前 rank 的 dataloader state（精确版，含 doc_buffer）
+        # 1. 收集当前 rank 的 dataloader state。优先使用 lightweight state，
+        # 避免把预取 buffer 序列化进每个 checkpoint。
         local_dl_state = None
         try:
             train_dl = self.trainer.train_dataloader
             if train_dl is not None:
                 dataset = train_dl.dataset
-                if hasattr(dataset, 'get_dataloader_state'):
+                if hasattr(dataset, 'lightweight_state_dict'):
+                    local_dl_state = dataset.lightweight_state_dict()
+                elif hasattr(dataset, 'get_dataloader_state'):
                     local_dl_state = dataset.get_dataloader_state()
                 elif hasattr(dataset, 'last_state_dict') and dataset.last_state_dict is not None:
                     local_dl_state = dataset.last_state_dict
@@ -703,11 +800,16 @@ class ModelTrainer(LightningModule):
             'python': random.getstate(),
         }
 
-        # 3. DDP: all_gather 收集所有 rank 的状态到 rank 0
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            all_dl_states = [None] * dist.get_world_size()
+        # 3. DDP: gather every rank's state into the checkpoint object. Lightning
+        # calls Trainer.save_checkpoint on all ranks; the strategy only writes
+        # rank0's checkpoint dict to disk, so rank0 must receive every shard here.
+        dist_ready = dist.is_available() and dist.is_initialized()
+        rank = dist.get_rank() if dist_ready else 0
+        world_size = dist.get_world_size() if dist_ready else 1
+        if world_size > 1:
+            all_dl_states = [None] * world_size
             dist.all_gather_object(all_dl_states, local_dl_state)
-            all_rng_states = [None] * dist.get_world_size()
+            all_rng_states = [None] * world_size
             dist.all_gather_object(all_rng_states, local_rng_state)
         else:
             all_dl_states = [local_dl_state]
@@ -718,7 +820,8 @@ class ModelTrainer(LightningModule):
         checkpoint['dataloader_state_dict'] = all_dl_states[0]  # 旧格式兼容
         checkpoint['rng_states_by_rank'] = all_rng_states
 
-        print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
+        if rank == 0:
+            print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
 
     def on_load_checkpoint(self, checkpoint):
         # --- 修复 torch.compile _orig_mod 前缀不匹配 ---
@@ -851,6 +954,19 @@ class ModelTrainer(LightningModule):
                 token_tensor = supervised_tokens.detach().to(device=self.device, dtype=torch.float32)
             else:
                 token_tensor = torch.tensor(supervised_tokens, device=self.device, dtype=torch.float32)
+            if not bool(torch.isfinite(loss_tensor).item()):
+                if getattr(self.trainer, "is_global_zero", True):
+                    print(
+                        f"[ValidationGuard] non-finite validation loss at "
+                        f"global_step={self.global_step}, dataloader_idx={dataloader_idx}, "
+                        f"batch_idx={batch_idx}; excluding it from epoch loss",
+                        flush=True,
+                    )
+                loss_tensor = torch.zeros_like(loss_tensor)
+                token_tensor = torch.zeros_like(token_tensor)
+                eval_step_dict = dict(eval_step_dict)
+                eval_step_dict['loss'] = loss_tensor
+                eval_step_dict['nonfinite_validation_batch'] = torch.ones((), device=self.device)
             if self._val_loss_sum is None:
                 self._val_loss_sum = torch.zeros((), device=self.device, dtype=torch.float32)
                 self._val_loss_tokens = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -1026,7 +1142,7 @@ class ModelTrainer(LightningModule):
                 for k, v in means.items():
                     self._cache_valid_metric(f'{k}_{src}', v)
                     if k == 'loss':
-                        self.log(f"valid_loss_{src}", v, prog_bar=False, sync_dist=False)
+                        self.log(f"valid_loss_{src}", v, prog_bar=False, sync_dist=True)
 
             if mixed:
                 self.log_metrics(mixed, "valid")
@@ -1046,7 +1162,7 @@ class ModelTrainer(LightningModule):
         self._cache_valid_metric('bpb', epoch_bpb)
         self._cache_valid_metric('supervised_tokens', self._val_supervised_tokens)
         self._cache_valid_metric('empty_supervision_batch', self._val_empty_supervision_batches)
-        self.log("valid_loss", epoch_loss, prog_bar=True, sync_dist=False)
+        self.log("valid_loss", epoch_loss, prog_bar=True, sync_dist=True)
 
         if getattr(self.trainer, "is_global_zero", True):
             valid_summary = (

@@ -10,6 +10,7 @@ RUN_SCRIPT="/mnt/shared-storage-user/puyuan/code/OpenEBM/openebm/elm/runs/rjob/r
 
 PRETRAIN_CKPT="${PRETRAIN_CKPT:-/mnt/shared-storage-user/luyudong/nova-sft/nova/logs/ebt_runs/d26-ctx2048-20260605-s2-step1-learnablealpha-init300-freeembed-direct/sft_train.v4/checkpoints/s=step=1687-d26-ctx2048-lr0.00024-bs1x32-muon_adamw-valid_loss=valid_loss=0.6590.ckpt}"
 CONDA_ENV_PATH="${CONDA_ENV_PATH:-/mnt/shared-storage-user/puyuan/conda_envs/nanochat}"
+FFN_DIM_MULTIPLIER="${FFN_DIM_MULTIPLIER:-2.67}"
 RUN_PREFIX="${RUN_PREFIX:-d26-ctx2048-sudoku-sft-freeembed-direct-2node-8gpu}"
 EXP_ID="${EXP_ID:-${RUN_PREFIX}-$(date +%Y%m%d-%H%M%S)}"
 
@@ -32,6 +33,7 @@ rjob submit \
   -e DISTRIBUTED_JOB=true \
   -e PRETRAIN_CKPT="${PRETRAIN_CKPT}" \
   -e CONDA_ENV_PATH="${CONDA_ENV_PATH}" \
+  -e FFN_DIM_MULTIPLIER="${FFN_DIM_MULTIPLIER}" \
   -e RUN_PREFIX="${RUN_PREFIX}" \
   -e EXP_ID="${EXP_ID}" \
   --custom-resources brainpp.cn/fuse=1 \

@@ -643,7 +643,15 @@ class EBT_NLP(LightningModule):
                     w_sum = flat_weights.sum().clamp_min(1.0)
                     cce_loss = (per_token * flat_weights).sum() / w_sum
                 else:
-                    cce_loss = F.cross_entropy(predicted_distribution, next_token_indices, label_smoothing=label_smoothing, ignore_index=-1)
+                    # Empty supervision batches have all targets set to ignore_index.
+                    # PyTorch's mean CE returns NaN in that case; normalize the summed
+                    # per-token loss by a clamped valid-token count instead.
+                    per_token = F.cross_entropy(
+                        predicted_distribution, next_token_indices,
+                        label_smoothing=label_smoothing, ignore_index=-1,
+                        reduction='none',
+                    )
+                    cce_loss = per_token.sum() / supervised_tokens_denom
             else:
                 predicted_distribution = self.log_softmax(predicted_distribution).reshape(-1, self.vocab_size)
                 if flat_weights is not None:
@@ -654,7 +662,13 @@ class EBT_NLP(LightningModule):
                     w_sum = flat_weights.sum().clamp_min(1.0)
                     cce_loss = (per_token * flat_weights).sum() / w_sum
                 else:
-                    cce_loss = F.nll_loss(predicted_distribution, next_token_indices, ignore_index=-1)
+                    # Same empty-supervision guard as CE above. This preserves a
+                    # zero-valued graph-connected loss instead of returning NaN.
+                    per_token = F.nll_loss(
+                        predicted_distribution, next_token_indices,
+                        ignore_index=-1, reduction='none',
+                    )
+                    cce_loss = per_token.sum() / supervised_tokens_denom
             
             if final_step_only_loss:
                 if mcmc_step == (total_mcmc_steps - 1):

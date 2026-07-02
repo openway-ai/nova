@@ -301,6 +301,21 @@ class SFTIterableDataset(_IterableDataset):
             "conv_buffer": copy.deepcopy(self.conv_buffer) if copy_buffer else self.conv_buffer,
         }
 
+    def lightweight_state_dict(self):
+        """Save streaming position without serializing the prefetch buffer."""
+        return {
+            "state_version": self.STATE_VERSION,
+            "split": self.split,
+            "cursor": self.cursor,
+            "consumed": self.consumed,
+            "epoch": self.epoch,
+            "it": self.it,
+            "buffer_size": self.buffer_size,
+            "row_capacity": self.row_capacity,
+            "rank": self.ddp_rank,
+            "world_size": self.ddp_world_size,
+        }
+
     def __iter__(self):
         """BOS-aligned best-fit packing, matching NanoChat chat formatting."""
         ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
@@ -398,7 +413,7 @@ class SFTIterableDataset(_IterableDataset):
             )
 
             self.it += 1
-            self.last_state_dict = self._build_state_dict(copy_buffer=False)
+            self.last_state_dict = self.lightweight_state_dict()
             if not self._debug_first_yield_logged:
                 supervised_tokens = int((targets != -1).sum().detach().cpu().item())
                 _sft_debug(
@@ -415,7 +430,7 @@ class SFTIterableDataset(_IterableDataset):
     def get_dataloader_state(self):
         if self.cursor is None:
             return self.last_state_dict
-        return self._build_state_dict(copy_buffer=True)
+        return self.lightweight_state_dict()
 
     def state_dict(self):
         state = self.get_dataloader_state()

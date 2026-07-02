@@ -6,6 +6,7 @@ https://huggingface.co/datasets/cais/mmlu
 import os
 from datasets import load_dataset
 from tasks.common import Task, render_mc
+from tasks.local_datasets import load_arrow_cache
 
 class MMLU(Task):
 
@@ -20,6 +21,25 @@ class MMLU(Task):
             assert split == "train", "auxiliary_train must be split into train"
         self.subset = subset
         self.split = split
+
+        self.ds = load_arrow_cache(
+            "mmlu",
+            {
+                "train": [f"**/{subset}/**/mmlu-train.arrow"],
+                "validation": [f"**/{subset}/**/mmlu-validation.arrow"],
+                "dev": [f"**/{subset}/**/mmlu-dev.arrow"],
+                "test": [f"**/{subset}/**/mmlu-test.arrow"],
+            },
+            split,
+        )
+        if self.ds is not None:
+            if subset == "auxiliary_train" and "train" in self.ds.column_names:
+                self.ds = self.ds.map(
+                    lambda row: row["train"],
+                    remove_columns=["train"],
+                    keep_in_memory=True,
+                )
+            return
 
         # 支持离线数据集
         cache_dir = None

@@ -7,6 +7,7 @@ We use the "smol" version, which is more appropriate for smaller models.
 import os
 from datasets import load_dataset
 from tasks.common import Task
+from tasks.local_datasets import load_arrow_cache
 
 class SmolTalk(Task):
     """ smol-smoltalk dataset. train is 460K rows, test is 24K rows. """
@@ -14,6 +15,18 @@ class SmolTalk(Task):
     def __init__(self, split, **kwargs):
         super().__init__(**kwargs)
         assert split in ["train", "test"], "SmolTalk split must be train|test"
+
+        self.ds = load_arrow_cache(
+            "smol-smoltalk",
+            {
+                "train": ["**/smol-smoltalk-train*.arrow"],
+                "test": ["**/smol-smoltalk-test.arrow"],
+            },
+            split,
+        )
+        if self.ds is not None:
+            self.length = len(self.ds)
+            return
 
         # 支持离线数据集
         cache_dir = None
