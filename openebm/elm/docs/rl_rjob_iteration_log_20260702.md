@@ -647,3 +647,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 139 `training_step_start`；step 130 reward_mean `0.1844`，reward_std `0.0393`，parse_rate `1.0`，answer_acc `0.0`，grad_norm `0.04684`，nan_params `0`；step 135 reward_mean `0.1333`，reward_std `0.0745`，parse_rate `1.0`，answer_acc `0.0` | 运行稳定，shaped reward 非零；exact answer 尚未稳定提升，但没有崩溃或退化到零方差。 |
 
 当前结论：不停止、不重启。Sudoku 已出现 reward 恢复和少量 full_solve，说明当前修复方向有效；下一轮继续观察 step 45 backward 与 step 50/55 是否保持有效 Sudoku 指标，若 local-zero rank 数重新扩大或 KL 再次持续升高，再进入保守调参分支。
+
+### 2026-07-03 02:30 +0800
+
+第三十二轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-851cb` | heartbeat 到 step 51 `skip_consensus_start`，`local_skip=0.0`，`unique_ratio=0.75`；主日志仍未落盘 step 50 完整指标，最新完整有效指标仍为 step 40：reward_mean `1.6158`，blank_accuracy `0.4083`，constraint_validity `0.1790`，full_solve `0.05`，nan_params `0`；step 45 为本地 `LOCAL_ZERO`，`skip_rank_count=1/8`，`global_skip=False` | step 45 的局部退化没有造成训练停滞，heartbeat 已推进到 step 51 且当前 rank 非 skip。由于 step 50 完整指标尚未落盘，本轮不追加调参结论；继续等待连续有效指标确认。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` | heartbeat 到 step 144 `training_step_start`；step 140 reward_mean `0.1496`，reward_std `0.0305`，parse_rate `1.0`，answer_acc `0.0`，grad_norm `0.033253`，nan_params `0` | 运行稳定，shaped reward 保持非零；不触发修复或重启。 |
+
+当前结论：继续跑。Sudoku 当前还不能判定已收敛，但已经不是早前 reward 全零或 ckpt 加载失败类问题；下一轮重点等待 step 50/55 的完整 reward、KL、skip_rank_count 和 grad_norm。
