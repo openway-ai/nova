@@ -96,7 +96,7 @@ GLOBAL_STD_MIN="${GLOBAL_STD_MIN:-0.2}"
 SKIP_DEGENERATE_THRESHOLD="${SKIP_DEGENERATE_THRESHOLD:-0.9}"
 MIN_REWARD_STD_TO_UPDATE="${MIN_REWARD_STD_TO_UPDATE:-1e-4}"
 MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE="${MIN_UNIQUE_COMPLETION_RATIO_TO_UPDATE:-0.0}"
-SKIP_CONSENSUS="${SKIP_CONSENSUS:-any}"      # stability-first: any bad rank skips the global step
+SKIP_CONSENSUS="${SKIP_CONSENSUS:-local}"    # bad ranks zero out; all-bad batches skip globally
 
 # MAX_STEPS="${MAX_STEPS:-160}"                # analyzed run peaked at 60-120 and degraded around 150-190
 MAX_STEPS="${MAX_STEPS:-1000}"                # analyzed run peaked at 60-120 and degraded around 150-190

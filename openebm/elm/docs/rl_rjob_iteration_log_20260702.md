@@ -420,3 +420,31 @@ Sudoku skip-guard 修复版重启：
 | 预期报告路径 | `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-231904/sft_train/sudoku_rl_analysis_report.md` |
 
 下一轮：确认新 rjob 进入 `Running` 并开始写入 `train.log`；随后重点检查 step 25 附近是否触发 `skipped_step=1.0`，而不是再次执行 KL-only 更新。
+
+### 2026-07-02 23:27 +0800
+
+第十五轮监控与二次修复：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | 新 rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-2-fb2b4` 已停止 | step 0 rank0 指标健康：reward_mean `1.5721`，reward_std `0.4567`，degenerate_group_rate `0.0`，unique_ratio `0.75`；但 `skip_consensus=any` 下 `skip_rank_count=1` 导致 `global_skip=True`、整步 `SKIPPED` | 第一版 skip guard 修复了 KL-only 坏更新，但 `any` 对 8 卡、每 rank 1 prompt 过于保守：单个 rank 的坏 rollout 会丢弃其它 rank 的健康梯度，容易造成高 skip rate 和训练停滞。 |
+| GSM8K RL | `Running`，继续保留 | heartbeat 到 step 70，上一完整 step 60 reward_mean `0.2254`、reward_std `0.0559`、nan_grad_params `0` | 未触发重启条件。 |
+
+二次修复动作：
+
+1. `openebm/elm/rl/ebm_grpo_trainer.py`
+   - 新增 `skip_consensus=local` 模式。
+   - 若所有 rank 都坏：全局 skip，并在 optimizer hook 中清空 grad 为 `None`。
+   - 若仅部分 rank 坏：坏 rank 返回 zero full-graph loss，避免 KL-only 更新；健康 rank 正常计算 loss，并通过 DDP all-reduce 提供有效梯度。
+2. `openebm/elm/rl/ebm_grpo_config.py`、`openebm/elm/rl/train_rl_sudoku.py`
+   - 将 Sudoku 默认 `skip_consensus` 改为 `local`，CLI choices 增加 `local`。
+3. `openebm/elm/runs/run_ebt_sudoku_rl.sh`、`openebm/elm/runs/rjob/run_sudoku_rl_optimized_rjob.sh`
+   - rjob 默认 `SKIP_CONSENSUS=local`。
+
+验证：
+
+- `bash -n openebm/elm/runs/run_ebt_sudoku_rl.sh`
+- `bash -n openebm/elm/runs/rjob/run_sudoku_rl_optimized_rjob.sh`
+- `python -m py_compile openebm/elm/rl/ebm_grpo_trainer.py openebm/elm/rl/ebm_grpo_config.py openebm/elm/rl/train_rl_sudoku.py`
+
+下一轮：提交并推送二次修复，重新提交 Sudoku rjob；新 run 预期 step 0 不应因为单个坏 rank 整步 skip，日志中应看到 `skip_consensus=local`，`global_skip=False`，并继续走正常 loss/backward。

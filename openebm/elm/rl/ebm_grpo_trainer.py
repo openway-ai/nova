@@ -198,6 +198,22 @@ class EBMGRPOTrainer(LightningModule):
                 return p.reshape(-1)[0] * 0.0
         return torch.zeros((), device=self.device, requires_grad=True)
 
+    def _zero_full_graph_loss(self, gen_data):
+        """Zero loss that touches the normal energy graph.
+
+        Used when only the local rank has a bad rollout. Healthy ranks still
+        contribute real gradients through DDP all-reduce; the bad rank
+        contributes zeros for the same graph instead of a KL-only update.
+        """
+        with torch.amp.autocast('cuda', enabled=False):
+            energies = compute_sequence_energy(
+                self.model,
+                gen_data["full_ids"],
+                gen_data["prompt_len"],
+                gen_data["completion_masks"].float(),
+            )
+        return energies.sum() * 0.0
+
     def _reward_component_short_names(self, components):
         short = {
             "format": "fmt",
@@ -285,6 +301,11 @@ class EBMGRPOTrainer(LightningModule):
             device=self.device,
         )
         skip_rank_count = torch.tensor([local_skip], device=self.device)
+        skip_consensus = getattr(self.config, "skip_consensus", "any")
+        if skip_consensus not in ("all", "any", "local"):
+            raise ValueError(f"Unknown skip_consensus: {skip_consensus}")
+        world_size = 1
+        local_zero_update = False
         self._log_phase(
             "skip_consensus_start",
             local_skip=local_skip,
@@ -292,19 +313,28 @@ class EBMGRPOTrainer(LightningModule):
             unique_ratio=round(float(unique_ratio_for_skip), 4),
         )
         if dist.is_available() and dist.is_initialized():
-            flag = torch.tensor([local_skip], device=self.device)
+            world_size = dist.get_world_size()
             dist.all_reduce(reason_counts, op=dist.ReduceOp.SUM)
             dist.all_reduce(skip_rank_count, op=dist.ReduceOp.SUM)
-            if getattr(self.config, "skip_consensus", "all") == "any":
+            skip_count = int(round(float(skip_rank_count.detach().cpu().item())))
+            any_rank_bad = skip_count > 0
+            all_ranks_bad = skip_count >= world_size
+            if skip_consensus == "any":
                 # Stability-first mode: if any rank sees a bad rollout, skip the
                 # optimizer step on all ranks to avoid one poisoned shard moving
                 # the shared policy.
-                dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+                global_skip = any_rank_bad
+            elif skip_consensus == "local":
+                # Hybrid mode: if every rank is bad, skip the whole step. If
+                # only this rank is bad, contribute a zero full-graph loss while
+                # healthy ranks contribute real gradients. This avoids KL-only
+                # updates from bad ranks without discarding healthy rank signal.
+                global_skip = all_ranks_bad
+                local_zero_update = local_skip > 0.5 and not global_skip
             else:
                 # Throughput-first mode: skip only when every rank agrees the
                 # batch has no useful signal.
-                dist.all_reduce(flag, op=dist.ReduceOp.MIN)
-            global_skip = flag.item() > 0.5
+                global_skip = all_ranks_bad
         else:
             global_skip = local_skip > 0.5
         global_skip_reasons = [
@@ -317,6 +347,9 @@ class EBMGRPOTrainer(LightningModule):
             global_skip=bool(global_skip),
             skip_rank_count=int(skip_rank_count.detach().cpu().item()),
             global_skip_reasons=global_skip_reasons,
+            skip_consensus=skip_consensus,
+            world_size=world_size,
+            local_zero_update=bool(local_zero_update),
         )
 
         self.log("stability/reward_std_too_low", float("low_reward_std" in skip_reasons))
@@ -327,6 +360,7 @@ class EBMGRPOTrainer(LightningModule):
         if global_skip:
             reported_skip_reasons = global_skip_reasons or skip_reasons
             self.log("stability/skipped_step", 1.0)
+            self.log("stability/local_zero_update", 0.0)
             self.log("stability/degenerate_group_rate", gen_data["degenerate_rate"])
             self.log("train/reward_mean", gen_data["reward_mean"], prog_bar=True)
             step = self.global_step
@@ -365,6 +399,53 @@ class EBMGRPOTrainer(LightningModule):
                 })
             return self._zero_placeholder_loss()
         self.log("stability/skipped_step", 0.0)
+
+        if local_zero_update:
+            self.log("stability/local_zero_update", 1.0)
+            self.log("stability/degenerate_group_rate", gen_data["degenerate_rate"])
+            self.log("train/reward_mean", gen_data["reward_mean"], prog_bar=True)
+            step = self.global_step
+            self._log_phase(
+                "local_zero_update",
+                local_skip_reasons=skip_reasons,
+                reward_mean=round(float(gen_data["reward_mean"]), 4),
+                reward_std=round(float(gen_data["reward_std"]), 4),
+            )
+            if step % self.config.log_interval == 0:
+                if self._is_rank0():
+                    print(
+                        f"[GRPO] step={step} LOCAL_ZERO reason={','.join(skip_reasons) or 'bad_local_rollout'} "
+                        f"degen={gen_data['degenerate_rate']:.2f} "
+                        f"reward={gen_data['reward_mean']:.3f}±{gen_data['reward_std']:.3f} "
+                        f"uniq={unique_ratio_for_skip:.2f}",
+                        flush=True,
+                    )
+                self._log_json_event("rl_step", step, {
+                    "loss": {
+                        "total": 0.0,
+                        "policy": 0.0,
+                        "ref_energy_kl": 0.0,
+                        "clip_ratio": 0.0,
+                    },
+                    "reward": {
+                        "mean": gen_data["reward_mean"],
+                        "std": gen_data["reward_std"],
+                        "var": gen_data.get("reward_var", 0.0),
+                        "advantage_var": gen_data.get("advantage_var", 0.0),
+                        "components": gen_data.get("reward_components", {}),
+                    },
+                    "rollout": {
+                        "completion_len_mean": gen_data.get("avg_completion_length", 0.0),
+                        "unique_completion_ratio": unique_ratio_for_skip,
+                        "degenerate_group_rate": gen_data.get("degenerate_rate", 0.0),
+                        "skipped_step": 0.0,
+                        "local_zero_update": 1.0,
+                        "skip_reasons": skip_reasons,
+                        "global_skip_rank_count": int(skip_rank_count.detach().cpu().item()),
+                    },
+                })
+            return self._zero_full_graph_loss(gen_data)
+        self.log("stability/local_zero_update", 0.0)
 
         if self._manual_gspo_updates:
             total_loss, total_metrics = self._manual_gspo_rollout_updates(gen_data)
