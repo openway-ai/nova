@@ -133,7 +133,10 @@ run_inside_rjob() {
         exit 1
     fi
 
+    set +e
     bash openebm/elm/runs/run_ebt_sudoku_rl.sh
+    TRAIN_EXIT_CODE=$?
+    set -e
 
     RUN_ROOT="${EBT_RUNS_ROOT}/${EXP_ID}"
     REPORT_DIR="$(find "${RUN_ROOT}" -maxdepth 1 -type d -name 'sft_train*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2- || true)"
@@ -187,6 +190,10 @@ EOF_META
     echo "Summary report:  ${REPORT_DIR}/sudoku_rl_analysis_report.md"
     echo "Metrics CSV:      ${REPORT_DIR}/analysis_metrics.csv"
     echo "Metadata:         ${REPORT_DIR}/config/fusion_rjob_metadata.txt"
+    if [[ "${TRAIN_EXIT_CODE}" -ne 0 ]]; then
+        echo "Sudoku RL training failed with exit code ${TRAIN_EXIT_CODE}; reports/metadata were still generated." >&2
+        exit "${TRAIN_EXIT_CODE}"
+    fi
 }
 
 submit_rjob() {
