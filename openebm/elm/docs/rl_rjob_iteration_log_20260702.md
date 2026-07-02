@@ -493,3 +493,14 @@ Sudoku local-skip 修复版重启：
 - 纠正 heartbeat 路径：Sudoku 第三版 heartbeat 位于 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-20260702-233012/logs/heartbeat.json`，不是 `sft_train/logs/heartbeat.json`。
 - 正确 heartbeat 显示当前已到 step 5 `generate_start`，时间戳 `2026-07-02 23:48:18`。
 - 因此当前不是卡死，只是 `train.log` 尚未刷出 step 5 完整指标；下一轮继续等待 step 5 `rollout_ready/loss_ready/backward_done`。
+
+### 2026-07-02 23:56 +0800
+
+第十八轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL | `Running`，heartbeat 到 step 7 `generate_start` | step 5: reward_mean `0.9253`，reward_std `0.1394`，range `[0.483, 0.966]`，blank_accuracy `0.0`，constraint_validity `0.0`，unique_ratio `0.9167`; `skip_consensus=local`，`skip_rank_count=1`，`global_skip=False`; loss `1.25e-6`; grad_norm `2.2634`，max_param_grad `0.5610`，nan_params `0` | local-skip 连续验证通过：单个坏 rank 不再导致整步 skip，且 step 5 有正常 backward/grad；reward 回落到 format+clue 信号为主，属于旧 run 也出现过的波动，暂不重启。 |
+| GSM8K RL | `Running`，heartbeat 到 step 82 | step 75: reward_mean `0.1230`，reward_std `0.0703`，parse_rate `1.0`，answer_acc `0.0`，nan_grad_params `0` | 运行健康但 exact answer 仍无稳定提升；继续观察。 |
+
+当前结论：Sudoku 第三版已通过 step 0/5 的 local-skip 和梯度健康检查。下一轮继续等待 step 10/15，最终重点验证 step 25 是否避免 KL-only collapse。
