@@ -1165,3 +1165,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | 控制面 `Running`，job `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca`；heartbeat 到 step 374 `training_step_start` | 最新明确指标仍为 step 365：reward_mean `0.2011`、reward_std `0.1151`、parse_rate `0.875`、ref_energy_kl `0.0424`；未见 NaN/Inf。 | GSM8K 正常推进，不重启。 |
 
 本轮动作：仅整理文档顺序并记录监控结果，无代码改动、无 rjob 重启。下一轮继续看 Sudoku step 30/31 是否有效更新，以及 last10 是否跌破 `1.0` 或 local-zero 是否增多。
+
+### 2026-07-03 12:52 +0800
+
+第七十九轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL diverse-slow | 控制面 `Running`，job `d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-10-e5d45`；heartbeat 到 step 32 `generate_start` | `rl_events.jsonl` 到 step 31，共 32 条事件。last5 平均 reward `1.1411`、reward_std `0.3603`、blank_accuracy `0.2396`、constraint_validity `0.1297`、full_solve `0.0075`，`LOCAL_ZERO=1/5`。last10 平均 reward `1.1009`、reward_std `0.3840`、full_solve `0.0112`，`LOCAL_ZERO=2/10`，max `ref_energy_kl=5.22e-5`。step 30 为单次 local-zero，skip_rank_count `3/8`；step 31 已恢复有效更新，reward_mean `1.7209`、std `0.3350`、unique_completion_ratio `1.0`。 | 已接近关注阈值：last10 继续下行且 local-zero 增至 `2/10`，但 step 31 立即恢复，尚未构成连续 collapse。暂不重启；下一轮若 last10 跌破 `1.0` 或 `LOCAL_ZERO>=3/10`，先展开 rollout 样本与 skip 原因再决定是否修复/调参。 |
+| GSM8K RL | 控制面 `Running`，job `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca`；heartbeat 到 step 380 `training_step_start` | step 370：reward_mean `0.1641`、reward_std `0.0995`、parse_rate `1.0`、ref_energy_kl `0.0323`、grad_norm `0.4916`、nan_grad_params `0`。 | GSM8K 仍健康推进，reward 低位波动但未塌缩，不重启。 |
+
+本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮重点看 Sudoku step 32/33 是否再次 local-zero，以及 reward_std 是否保持非零。
