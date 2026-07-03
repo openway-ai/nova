@@ -943,3 +943,12 @@ Sudoku local-skip 修复版重启：
 - 已停止旧 Sudoku rjob：`d26-ctx2048-sudoku-rl-fsdp2-merge-local-log1-fb84f`，08:13 控制面状态 `Stopped`。
 - 已提交新 Sudoku explore-anchor rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-explore-08-102ee`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-explore-anchor-20260703-0813`，08:14 控制面状态 `Running`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-explore-anchor-20260703-0813/`。
 - GSM8K rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` 保持 `Running`。
+
+### 2026-07-03 08:33 +0800
+
+第五十八轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL explore-anchor | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-explore-08-102ee` | 启动配置确认：commit `78464ec4158c3880acfcee8ee4eedb1450de7a50`，checkpoint remap 正常，hparams 为 `temperature=0.7`、`top_p=0.85`、`beta=2.0`、`muon_lr=5e-6`、`skip_consensus=local`。`rl_events.jsonl` 到 step 4，共 5 条事件：last5 平均 reward `1.0819`、blank_accuracy `0.1994`、constraint_validity `0.1179`、`LOCAL_ZERO=1/5`，max `ref_energy_kl=9.97e-8`。step 0/2/4 为有效更新，step 1 为低质 local-zero。 | 早期修复方向合理：local-zero 比旧 run 后段的 `4/10` 低，KL 接近 0，未见 NaN/Inf 或加载问题。继续观察到 step 10。 |
+| GSM8K RL | `Running`，heartbeat 到 step 282 `training_step_start` | 控制面正常。 | 健康运行，继续保留。 |
