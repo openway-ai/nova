@@ -952,3 +952,12 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL explore-anchor | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-explore-08-102ee` | 启动配置确认：commit `78464ec4158c3880acfcee8ee4eedb1450de7a50`，checkpoint remap 正常，hparams 为 `temperature=0.7`、`top_p=0.85`、`beta=2.0`、`muon_lr=5e-6`、`skip_consensus=local`。`rl_events.jsonl` 到 step 4，共 5 条事件：last5 平均 reward `1.0819`、blank_accuracy `0.1994`、constraint_validity `0.1179`、`LOCAL_ZERO=1/5`，max `ref_energy_kl=9.97e-8`。step 0/2/4 为有效更新，step 1 为低质 local-zero。 | 早期修复方向合理：local-zero 比旧 run 后段的 `4/10` 低，KL 接近 0，未见 NaN/Inf 或加载问题。继续观察到 step 10。 |
 | GSM8K RL | `Running`，heartbeat 到 step 282 `training_step_start` | 控制面正常。 | 健康运行，继续保留。 |
+
+### 2026-07-03 08:45 +0800
+
+第五十九轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL explore-anchor | `Running`，heartbeat 到 step 9 `generate_start` | `rl_events.jsonl` 到 step 8，共 9 条事件。last5 平均 reward `1.5252`、blank_accuracy `0.3309`、constraint_validity `0.1807`、full_solve `0.0400`，`LOCAL_ZERO=0/5`，max `ref_energy_kl=1.33e-6`。step 5/7 各出现 full_solve `0.1`；step 5-8 unique_completion_ratio 为 `0.8333-1.0`。 | explore-anchor 明显缓解 rollout collapse：最近 5 step 无 local-zero，reward 高于旧 run 后段，KL 极低。继续运行到 step 20，重点看 KL 是否继续受控。 |
+| GSM8K RL | `Running`，heartbeat 到 step 287 `training_step_start` | 控制面正常。 | 健康运行，继续保留。 |
