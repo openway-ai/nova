@@ -1055,3 +1055,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，heartbeat 到 step 335 `training_step_start` | step 325：reward_mean `0.1623`、reward_std `0.1153`、parse_rate `1.0`、ref_energy_kl `0.0208`、grad_norm `0.5183`、nan_grad_params `0`；此前 step 320 出现 answer_acc `0.125`。 | GSM8K 仍健康推进，不重启。 |
 
 本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮继续确认 Sudoku 在 step 10 后是否仍保持 `LOCAL_ZERO=0/5` 附近，并关注 full_solve 是否从偶发信号变为更稳定趋势。
+
+### 2026-07-03 11:06 +0800
+
+第六十九轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL diverse-slow | `Running`，heartbeat 到 step 10 `generate_start` | `rl_events.jsonl` 到 step 9，共 10 条事件。last5 平均 reward `1.6537`、reward_std `0.6382`、blank_accuracy `0.4038`、constraint_validity `0.1826`、full_solve `0.1050`，`LOCAL_ZERO=0/5`，max `ref_energy_kl=3.71e-6`。last10 平均 reward `1.3427`、full_solve `0.0562`，`LOCAL_ZERO=1/10`。step 9 单步 reward_mean `2.5974`、blank_accuracy `0.8524`、constraint_validity `0.3417`、full_solve `0.4125`，std `0.7196`，unique_completion_ratio `0.6875`。 | 这是目前最健康的 Sudoku 窗口：reward、blank_accuracy、full_solve 均明显高于 explore-anchor 后段，且没有重复高分零方差问题；KL 仍远低于关注线。尚不能判定收敛，继续观察到 step 20。 |
+| GSM8K RL | `Running`，heartbeat 到 step 340 `skip_consensus_start` | step 330/335 reward_mean `0.2347`/`0.2437`，reward_std `0.1479`/`0.0904`，parse_rate `0.875`/`1.0`，ref_energy_kl `0.0444`/`0.0459`，grad_norm step 330 `0.4164`，未见 NaN/Inf。 | GSM8K 持续健康推进，不重启。 |
+
+本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮重点检查 Sudoku step 10 以后是否维持高 reward/full_solve，并确认 `unique_completion_ratio` 降到 `0.6875` 后仍有足够 reward_std，不变成重复解零方差。
