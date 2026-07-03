@@ -1099,3 +1099,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，heartbeat 到 step 349 `backward_done` | latest heartbeat：grad_norm `0.3306`、max_grad `0.3205`、nan_grad_params `0`；此前 step 340 reward_mean `0.2922`。 | GSM8K 仍健康推进，不重启。 |
 
 本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮继续观察 Sudoku step 20 前后的 last10，并关注 KL 是否继续抬升。
+
+### 2026-07-03 11:51 +0800
+
+第七十三轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL diverse-slow | `Running`，heartbeat 到 step 19 `skip_consensus_start`，local_skip `0`、unique_ratio `1.0` | `rl_events.jsonl` 到 step 18，共 19 条事件。last5 平均 reward `1.5124`、reward_std `0.3464`、blank_accuracy `0.3333`、constraint_validity `0.1913`、full_solve `0.0300`，`LOCAL_ZERO=0/5`，max `ref_energy_kl=5.27e-5`。last10 平均 reward `1.4072`、full_solve `0.0562`，`LOCAL_ZERO=1/10`。step 17/18 均为有效更新，reward_mean `1.7131`/`1.2157`，unique_completion_ratio 均为 `1.0`。 | 仍健康：step 11 后没有连续 local-zero，last10 reward 维持在 `1.4` 左右，KL 仍低。尚未到 step 20，继续观察。 |
+| GSM8K RL | `Running`，heartbeat 到 step 352 `training_step_start` | step 345 reward_mean `0.2092`、reward_std `0.1515`、ref_energy_kl `0.0076`、grad_norm `0.5587`、nan_grad_params `0`；step 350 reward_mean `0.1445`、reward_std `0.0842`。 | GSM8K 仍健康推进，不重启。 |
+
+本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮继续看 Sudoku step 20 附近指标。
