@@ -997,3 +997,12 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL explore-anchor | `Running`，heartbeat 到 step 24 `generate_start` | `rl_events.jsonl` 到 step 23，共 24 条事件。last20 平均 reward `1.4618`、blank_accuracy `0.3190`、constraint_validity `0.1734`、full_solve `0.0550`，`LOCAL_ZERO=2/20`，max `ref_energy_kl=4.36e-5`。last10 平均 reward `1.4616`，`LOCAL_ZERO=0/10`。step 23 reward_mean `1.2359`、blank_accuracy `0.1955`、constraint_validity `0.0778`。 | 训练仍健康：local-zero 基本消失，KL 仍远低于关注线。full_solve 未持续上升但 reward/blank/validity 保持可用信号；继续运行，不重启。 |
 | GSM8K RL | `Running`，heartbeat 到 step 301 `training_step_start` | 控制面正常。 | 健康运行，继续保留。 |
+
+### 2026-07-03 09:49 +0800
+
+第六十四轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL explore-anchor | `Running`，heartbeat 到 step 27 `generate_start` | `rl_events.jsonl` 到 step 26，共 27 条事件。last20 平均 reward `1.3648`、blank_accuracy `0.2904`、constraint_validity `0.1599`、full_solve `0.0500`，`LOCAL_ZERO=3/20`，max `ref_energy_kl=4.36e-5`。step 25 单次低质 local-zero，step 26 恢复有效更新：reward_mean `1.2198`、blank_accuracy `0.1653`、constraint_validity `0.1000`。 | 近期 reward 有下行波动，但不是连续 collapse；KL 稳定低位。继续观察 step 30，不重启。 |
+| GSM8K RL | `Running`，heartbeat 到 step 306 `skip_consensus_start` | local_skip `0`，unique_ratio `1.0`；控制面正常。 | 健康运行，继续保留。 |
