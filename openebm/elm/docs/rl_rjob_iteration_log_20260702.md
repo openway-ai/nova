@@ -1066,3 +1066,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，heartbeat 到 step 340 `skip_consensus_start` | step 330/335 reward_mean `0.2347`/`0.2437`，reward_std `0.1479`/`0.0904`，parse_rate `0.875`/`1.0`，ref_energy_kl `0.0444`/`0.0459`，grad_norm step 330 `0.4164`，未见 NaN/Inf。 | GSM8K 持续健康推进，不重启。 |
 
 本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮重点检查 Sudoku step 10 以后是否维持高 reward/full_solve，并确认 `unique_completion_ratio` 降到 `0.6875` 后仍有足够 reward_std，不变成重复解零方差。
+
+### 2026-07-03 11:17 +0800
+
+第七十轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL diverse-slow | `Running`，heartbeat 到 step 12 `generate_start` | `rl_events.jsonl` 到 step 11，共 12 条事件。last5 平均 reward `1.3485`、reward_std `0.4689`、blank_accuracy `0.3129`、constraint_validity `0.1624`、full_solve `0.0975`，`LOCAL_ZERO=1/5`，max `ref_energy_kl=5.21e-6`。last10 平均 reward `1.3114`、full_solve `0.0562`，`LOCAL_ZERO=1/10`。step 10 有效更新，reward_mean `1.2888`；step 11 为单次低质 local-zero，reward/std 均为 0，skip_rank_count `1/8`。 | step 11 是单次坏 rollout，不是连续崩塌；last5/last10 仍保持非零 reward、足够 reward_std 和低 KL。暂不重启，继续观察 step 15/20，重点看 local-zero 是否再次连续化。 |
+| GSM8K RL | `Running`，heartbeat 到 step 345 `training_step_start` | step 340：reward_mean `0.2922`、reward_std `0.1208`、parse_rate `1.0`、ref_energy_kl `0.0491`、grad_norm `0.6970`、nan_grad_params `0`。 | GSM8K 仍健康推进，不重启。 |
+
+本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。
