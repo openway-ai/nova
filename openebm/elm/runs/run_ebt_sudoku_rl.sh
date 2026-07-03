@@ -54,17 +54,17 @@ export EXP_ID="${EXP_ID:-d26-ctx2048-sudoku-rl-gspo-$(date +%Y%m%d)}"
 ################################################################################
 # GRPO 超参数
 ################################################################################
-NUM_GENERATIONS="${NUM_GENERATIONS:-12}"            # keep enough group variance for Sudoku reward
+NUM_GENERATIONS="${NUM_GENERATIONS:-16}"            # more samples per prompt to keep GRPO group variance
 # MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-165}"     # 9x9 board ≤162 chars; tail tokens add noise
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-210}"     # 9x9 board ≤162 chars; tail tokens add noise
 
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-192}"
-# 2026-07-03 local-log1: after the zero-load/skip fixes, reward recovered but
-# steps 30-33 showed frequent LOCAL_ZERO from repeated completions. Raise
-# exploration modestly while tightening the anchor/update scale below.
-TEMPERATURE="${TEMPERATURE:-0.70}"
-TOP_P="${TOP_P:-0.85}"
-GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-6}" # sub-batch for generation (VRAM management)
+# 2026-07-03 explore-anchor still hit LOCAL_ZERO=4/10 around step 33:
+# KL stayed low, so the bottleneck is rollout diversity rather than anchor
+# drift. Use a larger group and moderately wider sampling while slowing updates.
+TEMPERATURE="${TEMPERATURE:-0.80}"
+TOP_P="${TOP_P:-0.90}"
+GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-4}" # sub-batch for generation (VRAM management)
 
 NUM_ITERATIONS="${NUM_ITERATIONS:-1}"              # legacy loss recomputation; keep 1 when using GSPO_UPDATE_EPOCHS
 GSPO_UPDATE_EPOCHS="${GSPO_UPDATE_EPOCHS:-1}"  # keep 1 by default; previous 2-epoch long run degraded after early gains
@@ -84,13 +84,13 @@ RL_LOSS_TYPE="${RL_LOSS_TYPE:-energy_gspo}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
 MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.005}"
-WARMUP_STEPS="${WARMUP_STEPS:-20}"
+WARMUP_STEPS="${WARMUP_STEPS:-50}"
 
 # ── Optimizer (v3 P0+P1+muon) ─────────────────────────────────────────────────
 # adamw      : v3 P0 multi-group AdamW (transformer/v2e/scalar/other split LR)
 # muon_adamw : Muon for transformer matrices + AdamW for the rest (matches SFT)
 RL_OPTIMIZER="${RL_OPTIMIZER:-muon_adamw}"  # SFT-validated hybrid optimizer: Muon matrices + AdamW lanes
-MUON_LR="${MUON_LR:-5e-6}"                  # Muon peak LR for transformer matrices; scheduler scales it after warmup
+MUON_LR="${MUON_LR:-2e-6}"                  # Muon peak LR for transformer matrices; scheduler scales it after warmup
 ADAMW_VOCAB_TO_EMBED_LR="${ADAMW_VOCAB_TO_EMBED_LR:--1}"  # <=0 => LEARNING_RATE * 0.5
 ADAMW_SCALAR_LR="${ADAMW_SCALAR_LR:--1}"                  # <=0 => LEARNING_RATE * 2.0
 ADAMW_OTHER_LR="${ADAMW_OTHER_LR:--1}"                    # <=0 => LEARNING_RATE

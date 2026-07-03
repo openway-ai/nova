@@ -1015,3 +1015,14 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL explore-anchor | `Running`，heartbeat 到 step 31 `generate_start` | `rl_events.jsonl` 到 step 30，共 31 条事件。last20 平均 reward `1.2051`、blank_accuracy `0.2413`、constraint_validity `0.1348`、full_solve `0.0200`，`LOCAL_ZERO=3/20`，max `ref_energy_kl=1.34e-4`。last10 平均 reward `1.0880`、`LOCAL_ZERO=2/10`；step 30 为低质 local-zero。 | step 30 拉低窗口均值，但 local-zero 仍未连续化，KL 低，step 29 刚恢复有效信号。当前不是需要重启的异常；继续观察 step 35/40。 |
 | GSM8K RL | `Running`，控制面正常 | 最近 heartbeat 仍在训练推进。 | 健康运行，继续保留。 |
+
+### 2026-07-03 10:14 +0800
+
+第六十六轮异常分析与修复：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL explore-anchor | 准备停止并重启为 diverse-slow 版本 | `rl_events.jsonl` 到 step 33，共 34 条事件。last10 平均 reward `1.1573`、blank_accuracy `0.2719`、constraint_validity `0.1431`、full_solve `0.0700`，`LOCAL_ZERO=4/10`；last5 `LOCAL_ZERO=3/5`。step 30/32 是低质 local-zero，step 33 是高分重复 local-zero：reward_mean `3.0`、full_solve `0.6`、std `0`。max `ref_energy_kl=1.49e-4`。 | 根因判断：KL 很低、checkpoint 和数据均正常，因此不是 KL 爆炸或加载问题；rollout collapse 在 warmup 后复现，说明每 rank 单 prompt、12 samples 的组内多样性仍不足，且更新后分布变窄。修复：`num_generations=16`、`temperature/top_p=0.80/0.90`、`generation_batch_size=4`，同时 `muon_lr=2e-6`、`warmup_steps=50`，目标是提高组内方差并放慢更新。 |
+| GSM8K RL | `Running`，不重启 | 控制面正常。 | 本轮修复只针对 Sudoku rollout collapse，GSM8K 继续运行。 |
+
+验证：`bash -n openebm/elm/runs/run_ebt_sudoku_rl.sh`、`bash -n openebm/elm/runs/rjob/run_sudoku_rl_optimized_rjob.sh`、`git diff --check` 均通过。
