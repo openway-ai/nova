@@ -88,17 +88,30 @@ def calculate_bpb_score(next_token_indices, per_token_loss, token_bytes):
 
       Args:
           next_token_indices: 1D LongTensor of target token indices (BS,)
-          per_token_loss: 1D tensor of per-token losses (reduction='none') or
-                          scalar mean loss (reduction='mean', backward compatible but less accurate)
+          per_token_loss: 1D tensor of per-token losses (reduction='none')
           token_bytes: 1D LongTensor of shape (vocab_size,), byte count per token id;
                        0 marks special tokens (e.g. <|bos|>) excluded from the metric.
 
       Returns:
-          (bpb, total_nats, total_bytes) tuple where:
+          (bpb, total_nats, total_bytes, total_tokens) tuple where:
           - bpb: bits per byte (float)
           - total_nats: sum of per-token losses for valid positions (float)
           - total_bytes: sum of byte counts for valid positions (int)
+          - total_tokens: number of valid byte-bearing tokens (int)
       """
+    if per_token_loss.dim() == 0:
+        raise ValueError(
+            "calculate_bpb_score requires per-token CE with reduction='none'. "
+            "Passing scalar mean CE silently produces invalid BPB."
+        )
+    if per_token_loss.numel() != next_token_indices.numel():
+        raise ValueError(
+            "calculate_bpb_score shape mismatch: "
+            f"per_token_loss.numel()={per_token_loss.numel()} vs "
+            f"next_token_indices.numel()={next_token_indices.numel()}."
+        )
+    per_token_loss = per_token_loss.reshape_as(next_token_indices)
+
     # Map target tokens → byte lengths; explicitly handle ignore_index (y < 0) from finetune masking
 
     if (next_token_indices.int() < 0).any():
@@ -113,16 +126,20 @@ def calculate_bpb_score(next_token_indices, per_token_loss, token_bytes):
         num_bytes = token_bytes[next_token_indices]  # [B*S]
 
     # Only count positions where token has bytes > 0 (excludes special tokens)
-    total_nats = (per_token_loss * (num_bytes > 0)).sum()
+    byte_bearing_tokens = num_bytes > 0
+    total_nats = (per_token_loss * byte_bearing_tokens).sum()
     total_bytes = num_bytes.sum().to(torch.int64)
+    total_tokens = byte_bearing_tokens.sum().to(torch.int64)
 
     # DDP aggregation across ranks
     if dist.is_initialized():
         dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
 
     total_nats_val = total_nats.item()
     total_bytes_val = total_bytes.item()
+    total_tokens_val = total_tokens.item()
     bpb = total_nats_val / (math.log(2) * total_bytes_val) if total_bytes_val > 0 else float('inf')
 
-    return bpb, total_nats_val, total_bytes_val
+    return bpb, total_nats_val, total_bytes_val, total_tokens_val

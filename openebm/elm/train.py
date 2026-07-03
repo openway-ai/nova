@@ -35,8 +35,205 @@ except ImportError:
 from openebm.elm import logger as text_logger
 from openebm.elm.disk_aware_checkpoint import DiskAwareCheckpoint
 from openebm.elm.eval import nlp_eval_acc
+from openebm.elm.train_engines import apply_train_engine, prepare_train_engine
 from openebm.elm.trainer import ModelTrainer
 from openebm.elm.utils import init_wandb_watch, model_sizes
+
+def _candidate_finetune_keys(key):
+    """Return compatible key variants across torch.compile checkpoint layouts.
+
+    Older runs in this repo saved the fully compiled model as
+    ``model._orig_mod.*``. Some stronger Sudoku SFT checkpoints were saved with
+    only the transformer compiled, producing ``model.transformer._orig_mod.*``
+    plus a duplicate ``model.transformer_eager.*``. Lightning's
+    ``strict=False`` would otherwise silently skip most of the model.
+    """
+    candidates = [key]
+
+    if key.startswith("model.transformer_eager."):
+        rest = key[len("model.transformer_eager."):]
+        candidates.extend([
+            "model.transformer." + rest,
+            "model._orig_mod.transformer." + rest,
+        ])
+    elif key.startswith("model.transformer._orig_mod."):
+        rest = key[len("model.transformer._orig_mod."):]
+        candidates.extend([
+            "model.transformer." + rest,
+            "model._orig_mod.transformer." + rest,
+        ])
+    elif key.startswith("model._orig_mod.transformer."):
+        rest = key[len("model._orig_mod.transformer."):]
+        candidates.extend([
+            "model.transformer._orig_mod." + rest,
+            "model.transformer." + rest,
+        ])
+    elif key.startswith("model._orig_mod."):
+        rest = key[len("model._orig_mod."):]
+        candidates.append("model." + rest)
+    elif key.startswith("model."):
+        rest = key[len("model."):]
+        candidates.append("model._orig_mod." + rest)
+
+    # Preserve order while deduplicating.
+    seen = set()
+    out = []
+    for cand in candidates:
+        if cand not in seen:
+            out.append(cand)
+            seen.add(cand)
+    return out
+
+
+def load_finetune_checkpoint_weights(model_trainer, ckpt_path, min_load_fraction=0.95, allow_partial=False):
+    """Load a finetuning checkpoint with compile-layout key remapping and guards."""
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    source_state = ckpt.get('state_dict', ckpt)
+    if not isinstance(source_state, dict):
+        raise TypeError(f"Checkpoint state_dict is not a dict: {type(source_state)}")
+
+    target_state = model_trainer.state_dict()
+    remapped_state = {}
+    source_to_target = {}
+    shape_mismatches = []
+    unmatched_source = []
+
+    for src_key, tensor in source_state.items():
+        matched_key = None
+        for cand in _candidate_finetune_keys(src_key):
+            target_tensor = target_state.get(cand)
+            if target_tensor is None:
+                continue
+            if hasattr(tensor, 'shape') and hasattr(target_tensor, 'shape') and tensor.shape != target_tensor.shape:
+                shape_mismatches.append((src_key, cand, tuple(tensor.shape), tuple(target_tensor.shape)))
+                continue
+            matched_key = cand
+            break
+
+        if matched_key is None:
+            unmatched_source.append(src_key)
+            continue
+
+        # Prefer the first source key for duplicate aliases such as transformer_eager.
+        if matched_key not in remapped_state:
+            remapped_state[matched_key] = tensor
+            source_to_target[src_key] = matched_key
+
+    incompatible = model_trainer.load_state_dict(remapped_state, strict=False)
+
+    trainable_target_keys = {
+        name for name, param in model_trainer.named_parameters()
+        if param.requires_grad
+    }
+    trainable_loaded = trainable_target_keys.intersection(remapped_state.keys())
+    target_tensor_count = len(target_state)
+    loaded_tensor_count = len(remapped_state)
+    target_param_elems = sum(
+        param.numel() for name, param in model_trainer.named_parameters()
+        if param.requires_grad
+    )
+    loaded_param_elems = sum(
+        model_trainer.state_dict()[name].numel()
+        for name in trainable_loaded
+        if name in model_trainer.state_dict()
+    )
+    load_fraction = loaded_param_elems / max(1, target_param_elems)
+
+    print("[SFT] checkpoint load compatibility report")
+    print(f"[SFT]   source tensors: {len(source_state)}")
+    print(f"[SFT]   target tensors: {target_tensor_count}")
+    print(f"[SFT]   loaded tensors: {loaded_tensor_count}")
+    print(f"[SFT]   trainable loaded tensors: {len(trainable_loaded)}/{len(trainable_target_keys)}")
+    print(f"[SFT]   trainable parameter coverage: {load_fraction:.6f}")
+    print(f"[SFT]   missing after remap: {len(incompatible.missing_keys)}")
+    print(f"[SFT]   unexpected after remap: {len(incompatible.unexpected_keys)}")
+    print(f"[SFT]   unmatched source tensors: {len(unmatched_source)}")
+    print(f"[SFT]   shape mismatches: {len(shape_mismatches)}")
+    if source_to_target:
+        examples = list(source_to_target.items())[:8]
+        print("[SFT]   remap examples:")
+        for src, dst in examples:
+            if src != dst:
+                print(f"[SFT]     {src} -> {dst}")
+    if incompatible.missing_keys:
+        print(f"[SFT]   missing sample: {incompatible.missing_keys[:12]}")
+    if unmatched_source:
+        print(f"[SFT]   unmatched source sample: {unmatched_source[:12]}")
+    if shape_mismatches:
+        print(f"[SFT]   shape mismatch sample: {shape_mismatches[:8]}")
+
+    if load_fraction < float(min_load_fraction) and not allow_partial:
+        raise RuntimeError(
+            f"Finetune checkpoint coverage too low ({load_fraction:.4f} < {min_load_fraction}). "
+            "This usually means the checkpoint was saved with an incompatible model/compile layout. "
+            "Set --allow_partial_finetune_load only if you intentionally want partial initialization."
+        )
+    return incompatible
+
+
+def validate_first_order_landscape_args(args):
+    mcmc_gradient_mode = getattr(args, "mcmc_gradient_mode", "second_order")
+    proposal_mode = getattr(args, "proposal_aware_nce_proposal", "uniform")
+    relaxed_cd_coeff = float(getattr(args, "proposal_aware_nce_relaxed_cd_coeff", 0.0) or 0.0)
+    local_cd_coeff = float(getattr(args, "first_order_local_cd_coeff", 0.0) or 0.0)
+    nce_base_coeff = float(getattr(args, "proposal_aware_nce_base_coeff", 1.0) or 0.0)
+    rank_coeff = float(getattr(args, "proposal_aware_nce_rank_coeff", 0.0) or 0.0)
+    k = int(getattr(args, "proposal_aware_nce_k", 1) or 1)
+    local_cd_num_pairs = int(getattr(args, "first_order_local_cd_num_pairs", 1) or 1)
+    local_cd_pair_stride = int(getattr(args, "first_order_local_cd_pair_stride", 1) or 1)
+
+    if mcmc_gradient_mode == "proposal_aware_nce":
+        if relaxed_cd_coeff > 0.0 and proposal_mode != "mcmc_final":
+            raise ValueError(
+                "--proposal_aware_nce_relaxed_cd_coeff requires "
+                "--proposal_aware_nce_proposal mcmc_final."
+            )
+        if nce_base_coeff < 0.0:
+            raise ValueError("--proposal_aware_nce_base_coeff must be non-negative.")
+        if relaxed_cd_coeff < 0.0:
+            raise ValueError("--proposal_aware_nce_relaxed_cd_coeff must be non-negative.")
+        if rank_coeff < 0.0:
+            raise ValueError("--proposal_aware_nce_rank_coeff must be non-negative.")
+        if nce_base_coeff == 0.0 and relaxed_cd_coeff == 0.0 and rank_coeff == 0.0:
+            raise ValueError(
+                "proposal_aware_nce has no active inner objective: "
+                "base_coeff, relaxed_cd_coeff, and rank_coeff are all zero."
+            )
+        if k < 1:
+            raise ValueError("--proposal_aware_nce_k must be >= 1.")
+        if k > 1:
+            print(
+                "[proposal_aware_nce] WARNING: k>1 expands dense [B,K,S,V] token tensors. "
+                "Use k=1 for the first FSDP2/ZeRO-3 memory validation.",
+                flush=True,
+            )
+
+    if local_cd_coeff != 0.0:
+        if mcmc_gradient_mode != "first_order_cd":
+            raise ValueError("--first_order_local_cd_coeff is only supported with --mcmc_gradient_mode first_order_cd.")
+        if local_cd_coeff < 0.0:
+            raise ValueError("--first_order_local_cd_coeff must be non-negative.")
+        if local_cd_num_pairs < 1:
+            raise ValueError("--first_order_local_cd_num_pairs must be >= 1.")
+        if local_cd_pair_stride < 1:
+            raise ValueError("--first_order_local_cd_pair_stride must be >= 1.")
+        if int(getattr(args, "mcmc_num_steps", 1) or 1) <= local_cd_pair_stride:
+            print(
+                "[first_order_cd] WARNING: first_order_local_cd has no adjacent stored pair "
+                "when mcmc_num_steps <= first_order_local_cd_pair_stride; the auxiliary "
+                "loss will be zero unless random extra steps create more states.",
+                flush=True,
+            )
+
+    graph_safe_first_order_modes = {"first_order_cd", "first_order_nce", "proposal_aware_nce"}
+    if mcmc_gradient_mode in graph_safe_first_order_modes and getattr(args, "mcmc_step_size_learnable", False):
+        print(
+            f"[{mcmc_gradient_mode}] WARNING: disabling mcmc_step_size_learnable because graph-safe "
+            "first-order objectives detach the MCMC sampler endpoint. Alpha would not receive the "
+            "original second-order landscape gradient on this path.",
+            flush=True,
+        )
+        args.mcmc_step_size_learnable = False
 
 @rank_zero_only # to ensure only one wandb run is created, if didnt do that then each GPU would create its own wandb run
 def setup_wandb(args): 
@@ -61,6 +258,8 @@ def main(args):
         args.no_wandb = True
         args.detect_anomaly = True
         args.limit_train_batches = 1
+
+    validate_first_order_landscape_args(args)
 
     os.makedirs("./logs", exist_ok=True)
 
@@ -181,14 +380,21 @@ def main(args):
     if args.max_scheduling_steps == -1:
         args.max_scheduling_steps = args.max_steps
 
+    prepare_train_engine(args)
     model_trainer = ModelTrainer(args)
 
     # SFT: 加载预训练权重但不恢复训练状态
     if args.finetuning_model_ckpt is not None and args.finetuning_model_ckpt != "":
         print(f"[SFT] 加载预训练权重: {args.finetuning_model_ckpt}")
-        ckpt = torch.load(args.finetuning_model_ckpt, map_location='cpu', weights_only=False)
-        model_trainer.load_state_dict(ckpt['state_dict'], strict=False)
+        load_finetune_checkpoint_weights(
+            model_trainer,
+            args.finetuning_model_ckpt,
+            min_load_fraction=args.min_finetune_load_fraction,
+            allow_partial=args.allow_partial_finetune_load,
+        )
         print(f"[SFT] 权重加载完成，训练从 step 0 开始")
+
+    apply_train_engine(model_trainer, args)
 
     # if args.debug_dataloader:
     #     debug_dataloader(args, model_trainer)
@@ -306,7 +512,12 @@ def main(args):
 def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", periodic_checkpoint=None):
     torch.autograd.set_detect_anomaly(args.detect_anomaly) #NOTE seems pl detect anomaly is not working so manually set it here
 
-    if args.find_unused_parameters or args.distributed_strategy == "ddp":
+    if args.distributed_strategy in (None, "None", "none", "null", ""):
+        args.distributed_strategy = "auto"
+
+    if getattr(args, "train_engine", "lightning_ddp") == "lightning_ddp" and (
+        args.find_unused_parameters or args.distributed_strategy == "ddp"
+    ):
             args.distributed_strategy = DDPStrategy(
                 find_unused_parameters=True,
                 gradient_as_bucket_view=True,
@@ -341,6 +552,19 @@ def set_trainer(args, wandb_logger, checkpoint_callback, stage = "train", period
             AdaptiveRatioCallback(
                 ratio_schedule=getattr(args, 'sudoku_ratio_schedule', 'fixed'),
                 difficulty_schedule=getattr(args, 'sudoku_difficulty_schedule', 'fixed'),
+                phase1_steps=getattr(args, 'sudoku_phase1_steps', 600),
+                phase2_steps=getattr(args, 'sudoku_phase2_steps', 2400),
+                warmup_ratio=getattr(args, 'sudoku_warmup_ratio', 0.60),
+                focus_ratio=getattr(args, 'sudoku_focus_ratio', 0.85),
+                consolidate_ratio=getattr(args, 'sudoku_consolidate_ratio', 0.70),
+                sft_baseline=getattr(args, 'sudoku_guard_sft_baseline', 1.121),
+                sft_tolerance=getattr(args, 'sudoku_guard_tolerance', 0.03),
+                ratio_floor=getattr(args, 'sudoku_ratio_floor', 0.50),
+                ratio_ceil=getattr(args, 'sudoku_ratio_ceil', 0.85),
+                ratio_step=getattr(args, 'sudoku_ratio_step', 0.05),
+                warmup_bucket_weights=getattr(args, 'sudoku_warmup_bucket_weights', None),
+                focus_bucket_weights=getattr(args, 'sudoku_focus_bucket_weights', None),
+                consolidate_bucket_weights=getattr(args, 'sudoku_consolidate_bucket_weights', None),
             )
         )
 
@@ -538,6 +762,107 @@ if __name__ == '__main__':
 
     parser.add_argument("--no_mcmc_detach", help="dont detach between mcmc steps, probably need to use for S2 models but can increase instability due to longer gradient computation graphs", action="store_true", default=False)
 
+    parser.add_argument("--mcmc_gradient_mode", type=str, default="second_order",
+        choices=["second_order", "first_order_debug", "first_order_cd", "first_order_nce", "proposal_aware_nce"],
+        help=(
+            "Controls whether MCMC refinement participates in higher-order autograd. "
+            "second_order preserves the current EBT objective. first_order_debug forces "
+            "autograd.grad(create_graph=False) for isolation only. first_order_cd uses "
+            "detached MCMC samples with a graph-safe contrastive energy surrogate and "
+            "recomputes positive/negative energies in one transformer pass. first_order_nce "
+            "uses the same graph-safe recomputation path with a logistic NCE energy loss. "
+            "proposal_aware_nce uses sampled negatives from a known proposal distribution "
+            "with an explicit log-q correction; the default uniform proposal skips MCMC."
+        ))
+
+    parser.add_argument("--first_order_cd_loss_coeff", type=float, default=1.0,
+        help="Loss coefficient for mcmc_gradient_mode=first_order_cd.")
+
+    parser.add_argument("--first_order_cd_loss_type", type=str, default="ce",
+        choices=["ce", "margin"],
+        help="First-order CD surrogate loss: CE over positive/negative energies or margin ranking.")
+
+    parser.add_argument("--first_order_cd_margin", type=float, default=1.0,
+        help="Margin used when --first_order_cd_loss_type margin.")
+
+    parser.add_argument("--first_order_local_cd_coeff", type=float, default=0.0,
+        help=(
+            "Optional trajectory-local auxiliary coefficient for mcmc_gradient_mode=first_order_cd. "
+            "Default 0 keeps the original endpoint first_order_cd behavior."
+        ))
+
+    parser.add_argument("--first_order_local_cd_num_pairs", type=int, default=1,
+        help="Number of adjacent detached MCMC state pairs to use for first_order_local_cd.")
+
+    parser.add_argument("--first_order_local_cd_pair_stride", type=int, default=1,
+        help="Stride between detached MCMC states used by first_order_local_cd.")
+
+    parser.add_argument("--first_order_local_cd_loss_type", type=str, default="raw",
+        choices=["raw", "softplus"],
+        help=(
+            "Trajectory-local loss for first_order_cd. raw minimizes E(z_{k+s})-E(z_k); "
+            "softplus applies softplus to the same descent-signed energy delta."
+        ))
+
+    parser.add_argument("--first_order_local_cd_margin", type=float, default=0.0,
+        help="Margin added inside softplus for --first_order_local_cd_loss_type softplus.")
+
+    parser.add_argument("--first_order_nce_loss_coeff", type=float, default=1.0,
+        help="Loss coefficient for mcmc_gradient_mode=first_order_nce.")
+
+    parser.add_argument("--proposal_aware_nce_loss_coeff", type=float, default=1.0,
+        help="Loss coefficient for mcmc_gradient_mode=proposal_aware_nce.")
+
+    parser.add_argument("--proposal_aware_nce_base_coeff", type=float, default=1.0,
+        help=(
+            "Coefficient for the discrete proposal-aware NCE term inside "
+            "mcmc_gradient_mode=proposal_aware_nce. Set <1 when using relaxed CD "
+            "as the landscape-dominant objective."
+        ))
+
+    parser.add_argument("--proposal_aware_nce_k", type=int, default=1,
+        help="Number of proposal negatives per valid token for proposal_aware_nce.")
+
+    parser.add_argument("--proposal_aware_nce_proposal", type=str, default="uniform",
+        choices=["uniform", "mcmc_final"],
+        help=(
+            "Proposal distribution for proposal_aware_nce. uniform is exact and skips MCMC. "
+            "mcmc_final reuses the detached final MCMC logits as an adaptive stop-gradient "
+            "proposal and is therefore approximate rather than strict NCE."
+        ))
+
+    parser.add_argument("--proposal_aware_nce_logz_offset", type=float, default=None,
+        help=(
+            "Fixed log-normalizer offset a(c,t) used by proposal_aware_nce. "
+            "Default None uses log(vocab_size) for uniform and 0 for mcmc_final."
+        ))
+
+    parser.add_argument("--proposal_aware_nce_rank_coeff", type=float, default=0.0,
+        help="Optional ranking auxiliary coefficient for proposal_aware_nce.")
+
+    parser.add_argument("--proposal_aware_nce_rank_margin", type=float, default=1.0,
+        help="Margin for proposal_aware_nce ranking auxiliary.")
+
+    parser.add_argument("--proposal_aware_nce_exclude_positive_negatives",
+        help=(
+            "When sampling proposal negatives, exclude the ground-truth token from "
+            "the negative draw. This is a landscape-oriented option and is not strict NCE."
+        ),
+        action="store_true", default=False)
+
+    parser.add_argument("--proposal_aware_nce_relaxed_cd_coeff", type=float, default=0.0,
+        help=(
+            "Optional continuous relaxed-state CD auxiliary for proposal_aware_nce. "
+            "Requires --proposal_aware_nce_proposal mcmc_final and directly contrasts "
+            "the positive one-hot target against the detached final MCMC relaxed state."
+        ))
+
+    parser.add_argument("--proposal_aware_nce_relaxed_cd_margin", type=float, default=0.0,
+        help=(
+            "Margin for proposal_aware_nce relaxed CD auxiliary. The default 0.0 matches "
+            "the first_order_cd CE-style softplus(E_pos - E_relaxed) objective."
+        ))
+
     parser.add_argument("--contrastive_loss", help="uses a contrastive loss to shape the landscape of EBM, idea from IRED paper https://arxiv.org/abs/2406.11179", action="store_true", default=False)
 
     parser.add_argument("--contrastive_loss_coeff", help="coefficient for contrastive loss, didnt work well not used", type=float, default=0.0005)
@@ -631,6 +956,97 @@ if __name__ == '__main__':
     
     parser.add_argument("--distributed_strategy", help="distributed strategy - ddp_spawn, ddp, fsdp_native, or None", default='ddp')
 
+    # Train engine selection. Defaults preserve the current Lightning/DDP path.
+    parser.add_argument("--train_engine", type=str, default="lightning_ddp",
+        choices=[
+            "lightning_ddp",
+            "fsdp2",
+            "zero-1",
+            "zero-2",
+            "zero-3",
+            "deepspeed-zero1",
+            "deepspeed-zero2",
+            "deepspeed-zero3",
+            "megatron",
+        ],
+        help="Optional training engine. Implemented: lightning_ddp, fsdp2, zero-1, zero-2. zero-3 is reserved.")
+    parser.add_argument("--fsdp_sharding_strategy", type=str, default="full_shard",
+        choices=["full_shard", "hybrid_shard", "no_shard"],
+        help="[FSDP2 MVP] Parsed for future policy selection; current implementation uses full-shard style wrapping.")
+    parser.add_argument("--fsdp_cpu_offload", action="store_true", default=False,
+        help="[FSDP2 MVP] Parsed but not enabled yet; kept explicit to avoid silent CPU-offload behavior.")
+    parser.add_argument("--fsdp_activation_checkpointing", type=str, default="off",
+        choices=["off", "non_create_graph_steps", "all_blocks"],
+        help="[FSDP2 MVP] Kept off by default because EBT MCMC uses create_graph=True.")
+    parser.add_argument("--fsdp_mixed_precision", type=str, default="bf16",
+        choices=["bf16", "fp32"],
+        help="[FSDP2 MVP] Parsed for future FSDP policy; current dtype still follows --float_precision.")
+    parser.add_argument("--fsdp_state_dict_type", type=str, default="sharded",
+        choices=["sharded", "full", "both"],
+        help="[FSDP2 MVP] Only sharded training checkpoints are supported initially.")
+    parser.add_argument("--fsdp_force_truncate_mcmc", action="store_true", default=False,
+        help="[FSDP2 MVP] Force truncate_mcmc=True to reduce high-order MCMC graph retention.")
+    parser.add_argument("--fsdp_wrap_policy", type=str, default="transformer_block",
+        choices=["transformer_block", "transformer_root", "none"],
+        help="[FSDP2 MVP] Wrap transformer blocks first, keeping EBT-specific MCMC modules replicated.")
+    parser.add_argument("--fsdp_reshard_after_forward", type=str, default="false",
+        choices=["true", "false"],
+        help="[FSDP2 MVP] Defaults false because EBT MCMC uses create_graph=True.")
+    parser.add_argument("--fsdp_disable_compile", action="store_true", default=True,
+        help="[FSDP2 MVP] Disable torch.compile because EBT MCMC uses create_graph=True.")
+    parser.add_argument("--fsdp_allow_muon_adamw", action="store_true", default=False,
+        help="[FSDP2 MVP] Opt in to experimental MuonAdamW under FSDP2; default falls back to layered AdamW.")
+    parser.add_argument("--fsdp_muon_dtensor_policy", type=str, default="adamw",
+        choices=["adamw", "error"],
+        help="[FSDP2 MuonAdamW] DTensor matrix params cannot use Muon's shape-stacked update. "
+             "'adamw' routes them through a DTensor-safe AdamW branch; 'error' fails fast.")
+    parser.add_argument("--fsdp_first_order_mcmc_debug", action="store_true", default=False,
+        help="[FSDP2 DEBUG] Force MCMC autograd.grad(create_graph=False) under FSDP2 to isolate second-order/FSDP interactions. Not equivalent EBT training.")
+
+    parser.add_argument("--zero_config", type=str, default="",
+        help="[DeepSpeed ZeRO] Optional config JSON for zero-1/zero-2. If set, zero_optimization.stage must match --train_engine.")
+    parser.add_argument("--deepspeed_repo_path", type=str, default="/mnt/shared-storage-user/puyuan/code/DeepSpeed",
+        help="[DeepSpeed ZeRO] Optional local DeepSpeed source checkout used as an import fallback before requiring installed deepspeed.")
+    parser.add_argument("--zero_cpu_offload_optimizer", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Enable optimizer-state CPU offload for ZeRO-1/2.")
+    parser.add_argument("--zero_cpu_offload_parameters", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Reserved for ZeRO-3. Ignored for ZeRO-1/2.")
+    parser.add_argument("--zero3_param_dtype", type=str, default="fp32",
+        choices=["fp32", "bf16"],
+        help=(
+            "[DeepSpeed ZeRO-3] Force a uniform floating parameter dtype before "
+            "DeepSpeed initialization. ZeRO-3 defragmentation requires uniform "
+            "trainable parameter partitions; default fp32 matches bf16-mixed training."
+        ))
+    parser.add_argument("--zero_allgather_bucket_size", type=int, default=0,
+        help="[DeepSpeed ZeRO] Optional allgather_bucket_size. 0 lets Lightning/DeepSpeed choose.")
+    parser.add_argument("--zero_reduce_bucket_size", type=int, default=0,
+        help="[DeepSpeed ZeRO] Optional reduce_bucket_size. 0 lets Lightning/DeepSpeed choose.")
+    parser.add_argument("--zero_contiguous_gradients", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Request contiguous gradients when supported by the installed Lightning version.")
+    parser.add_argument("--zero_force_truncate_mcmc", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Force truncate_mcmc=True to reduce retained second-order graph memory.")
+    parser.add_argument("--zero_disable_compile", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Disable torch.compile for ZeRO runs.")
+    parser.add_argument("--zero_allow_compile", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Opt in to torch.compile under ZeRO. Default disables compile because EBT MCMC uses create_graph=True.")
+    parser.add_argument("--zero_allow_muon_adamw", action="store_true", default=False,
+        help="[DeepSpeed ZeRO] Deprecated compatibility flag. MuonAdamW is not supported under ZeRO-1/2/3 because DeepSpeed flattens/partitions optimizer params; use --zero_muon_policy instead.")
+    parser.add_argument("--zero_muon_policy", type=str, default="adamw",
+        choices=["adamw", "error"],
+        help=(
+            "[DeepSpeed ZeRO] What to do if --optimizer muon_adamw is requested. "
+            "Default 'adamw' falls back to layered AdamW because ZeRO passes flattened/"
+            "partitioned tensors to the base optimizer, while Muon requires full 2D matrices. "
+            "'error' fails fast."
+        ))
+    parser.add_argument("--zero3_muon_policy", type=str, default="adamw",
+        choices=["adamw", "error"],
+        help=(
+            "[DeepSpeed ZeRO-3] Deprecated alias for --zero_muon_policy. "
+            "Kept for older scripts."
+        ))
+
 
     #TRAINING#########################################################
 
@@ -649,6 +1065,8 @@ if __name__ == '__main__':
     parser.add_argument("--execution_mode", type=str, choices=["pretrain", "finetune", "inference"], default="pretrain")
     
     parser.add_argument("--finetuning_model_ckpt", help="model ckpt when finetuning", type=str, default=None)
+    parser.add_argument("--min_finetune_load_fraction", help="minimum trainable parameter coverage required when loading --finetuning_model_ckpt", type=float, default=0.95)
+    parser.add_argument("--allow_partial_finetune_load", help="allow partial finetune checkpoint initialization even when coverage is below --min_finetune_load_fraction", action="store_true", default=False)
 
     #METRICS#########################################################
     #NOTE reported metrics in wandb will be averages over the time span they are being computed, so the final one in an epoch will be the most accurate
@@ -763,6 +1181,20 @@ if __name__ == '__main__':
         choices=["fixed", "three_phase"],
         default="fixed",
     )
+    parser.add_argument("--sudoku_phase1_steps", help="Sudoku three-phase schedule warmup/focus boundary.", type=int, default=600)
+    parser.add_argument("--sudoku_phase2_steps", help="Sudoku three-phase schedule focus/consolidation boundary.", type=int, default=2400)
+    parser.add_argument("--sudoku_warmup_ratio", help="Sudoku sample ratio during warmup phase.", type=float, default=0.60)
+    parser.add_argument("--sudoku_focus_ratio", help="Sudoku sample ratio during hard-focus phase.", type=float, default=0.85)
+    parser.add_argument("--sudoku_consolidate_ratio", help="Sudoku sample ratio during consolidation phase.", type=float, default=0.70)
+    parser.add_argument("--sudoku_guard_sft_baseline", help="valid_loss_sft baseline used by the Sudoku retention guard.", type=float, default=1.121)
+    parser.add_argument("--sudoku_guard_tolerance", help="Allowed valid_loss_sft drift before lowering Sudoku ratio.", type=float, default=0.03)
+    parser.add_argument("--sudoku_ratio_floor", help="Minimum Sudoku ratio allowed by retention guard.", type=float, default=0.50)
+    parser.add_argument("--sudoku_ratio_ceil", help="Maximum Sudoku ratio allowed by retention guard.", type=float, default=0.85)
+    parser.add_argument("--sudoku_ratio_step", help="Sudoku ratio adjustment step used by retention guard.", type=float, default=0.05)
+    parser.add_argument("--sudoku_warmup_bucket_weights", help="Hard/medium/easy bucket weights for Sudoku warmup phase.", nargs=3, type=float, default=None)
+    parser.add_argument("--sudoku_focus_bucket_weights", help="Hard/medium/easy bucket weights for Sudoku focus phase.", nargs=3, type=float, default=None)
+    parser.add_argument("--sudoku_consolidate_bucket_weights", help="Hard/medium/easy bucket weights for Sudoku consolidation phase.", nargs=3, type=float, default=None)
+    parser.add_argument("--dataset_seed", help="Optional dataset RNG seed. -1 keeps dataset default behavior.", type=int, default=-1)
     
     parser.add_argument("--dataset_dir", help="dataset base directory", default="")
 

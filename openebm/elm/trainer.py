@@ -2,48 +2,14 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-# from torch.utils.data import random_split, Dataset
-# from torchvision import transforms
-# from torchvision.transforms import ToPILImage
 from torch.distributed import all_reduce
 import wandb
 import gc
 
-# from data.vid.ucf_dataloader import *
-# from data.vid.kinetics_dataloader import *
-# from data.img.imagenet_dataloader import *
-# from data.img.coco_tiny_dataset import COCOTinyDataset
-# from data.img.coco_medium_dataset import COCOMediumDataset
-# from data.vid.aggregate_dataloader import *
-# from data.vid.vid_synthetic_dataset import VIDSyntheticDataset
-# from data.nlp.pajama_dataloader import RedPajamaDataset
-# from data.nlp.fineweb_dataloader import FineWebDataset
-# from data.nlp.collator import NLP_HF_Collator
-# from data.nlp.bigbench_dataloader import BigBenchDataset
-# from data.nlp.gsm8k_dataloader import GSM8KDataset
-# from data.nlp.lambada_dataset import LambadaDataset
-# from data.nlp.squad_dataloader import SQuADDataset
-# from data.nlp.ai2arc_dataloader import AI2ArcDataset
-# from data.nlp.planbench_dataloader import PlanBenchDataset
-# from data.nlp.synthetic_dataset import NLPSyntheticDataset
-
 from openebm.elm.collector import NLP_HF_Collator
 from datasets import load_dataset, load_from_disk
 import os
-# from model.vid.ebt import EBT_VID
 from openebm.elm.modeling_ebt import EBT_NLP
-# from model.img.ebt_t2i import EBT_IMG_T2I
-# from model.img.ebt_denoise import EBT_IMG_Denoise
-
-# from model.vid.baseline_transformer import Baseline_Transformer_VID
-# from model.nlp.baseline_transformer import Baseline_Transformer_NLP
-
-# from model.img.dit_t2i import Diffusion_Transformer_IMG_T2I
-# from model.img.dit_denoise import Diffusion_Transformer_IMG_Denoise
-
-
-# from nanolightning.torchlightning_module import LightningModule
-# from nanolightning.iteratabledataset import generate_dataloader, IterableDataset
 
 try:
     from lightning.pytorch import LightningModule
@@ -120,17 +86,25 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 #   600 ≤ step < 2400                  → 0.85  (focus)
 #   step ≥ 2400                        → 0.7   (consolidation)
 # The retention guard then clips this around `valid_loss_sft` drift on each val tick.
+_V3_DEFAULT_PHASE1_STEPS = 600
+_V3_DEFAULT_PHASE2_STEPS = 2400
+_V3_DEFAULT_WARMUP_RATIO = 0.60
+_V3_DEFAULT_FOCUS_RATIO = 0.85
+_V3_DEFAULT_CONSOLIDATE_RATIO = 0.70
 _V3_RATIO_PHASES = [
-    {'lo': 0,    'hi': 600,   'ratio': 0.6},
-    {'lo': 600,  'hi': 2400,  'ratio': 0.85},
-    {'lo': 2400, 'hi': 10**9, 'ratio': 0.7},
+    {'lo': 0,    'hi': _V3_DEFAULT_PHASE1_STEPS, 'ratio': _V3_DEFAULT_WARMUP_RATIO},
+    {'lo': _V3_DEFAULT_PHASE1_STEPS, 'hi': _V3_DEFAULT_PHASE2_STEPS, 'ratio': _V3_DEFAULT_FOCUS_RATIO},
+    {'lo': _V3_DEFAULT_PHASE2_STEPS, 'hi': 10**9, 'ratio': _V3_DEFAULT_CONSOLIDATE_RATIO},
 ]
 # Difficulty bucket weights aligned with SudokuSFTV2IterableDataset.DIFFICULTY_BUCKETS
 # (hard 17-22, medium 23-28, easy 29-34). P5 in the v3 spec.
+_V3_DEFAULT_WARMUP_BUCKET_WEIGHTS = [0.33, 0.33, 0.34]
+_V3_DEFAULT_FOCUS_BUCKET_WEIGHTS = [0.55, 0.30, 0.15]
+_V3_DEFAULT_CONSOLIDATE_BUCKET_WEIGHTS = [0.40, 0.35, 0.25]
 _V3_DIFFICULTY_PHASES = [
-    {'lo': 0,    'hi': 600,   'weights': [0.33, 0.33, 0.34]},   # warmup uniform
-    {'lo': 600,  'hi': 2400,  'weights': [0.55, 0.30, 0.15]},   # focus on hard tail
-    {'lo': 2400, 'hi': 10**9, 'weights': [0.40, 0.35, 0.25]},   # consolidation
+    {'lo': 0,    'hi': _V3_DEFAULT_PHASE1_STEPS, 'weights': _V3_DEFAULT_WARMUP_BUCKET_WEIGHTS},   # warmup uniform
+    {'lo': _V3_DEFAULT_PHASE1_STEPS, 'hi': _V3_DEFAULT_PHASE2_STEPS, 'weights': _V3_DEFAULT_FOCUS_BUCKET_WEIGHTS},   # focus on hard tail
+    {'lo': _V3_DEFAULT_PHASE2_STEPS, 'hi': 10**9, 'weights': _V3_DEFAULT_CONSOLIDATE_BUCKET_WEIGHTS},   # consolidation
 ]
 # Retention guard (P4): SFT-loss target used to keep core SFT capability from drifting.
 # v2 baseline `valid_loss_sft` was 1.121 across the 0.4/0.6/0.8 sweep; we accept up to
@@ -185,6 +159,19 @@ class AdaptiveRatioCallback:
         self,
         ratio_schedule='three_phase_with_guard',
         difficulty_schedule='three_phase',
+        phase1_steps=_V3_DEFAULT_PHASE1_STEPS,
+        phase2_steps=_V3_DEFAULT_PHASE2_STEPS,
+        warmup_ratio=_V3_DEFAULT_WARMUP_RATIO,
+        focus_ratio=_V3_DEFAULT_FOCUS_RATIO,
+        consolidate_ratio=_V3_DEFAULT_CONSOLIDATE_RATIO,
+        sft_baseline=_V3_SFT_BASELINE,
+        sft_tolerance=_V3_SFT_TOLERANCE,
+        ratio_floor=_V3_RATIO_FLOOR,
+        ratio_ceil=_V3_RATIO_CEIL,
+        ratio_step=_V3_RATIO_STEP,
+        warmup_bucket_weights=None,
+        focus_bucket_weights=None,
+        consolidate_bucket_weights=None,
     ):
         try:
             from lightning.pytorch.callbacks import Callback as _LCB
@@ -195,6 +182,21 @@ class AdaptiveRatioCallback:
         AdaptiveRatioCallback._mixin_callback(self, _LCB)
         self.ratio_schedule = ratio_schedule
         self.difficulty_schedule = difficulty_schedule
+        self.phase1_steps = int(phase1_steps)
+        self.phase2_steps = int(phase2_steps)
+        if self.phase2_steps <= self.phase1_steps:
+            self.phase2_steps = self.phase1_steps + 1
+        self.warmup_ratio = float(warmup_ratio)
+        self.focus_ratio = float(focus_ratio)
+        self.consolidate_ratio = float(consolidate_ratio)
+        self.sft_baseline = float(sft_baseline)
+        self.sft_tolerance = float(sft_tolerance)
+        self.ratio_floor = float(ratio_floor)
+        self.ratio_ceil = float(ratio_ceil)
+        self.ratio_step = float(ratio_step)
+        self.warmup_bucket_weights = list(warmup_bucket_weights or _V3_DEFAULT_WARMUP_BUCKET_WEIGHTS)
+        self.focus_bucket_weights = list(focus_bucket_weights or _V3_DEFAULT_FOCUS_BUCKET_WEIGHTS)
+        self.consolidate_bucket_weights = list(consolidate_bucket_weights or _V3_DEFAULT_CONSOLIDATE_BUCKET_WEIGHTS)
         self._last_logged_step = -1
 
     @staticmethod
@@ -217,10 +219,20 @@ class AdaptiveRatioCallback:
         return ds
 
     def _phase_ratio(self, step):
-        return _v3_three_phase_value(step, _V3_RATIO_PHASES, default=0.6)
+        phases = [
+            {'lo': 0, 'hi': self.phase1_steps, 'ratio': self.warmup_ratio},
+            {'lo': self.phase1_steps, 'hi': self.phase2_steps, 'ratio': self.focus_ratio},
+            {'lo': self.phase2_steps, 'hi': 10**9, 'ratio': self.consolidate_ratio},
+        ]
+        return _v3_three_phase_value(step, phases, default=self.warmup_ratio)
 
     def _phase_bucket_weights(self, step):
-        return list(_v3_three_phase_value(step, _V3_DIFFICULTY_PHASES, default=[1, 1, 1]))
+        phases = [
+            {'lo': 0, 'hi': self.phase1_steps, 'weights': self.warmup_bucket_weights},
+            {'lo': self.phase1_steps, 'hi': self.phase2_steps, 'weights': self.focus_bucket_weights},
+            {'lo': self.phase2_steps, 'hi': 10**9, 'weights': self.consolidate_bucket_weights},
+        ]
+        return list(_v3_three_phase_value(step, phases, default=[1, 1, 1]))
 
     # ── Lightning hooks ────────────────────────────────────────────────
 
@@ -236,8 +248,8 @@ class AdaptiveRatioCallback:
             # of the schedule. We apply phase-on-transition edges; guard nudges live
             # in on_validation_epoch_end.
             current = float(ds.sudoku_ratio)
-            phase_lo = max(_V3_RATIO_FLOOR, base - 0.10)
-            phase_hi = min(_V3_RATIO_CEIL, base + 0.05)
+            phase_lo = max(self.ratio_floor, base - 0.10)
+            phase_hi = min(self.ratio_ceil, base + 0.05)
             if not (phase_lo <= current <= phase_hi):
                 ds.sudoku_ratio = float(base)
         elif self.ratio_schedule == 'fixed':
@@ -282,12 +294,12 @@ class AdaptiveRatioCallback:
             return
         if isinstance(sft_loss, torch.Tensor):
             sft_loss = sft_loss.detach().float().item()
-        delta = float(sft_loss) - _V3_SFT_BASELINE
+        delta = float(sft_loss) - self.sft_baseline
         before = float(ds.sudoku_ratio)
-        if delta > _V3_SFT_TOLERANCE:
-            new_r = max(_V3_RATIO_FLOOR, before - _V3_RATIO_STEP)
+        if delta > self.sft_tolerance:
+            new_r = max(self.ratio_floor, before - self.ratio_step)
         elif delta < 0.0:
-            new_r = min(_V3_RATIO_CEIL, before + _V3_RATIO_STEP)
+            new_r = min(self.ratio_ceil, before + self.ratio_step)
         else:
             new_r = before
         if abs(new_r - before) > 1e-6:
@@ -300,13 +312,22 @@ class AdaptiveRatioCallback:
                   f"(Δ={delta:+.4f}) → sudoku_ratio {before:.2f} → {new_r:.2f}")
 
 
+def _sanitize_hparams_for_checkpoint(hparams_dict):
+    """Avoid storing runtime strategy objects in Lightning hyperparameters."""
+    sanitized = dict(hparams_dict)
+    strategy = sanitized.get("distributed_strategy")
+    if strategy is not None and not isinstance(strategy, str):
+        sanitized["distributed_strategy"] = strategy.__class__.__name__
+    return sanitized
+
+
 class ModelTrainer(LightningModule):
     def __init__(self, hparams, trained_model = None):
         super().__init__()
         if isinstance(hparams, dict):#passed in from model ckpt
-            self.hparams.update(hparams)
+            self.hparams.update(_sanitize_hparams_for_checkpoint(hparams))
         else:
-            self.hparams.update(vars(hparams))
+            self.hparams.update(_sanitize_hparams_for_checkpoint(vars(hparams)))
         # self.txt_logger = hparams.txt_logger if txt_logger == None else txt_logger # txt_logger is no longer supported
 
         # Initialize tracking for test metrics
@@ -316,9 +337,11 @@ class ModelTrainer(LightningModule):
         # Training throughput tracking
         self._train_step_start_time = None
         self._train_start_time = None  # wall-clock start for ETA
+        self._last_cuda_memory_metrics = {}
 
         # Dataloader resume state: 用于从 checkpoint 恢复 dataloader 位置
         self._dataloader_resume_state = None
+        self._fsdp2_gradient_clip_warned = False
 
         if self.hparams.modality == "NLP":
             if "execution_mode" in self.hparams and "save_generation_logs_dir" in self.hparams and self.hparams.execution_mode == "inference": # two of these are sanity check for loading pretrained ckpt that may not have newer params
@@ -547,6 +570,10 @@ class ModelTrainer(LightningModule):
             self._rng_resume_state = None
             print(f"[Exact Resume] RNG states restored for rank {self.global_rank}")
 
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            self._last_cuda_memory_metrics = {}
+
         if self.hparams.debug_unused_parameters: 
             for name, param in self.model.named_parameters():
                 if param.requires_grad and "image_encoder" not in name: # NOTE need to modify this code to exclude specific frozen portions
@@ -601,11 +628,69 @@ class ModelTrainer(LightningModule):
 
         else:
             eval_step_dict = self.eval_step(batch, "train")
+
+        eval_step_dict.update(self._get_sudoku_mixed_train_metrics())
         
         self.log_metrics(eval_step_dict, "train")
         return eval_step_dict['loss']   
+
+    def _get_sudoku_mixed_train_metrics(self):
+        """Expose Sudoku mixed-data curriculum health as normal train metrics.
+
+        These are intentionally scalar-only so they flow through the existing
+        `log_metrics(..., phase="train")` path and appear in logs/W&B without a
+        separate callback. The dataset keeps defaults diverse; these metrics just
+        make source mix, difficulty sampling, format mix, and blank-weight coverage
+        observable.
+        """
+        if getattr(self.hparams, 'dataset_name', '') != 'sudoku_mixed':
+            return {}
+        try:
+            train_dl = getattr(self.trainer, 'train_dataloader', None)
+            ds = getattr(train_dl, 'dataset', None)
+        except Exception:
+            return {}
+        if ds is None or not hasattr(ds, 'last_batch_source'):
+            return {}
+
+        source = getattr(ds, 'last_batch_source', None)
+        metrics = {
+            'sudoku_source_is_sudoku': 1.0 if source == 'sudoku' else 0.0,
+        }
+        if hasattr(ds, 'sudoku_ratio'):
+            metrics['sudoku_ratio_active_step'] = float(ds.sudoku_ratio)
+
+        sudoku_ds = getattr(ds, 'sudoku_ds', None)
+        bucket_weights = getattr(sudoku_ds, 'bucket_weights', None)
+        buckets = getattr(sudoku_ds, 'DIFFICULTY_BUCKETS', [])
+        if bucket_weights is not None and buckets:
+            for i, bucket in enumerate(buckets):
+                if i < len(bucket_weights):
+                    metrics[f'sudoku_bucket_weight_{bucket[0]}'] = float(bucket_weights[i])
+
+        if source != 'sudoku':
+            return metrics
+
+        meta = getattr(ds, 'last_batch_meta', {}) or {}
+        n_conv = max(int(meta.get('num_conversations', 0)), 1)
+        metrics['sudoku_batch_num_conversations'] = float(meta.get('num_conversations', 0))
+        metrics['sudoku_batch_mean_given_count'] = float(meta.get('mean_given_count', 0.0))
+        metrics['sudoku_blank_weight_apply_rate'] = float(meta.get('blank_weight_apply_rate', 0.0))
+        metrics['sudoku_blank_weight_eligible_frac'] = (
+            float(meta.get('blank_weight_eligible', 0)) / n_conv
+        )
+
+        for bucket_name, count in (meta.get('difficulty_bucket_counts', {}) or {}).items():
+            metrics[f'sudoku_batch_bucket_frac_{bucket_name}'] = float(count) / n_conv
+        for fmt, count in (meta.get('puzzle_format_counts', {}) or {}).items():
+            metrics[f'sudoku_batch_puzzle_format_frac_{fmt}'] = float(count) / n_conv
+        for fmt, count in (meta.get('solution_format_counts', {}) or {}).items():
+            metrics[f'sudoku_batch_solution_format_frac_{fmt}'] = float(count) / n_conv
+        return metrics
     
     def on_after_backward(self):
+        self._sync_fsdp2_replicated_grads()
+
         if self.hparams.log_gradients:
             total_norm = 0.0
             num_parameters = 0
@@ -628,6 +713,105 @@ class ModelTrainer(LightningModule):
             things_to_log['avg_gradient_norms'] = average_norm
             things_to_log['pct_gradient_clipped'] = percentage_clipped
             self.log_metrics(things_to_log, "train", log_torchmetrics = False)
+
+    def _sync_fsdp2_replicated_grads(self):
+        """Synchronize non-FSDP replicated parameter grads under native FSDP2.
+
+        The FSDP2 MVP uses native composable FSDP while Lightning runs one
+        single-device Trainer per torchrun rank. FSDP-managed DTensor
+        parameters reduce their gradients internally, but intentionally
+        replicated parameters (alpha, embeddings, vocab_to_embed, transformer
+        root leftovers such as VE/norm/final_layer) would otherwise update
+        independently on each rank. We all-reduce only plain Tensor grads and
+        skip DTensor grads managed by FSDP2.
+        """
+        if getattr(self.hparams, "train_engine", "lightning_ddp") != "fsdp2":
+            return
+        try:
+            import torch.distributed as dist
+        except Exception:
+            return
+        if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+            return
+
+        try:
+            from torch.distributed.tensor import DTensor
+        except Exception:
+            DTensor = ()
+
+        world_size = dist.get_world_size()
+        for name, param in self.named_parameters():
+            if "model.transformer.layers." in name:
+                continue
+            grad = param.grad
+            if grad is None:
+                continue
+            if DTensor and (isinstance(param, DTensor) or isinstance(grad, DTensor)):
+                continue
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+            grad.div_(world_size)
+
+    def _collect_cuda_memory_metrics(self):
+        if not torch.cuda.is_available():
+            return {}
+
+        device = torch.cuda.current_device()
+        local_values = {
+            "allocated": torch.cuda.memory_allocated(device) / 1024**3,
+            "reserved": torch.cuda.memory_reserved(device) / 1024**3,
+            "peak_allocated": torch.cuda.max_memory_allocated(device) / 1024**3,
+            "peak_reserved": torch.cuda.max_memory_reserved(device) / 1024**3,
+        }
+        max_values = dict(local_values)
+
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                values_tensor = torch.tensor(
+                    [
+                        local_values["allocated"],
+                        local_values["reserved"],
+                        local_values["peak_allocated"],
+                        local_values["peak_reserved"],
+                    ],
+                    device=torch.device("cuda", device),
+                    dtype=torch.float32,
+                )
+                dist.all_reduce(values_tensor, op=dist.ReduceOp.MAX)
+                max_values = {
+                    "allocated": values_tensor[0].item(),
+                    "reserved": values_tensor[1].item(),
+                    "peak_allocated": values_tensor[2].item(),
+                    "peak_reserved": values_tensor[3].item(),
+                }
+        except Exception:
+            max_values = dict(local_values)
+
+        metrics = {}
+        for key, value in local_values.items():
+            metrics[f"memory/{key}_rank_gb"] = value
+        for key, value in max_values.items():
+            metrics[f"memory/{key}_max_gb"] = value
+        return metrics
+
+    def _is_native_fsdp2_engine(self):
+        return getattr(self.hparams, "train_engine", "lightning_ddp") == "fsdp2"
+
+    def _metric_sync_dist(self):
+        # Native torch FSDP2 already drives model collectives outside Lightning's
+        # distributed strategy. Extra per-step Lightning metric all-gathers can
+        # interleave with FSDP all-gathers and leave ranks waiting on different
+        # collective sequence numbers, so keep FSDP2 metric logging rank-local.
+        return not self._is_native_fsdp2_engine()
+
+    def _is_global_rank_zero(self):
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                return dist.get_rank() == 0
+        except Exception:
+            pass
+        return not hasattr(self, "trainer") or self.trainer is None or self.trainer.is_global_zero
         
     def on_train_batch_end(self, outputs, batch, batch_idx):
         #NOTE when using this may need to explicitly add code like 'if "image_encoder" not in name' for frozen params (with requires_grad == False)
@@ -672,6 +856,15 @@ class ModelTrainer(LightningModule):
         self._train_step_start_time = now
         if self._train_start_time is None:
             self._train_start_time = now
+
+        memory_metrics = self._collect_cuda_memory_metrics()
+        self._last_cuda_memory_metrics = memory_metrics
+        if memory_metrics:
+            self.log_dict(memory_metrics, prog_bar=False, on_step=True, on_epoch=False)
+            self.log("gpu_mem_allocated_gb", memory_metrics["memory/allocated_rank_gb"],
+                     prog_bar=False, on_step=True, on_epoch=False)
+            self.log("gpu_mem_reserved_gb", memory_metrics["memory/reserved_rank_gb"],
+                     prog_bar=False, on_step=True, on_epoch=False)
 
     # def on_train_epoch_end(self): ## not effective for EBT
     #     if self.hparams.optimizer != "adamw": # e.g. for lars need to manually update epoch
@@ -719,6 +912,64 @@ class ModelTrainer(LightningModule):
         checkpoint['rng_states_by_rank'] = all_rng_states
 
         print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
+
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
+        """Clip FSDP2 DTensor and regular Tensor gradients in separate groups.
+
+        Lightning's default norm clipping passes all gradients to
+        ``torch.nn.utils.clip_grad_norm_`` at once. With composable FSDP2, wrapped
+        transformer block gradients are DTensors while replicated EBT root
+        parameters such as embeddings/vocab_to_embed/alpha remain regular
+        tensors. PyTorch foreach norm rejects that mixed list, so split by grad
+        type before clipping.
+        """
+        if getattr(self.hparams, "train_engine", "lightning_ddp") != "fsdp2":
+            return super().configure_gradient_clipping(
+                optimizer,
+                gradient_clip_val=gradient_clip_val,
+                gradient_clip_algorithm=gradient_clip_algorithm,
+            )
+
+        if gradient_clip_val is None or gradient_clip_val <= 0:
+            return
+
+        algorithm = str(gradient_clip_algorithm or "norm").lower()
+        if "norm" not in algorithm:
+            return super().configure_gradient_clipping(
+                optimizer,
+                gradient_clip_val=gradient_clip_val,
+                gradient_clip_algorithm=gradient_clip_algorithm,
+            )
+
+        regular_params = []
+        dtensor_params = []
+        for group in optimizer.param_groups:
+            for param in group.get("params", []):
+                grad = getattr(param, "grad", None)
+                if grad is None:
+                    continue
+                if self._is_dtensor(grad):
+                    dtensor_params.append(param)
+                else:
+                    regular_params.append(param)
+
+        if not self._fsdp2_gradient_clip_warned:
+            print(
+                "[train_engine=fsdp2] Using split gradient clipping for "
+                f"{len(dtensor_params)} DTensor params and {len(regular_params)} regular Tensor params.",
+                flush=True,
+            )
+            self._fsdp2_gradient_clip_warned = True
+
+        if dtensor_params:
+            torch.nn.utils.clip_grad_norm_(dtensor_params, gradient_clip_val, foreach=False)
+        if regular_params:
+            torch.nn.utils.clip_grad_norm_(regular_params, gradient_clip_val, foreach=False)
+
+    @staticmethod
+    def _is_dtensor(tensor):
+        tensor_type = type(tensor)
+        return tensor_type.__name__ == "DTensor" or tensor_type.__module__.startswith("torch.distributed.tensor")
 
     def on_load_checkpoint(self, checkpoint):
         # --- 修复 torch.compile _orig_mod 前缀不匹配 ---
@@ -788,6 +1039,7 @@ class ModelTrainer(LightningModule):
         self._val_loss_tokens = None
         self._val_bpb_nats = 0.0
         self._val_bpb_bytes = 0
+        self._val_bpb_tokens = 0
         self._val_supervised_tokens = 0
         self._val_empty_supervision_batches = 0
 
@@ -871,12 +1123,27 @@ class ModelTrainer(LightningModule):
             tagged = {
                 f"{k}_{src}": v
                 for k, v in eval_step_dict.items()
-                if k not in ('loss', 'bpb', 'bpb_nats', 'bpb_bytes')
+                if k not in (
+                    'loss',
+                    'bpb',
+                    'bpb_nats',
+                    'bpb_bytes',
+                    'bpb_tokens',
+                    'bpb_nats_per_token',
+                    'bpb_bytes_per_token',
+                )
             }
             self.log_metrics(tagged, "valid")
             buf = self._val_source_buf.setdefault(src, {})
             for k, v in eval_step_dict.items():
-                if k in ('bpb', 'bpb_nats', 'bpb_bytes'):
+                if k in (
+                    'bpb',
+                    'bpb_nats',
+                    'bpb_bytes',
+                    'bpb_tokens',
+                    'bpb_nats_per_token',
+                    'bpb_bytes_per_token',
+                ):
                     continue
                 if isinstance(v, torch.Tensor) and v.dim() == 0:
                     val = v.detach().float()
@@ -900,16 +1167,21 @@ class ModelTrainer(LightningModule):
         # (BPB = sum(nats) / (log2 * sum(bytes)), 不能对 per-batch BPB 做算术平均)
         bpb_nats = eval_step_dict.get('bpb_nats', 0)
         bpb_bytes = eval_step_dict.get('bpb_bytes', 0)
+        bpb_tokens = eval_step_dict.get('bpb_tokens', 0)
         if isinstance(bpb_nats, torch.Tensor):
             bpb_nats = bpb_nats.item()
         if isinstance(bpb_bytes, torch.Tensor):
             bpb_bytes = bpb_bytes.item()
+        if isinstance(bpb_tokens, torch.Tensor):
+            bpb_tokens = bpb_tokens.item()
         self._val_bpb_nats += bpb_nats
         self._val_bpb_bytes += bpb_bytes
+        self._val_bpb_tokens += bpb_tokens
         if has_source:
-            bpb_slot = self._val_source_bpb.setdefault(src, {'nats': 0.0, 'bytes': 0})
+            bpb_slot = self._val_source_bpb.setdefault(src, {'nats': 0.0, 'bytes': 0, 'tokens': 0})
             bpb_slot['nats'] += bpb_nats
             bpb_slot['bytes'] += bpb_bytes
+            bpb_slot['tokens'] += bpb_tokens
 
         supervised_tokens = eval_step_dict.get('supervised_tokens', 0)
         empty_supervision_batch = eval_step_dict.get('empty_supervision_batch', 0)
@@ -922,7 +1194,8 @@ class ModelTrainer(LightningModule):
 
         suffix = f"_{src}" if has_source else ""
         for k, v in eval_step_dict.items():
-            if k in ('bpb', 'bpb_nats', 'bpb_bytes'):
+            # 跳过 BPB 累积中间量，它们不应作为独立指标显示
+            if k in ('bpb', 'bpb_nats', 'bpb_bytes', 'bpb_tokens', 'bpb_nats_per_token', 'bpb_bytes_per_token'):
                 continue
             if k == 'loss' and not has_source:
                 continue
@@ -968,6 +1241,7 @@ class ModelTrainer(LightningModule):
         buf = getattr(self, '_val_source_buf', None)
         if sources and buf:
             ratio = self._active_sudoku_ratio(default=0.6)
+            ratio = max(0.0, min(1.0, ratio))
             weights = {'sudoku': ratio, 'sft': 1.0 - ratio}
             balanced_weights = {'sudoku': 0.5, 'sft': 0.5}
             all_keys = set()
@@ -1029,6 +1303,7 @@ class ModelTrainer(LightningModule):
                         self.log(f"valid_loss_{src}", v, prog_bar=False, sync_dist=False)
 
             if mixed:
+                mixed['sudoku_ratio_eval_weight'] = ratio
                 self.log_metrics(mixed, "valid")
                 for k, v in mixed.items():
                     self._cache_valid_metric(k, v)
@@ -1041,22 +1316,40 @@ class ModelTrainer(LightningModule):
             epoch_bpb = self._val_bpb_nats / (math.log(2) * self._val_bpb_bytes)
         else:
             epoch_bpb = float('inf')
+        if self._val_bpb_tokens > 0:
+            epoch_nats_per_token = self._val_bpb_nats / self._val_bpb_tokens
+            epoch_bytes_per_token = self._val_bpb_bytes / self._val_bpb_tokens
+        else:
+            epoch_nats_per_token = 0.0
+            epoch_bytes_per_token = 0.0
 
         self._cache_valid_metric('loss', epoch_loss_value)
         self._cache_valid_metric('bpb', epoch_bpb)
+        self._cache_valid_metric('bpb_nats_per_token', epoch_nats_per_token)
+        self._cache_valid_metric('bpb_bytes_per_token', epoch_bytes_per_token)
+        self._cache_valid_metric('bpb_tokens', self._val_bpb_tokens)
+        self._cache_valid_metric('bpb_bytes', self._val_bpb_bytes)
         self._cache_valid_metric('supervised_tokens', self._val_supervised_tokens)
         self._cache_valid_metric('empty_supervision_batch', self._val_empty_supervision_batches)
         self.log("valid_loss", epoch_loss, prog_bar=True, sync_dist=False)
 
         # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
-        if self.logger is not None:
+        if self.logger is not None and self._is_global_rank_zero():
             try:
-                self.logger.experiment.log({
-                    'valid_loss': epoch_loss_value,
-                    'valid_bpb': epoch_bpb,
-                    'valid_supervised_tokens': self._val_supervised_tokens,
-                    'valid_empty_supervision_batch': self._val_empty_supervision_batches,
-                }, step=self.global_step)
+                self.logger.experiment.log(
+                    {
+                        'valid_loss': epoch_loss_value,
+                        'valid_bpb': epoch_bpb,
+                        'valid_bpb_total_nats': self._val_bpb_nats,
+                        'valid_bpb_total_bytes': self._val_bpb_bytes,
+                        'valid_bpb_total_tokens': self._val_bpb_tokens,
+                        'valid_bpb_nats_per_token': epoch_nats_per_token,
+                        'valid_bpb_bytes_per_token': epoch_bytes_per_token,
+                        'valid_supervised_tokens': self._val_supervised_tokens,
+                        'valid_empty_supervision_batch': self._val_empty_supervision_batches,
+                    },
+                    step=self.global_step,
+                )
             except Exception:
                 pass
 
@@ -1518,14 +1811,107 @@ class ModelTrainer(LightningModule):
         # else:
         #     raise NotImplementedError(f"Modality {self.hparams.modality} does not have configure optimizers supported yet")
         
+    def _fsdp2_optimizer_compat_enabled(self):
+        return getattr(self.hparams, "train_engine", "lightning_ddp") == "fsdp2"
+
+    @staticmethod
+    def _is_dtensor_parameter(param):
+        return param.__class__.__name__ == "DTensor" or param.__class__.__module__.startswith("torch.distributed.tensor")
+
+    def _split_optimizer_groups_for_fsdp2(self, optimizer_parameters):
+        """
+        Composable FSDP2 replaces wrapped module parameters with DTensor while
+        replicated root parameters remain regular Tensor/Parameter objects.
+        PyTorch foreach optimizer kernels cannot operate on mixed Tensor and
+        DTensor lists, so keep them in separate param groups.
+        """
+        if not self._fsdp2_optimizer_compat_enabled():
+            return optimizer_parameters
+
+        split_groups = []
+        num_split_groups = 0
+        for group in optimizer_parameters:
+            params = group.get("params", [])
+            if isinstance(params, torch.Tensor):
+                params = [params]
+            else:
+                params = list(params)
+
+            regular_params = []
+            dtensor_params = []
+            for param in params:
+                if self._is_dtensor_parameter(param):
+                    dtensor_params.append(param)
+                else:
+                    regular_params.append(param)
+
+            for tensor_kind, kind_params in (("tensor", regular_params), ("dtensor", dtensor_params)):
+                if not kind_params:
+                    continue
+                new_group = dict(group)
+                new_group["params"] = kind_params
+                new_group["fsdp2_tensor_kind"] = tensor_kind
+                split_groups.append(new_group)
+
+            if regular_params and dtensor_params:
+                num_split_groups += 1
+
+        if num_split_groups:
+            print(
+                "[train_engine=fsdp2] Split "
+                f"{num_split_groups} optimizer param group(s) by Tensor/DTensor kind "
+                "to avoid mixed distributed optimizer foreach kernels."
+            )
+        return split_groups
+
+    def _adamw_optimizer_kwargs(self):
+        kwargs = {"betas": [self.hparams.beta1, self.hparams.beta2]}
+        if self._fsdp2_optimizer_compat_enabled():
+            # AdamW's foreach/fused implementations bucket tensors by device and
+            # dtype and currently reject mixed Tensor/DTensor lists. The single
+            # tensor path is slower but avoids that kernel-level incompatibility.
+            kwargs["foreach"] = False
+            kwargs["fused"] = False
+            print("[train_engine=fsdp2] AdamW foreach/fused disabled for DTensor compatibility.")
+        return kwargs
+
+    @staticmethod
+    def _adamw_eager_step_param(param, grad, state, group):
+        if not state:
+            state['step'] = 0
+            state['exp_avg'] = torch.zeros_like(param)
+            state['exp_avg_sq'] = torch.zeros_like(param)
+
+        exp_avg = state['exp_avg']
+        exp_avg_sq = state['exp_avg_sq']
+        state['step'] += 1
+
+        lr = group['lr']
+        beta1, beta2 = group['betas']
+        eps = group['eps']
+        weight_decay = group['weight_decay']
+
+        if weight_decay != 0:
+            param.mul_(1 - lr * weight_decay)
+
+        exp_avg.lerp_(grad, 1 - beta1)
+        exp_avg_sq.lerp_(grad.square(), 1 - beta2)
+
+        bias1 = 1 - beta1 ** state['step']
+        bias2 = 1 - beta2 ** state['step']
+        denom = (exp_avg_sq / bias2).sqrt().add_(eps)
+        step_size = lr / bias1
+        param.addcdiv_(exp_avg, denom, value=-step_size)
+
     def get_optimizer(self, optimizer_parameters): # function for once gotten optimizer_parameters to get optimizer, i.e. adamw, lars, etc
+        optimizer_parameters = self._split_optimizer_groups_for_fsdp2(optimizer_parameters)
         if self.hparams.optimizer == "lars":
             lars_exclude_bias_and_norm = None if not self.hparams.lars_exclude_bias_bn_wd else exclude_bias_and_norm
             optimizer = LARS(optimizer_parameters, lr=self.hparams.peak_learning_rate, weight_decay=self.hparams.weight_decay, momentum=self.hparams.beta1, eta=self.hparams.lars_trust_coeff, weight_decay_filter=lars_exclude_bias_and_norm, lars_adaptation_filter=lars_exclude_bias_and_norm)
         elif self.hparams.optimizer == "stableadamw":
             optimizer = StableAdamWUnfused(optimizer_parameters, betas=[self.hparams.beta1, self.hparams.beta2])
         else:
-            optimizer = torch.optim.AdamW(optimizer_parameters, betas=[self.hparams.beta1, self.hparams.beta2])
+            optimizer = torch.optim.AdamW(optimizer_parameters, **self._adamw_optimizer_kwargs())
         return optimizer
     
     def on_warm_up_finished(self):
@@ -1669,16 +2055,38 @@ class ModelTrainer(LightningModule):
         ve_embed_params = []
         ve_gate_params = []
         transformer_matrix_params = []
+        transformer_dtensor_matrix_params = []
         transformer_scalar_params = []
+        train_engine = getattr(self.hparams, 'train_engine', 'lightning_ddp')
+        fsdp2_muon_dtensor_policy = getattr(self.hparams, 'fsdp_muon_dtensor_policy', 'adamw')
         for name, param in self.model.transformer.named_parameters():
             if 'value_embeds.' in name:
                 ve_embed_params.append(param)
             elif 've_gate.' in name:
                 ve_gate_params.append(param)
             elif param.ndim >= 2:
-                transformer_matrix_params.append(param)
+                if train_engine == "fsdp2" and self._is_dtensor_parameter(param):
+                    transformer_dtensor_matrix_params.append(param)
+                else:
+                    transformer_matrix_params.append(param)
             else:
                 transformer_scalar_params.append(param)
+
+        if transformer_dtensor_matrix_params:
+            if fsdp2_muon_dtensor_policy == "error":
+                raise RuntimeError(
+                    "FSDP2 MuonAdamW requested, but transformer matrix parameters are DTensors. "
+                    "NanoChat Muon stacks full Tensor parameters and cannot safely update DTensor shards. "
+                    "Use --fsdp_muon_dtensor_policy adamw to route DTensor matrices through a "
+                    "DTensor-safe AdamW branch, or use --fsdp_wrap_policy none for a diagnostic "
+                    "full-Muon run without FSDP2 sharding."
+                )
+            print(
+                "[Muon+AdamW][FSDP2] Routing "
+                f"{len(transformer_dtensor_matrix_params)} DTensor matrix params through eager AdamW; "
+                f"{len(transformer_matrix_params)} regular matrix params remain eligible for Muon.",
+                flush=True,
+            )
 
         # --- 构建 param_groups ---
         param_groups = []
@@ -1716,6 +2124,12 @@ class ModelTrainer(LightningModule):
                 kind='adamw', params=ve_gate_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
+        if transformer_dtensor_matrix_params:
+            param_groups.append(dict(
+                kind='adamw', params=transformer_dtensor_matrix_params,
+                lr=self.hparams.peak_learning_rate, betas=adam_betas, eps=1e-10,
+                weight_decay=self.hparams.weight_decay, adamw_impl='eager_dtensor',
+            ))
 
         # Muon groups: 按 shape 分组 (Muon 要求同组参数 shape 相同用于 stack)
         shape_groups = {}
@@ -1738,6 +2152,23 @@ class ModelTrainer(LightningModule):
         if use_cpu_offload:
             class PLMuonAdamW(MuonAdamW):
                 """MuonAdamW + CPU offload: AdamW 和 Muon 优化器状态均存放在 CPU。"""
+
+                def _step_adamw(self, group):
+                    use_eager = group.get('adamw_impl') == 'eager_dtensor'
+                    if not use_eager:
+                        for p in group['params']:
+                            if p.grad is not None and (
+                                ModelTrainer._is_dtensor_parameter(p) or ModelTrainer._is_dtensor_parameter(p.grad)
+                            ):
+                                use_eager = True
+                                break
+                    if not use_eager:
+                        return super()._step_adamw(group)
+
+                    for p in group['params']:
+                        if p.grad is None:
+                            continue
+                        ModelTrainer._adamw_eager_step_param(p, p.grad, self.state[p], group)
 
                 @torch.no_grad()
                 def step(self, closure=None):
@@ -1804,6 +2235,24 @@ class ModelTrainer(LightningModule):
         else:
             class PLMuonAdamW(MuonAdamW):
                 """MuonAdamW wrapper compatible with PyTorch Lightning's optimizer.step(closure=closure)."""
+
+                def _step_adamw(self, group):
+                    use_eager = group.get('adamw_impl') == 'eager_dtensor'
+                    if not use_eager:
+                        for p in group['params']:
+                            if p.grad is not None and (
+                                ModelTrainer._is_dtensor_parameter(p) or ModelTrainer._is_dtensor_parameter(p.grad)
+                            ):
+                                use_eager = True
+                                break
+                    if not use_eager:
+                        return super()._step_adamw(group)
+
+                    for p in group['params']:
+                        if p.grad is None:
+                            continue
+                        ModelTrainer._adamw_eager_step_param(p, p.grad, self.state[p], group)
+
                 @torch.no_grad()
                 def step(self, closure=None):
                     if closure is not None:
@@ -1822,6 +2271,7 @@ class ModelTrainer(LightningModule):
 
         # --- 日志 ---
         num_muon_params = sum(p.numel() for p in transformer_matrix_params)
+        num_dtensor_adamw_params = sum(p.numel() for p in transformer_dtensor_matrix_params)
         num_ve_params = (
             sum(p.numel() for p in ve_embed_params) +
             sum(p.numel() for p in ve_gate_params)
@@ -1831,6 +2281,7 @@ class ModelTrainer(LightningModule):
             sum(p.numel() for p in embedding_params) +
             sum(p.numel() for p in vocab_to_embed_params) +
             sum(p.numel() for p in transformer_scalar_params) +
+            num_dtensor_adamw_params +
             num_ve_params
         )
         print(f"=" * 80)
@@ -1840,6 +2291,11 @@ class ModelTrainer(LightningModule):
         print(f"  AdamW params: {num_adamw_params:,} ({num_adamw_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
         if num_ve_params > 0:
             print(f"  VE params: {num_ve_params:,} (AdamW, embedding_lr)")
+        if num_dtensor_adamw_params > 0:
+            print(
+                f"  FSDP2 DTensor matrix params: {num_dtensor_adamw_params:,} "
+                "(AdamW eager fallback; Muon requires full regular Tensor params)"
+            )
         print(f"  Muon LR: {muon_lr}, momentum: {muon_momentum}, ns_steps: {muon_ns_steps}, beta2: {muon_beta2}")
         print(f"  Alpha LR: {alpha_lr} (AdamW) [EBT 特有]")
         print(f"  Embedding LR: {embedding_lr} (AdamW)")
@@ -2164,6 +2620,7 @@ class ModelTrainer(LightningModule):
             blank_weight = float(getattr(self.hparams, 'sudoku_blank_loss_weight', 1.0))
             difficulty_sched = getattr(self.hparams, 'sudoku_difficulty_schedule', 'fixed')
             initial_bucket_weights = _v3_initial_bucket_weights(difficulty_sched)
+            dataset_seed = int(getattr(self.hparams, 'dataset_seed', -1))
             train_dataloader = generate_sudoku_mixed_dataloader(
                 tokenizer=tokenizer,
                 batch_size=self.hparams.batch_size_per_device,
@@ -2173,6 +2630,7 @@ class ModelTrainer(LightningModule):
                 device=self.device,
                 resume_state_dict=resume_state,
                 sudoku_ratio=getattr(self.hparams, 'sudoku_ratio', 0.6),
+                seed=None if dataset_seed < 0 else dataset_seed,
                 blank_loss_weight=blank_weight,
                 difficulty_bucket_weights=initial_bucket_weights,
             )
@@ -2325,13 +2783,13 @@ class ModelTrainer(LightningModule):
         keys = list(metrics_dict.keys()) # Iterate over a copy of the keys to avoid modification issues during iteration
         for key in keys:
             # 跳过 BPB 相关指标，它们不应通过 Lightning log_dict 上报：
-            # - bpb_nats/bpb_bytes: BPB 累积中间量
+            # - bpb_nats/bpb_bytes/bpb_tokens: BPB 累积中间量
             # - bpb (非 train 阶段): BPB 是比率指标 (nats/bytes)，
             #   Lightning 的 on_epoch=True 会对 per-batch bpb 做算术平均，这是数学错误的
             #   正确做法是在 on_validation_epoch_end 中从累积 nats/bytes 重新计算
-            if key in ('bpb_nats', 'bpb_bytes'):
+            if key in ('bpb_nats', 'bpb_bytes', 'bpb_tokens'):
                 continue
-            if key == 'bpb' and phase != 'train':
+            if key in ('bpb', 'bpb_nats_per_token', 'bpb_bytes_per_token') and phase != 'train':
                 continue
             if key == 'loss' and phase == 'valid':
                 continue
@@ -2377,7 +2835,7 @@ class ModelTrainer(LightningModule):
             if phase == "train":
                 # 训练阶段：on_step=True, on_epoch=False
                 # 每个 train step 独立上报，不跨 step 累积。
-                self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True,
+                self.log_dict(scalar_metrics, sync_dist=self._metric_sync_dist(), prog_bar=True,
                               on_step=True, on_epoch=False)
             else:
                 # 验证/测试阶段：on_step=False, on_epoch=True
@@ -2386,7 +2844,7 @@ class ModelTrainer(LightningModule):
                 # 不会跨多次 val_check_interval 累积（不存在"280次val被平均"的问题）。
                 # ModelCheckpoint 在 on_validation_end 查询 epoch-level 指标，
                 # 必须用 on_epoch=True 才能让 valid_loss 出现在 returned metrics 里。
-                self.log_dict(scalar_metrics, sync_dist=True, prog_bar=True,
+                self.log_dict(scalar_metrics, sync_dist=self._metric_sync_dist(), prog_bar=True,
                               on_step=False, on_epoch=True)
 
         # === 增强的调试日志 (仅 train 阶段) ===
@@ -2437,17 +2895,8 @@ class ModelTrainer(LightningModule):
             self.log("step", float(current_step), prog_bar=True, on_step=True, on_epoch=False)
             self.log("progress_pct", progress_pct, prog_bar=False, on_step=True, on_epoch=False)
 
-            # GPU 内存使用 (如果可用)
-            if torch.cuda.is_available():
-                gpu_mem_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-                gpu_mem_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
-                self.log("gpu_mem_allocated_gb", gpu_mem_allocated, prog_bar=False,
-                         on_step=True, on_epoch=False)
-                self.log("gpu_mem_reserved_gb", gpu_mem_reserved, prog_bar=False,
-                         on_step=True, on_epoch=False)
-
             # === 丰富训练日志 (仅 rank 0 打印, 避免 DDP 重复) ===
-            if self.trainer.is_global_zero:
+            if self._is_global_rank_zero():
                 # --- 时间统计 ---
                 dt_ms = (getattr(self, '_last_dt', None) or 0.0) * 1000.0
                 wall_elapsed = 0.0
@@ -2508,6 +2957,7 @@ class ModelTrainer(LightningModule):
                     loss_val = loss_val.item()
 
                 # --- 最新 valid 指标 ---
+                import math as _math
                 last_valid = getattr(self, '_last_valid_metrics', {})
                 callback_metrics = getattr(self.trainer, 'callback_metrics', {})
 
@@ -2524,7 +2974,8 @@ class ModelTrainer(LightningModule):
                     callback_metrics.get('valid_loss') if callback_metrics is not None else None
                 )
                 if valid_loss_val is None:
-                    valid_loss_val = last_valid.get('loss', None)
+                    valid_loss_val = last_valid.get('objective_loss', last_valid.get('loss', None))
+                valid_final_ce_val = last_valid.get('final_step_ce', last_valid.get('final_step_loss', None))
                 valid_bpb_val = last_valid.get('bpb', None)
                 valid_ppl_val = _metric_to_float(
                     callback_metrics.get('valid_perplexity') if callback_metrics is not None else None
@@ -2533,11 +2984,15 @@ class ModelTrainer(LightningModule):
                     valid_ppl_val = last_valid.get('perplexity', None)
                 valid_str = ""
                 if valid_loss_val is not None:
-                    valid_str += f" | valid_loss: {valid_loss_val:.4f}"
+                    valid_str += f" | valid_objective: {valid_loss_val:.4f}"
+                if valid_final_ce_val is not None:
+                    valid_str += f" | valid_final_ce: {valid_final_ce_val:.4f}"
                 if valid_bpb_val is not None:
                     valid_str += f" | valid_bpb: {valid_bpb_val:.4f}"
-                if valid_ppl_val is not None:
+                if valid_ppl_val is not None and _math.isfinite(valid_ppl_val):
                     valid_str += f" | valid_ppl: {valid_ppl_val:.2f}"
+                elif valid_ppl_val is not None:
+                    valid_str += " | valid_ppl: overflow"
                 # 方案A: 当存在拆分来源时, 额外展示 sudoku / sft 各自指标
                 for src in ('sudoku', 'sft'):
                     sub_loss = last_valid.get(f'loss_{src}', None)
@@ -2551,11 +3006,31 @@ class ModelTrainer(LightningModule):
                         valid_str += f" | {src}_ppl: {sub_ppl:.2f}"
 
                 # --- 打印 ---
-                # alpha_val_str = ""
-                # if self.hparams.mcmc_step_size_learnable:
-                #     alpha_val = self.model.alpha.detach()
-                #     alpha_grad_str = f" grad={self.model.alpha.grad.item():.6f}" if self.model.alpha.grad is not None else " grad=None"
-                #     alpha_val_str = f" | alpha: {alpha_val.item():.6f} ({alpha_val.dtype}){alpha_grad_str}"
+                memory_metrics = getattr(self, '_last_cuda_memory_metrics', {})
+                mem_str = ""
+                if memory_metrics:
+                    mem_str = (
+                        " | mem: "
+                        f"{memory_metrics.get('memory/allocated_max_gb', 0.0):.2f}/"
+                        f"{memory_metrics.get('memory/reserved_max_gb', 0.0):.2f}/"
+                        f"{memory_metrics.get('memory/peak_allocated_max_gb', 0.0):.2f}GB"
+                    )
+
+                alpha_val_str = ""
+                if self.hparams.mcmc_step_size_learnable:
+                    alpha_obj = self.model.alpha
+                    if isinstance(alpha_obj, nn.ParameterList):
+                        alpha_parts = []
+                        for idx, alpha_param in enumerate(list(alpha_obj)[:3]):
+                            grad = alpha_param.grad
+                            grad_str = f"{grad.detach().float().item():.6f}" if grad is not None else "None"
+                            alpha_parts.append(f"{idx}:{alpha_param.detach().float().item():.6f}/g={grad_str}")
+                        suffix = ",..." if len(alpha_obj) > 3 else ""
+                        alpha_val_str = f" | alpha: [{','.join(alpha_parts)}{suffix}]"
+                    else:
+                        alpha_val = alpha_obj.detach()
+                        alpha_grad_str = f" grad={alpha_obj.grad.item():.6f}" if alpha_obj.grad is not None else " grad=None"
+                        alpha_val_str = f" | alpha: {alpha_val.item():.6f} ({alpha_val.dtype}){alpha_grad_str}"
                 print(
                     f"step {current_step:05d}/{max_steps} ({progress_pct:.2f}%) | "
                     f"loss: {loss_val:.6f}"
@@ -2566,7 +3041,8 @@ class ModelTrainer(LightningModule):
                     f"mfu: {mfu:.2f} | "
                     f"epoch: {epoch} | "
                     f"total time: {total_min:.2f}m"
-                    f"{eta_str}",
-                    # f"{alpha_val_str}",
+                    f"{mem_str}"
+                    f"{eta_str}"
+                    f"{alpha_val_str}",
                     flush=True,
                 )

@@ -89,6 +89,11 @@ class SudokuMixedIterableDataset(_IterableDataset):
             if isinstance(resume_state_dict, dict)
             else None
         )
+        self.last_batch_meta = (
+            copy.deepcopy(resume_state_dict.get("last_batch_meta"))
+            if isinstance(resume_state_dict, dict)
+            else {}
+        ) or {}
 
         # 预估两侧 iterator 的 max_iter 上界。因为按概率采样，每侧实际用量 ≈ max_iter * ratio。
         # 给 1.5 倍缓冲避免 StopIteration（底层 iterator 对 train split 是循环的）
@@ -142,6 +147,7 @@ class SudokuMixedIterableDataset(_IterableDataset):
             "sudoku_ratio": self.sudoku_ratio,
             "mix_rng_state": mix_rng_state,
             "last_batch_source": self.last_batch_source,
+            "last_batch_meta": copy.deepcopy(self.last_batch_meta),
             "sudoku_state": self.sudoku_ds.state_dict(),
             "sft_state": self.sft_ds.state_dict(),
         }
@@ -169,6 +175,7 @@ class SudokuMixedIterableDataset(_IterableDataset):
             self._mix_rng_state = copy.deepcopy(state_dict.get("mix_rng_state"))
             self._mix_rng = None
             self.last_batch_source = state_dict.get("last_batch_source")
+            self.last_batch_meta = copy.deepcopy(state_dict.get("last_batch_meta") or {})
             if "sudoku_state" in state_dict:
                 self.sudoku_ds.load_state_dict(state_dict["sudoku_state"])
             if "sft_state" in state_dict:
@@ -224,6 +231,10 @@ class SudokuMixedIterableDataset(_IterableDataset):
 
             self.it += 1
             self.last_batch_source = chosen
+            if chosen == 'sudoku':
+                self.last_batch_meta = dict(getattr(self.sudoku_ds, 'last_batch_meta', {}) or {})
+            else:
+                self.last_batch_meta = {}
             self.last_state_dict = self._build_state_dict()
             yield batch
 
