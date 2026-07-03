@@ -925,3 +925,14 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL local-log1 | `Running`，heartbeat 到 step 30 `generate_start` | `rl_events.jsonl` 到 step 29，共 30 条事件。last10 平均 reward `1.2624`、blank_accuracy `0.2521`、constraint_validity `0.1353`、full_solve `0`，`LOCAL_ZERO=1/10`，max `ref_energy_kl=6.24e-4`。step 27/28 恢复有效更新，reward_mean `1.4946`/`1.3400`；step 29 reward_mean `1.1453`，KL `6.24e-4`。 | reward 未连续崩塌，但 KL 已接近 `1e-3` 关注线。已检查可调手柄：`BETA`、`MUON_LR`、`LEARNING_RATE`、`max_grad_per_param`；若下一轮 KL 越过 `1e-3` 或 reward 继续掉到 clue-only，将优先重启 Sudoku 为更强 anchor 或更低 Muon LR。当前先不重启。 |
 | GSM8K RL | `Running`，heartbeat 到 step 266 `training_step_start` | 控制面正常。 | 健康运行，继续保留。 |
+
+### 2026-07-03 08:11 +0800
+
+第五十七轮异常分析与修复：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL local-log1 | 准备停止并重启为 explore-anchor 版本 | `rl_events.jsonl` 到 step 33，共 34 条事件。last10 平均 reward `1.1592`、blank_accuracy `0.2813`、constraint_validity `0.1338`、full_solve `0.0600`，`LOCAL_ZERO=4/10`；last5 `LOCAL_ZERO=3/5`。step 30/32 为低质 zero，step 33 为高分重复 zero：reward_mean `3.0`、blank_accuracy `1.0`、full_solve `0.6`、std `0`。max `ref_energy_kl=6.24e-4`，尚未越过 `1e-3`。 | 根因判断：checkpoint/数据/skip consensus 已正常，新的瓶颈是采样多样性不足导致 repeated completions 与 reward_std=0，GRPO 没有优势信号，表现为 rollout collapse。修复：Sudoku 默认 `temperature/top_p` 从 `0.60/0.75` 调为 `0.70/0.85`；同时 `BETA` 从 `1.0` 调为 `2.0`、`MUON_LR` 从 `1e-5` 调为 `5e-6`，用更强 anchor 和更小 Muon 步长抵消更高探索带来的 KL 风险。 |
+| GSM8K RL | `Running`，不重启 | heartbeat 到 step 271 `training_step_start`，控制面正常。 | 本轮修复只针对 Sudoku rollout collapse，GSM8K 继续运行。 |
+
+验证：`bash -n openebm/elm/runs/run_ebt_sudoku_rl.sh`、`bash -n openebm/elm/runs/rjob/run_sudoku_rl_optimized_rjob.sh`、`git diff --check` 均通过。

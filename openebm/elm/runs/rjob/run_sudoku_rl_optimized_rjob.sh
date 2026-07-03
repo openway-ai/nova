@@ -41,8 +41,11 @@ NUM_GPUS="${NUM_GPUS:-8}"
 NUM_GENERATIONS="${NUM_GENERATIONS:-12}"
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-210}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-192}"
-TEMPERATURE="${TEMPERATURE:-0.60}"
-TOP_P="${TOP_P:-0.75}"
+# 2026-07-03 local-log1 reached healthy reward but then hit frequent
+# LOCAL_ZERO from repeated completions around steps 30-33. Use slightly higher
+# exploration, paired with stronger anchoring and a smaller Muon update below.
+TEMPERATURE="${TEMPERATURE:-0.70}"
+TOP_P="${TOP_P:-0.85}"
 GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-6}"
 RL_LOSS_TYPE="${RL_LOSS_TYPE:-energy_gspo}"
 MAX_STEPS="${MAX_STEPS:-1000}"
@@ -53,8 +56,8 @@ SAVE_TOP_K="${SAVE_TOP_K:-2}"
 # usable blank/validity reward and format/clue-only batches with high pre-clip
 # grad_norm at steps 50/55/60/65/75.
 LEARNING_RATE="${LEARNING_RATE:-1e-7}"
-MUON_LR="${MUON_LR:-1e-5}"
-BETA="${BETA:-1.0}"
+MUON_LR="${MUON_LR:-5e-6}"
+BETA="${BETA:-2.0}"
 GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-0.5}"
 MAX_GRAD_PER_PARAM="${MAX_GRAD_PER_PARAM:-0.005}"
 ENERGY_KL_MODE="${ENERGY_KL_MODE:-symmetric_huber}"
