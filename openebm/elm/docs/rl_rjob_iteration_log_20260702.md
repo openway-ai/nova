@@ -916,3 +916,12 @@ Sudoku local-skip 修复版重启：
 | --- | --- | --- | --- |
 | Sudoku RL local-log1 | `Running`，heartbeat 到 step 27 `generate_start` | `rl_events.jsonl` 到 step 26，共 27 条事件。last10 平均 reward `1.2478`、blank_accuracy `0.2347`、constraint_validity `0.1433`、full_solve `0`，`LOCAL_ZERO=1/10`，max `ref_energy_kl=2.01e-4`。step 25 为低质 local-zero：reward_mean `0`、std `0`、skip_rank_count `3/8`；step 26 恢复有效更新：reward_mean `1.2294`、blank_accuracy `0.1638`、constraint_validity `0.0996`。 | 本轮 reward 均值受 step 25 单次坏 rollout 拉低，但不是连续退化；KL 峰值未继续上升，仍低于关注线。继续运行，不重启；下一轮看 last10 是否恢复到 `1.3+`。 |
 | GSM8K RL | `Running`，heartbeat 到 step 260 `skip_consensus_start` | local_skip `0`，unique_ratio `1.0`；控制面正常。 | 健康运行，继续保留。 |
+
+### 2026-07-03 08:00 +0800
+
+第五十六轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL local-log1 | `Running`，heartbeat 到 step 30 `generate_start` | `rl_events.jsonl` 到 step 29，共 30 条事件。last10 平均 reward `1.2624`、blank_accuracy `0.2521`、constraint_validity `0.1353`、full_solve `0`，`LOCAL_ZERO=1/10`，max `ref_energy_kl=6.24e-4`。step 27/28 恢复有效更新，reward_mean `1.4946`/`1.3400`；step 29 reward_mean `1.1453`，KL `6.24e-4`。 | reward 未连续崩塌，但 KL 已接近 `1e-3` 关注线。已检查可调手柄：`BETA`、`MUON_LR`、`LEARNING_RATE`、`max_grad_per_param`；若下一轮 KL 越过 `1e-3` 或 reward 继续掉到 clue-only，将优先重启 Sudoku 为更强 anchor 或更低 Muon LR。当前先不重启。 |
+| GSM8K RL | `Running`，heartbeat 到 step 266 `training_step_start` | 控制面正常。 | 健康运行，继续保留。 |
