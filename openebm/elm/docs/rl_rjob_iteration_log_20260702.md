@@ -1198,3 +1198,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | 控制面 `Running`，job `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca`；heartbeat 到 step 391 `training_step_start` | step 385：reward_mean `0.1784`、reward_std `0.1162`、parse_rate `0.875`、ref_energy_kl `0.0237`、grad_norm `0.6911`、nan_grad_params `0`。 | GSM8K 正常推进，不重启。 |
 
 本轮动作：仅记录恢复趋势，无代码改动、无 rjob 重启。下一轮继续观察 Sudoku step 37/38 是否维持低 local-zero。
+
+### 2026-07-03 13:28 +0800
+
+第八十二轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL diverse-slow | 控制面 `Running`，job `d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-10-e5d45`；heartbeat 到 step 40 `generate_start` | `rl_events.jsonl` 到 step 39，共 40 条事件。last5 平均 reward `1.0916`、reward_std `0.3138`、full_solve `0.0075`，`LOCAL_ZERO=1/5`。last10 平均 reward `1.1800`、reward_std `0.3076`、full_solve `0.0675`，`LOCAL_ZERO=3/10`，max `ref_energy_kl=1.91e-4`。step 38 为 local-zero，skip_rank_count `2/8`；step 39 立即恢复，reward_mean `1.6496`、std `0.6249`、full_solve `0.0375`。 | 再次触及 `LOCAL_ZERO=3/10`，但仍是间歇式局部退化而非连续 collapse。由于 step 39 已恢复且 KL 低，暂不重启；下一轮若连续 local-zero 或 last10 跌破 `1.0` 再升级处理。 |
+| GSM8K RL | 控制面 `Running`，job `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca`；heartbeat 到 step 396 `training_step_start` | step 390 reward_mean `0.0728`、reward_std `0.0703`、parse_rate `0.75`；step 395 reward_mean `0.1576`、reward_std `0.1224`，未见 NaN。 | GSM8K 有低分波动但仍有 reward 方差并已回升，不重启。 |
+
+本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮继续关注 Sudoku local-zero 是否连续化。
