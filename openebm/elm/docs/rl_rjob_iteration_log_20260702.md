@@ -936,3 +936,10 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，不重启 | heartbeat 到 step 271 `training_step_start`，控制面正常。 | 本轮修复只针对 Sudoku rollout collapse，GSM8K 继续运行。 |
 
 验证：`bash -n openebm/elm/runs/run_ebt_sudoku_rl.sh`、`bash -n openebm/elm/runs/rjob/run_sudoku_rl_optimized_rjob.sh`、`git diff --check` 均通过。
+
+重启动作：
+
+- 修复 commit：`78464ec4158c3880acfcee8ee4eedb1450de7a50`，已推送到远端 `dev-openebm-sudoku-rl-fsdp2-merge`。
+- 已停止旧 Sudoku rjob：`d26-ctx2048-sudoku-rl-fsdp2-merge-local-log1-fb84f`，08:13 控制面状态 `Stopped`。
+- 已提交新 Sudoku explore-anchor rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-explore-08-102ee`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-explore-anchor-20260703-0813`，08:14 控制面状态 `Running`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-explore-anchor-20260703-0813/`。
+- GSM8K rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` 保持 `Running`。
