@@ -1253,3 +1253,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | 控制面 `Running`，job `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca`；heartbeat 到 step 409 `training_step_start` | 最新完整指标仍为 step 400：reward_mean `0.2065`、reward_std `0.0918`、parse_rate `1.0`、ref_energy_kl `0.0137`、loss `0.00547`；未见新 Traceback 或 NaN/Inf。 | GSM8K 继续推进，暂无异常，不重启。 |
 
 本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮重点看 Sudoku last5 是否从 `0.9851` 回升，以及 KL 是否继续维持低量级。
+
+### 2026-07-03 14:28 +0800
+
+第八十七轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL diverse-slow | 控制面 `Running`，job `d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-10-e5d45`；heartbeat 到 step 52 `generate_start` | `rl_events.jsonl` 到 step 51，共 52 条事件。last5 平均 reward `1.3189`、reward_std `0.3877`、format `0.5000`、blank_accuracy `0.2368`、constraint_validity `0.1106`、full_solve `0.0150`，`LOCAL_ZERO=0/5`。last10 平均 reward `1.1789`、reward_std `0.3880`、full_solve `0.0225`，`LOCAL_ZERO=1/10`，max `ref_energy_kl=0.00191`。step 51 reward_mean `2.0811`、blank_accuracy `0.7274`、constraint_validity `0.3181`、full_solve `0.0375`。 | last5 从 14:16 的 `0.9851` 明显恢复，最近 5 步没有 local-zero；KL 仍低。继续当前 rjob，不重启。 |
+| GSM8K RL | 控制面 `Running`，job `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca`；heartbeat 到 step 414 `training_step_start` | step 405：reward_mean `0.1376`、reward_std `0.1322`、parse_rate `1.0`、ref_energy_kl `0.0245`；step 410：reward_mean `0.2517`、reward_std `0.0807`、ref_energy_kl `0.0374`，未见 NaN/Inf。 | GSM8K 正常波动并在 step 410 回升，不重启。 |
+
+本轮动作：仅记录恢复趋势，无代码改动、无 rjob 重启。下一轮继续关注 Sudoku 是否保持 `LOCAL_ZERO=0/5` 附近，以及 GSM8K step 410 backward 是否正常完成。
