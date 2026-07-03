@@ -1176,3 +1176,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | 控制面 `Running`，job `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca`；heartbeat 到 step 380 `training_step_start` | step 370：reward_mean `0.1641`、reward_std `0.0995`、parse_rate `1.0`、ref_energy_kl `0.0323`、grad_norm `0.4916`、nan_grad_params `0`。 | GSM8K 仍健康推进，reward 低位波动但未塌缩，不重启。 |
 
 本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮重点看 Sudoku step 32/33 是否再次 local-zero，以及 reward_std 是否保持非零。
+
+### 2026-07-03 13:04 +0800
+
+第八十轮监控与异常分析：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL diverse-slow | 控制面 `Running`，job `d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-10-e5d45`；heartbeat 到 step 35 `generate_start` | `rl_events.jsonl` 到 step 34，共 35 条事件。last5 平均 reward `1.2683`、reward_std `0.3013`、full_solve `0.1275`，`LOCAL_ZERO=2/5`。last10 平均 reward `1.1647`、reward_std `0.3430`、full_solve `0.0675`，`LOCAL_ZERO=3/10`，max `ref_energy_kl=1.91e-4`。step 32 为 local-zero，skip_rank_count `1/8`；step 33/34 随即恢复，reward_mean `2.8731`/`1.7477`，full_solve `0.5625`/`0.0750`。 | 触发 `LOCAL_ZERO>=3/10` 的分析条件，但不是连续 collapse。local-zero 的 skip reasons 均为 `degenerate_group_rate,low_reward_std,low_reward_mean,low_reward_format`，且只影响部分 rank。`loss=0` 但 rank0 `grad_norm>0` 是 DDP local 模式下健康 rank 梯度 all-reduce 后的同步更新，不是 stale grad 或 checkpoint 加载问题。暂不重启。 |
+| GSM8K RL | 控制面 `Running`，job `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca`；heartbeat 到 step 385 `training_step_start` | step 375 reward_mean `0.2131`、reward_std `0.0731`；step 380 reward_mean `0.1420`、reward_std `0.1188`；parse/format 信号仍非零，grad_norm step 375 `0.3855`，nan_grad_params `0`。 | GSM8K 仍健康推进，不重启。 |
+
+本轮动作：只做异常分析与记录，无代码改动、无 rjob 重启。后续若 Sudoku 变成连续 local-zero 或 last10 reward 跌破 `1.0` 且无法恢复，再考虑切回全局 `skip_consensus=any` 或调整采样/数据，而不是现在打断已有高质量 step 33/34 的训练信号。
