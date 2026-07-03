@@ -939,13 +939,6 @@ Sudoku local-skip 修复版重启：
 
 重启动作：
 
-- 修复 commit：`84b6961a234b3067ce9f72424023cacc07eddd1d`，已推送到远端 `dev-openebm-sudoku-rl-fsdp2-merge`。
-- 已停止旧 Sudoku explore-anchor rjob：`d26-ctx2048-sudoku-rl-fsdp2-merge-explore-08-102ee`，10:16 控制面状态 `Stopped`。
-- 已提交新 Sudoku diverse-slow rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-10-e5d45`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-slow-20260703-1017`，10:17 控制面状态 `Starting`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-slow-20260703-1017/`。
-- GSM8K rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` 保持 `Running`。
-
-重启动作：
-
 - 修复 commit：`78464ec4158c3880acfcee8ee4eedb1450de7a50`，已推送到远端 `dev-openebm-sudoku-rl-fsdp2-merge`。
 - 已停止旧 Sudoku rjob：`d26-ctx2048-sudoku-rl-fsdp2-merge-local-log1-fb84f`，08:13 控制面状态 `Stopped`。
 - 已提交新 Sudoku explore-anchor rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-explore-08-102ee`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-explore-anchor-20260703-0813`，08:14 控制面状态 `Running`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-explore-anchor-20260703-0813/`。
@@ -1033,3 +1026,21 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，不重启 | 控制面正常。 | 本轮修复只针对 Sudoku rollout collapse，GSM8K 继续运行。 |
 
 验证：`bash -n openebm/elm/runs/run_ebt_sudoku_rl.sh`、`bash -n openebm/elm/runs/rjob/run_sudoku_rl_optimized_rjob.sh`、`git diff --check` 均通过。
+
+重启动作：
+
+- 修复 commit：`84b6961a234b3067ce9f72424023cacc07eddd1d`，已推送到远端 `dev-openebm-sudoku-rl-fsdp2-merge`。
+- 已停止旧 Sudoku explore-anchor rjob：`d26-ctx2048-sudoku-rl-fsdp2-merge-explore-08-102ee`，10:16 控制面状态 `Stopped`。
+- 已提交新 Sudoku diverse-slow rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-10-e5d45`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-slow-20260703-1017`，10:17 控制面状态 `Starting`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-slow-20260703-1017/`。
+- GSM8K rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` 保持 `Running`。
+
+### 2026-07-03 10:40 +0800
+
+第六十七轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL diverse-slow | `Running`，rjob `d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-10-e5d45`，heartbeat 到 step 4 `generate_start` | `rl_events.jsonl` 到 step 3，共 4 条事件。平均 reward `0.9279`、reward_std `0.3294`、blank_accuracy `0.1387`、constraint_validity `0.0730`、full_solve `0.0094`，`LOCAL_ZERO=1/4`，max `ref_energy_kl=5.64e-9`。step 1 为低质 local-zero：reward `0`、std `0`、skip_rank_count `5/8`；step 2/3 已恢复有效更新，reward_mean `1.1073`/`1.0028`，unique_completion_ratio `1.0`/`0.9375`。 | 当前不是 checkpoint 加载或 TF-head 解码问题，step 1 更像单次坏 rollout 批次。diverse-slow 已在后续 step 恢复非零 reward 与组内方差信号，KL 近 0；暂不重启，继续观察到 step 10/20。 |
+| GSM8K RL | `Running`，rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca`，heartbeat 到 step 329 `training_step_start` | 最近明确指标 step 320：reward_mean `0.3875`、reward_std `0.2567`、range `[0.175, 1.000]`、parse_rate `1.0`、answer_acc `0.125`、ref_energy_kl `0.0523`、grad/NaN 未见异常。 | GSM8K 训练健康推进，不重启。 |
+
+本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮继续重点观察 Sudoku `LOCAL_ZERO` 是否在最近 10 步内回升到 `4/10` 以上，以及 reward/blank/validity 是否持续下行。
