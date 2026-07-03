@@ -1121,3 +1121,14 @@ Sudoku local-skip 修复版重启：
 | GSM8K RL | `Running`，heartbeat 到 step 357 `training_step_start` | step 345/350/355 reward_mean `0.2092`/`0.1445`/`0.1248`，reward_std `0.1515`/`0.0842`/`0.1293`，parse_rate `1.0`/`0.875`/`0.750`，grad_norm step 350 `0.3739`，未见 NaN。 | GSM8K reward 有下行波动但仍有方差信号与正常梯度；暂不重启，继续监控。 |
 
 本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮继续观察 Sudoku step 30 前后是否维持低 local-zero，并关注 GSM8K reward 下行是否持续。
+
+### 2026-07-03 12:14 +0800
+
+第七十五轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL diverse-slow | `Running`，heartbeat 到 step 24 `skip_consensus_start`，local_skip `0`、unique_ratio `1.0` | `rl_events.jsonl` 到 step 23，共 24 条事件。last5 平均 reward `1.3242`、reward_std `0.4393`、blank_accuracy `0.2269`、constraint_validity `0.1210`、full_solve `0.0225`，`LOCAL_ZERO=0/5`，max `ref_energy_kl=6.77e-5`。last10 平均 reward `1.4183`、full_solve `0.0262`，`LOCAL_ZERO=0/10`；last20 `LOCAL_ZERO=1/20`。step 22/23 均为有效更新。 | Sudoku 仍稳定：最近 10 step 无 local-zero，rollout collapse 暂未复现。reward 稳定但 full_solve 仍低，尚不能判定收敛；继续观察 step 30。 |
+| GSM8K RL | `Running`，heartbeat 到 step 362 `training_step_start` | step 345/350/355 reward_mean `0.2092`/`0.1445`/`0.1248`，reward_std `0.1515`/`0.0842`/`0.1293`，parse_rate `1.0`/`0.875`/`0.750`，未见 NaN。 | GSM8K reward 近期下行但仍有方差信号和正常梯度；暂不重启，下一轮继续观察是否持续退化。 |
+
+本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。
