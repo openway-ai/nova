@@ -939,6 +939,13 @@ Sudoku local-skip 修复版重启：
 
 重启动作：
 
+- 修复 commit：`84b6961a234b3067ce9f72424023cacc07eddd1d`，已推送到远端 `dev-openebm-sudoku-rl-fsdp2-merge`。
+- 已停止旧 Sudoku explore-anchor rjob：`d26-ctx2048-sudoku-rl-fsdp2-merge-explore-08-102ee`，10:16 控制面状态 `Stopped`。
+- 已提交新 Sudoku diverse-slow rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-10-e5d45`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-slow-20260703-1017`，10:17 控制面状态 `Starting`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-diverse-slow-20260703-1017/`。
+- GSM8K rjob `d26-ctx2048-gsm8k-rl-fsdp2-merge-20260702-20-b18ca` 保持 `Running`。
+
+重启动作：
+
 - 修复 commit：`78464ec4158c3880acfcee8ee4eedb1450de7a50`，已推送到远端 `dev-openebm-sudoku-rl-fsdp2-merge`。
 - 已停止旧 Sudoku rjob：`d26-ctx2048-sudoku-rl-fsdp2-merge-local-log1-fb84f`，08:13 控制面状态 `Stopped`。
 - 已提交新 Sudoku explore-anchor rjob：metadata name `d26-ctx2048-sudoku-rl-fsdp2-merge-explore-08-102ee`，showname/EXP_ID `d26-ctx2048-sudoku-rl-fsdp2-merge-explore-anchor-20260703-0813`，08:14 控制面状态 `Running`，预计输出目录 `/mnt/shared-storage-user/puyuan/code/OpenEBM/logs/ebt_runs/d26-ctx2048-sudoku-rl-fsdp2-merge-explore-anchor-20260703-0813/`。
