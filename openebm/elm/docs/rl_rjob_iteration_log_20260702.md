@@ -1078,6 +1078,17 @@ Sudoku local-skip 修复版重启：
 
 本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。
 
+### 2026-07-03 12:25 +0800
+
+第七十六轮监控：
+
+| 任务 | 状态 | 指标快照 | 判断 |
+| --- | --- | --- | --- |
+| Sudoku RL diverse-slow | `Running`，heartbeat 到 step 27 `generate_start` | `rl_events.jsonl` 到 step 26，共 27 条事件。last5 平均 reward `1.0608`、reward_std `0.4077`、blank_accuracy `0.1674`、constraint_validity `0.1119`、full_solve `0.0150`，`LOCAL_ZERO=1/5`，max `ref_energy_kl=5.22e-5`。last10 平均 reward `1.2365`、full_solve `0.0112`，`LOCAL_ZERO=1/10`。step 25 为单次低质 local-zero，skip_rank_count `3/8`；step 26 已恢复有效更新，reward_mean `1.3208`、std `0.4562`。 | 最近窗口较 step 20 附近回落，但仍不是连续 collapse；step 25 后能恢复有效更新。暂不重启，继续观察是否再次出现连续 local-zero。 |
+| GSM8K RL | `Running`，heartbeat 到 step 367 `training_step_start` | step 360 reward_mean `0.1336`、reward_std `0.0873`；step 365 reward_mean `0.2011`、reward_std `0.1151`，parse_rate `0.875`，未见 NaN。 | GSM8K reward 从低点回升，仍有方差信号与正常梯度；不重启。 |
+
+本轮动作：仅记录监控结果，无代码改动、无 rjob 重启。下一轮重点看 Sudoku last10 是否继续下行或 local-zero 是否连续化。
+
 ### 2026-07-03 11:28 +0800
 
 第七十一轮监控：
