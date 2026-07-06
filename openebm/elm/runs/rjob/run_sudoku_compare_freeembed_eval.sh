@@ -64,6 +64,9 @@ RJOB_PRIORITY="${RJOB_PRIORITY:-1}"
 RJOB_CHARGED_GROUP="${RJOB_CHARGED_GROUP:-narmodel_gpu}"
 RJOB_PRIVATE_MACHINE="${RJOB_PRIVATE_MACHINE:-group}"
 RJOB_IMAGE="${RJOB_IMAGE:-registry.h.pjlab.org.cn/ailab-rlinfra-rlinfra_gpu/easyr1:lightrft-20260119}"
+RJOB_FUSE_RESOURCE="${RJOB_FUSE_RESOURCE:-1}"
+RJOB_MLNX_SHARED="${RJOB_MLNX_SHARED:-${RJOB_GPU}}"
+RJOB_MELLANOX_RDMA="${RJOB_MELLANOX_RDMA:-1}"
 HF_PUBLIC_MOUNT="${HF_PUBLIC_MOUNT:-gpfs://gpfs2/gpfs2-shared-public:/mnt/shared-storage-gpfs2/gpfs2-shared-public}"
 
 if [[ "${INSIDE_RJOB:-0}" != "1" && "${SUBMIT_RJOB:-1}" == "1" ]]; then
@@ -108,9 +111,9 @@ if [[ "${INSIDE_RJOB:-0}" != "1" && "${SUBMIT_RJOB:-1}" == "1" ]]; then
     -e FFN_DIM_MULTIPLIER="${FFN_DIM_MULTIPLIER}" \
     -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}" \
     -e MPLCONFIGDIR="${MPLCONFIGDIR}" \
-    --custom-resources brainpp.cn/fuse=1 \
-    --custom-resources rdma/mlnx_shared=8 \
-    --custom-resources mellanox.com/mlnx_rdma=1 \
+    --custom-resources brainpp.cn/fuse="${RJOB_FUSE_RESOURCE}" \
+    --custom-resources rdma/mlnx_shared="${RJOB_MLNX_SHARED}" \
+    --custom-resources mellanox.com/mlnx_rdma="${RJOB_MELLANOX_RDMA}" \
     -- bash -exc "${RUN_SCRIPT}"
   exit 0
 fi
