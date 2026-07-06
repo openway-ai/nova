@@ -32,10 +32,14 @@ RUN_SCRIPT="${RUN_SCRIPT:-${SCRIPT_DIR}/run_sudoku_compare_freeembed_eval.sh}"
 CONDA_ENV_PATH="${CONDA_ENV_PATH:-/mnt/shared-storage-user/puyuan/conda_envs/nanochat}"
 PYTHON_BIN="${PYTHON_BIN:-${CONDA_ENV_PATH}/bin/python}"
 REPO_ROOT="${REPO_ROOT:-${OPENEBM_HOME_DEFAULT}}"
+SOURCE_REPO_ROOT="${SOURCE_REPO_ROOT:-${REPO_ROOT}}"
+COMPARE_BRANCH="${COMPARE_BRANCH:-dev-openebm-sudoku-compare}"
+COMPARE_COMMIT="${COMPARE_COMMIT:-$(git -C "${SOURCE_REPO_ROOT}" rev-parse "${COMPARE_BRANCH}")}"
 
 EBM_CKPT="${EBM_CKPT:-${REPO_ROOT}/logs/ebt_runs/d26-ctx2048-sudoku-sft-freeembed-direct-1node-8gpu-20260625-190601/sft_train/checkpoints/s=step=2999-d26-ctx2048-lr5e-05-bs1x32-muon_adamw-valid_loss=valid_loss=0.4366.ckpt}"
-RUN_PREFIX="${RUN_PREFIX:-sudoku-compare-freeembed-eval}"
+RUN_PREFIX="${RUN_PREFIX:-sudoku-compare-freeembed-eval-fix2}"
 RUN_ID="${RUN_ID:-${RUN_PREFIX}-$(date +%Y%m%d-%H%M%S)}"
+JOB_WORKTREE="${JOB_WORKTREE:-/tmp/openebm-sudoku-compare-${RUN_ID}}"
 
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/openebm/elm/runs/sudoku_compare}"
 DATA_DIR="${DATA_DIR:-${REPO_ROOT}/openebm/elm/data/sudoku_cache_v2}"
@@ -56,7 +60,7 @@ FFN_DIM_MULTIPLIER="${FFN_DIM_MULTIPLIER:-2.67}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.6}"
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib}"
 
-RJOB_NAME="${RJOB_NAME:-sudoku-compare-freeembed-eval}"
+RJOB_NAME="${RJOB_NAME:-sudoku-compare-freeembed-eval-fix2}"
 RJOB_GPU="${RJOB_GPU:-8}"
 RJOB_MEMORY="${RJOB_MEMORY:-1000000}"
 RJOB_CPU="${RJOB_CPU:-100}"
@@ -74,6 +78,24 @@ if [[ "${INSIDE_RJOB:-0}" != "1" && "${SUBMIT_RJOB:-1}" == "1" ]]; then
     echo "Run script not found: ${RUN_SCRIPT}" >&2
     exit 1
   fi
+  git -C "${SOURCE_REPO_ROOT}" cat-file -e "${COMPARE_COMMIT}^{commit}"
+
+  JOB_COMMAND='
+set -euo pipefail
+cd "${SOURCE_REPO_ROOT}"
+git cat-file -e "${COMPARE_COMMIT}^{commit}"
+if [[ -e "${JOB_WORKTREE}" ]]; then
+  echo "Job worktree already exists: ${JOB_WORKTREE}" >&2
+  exit 1
+fi
+git worktree add --detach "${JOB_WORKTREE}" "${COMPARE_COMMIT}"
+cd "${JOB_WORKTREE}"
+echo "[run_sudoku_compare_freeembed_eval] compare_branch=${COMPARE_BRANCH}"
+echo "[run_sudoku_compare_freeembed_eval] compare_commit=$(git rev-parse HEAD)"
+export REPO_ROOT="${JOB_WORKTREE}"
+export NOVA_HOME="${JOB_WORKTREE}"
+INSIDE_RJOB=1 SUBMIT_RJOB=0 bash openebm/elm/runs/rjob/run_sudoku_compare_freeembed_eval.sh
+'
 
   rjob submit \
     --name="${RJOB_NAME}" \
@@ -87,9 +109,12 @@ if [[ "${INSIDE_RJOB:-0}" != "1" && "${SUBMIT_RJOB:-1}" == "1" ]]; then
     --mount=gpfs://gpfs1/puyuan:/mnt/shared-storage-user/puyuan \
     --mount=gpfs://gpfs1/luyudong:/mnt/shared-storage-user/luyudong \
     --mount="${HF_PUBLIC_MOUNT}" \
-    -e INSIDE_RJOB=1 \
     -e DISTRIBUTED_JOB=true \
+    -e SOURCE_REPO_ROOT="${SOURCE_REPO_ROOT}" \
     -e REPO_ROOT="${REPO_ROOT}" \
+    -e COMPARE_BRANCH="${COMPARE_BRANCH}" \
+    -e COMPARE_COMMIT="${COMPARE_COMMIT}" \
+    -e JOB_WORKTREE="${JOB_WORKTREE}" \
     -e CONDA_ENV_PATH="${CONDA_ENV_PATH}" \
     -e PYTHON_BIN="${PYTHON_BIN}" \
     -e EBM_CKPT="${EBM_CKPT}" \
@@ -114,7 +139,7 @@ if [[ "${INSIDE_RJOB:-0}" != "1" && "${SUBMIT_RJOB:-1}" == "1" ]]; then
     --custom-resources brainpp.cn/fuse="${RJOB_FUSE_RESOURCE}" \
     --custom-resources rdma/mlnx_shared="${RJOB_MLNX_SHARED}" \
     --custom-resources mellanox.com/mlnx_rdma="${RJOB_MELLANOX_RDMA}" \
-    -- bash -exc "${RUN_SCRIPT}"
+    -- bash -exc "${JOB_COMMAND}"
   exit 0
 fi
 
