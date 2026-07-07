@@ -163,6 +163,7 @@ export EXP_DIR="${EBT_RUNS_ROOT}/${EXP_ID}"
 STAGE_DIR="${EXP_DIR}/sft_train"
 export EXP_CKPT_DIR="${STAGE_DIR}/checkpoints"
 export EXP_WANDB_DIR="${STAGE_DIR}/logs"
+export EXP_LOG_FILE="${EXP_WANDB_DIR}/train.log"
 export EXP_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
 mkdir -p "${STAGE_DIR}/config" "${EXP_CKPT_DIR}" "${EXP_WANDB_DIR}"
@@ -170,7 +171,14 @@ cp "$0" "${STAGE_DIR}/config/run_script.sh" 2>/dev/null || true
 _exp_write_meta "${EXP_DIR}" "sft_train"
 _exp_git_info "${STAGE_DIR}/config/git_info.txt"
 
-LOG_FILE="${EXP_WANDB_DIR}/train_rank${NODE_RANK}.log"
+RANK_LOG_FILE="${EXP_WANDB_DIR}/train_rank${NODE_RANK}.log"
+if [[ "${NODE_RANK}" == "0" ]]; then
+    LOG_FILE="${EXP_LOG_FILE}"
+    EXTRA_LOG_FILE="${RANK_LOG_FILE}"
+else
+    LOG_FILE="${RANK_LOG_FILE}"
+    EXTRA_LOG_FILE=""
+fi
 export RUN_NAME="${EXP_ID}-rank${NODE_RANK}"
 
 if [[ "${NODE_RANK}" == "0" ]]; then
@@ -202,7 +210,7 @@ if [[ "${NODE_RANK}" == "0" ]]; then
         "save_top_k=${SAVE_TOP_K}"
 fi
 
-exec > >(awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush() }' | tee -a "${LOG_FILE}") 2>&1
+exp_start_train_log_tee "${LOG_FILE}" "${EXTRA_LOG_FILE}"
 
 ################################################################################
 # Preflight checks
@@ -233,6 +241,7 @@ echo "TORCHRUN_BIN:          ${TORCHRUN_BIN}"
 echo "EXP_DIR:               ${EXP_DIR}"
 echo "EXP_CKPT_DIR:          ${EXP_CKPT_DIR}"
 echo "LOG_FILE:              ${LOG_FILE}"
+[[ -n "${EXTRA_LOG_FILE}" ]] && echo "EXTRA_LOG_FILE:        ${EXTRA_LOG_FILE}"
 
 MISSING=()
 [[ ! -f "${SUDOKU_DATA_DIR_V2}/rrn_train.pt" ]] && MISSING+=("rrn_train.pt")
