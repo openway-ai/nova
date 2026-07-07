@@ -789,11 +789,16 @@ def load_splits(data_dir):
     return splits
 
 
-def _resolve_split_sizes(args, splits, wanted=None):
+def _resolve_split_ranges(args, splits, wanted=None):
     raw = {
         'train': args.num_samples_train if args.num_samples_train is not None else args.num_samples,
         'val':   args.num_samples_val   if args.num_samples_val   is not None else args.num_samples,
         'test':  args.num_samples_test  if args.num_samples_test  is not None else args.num_samples,
+    }
+    starts = {
+        'train': args.start_index_train if args.start_index_train is not None else args.start_index,
+        'val':   args.start_index_val   if args.start_index_val   is not None else args.start_index,
+        'test':  args.start_index_test  if args.start_index_test  is not None else args.start_index,
     }
     full_flags = {
         'train': args.full or args.full_train,
@@ -806,11 +811,22 @@ def _resolve_split_sizes(args, splits, wanted=None):
         if wanted_set is not None and name not in wanted_set:
             continue
         total = len(samples)
+        start = int(starts.get(name) or 0)
+        if start < 0:
+            raise ValueError(f'--start_index_{name} must be >= 0')
+        start = min(start, total)
         n = raw.get(name)
         if full_flags.get(name) or n is None or n < 0:
-            n = total
-        out[name] = min(n, total)
+            stop = total
+        else:
+            stop = min(total, start + max(0, int(n)))
+        out[name] = {'start': start, 'stop': stop, 'n': max(0, stop - start), 'total': total}
     return out
+
+
+def _resolve_split_sizes(args, splits, wanted=None):
+    ranges = _resolve_split_ranges(args, splits, wanted=wanted)
+    return {name: spec['n'] for name, spec in ranges.items()}
 
 
 def _find_free_port() -> int:
@@ -894,13 +910,23 @@ def _run_eval(args, rank: int, world_size: int):
         verbose=(rank == 0),
     )
 
-    split_n = _resolve_split_sizes(args, splits, wanted=usable)
+    split_ranges = _resolve_split_ranges(args, splits, wanted=usable)
+    split_n = {s: spec['n'] for s, spec in split_ranges.items()}
     if rank == 0:
         print(f"[eval_sudoku_samples] world_size={world_size} dtype={args.dtype} "
               f"max_tokens={args.max_tokens} splits={usable} sizes={split_n}")
+        print(
+            "[eval_sudoku_samples] index_ranges="
+            + str({s: [spec['start'], spec['stop']] for s, spec in split_ranges.items()})
+            + " tqdm shows rank-0 local shard, not the global sample count"
+        )
 
     # Flat work pool across splits for balanced rank workloads.
-    pool = [(s, i) for s in usable for i in range(split_n[s])]
+    pool = [
+        (s, i)
+        for s in usable
+        for i in range(split_ranges[s]['start'], split_ranges[s]['stop'])
+    ]
     my_pool = pool[rank::world_size]
 
     # Per-rank shard (structured mode) — streaming JSONL.
@@ -934,10 +960,15 @@ def _run_eval(args, rank: int, world_size: int):
     t_split_start = {s: time.time() for s in usable}
     t_split_end = {s: None for s in usable}
     seen_counts = {s: 0 for s in usable}
-    total_expected = {s: len(range(split_n[s])[rank::world_size]) for s in usable}
+    total_expected = {
+        s: len(range(split_ranges[s]['start'], split_ranges[s]['stop'])[rank::world_size])
+        for s in usable
+    }
 
     t_all_start = time.time()
     rolling_c, rolling_t = 0, 0
+    sample_error_logs = 0
+    max_sample_error_logs = 5
 
     for (split_name, i) in iterable:
         if getattr(args, 'resume', False) and i in done[split_name]:
@@ -957,6 +988,7 @@ def _run_eval(args, rank: int, world_size: int):
             )
         except Exception as e:
             # Record a failed sample but keep going.
+            tb = traceback.format_exc()
             res = {
                 'puzzle_text': '', 'solution_text': '', 'response': f'<error: {e}>',
                 'pred': None, 'correct': 0, 'total': 81,
@@ -968,9 +1000,14 @@ def _run_eval(args, rank: int, world_size: int):
                 'prompt_used': '',
                 'puzzle_format': 'grid', 'solution_format': 'unknown',
                 'elapsed_s': 0.0, 'tokens_generated': 0,
+                'error_type': type(e).__name__,
+                'error': str(e),
             }
             if rank == 0:
                 print(f"[eval_sudoku_samples] sample error split={split_name} idx={i}: {e}")
+                if sample_error_logs < max_sample_error_logs:
+                    print(f"[eval_sudoku_samples] sample traceback split={split_name} idx={i}:\n{tb}")
+                sample_error_logs += 1
 
         # Stream to per-rank shard.
         if structured:
@@ -994,6 +1031,9 @@ def _run_eval(args, rank: int, world_size: int):
                 'tokens_generated': res['tokens_generated'],
                 'response': res['response'], 'pred': res['pred'],
             }
+            if res.get('error') is not None:
+                obj['error_type'] = res.get('error_type')
+                obj['error'] = res.get('error')
             try:
                 shard_fps[split_name].write(json.dumps(obj, ensure_ascii=False) + '\n')
             except Exception as e:
@@ -1217,6 +1257,11 @@ def _build_parser():
     parser.add_argument('--num_samples_train', type=int, default=None)
     parser.add_argument('--num_samples_val', type=int, default=None)
     parser.add_argument('--num_samples_test', type=int, default=None)
+    parser.add_argument('--start_index', type=int, default=0,
+                        help='Default start index per split. Range semantics are [start, start + num_samples).')
+    parser.add_argument('--start_index_train', type=int, default=None)
+    parser.add_argument('--start_index_val', type=int, default=None)
+    parser.add_argument('--start_index_test', type=int, default=None)
     parser.add_argument('--full', action='store_true', help='Evaluate all samples in every requested split.')
     parser.add_argument('--full_train', action='store_true')
     parser.add_argument('--full_val', action='store_true')

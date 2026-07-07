@@ -1,19 +1,25 @@
 """
 磁盘空间感知的 Checkpoint 回调
-在保存 checkpoint 前检查磁盘空间，空间不足时强制清理旧 checkpoint
+在保存 checkpoint 前检查磁盘空间；base train 默认可清理旧 checkpoint，
+SFT 可通过 cleanup_on_low_space=False 禁止自动清理。
 """
 import os
 import shutil
 from pathlib import Path
-from lightning.pytorch.callbacks import ModelCheckpoint
+
+try:
+    from lightning.pytorch.callbacks import ModelCheckpoint
+except ImportError:
+    from pytorch_lightning.callbacks import ModelCheckpoint
 
 
 class DiskAwareCheckpoint(ModelCheckpoint):
     """带磁盘空间检测的 ModelCheckpoint"""
 
-    def __init__(self, *args, min_free_gb=50, **kwargs):
+    def __init__(self, *args, min_free_gb=10, cleanup_on_low_space=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.min_free_gb = min_free_gb
+        self.cleanup_on_low_space = cleanup_on_low_space
 
     def _check_disk_space(self):
         """检查磁盘剩余空间（GB）"""
@@ -50,8 +56,14 @@ class DiskAwareCheckpoint(ModelCheckpoint):
         free_gb = self._check_disk_space()
 
         if free_gb < self.min_free_gb:
-            print(f"[DiskAware] ⚠️  磁盘空间不足: {free_gb:.1f}GB < {self.min_free_gb}GB")
-            print(f"[DiskAware] 🧹 开始清理旧 checkpoint...")
+            message = (
+                f"[DiskAware] checkpoint 保存已停止: 剩余磁盘空间 "
+                f"{free_gb:.1f}GB < 保留阈值 {self.min_free_gb:.1f}GB，目录: {self.dirpath}。"
+            )
+            if not self.cleanup_on_low_space:
+                raise RuntimeError(f"{message} 为避免删除 best/top-k checkpoint，未自动清理旧模型。")
+
+            print(f"{message} cleanup_on_low_space=True，开始清理旧 checkpoint...")
             self._cleanup_old_checkpoints()
 
             # 再次检查

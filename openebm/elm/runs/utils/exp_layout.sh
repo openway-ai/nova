@@ -365,6 +365,60 @@ EOREF
 }
 
 # ---------------------------------------------------------------------------
+# exp_start_train_log_tee
+#
+# Redirect all subsequent stdout/stderr to a timestamped train log while still
+# streaming to the rjob/terminal console.
+#
+# 参数:
+#   $1 = primary log file, defaults to EXP_LOG_FILE
+#   $2 = optional secondary log file, useful for rank-specific logs
+#
+# Notes:
+#   - Call this once, after EXP_LOG_FILE/EXP_WANDB_DIR have been set and before
+#     preflight checks or torchrun.
+#   - For multi-node jobs, prefer rank0 -> train.log plus train_rank0.log, and
+#     nonzero node ranks -> train_rankN.log only.
+# ---------------------------------------------------------------------------
+exp_start_train_log_tee() {
+    local primary_log="${1:-${EXP_LOG_FILE:-}}"
+    local secondary_log="${2:-}"
+
+    if [ -z "$primary_log" ]; then
+        if [ -n "${EXP_WANDB_DIR:-}" ]; then
+            primary_log="${EXP_WANDB_DIR}/train.log"
+        else
+            echo "错误: exp_start_train_log_tee requires EXP_LOG_FILE or EXP_WANDB_DIR" >&2
+            return 1
+        fi
+    fi
+
+    mkdir -p "$(dirname "$primary_log")"
+    touch "$primary_log"
+    export EXP_LOG_FILE="$primary_log"
+
+    if [ -n "$secondary_log" ] && [ "$secondary_log" != "$primary_log" ]; then
+        mkdir -p "$(dirname "$secondary_log")"
+        touch "$secondary_log"
+    fi
+
+    if [ -n "${_EXP_TRAIN_LOG_TEE_STARTED:-}" ]; then
+        echo "  注意: stdout/stderr 已经重定向到日志，跳过重复 tee"
+        return 0
+    fi
+    export _EXP_TRAIN_LOG_TEE_STARTED=1
+
+    if [ -n "$secondary_log" ] && [ "$secondary_log" != "$primary_log" ]; then
+        exec > >(awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush() }' | tee -a "$primary_log" "$secondary_log") 2>&1
+        echo "  Train log:    ${primary_log}"
+        echo "  Rank log:     ${secondary_log}"
+    else
+        exec > >(awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush() }' | tee -a "$primary_log") 2>&1
+        echo "  Train log:    ${primary_log}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # exp_save_hparams
 #
 # 将关键超参数写入 hparams.json。

@@ -25,10 +25,13 @@ import numpy as np
 # 从 generate.py 导入核心逻辑，保证行为 100% 一致
 from openebm.elm.generate import call_model_forward_decode, _get_tokenizer, sample_top_p
 
-# 清除分布式训练环境变量
-for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT']:
-    if var in os.environ:
-        del os.environ[var]
+# Standalone interactive usage should not inherit stale distributed variables,
+# but importing this module inside torchrun/mp.spawn eval must not mutate the
+# caller's process-group environment.
+if __name__ == "__main__" and not int(os.environ.get("WORLD_SIZE", "0")):
+    for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT']:
+        if var in os.environ:
+            del os.environ[var]
 
 # 设置离线模式
 os.environ['NANOCHAT_OFFLINE_MODE'] = '1'
@@ -114,6 +117,27 @@ class EBTChatEngine:
 
         self._load_model(checkpoint_path, tokenizer_path)
 
+    @staticmethod
+    def _normalize_state_dict_key(key: str) -> str:
+        """Normalize Lightning/DDP/torch.compile checkpoint prefixes.
+
+        Some Sudoku SFT checkpoints were saved after compiling only the
+        transformer, producing keys like ``model.transformer._orig_mod.layers``.
+        A leading-only ``_orig_mod`` strip leaves those as unexpected keys and
+        drops the whole transformer under ``strict=False``.
+        """
+        if key.startswith('model.'):
+            key = key[len('model.'):]
+        while key.startswith('_orig_mod.'):
+            key = key[len('_orig_mod.'):]
+        key = key.replace('._orig_mod.', '.')
+        return key
+
+    @staticmethod
+    def _missing_trainable_keys(module: torch.nn.Module, missing_keys) -> list[str]:
+        trainable = {name for name, param in module.named_parameters() if param.requires_grad}
+        return [key for key in missing_keys if key in trainable]
+
     def _load_model(self, checkpoint_path: str, tokenizer_path: str):
         """加载模型和 tokenizer"""
         print_colored("正在加载模型...", Colors.YELLOW)
@@ -166,16 +190,12 @@ class EBTChatEngine:
         # 【修复点 5】: 彻底清洗 state_dict 键名，解决 torch.compile 带来的 _orig_mod 前缀问题
         state_dict = checkpoint.get('state_dict', checkpoint)
         new_state_dict = {}
+        renamed_keys = 0
         for k, v in state_dict.items():
-            new_key = k
-            # 1. 剥离 PyTorch Lightning 或 DDP 可能带来的 'model.' 前缀
-            if new_key.startswith('model.'):
-                new_key = new_key[6:]
-            # 2. 剥离 torch.compile 带来的 '_orig_mod.' 前缀
-            if new_key.startswith('_orig_mod.'):
-                new_key = new_key[10:]
-            
+            new_key = self._normalize_state_dict_key(k)
+            renamed_keys += int(new_key != k)
             new_state_dict[new_key] = v
+        print(f"  Normalized checkpoint keys: renamed={renamed_keys} total={len(new_state_dict)}")
 
         # 尝试加载权重，并强制要求严格匹配 (strict=True)，这样如果有遗漏能立刻发现
         try:
@@ -183,7 +203,20 @@ class EBTChatEngine:
             print_colored("  ✓ 权重加载成功 (strict=True，所有参数完美匹配)", Colors.GREEN)
         except Exception as e:
             print_colored(f"  ⚠ 严格加载失败，正在回退到 strict=False。详细错误:\n{e}", Colors.YELLOW)
-            self.model.load_state_dict(new_state_dict, strict=False)
+            incompatible = self.model.load_state_dict(new_state_dict, strict=False)
+            missing_trainable = self._missing_trainable_keys(self.model, incompatible.missing_keys)
+            if missing_trainable:
+                preview = ", ".join(missing_trainable[:16])
+                suffix = "" if len(missing_trainable) <= 16 else f", ... (+{len(missing_trainable) - 16} more)"
+                raise RuntimeError(
+                    "Checkpoint load is missing trainable model weights after key normalization: "
+                    f"{preview}{suffix}. Refusing to continue with a partially initialized model."
+                ) from e
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                print(
+                    "  strict=False compatibility load succeeded with "
+                    f"missing={len(incompatible.missing_keys)} unexpected={len(incompatible.unexpected_keys)}"
+                )
 
         self.model = self.model.to(device=self.device, dtype=self.dtype)
         self.model.eval()

@@ -222,6 +222,32 @@ class AdaptiveRatioCallback:
     def _phase_bucket_weights(self, step):
         return list(_v3_three_phase_value(step, _V3_DIFFICULTY_PHASES, default=[1, 1, 1]))
 
+    def _distributed_sft_loss(self, pl_module):
+        import torch.distributed as dist
+
+        device = getattr(pl_module, 'device', None)
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+        loss_tokens = torch.zeros((), device=device, dtype=torch.float32)
+        source_loss_buf = getattr(pl_module, '_val_source_loss_buf', {})
+        slot = source_loss_buf.get('sft') if isinstance(source_loss_buf, dict) else None
+        if isinstance(slot, dict) and 'sum' in slot and 'tokens' in slot:
+            loss_sum = slot['sum'].detach().to(device=device, dtype=torch.float32).clone()
+            loss_tokens = slot['tokens'].detach().to(device=device, dtype=torch.float32).clone()
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(loss_tokens, op=dist.ReduceOp.SUM)
+
+        if loss_tokens.item() <= 0:
+            return None
+        sft_loss = (loss_sum / loss_tokens).detach()
+        if not torch.isfinite(sft_loss):
+            return None
+        return float(sft_loss.item())
+
     # ── Lightning hooks ────────────────────────────────────────────────
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):  # type: ignore[override]
@@ -249,15 +275,16 @@ class AdaptiveRatioCallback:
                 sudoku_ds.bucket_weights = self._phase_bucket_weights(step)
         # 3. periodic log so the run.log shows the active schedule
         if step != self._last_logged_step and (step % 100 == 0):
-            try:
-                pl_module.log_metrics(
-                    {
-                        'sudoku_ratio_active': float(ds.sudoku_ratio),
-                    },
-                    'train',
+            if getattr(trainer, 'is_global_zero', True):
+                try:
+                    pl_module._cache_valid_metric('sudoku_ratio_active', float(ds.sudoku_ratio))
+                except Exception:
+                    pass
+                print(
+                    f"[AdaptiveRatioCallback] global_step={step} "
+                    f"sudoku_ratio_active={float(ds.sudoku_ratio):.2f}",
+                    flush=True,
                 )
-            except Exception:
-                pass
             self._last_logged_step = step
 
     def on_validation_epoch_end(self, trainer, pl_module):  # type: ignore[override]
@@ -266,23 +293,10 @@ class AdaptiveRatioCallback:
         ds = self._get_mixed_dataset(trainer)
         if ds is None:
             return
-        sft_loss = None
-        callback_metrics = getattr(trainer, 'callback_metrics', None)
-        if callback_metrics is not None:
-            try:
-                sft_loss = callback_metrics.get('valid_loss_sft')
-            except AttributeError:
-                pass
-        if sft_loss is None:
-            last_metrics = getattr(pl_module, '_last_valid_metrics', None)
-            if not last_metrics:
-                return
-            sft_loss = last_metrics.get('valid_loss_sft')
+        sft_loss = self._distributed_sft_loss(pl_module)
         if sft_loss is None:
             return
-        if isinstance(sft_loss, torch.Tensor):
-            sft_loss = sft_loss.detach().float().item()
-        delta = float(sft_loss) - _V3_SFT_BASELINE
+        delta = sft_loss - _V3_SFT_BASELINE
         before = float(ds.sudoku_ratio)
         if delta > _V3_SFT_TOLERANCE:
             new_r = max(_V3_RATIO_FLOOR, before - _V3_RATIO_STEP)
@@ -290,14 +304,23 @@ class AdaptiveRatioCallback:
             new_r = min(_V3_RATIO_CEIL, before + _V3_RATIO_STEP)
         else:
             new_r = before
+
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            device = getattr(pl_module, 'device', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+            new_r_tensor = torch.tensor(float(new_r), device=device, dtype=torch.float32)
+            dist.broadcast(new_r_tensor, src=0)
+            new_r = float(new_r_tensor.item())
+
         if abs(new_r - before) > 1e-6:
             ds.sudoku_ratio = float(new_r)
-            try:
-                pl_module.log_metrics({'sudoku_ratio_guard_adjusted': float(new_r)}, 'valid')
-            except Exception:
-                pass
-            print(f"[AdaptiveRatioCallback] valid_loss_sft={sft_loss:.4f} "
-                  f"(Δ={delta:+.4f}) → sudoku_ratio {before:.2f} → {new_r:.2f}")
+            if getattr(trainer, 'is_global_zero', True):
+                try:
+                    pl_module._cache_valid_metric('sudoku_ratio_guard_adjusted', float(new_r))
+                except Exception:
+                    pass
+                print(f"[AdaptiveRatioCallback] valid_loss_sft={sft_loss:.4f} "
+                      f"(Δ={delta:+.4f}) → sudoku_ratio {before:.2f} → {new_r:.2f}", flush=True)
 
 
 class ModelTrainer(LightningModule):
@@ -559,6 +582,45 @@ class ModelTrainer(LightningModule):
         def hook(grad):
             self.model.used_parameters.add(name)  # Adjusted to self.model.used_parameters
         return hook
+
+    def _model_connected_zero_loss(self, reference=None):
+        if isinstance(reference, torch.Tensor):
+            zero = reference.detach().new_zeros(())
+        else:
+            zero = torch.zeros((), device=self.device, dtype=torch.float32)
+
+        touched_any_param = False
+        for param in self.parameters():
+            if param.requires_grad and param.numel() > 0:
+                zero = zero + param.reshape(-1)[0] * 0.0
+                touched_any_param = True
+        if not touched_any_param:
+            zero = zero.requires_grad_()
+        return zero
+
+    def _distributed_any_flag(self, local_flag, device=None):
+        import torch.distributed as dist
+
+        if device is None:
+            device = self.device
+        flag = torch.tensor(1 if local_flag else 0, device=device, dtype=torch.int32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item())
+
+    def _nonfinite_exception(self, exc):
+        msg = str(exc).lower()
+        return any(token in msg for token in ("nan", "inf", "nonfinite", "non-finite"))
+
+    def _warn_nonfinite_train_batch(self, reason):
+        if self.trainer.is_global_zero:
+            count = getattr(self, '_nonfinite_train_batches', 0) + 1
+            self._nonfinite_train_batches = count
+            if count <= 5 or count % 50 == 0:
+                print(
+                    f"[NonFiniteGuard] skipped train batch at global_step={self.global_step}: {reason}",
+                    flush=True,
+                )
     
     @staticmethod
     def wandb_activation_hook(run, step):
@@ -586,21 +648,53 @@ class ModelTrainer(LightningModule):
         return hook
     
     def training_step(self, batch, batch_idx):
+        eval_step_dict = None
+        nonfinite_reason = None
         # Activation logging only when wandb_watch is on AND level is "all"
-        if not self.hparams.no_wandb and self.hparams.wandb_watch and getattr(self.hparams, 'wandb_watch_level', 'parameters') == 'all' and self.global_step % self.hparams.wandb_watch_log_freq == 0: # activation logging
-            hook_handles = []
-            hook_function = self.wandb_activation_hook(run=self.logger, step=self.global_step)
-            for module in self.model.modules():
-                if any(param.requires_grad for param in module.parameters(recurse=False)): # only do for unfrozen params that are training
-                    handle = module.register_forward_hook(hook_function)
-                    hook_handles.append(handle)
-            
-            eval_step_dict = self.eval_step(batch, "train")
-            for handle in hook_handles:
-                handle.remove()
+        try:
+            if not self.hparams.no_wandb and self.hparams.wandb_watch and getattr(self.hparams, 'wandb_watch_level', 'parameters') == 'all' and self.global_step % self.hparams.wandb_watch_log_freq == 0: # activation logging
+                hook_handles = []
+                hook_function = self.wandb_activation_hook(run=self.logger, step=self.global_step)
+                for module in self.model.modules():
+                    if any(param.requires_grad for param in module.parameters(recurse=False)): # only do for unfrozen params that are training
+                        handle = module.register_forward_hook(hook_function)
+                        hook_handles.append(handle)
 
+                try:
+                    eval_step_dict = self.eval_step(batch, "train")
+                finally:
+                    for handle in hook_handles:
+                        handle.remove()
+
+            else:
+                eval_step_dict = self.eval_step(batch, "train")
+        except (FloatingPointError, RuntimeError, ValueError) as exc:
+            if not self._nonfinite_exception(exc):
+                raise
+            nonfinite_reason = f"eval_step raised {type(exc).__name__}: {exc}"
+            eval_step_dict = {'loss': self._model_connected_zero_loss()}
+
+        loss = eval_step_dict['loss']
+        local_nonfinite = nonfinite_reason is not None
+        if isinstance(loss, torch.Tensor):
+            local_nonfinite = local_nonfinite or (not bool(torch.isfinite(loss.detach()).item()))
+        elif isinstance(loss, (int, float)):
+            local_nonfinite = local_nonfinite or (not torch.isfinite(torch.tensor(loss)).item())
+
+        if self._distributed_any_flag(local_nonfinite, loss.device if isinstance(loss, torch.Tensor) else self.device):
+            if nonfinite_reason is None:
+                nonfinite_reason = "non-finite loss on at least one rank"
+            self._warn_nonfinite_train_batch(nonfinite_reason)
+            safe_loss = self._model_connected_zero_loss(loss if isinstance(loss, torch.Tensor) else None)
+            eval_step_dict = {
+                key: (torch.nan_to_num(value.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+                      if isinstance(value, torch.Tensor) else value)
+                for key, value in eval_step_dict.items()
+            }
+            eval_step_dict['loss'] = safe_loss
+            eval_step_dict['nonfinite_batch_skipped'] = safe_loss.detach().new_tensor(1.0)
         else:
-            eval_step_dict = self.eval_step(batch, "train")
+            eval_step_dict['nonfinite_batch_skipped'] = loss.detach().new_tensor(0.0) if isinstance(loss, torch.Tensor) else torch.tensor(0.0, device=self.device)
         
         self.log_metrics(eval_step_dict, "train")
         return eval_step_dict['loss']   
@@ -679,17 +773,20 @@ class ModelTrainer(LightningModule):
     #         optimizer.update_epoch(self.current_epoch)
 
     def on_save_checkpoint(self, checkpoint):
-        # 保存 per-rank dataloader 位置 + RNG 状态到 checkpoint，用于精确续训
+        # 保存 per-rank dataloader 位置 + RNG 状态到 checkpoint，用于续训
         import torch.distributed as dist
         import random
 
-        # 1. 收集当前 rank 的 dataloader state（精确版，含 doc_buffer）
+        # 1. 收集当前 rank 的 dataloader state。优先使用 lightweight state，
+        # 避免把预取 buffer 序列化进每个 checkpoint。
         local_dl_state = None
         try:
             train_dl = self.trainer.train_dataloader
             if train_dl is not None:
                 dataset = train_dl.dataset
-                if hasattr(dataset, 'get_dataloader_state'):
+                if hasattr(dataset, 'lightweight_state_dict'):
+                    local_dl_state = dataset.lightweight_state_dict()
+                elif hasattr(dataset, 'get_dataloader_state'):
                     local_dl_state = dataset.get_dataloader_state()
                 elif hasattr(dataset, 'last_state_dict') and dataset.last_state_dict is not None:
                     local_dl_state = dataset.last_state_dict
@@ -703,11 +800,16 @@ class ModelTrainer(LightningModule):
             'python': random.getstate(),
         }
 
-        # 3. DDP: all_gather 收集所有 rank 的状态到 rank 0
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            all_dl_states = [None] * dist.get_world_size()
+        # 3. DDP: gather every rank's state into the checkpoint object. Lightning
+        # calls Trainer.save_checkpoint on all ranks; the strategy only writes
+        # rank0's checkpoint dict to disk, so rank0 must receive every shard here.
+        dist_ready = dist.is_available() and dist.is_initialized()
+        rank = dist.get_rank() if dist_ready else 0
+        world_size = dist.get_world_size() if dist_ready else 1
+        if world_size > 1:
+            all_dl_states = [None] * world_size
             dist.all_gather_object(all_dl_states, local_dl_state)
-            all_rng_states = [None] * dist.get_world_size()
+            all_rng_states = [None] * world_size
             dist.all_gather_object(all_rng_states, local_rng_state)
         else:
             all_dl_states = [local_dl_state]
@@ -718,7 +820,8 @@ class ModelTrainer(LightningModule):
         checkpoint['dataloader_state_dict'] = all_dl_states[0]  # 旧格式兼容
         checkpoint['rng_states_by_rank'] = all_rng_states
 
-        print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
+        if rank == 0:
+            print(f"[Checkpoint] 保存 per-rank dataloader state ({len(all_dl_states)} ranks) + RNG states")
 
     def on_load_checkpoint(self, checkpoint):
         # --- 修复 torch.compile _orig_mod 前缀不匹配 ---
@@ -851,6 +954,19 @@ class ModelTrainer(LightningModule):
                 token_tensor = supervised_tokens.detach().to(device=self.device, dtype=torch.float32)
             else:
                 token_tensor = torch.tensor(supervised_tokens, device=self.device, dtype=torch.float32)
+            if not bool(torch.isfinite(loss_tensor).item()):
+                if getattr(self.trainer, "is_global_zero", True):
+                    print(
+                        f"[ValidationGuard] non-finite validation loss at "
+                        f"global_step={self.global_step}, dataloader_idx={dataloader_idx}, "
+                        f"batch_idx={batch_idx}; excluding it from epoch loss",
+                        flush=True,
+                    )
+                loss_tensor = torch.zeros_like(loss_tensor)
+                token_tensor = torch.zeros_like(token_tensor)
+                eval_step_dict = dict(eval_step_dict)
+                eval_step_dict['loss'] = loss_tensor
+                eval_step_dict['nonfinite_validation_batch'] = torch.ones((), device=self.device)
             if self._val_loss_sum is None:
                 self._val_loss_sum = torch.zeros((), device=self.device, dtype=torch.float32)
                 self._val_loss_tokens = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -1026,7 +1142,7 @@ class ModelTrainer(LightningModule):
                 for k, v in means.items():
                     self._cache_valid_metric(f'{k}_{src}', v)
                     if k == 'loss':
-                        self.log(f"valid_loss_{src}", v, prog_bar=False, sync_dist=False)
+                        self.log(f"valid_loss_{src}", v, prog_bar=False, sync_dist=True)
 
             if mixed:
                 self.log_metrics(mixed, "valid")
@@ -1046,7 +1162,19 @@ class ModelTrainer(LightningModule):
         self._cache_valid_metric('bpb', epoch_bpb)
         self._cache_valid_metric('supervised_tokens', self._val_supervised_tokens)
         self._cache_valid_metric('empty_supervision_batch', self._val_empty_supervision_batches)
-        self.log("valid_loss", epoch_loss, prog_bar=True, sync_dist=False)
+        self.log("valid_loss", epoch_loss, prog_bar=True, sync_dist=True)
+
+        if getattr(self.trainer, "is_global_zero", True):
+            valid_summary = (
+                f"[Validation] global_step={self.global_step} | "
+                f"valid_loss: {epoch_loss.detach().item():.6f} | "
+                f"valid_bpb: {epoch_bpb:.6f}"
+            )
+            valid_summary += (
+                f" | valid_supervised_tokens: {self._val_supervised_tokens} | "
+                f"valid_empty_supervision_batch: {self._val_empty_supervision_batches}"
+            )
+            print(valid_summary, flush=True)
 
         # 直接上报正确的 epoch-level BPB 到 wandb，覆盖 Lightning 的算术平均值
         if self.logger is not None:
@@ -1497,7 +1625,7 @@ class ModelTrainer(LightningModule):
         sys.stdout.flush()
 
     def eval_step(self, batch, phase, token_bytes=None):
-        things_to_log = self.model.forward_loss_wrapper(batch, phase, token_bytes=token_bytes, global_step=self.global_step) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop
+        things_to_log = self.model.forward_loss_wrapper(batch, phase, token_bytes=token_bytes) # things_to_log will be a dict of various things being logged. it NEEDS TO contain the 'loss' key as this is used to backprop
 
         if len(self.metrics) > 0:
             raise NotImplementedError("Need to implement torchmetrics stuff, i.e. looping through self.torchmetrics_dict.keys(), checking to make sure 'phase in key', and updating based off predicted and labels i.e. self.torchmetrics_dict[key].update(logits, labels), more info https://lightning.ai/docs/torchmetrics/stable/pages/lightning.html (just be careful make sure to detach logits before using them and only update current phase). recommended to possibly return things_to_log and logits from forward_loss_wrapper to do this easily")
@@ -1577,9 +1705,70 @@ class ModelTrainer(LightningModule):
                 enable_wd_decay=enable_wd_decay
             )
         return lr_scheduler
+
+    def _split_tf_head_params(self):
+        tf_head_matrix_params = []
+        tf_head_scalar_params = []
+        if not bool(getattr(self.hparams, 'use_tf_head', False)):
+            return tf_head_matrix_params, tf_head_scalar_params
+        if not hasattr(self.model, 'tf_head') or self.model.tf_head is None:
+            return tf_head_matrix_params, tf_head_scalar_params
+
+        for _, param in self.model.tf_head.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.ndim >= 2:
+                tf_head_matrix_params.append(param)
+            else:
+                tf_head_scalar_params.append(param)
+        return tf_head_matrix_params, tf_head_scalar_params
+
+    def _validate_optimizer_param_coverage(self, optimizer):
+        named_trainable_params = [
+            (name, param) for name, param in self.model.named_parameters()
+            if param.requires_grad
+        ]
+        id_to_name = {id(param): name for name, param in named_trainable_params}
+        seen_param_groups = {}
+        duplicate_params = []
+
+        for group_idx, group in enumerate(optimizer.param_groups):
+            for param in group['params']:
+                if not getattr(param, 'requires_grad', False):
+                    continue
+                param_id = id(param)
+                if param_id in seen_param_groups:
+                    duplicate_params.append(
+                        (id_to_name.get(param_id, '<unnamed>'), seen_param_groups[param_id], group_idx)
+                    )
+                else:
+                    seen_param_groups[param_id] = group_idx
+
+        missing_params = [
+            (name, param.numel()) for name, param in named_trainable_params
+            if id(param) not in seen_param_groups
+        ]
+        if not missing_params and not duplicate_params:
+            return
+
+        messages = ["Optimizer parameter coverage check failed."]
+        if missing_params:
+            preview = ", ".join(f"{name}({numel:,})" for name, numel in missing_params[:20])
+            if len(missing_params) > 20:
+                preview += f", ... +{len(missing_params) - 20} more"
+            messages.append(f"Missing trainable params: {preview}")
+        if duplicate_params:
+            preview = ", ".join(
+                f"{name}(groups {first}->{second})" for name, first, second in duplicate_params[:20]
+            )
+            if len(duplicate_params) > 20:
+                preview += f", ... +{len(duplicate_params) - 20} more"
+            messages.append(f"Duplicate optimizer params: {preview}")
+        raise RuntimeError("\n".join(messages))
     
     def get_optimizer_scheduler_dict(self, optimizer_parameters):
         optimizer = self.get_optimizer(optimizer_parameters)
+        self._validate_optimizer_param_coverage(optimizer)
         lr_scheduler = self.get_lr_scheduler(optimizer)
         # lr_schedule will work each step
         return {
@@ -1591,6 +1780,11 @@ class ModelTrainer(LightningModule):
             }
         }
 
+    def _alpha_optimizer_params(self):
+        if isinstance(self.model.alpha, nn.ParameterList):
+            return [p for p in self.model.alpha.parameters() if p.requires_grad]
+        return [self.model.alpha] if self.model.alpha.requires_grad else []
+
     def _configure_muon_adamw_optimizer(self):
         """
         Muon + AdamW 混合优化器 (复用 nanochat/optim.py 的 MuonAdamW)
@@ -1599,8 +1793,10 @@ class ModelTrainer(LightningModule):
         - alpha: AdamW, 高 LR (mcmc_step_size_lr_multiplier × peak_lr), 无 weight decay [EBT 特有]
         - embeddings: AdamW, 独立绝对 LR (对齐 NanoChat embedding_lr), 无 weight decay
         - vocab_to_embed: AdamW, 独立绝对 LR (EBT 特有, 保守), 无 weight decay
-        - transformer 标量 (ndim < 2): AdamW, 独立绝对 LR, 无 weight decay
-        - transformer 矩阵 (ndim >= 2): Muon, 按 shape 分组 (Muon 要求同组参数 shape 相同)
+        - transformer / TF-head 标量 (ndim < 2): AdamW, 独立绝对 LR, 无 weight decay
+        - transformer / TF-head 矩阵 (ndim >= 2): Muon, 按 shape 分组 (Muon 要求同组参数 shape 相同)
+        - 可选: post_update_state_unembed 的 TF-head 矩阵可通过
+          --post_update_state_tf_head_adamw 放入 AdamW，避免大 vocab head 进入 Muon
 
         LR 设计原理:
         - embedding 不在 MCMC 循环内, 梯度行为与 NanoChat 一致, 可用高 LR
@@ -1655,10 +1851,7 @@ class ModelTrainer(LightningModule):
         alpha_lr = self.hparams.mcmc_step_size_lr_multiplier * self.hparams.peak_learning_rate
 
         # --- 参数收集 ---
-        if isinstance(self.model.alpha, nn.ParameterList):
-            alpha_params = list(self.model.alpha.parameters())
-        else:
-            alpha_params = [self.model.alpha]
+        alpha_params = self._alpha_optimizer_params()
         embedding_params = list(self.model.embeddings.parameters())
 
         vocab_to_embed_params = []
@@ -1668,17 +1861,35 @@ class ModelTrainer(LightningModule):
         # VE 参数单独收集，分配给 AdamW (不能放入 Muon)
         ve_embed_params = []
         ve_gate_params = []
+        energy_head_matrix_params = []
         transformer_matrix_params = []
         transformer_scalar_params = []
+        pre_update_hidden_unembed = getattr(self.hparams, 'tf_head_type', '') == 'pre_update_hidden_unembed'
         for name, param in self.model.transformer.named_parameters():
-            if 'value_embeds.' in name:
+            if not param.requires_grad:
+                continue
+            clean_name = name.replace('_orig_mod.', '')
+            if 'value_embeds.' in clean_name:
                 ve_embed_params.append(param)
-            elif 've_gate.' in name:
+            elif 've_gate.' in clean_name:
                 ve_gate_params.append(param)
+            elif pre_update_hidden_unembed and clean_name.startswith('final_layer.') and param.ndim >= 2:
+                # pre_update_hidden_unembed takes CE logits from the trunk hidden
+                # before the MCMC update. With the default inter-step detach, the
+                # scalar energy head can legitimately receive no CE gradient.
+                # Muon stacks every grad in a shape group and cannot handle None.
+                energy_head_matrix_params.append(param)
             elif param.ndim >= 2:
                 transformer_matrix_params.append(param)
             else:
                 transformer_scalar_params.append(param)
+        tf_head_matrix_params, tf_head_scalar_params = self._split_tf_head_params()
+        post_state_tf_head_adamw = (
+            getattr(self.hparams, 'tf_head_type', '') == 'post_update_state_unembed'
+            and bool(getattr(self.hparams, 'post_update_state_tf_head_adamw', False))
+        )
+        tf_head_matrix_adamw_params = tf_head_matrix_params if post_state_tf_head_adamw else []
+        tf_head_matrix_muon_params = [] if post_state_tf_head_adamw else tf_head_matrix_params
 
         # --- 构建 param_groups ---
         param_groups = []
@@ -1699,9 +1910,10 @@ class ModelTrainer(LightningModule):
                 kind='adamw', params=vocab_to_embed_params,
                 lr=vocab_to_embed_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
-        if transformer_scalar_params:
+        scalar_params = transformer_scalar_params + tf_head_scalar_params
+        if scalar_params:
             param_groups.append(dict(
-                kind='adamw', params=transformer_scalar_params,
+                kind='adamw', params=scalar_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
         # VE embedding 参数: AdamW, 使用 embedding_lr (与 NanoChat 一致)
@@ -1716,10 +1928,21 @@ class ModelTrainer(LightningModule):
                 kind='adamw', params=ve_gate_params,
                 lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
+        if energy_head_matrix_params:
+            param_groups.append(dict(
+                kind='adamw', params=energy_head_matrix_params,
+                lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if tf_head_matrix_adamw_params:
+            param_groups.append(dict(
+                kind='adamw', params=tf_head_matrix_adamw_params,
+                lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
 
         # Muon groups: 按 shape 分组 (Muon 要求同组参数 shape 相同用于 stack)
         shape_groups = {}
-        for p in transformer_matrix_params:
+        muon_matrix_params = transformer_matrix_params + tf_head_matrix_muon_params
+        for p in muon_matrix_params:
             shape_groups.setdefault(p.shape, []).append(p)
 
         for shape in sorted(shape_groups.keys()):
@@ -1812,6 +2035,7 @@ class ModelTrainer(LightningModule):
                     super().step()
 
         optimizer = PLMuonAdamW(param_groups)
+        self._validate_optimizer_param_coverage(optimizer)
 
         # 设置 initial_lr (PL LR scheduler 需要)
         for group in optimizer.param_groups:
@@ -1821,7 +2045,12 @@ class ModelTrainer(LightningModule):
         lr_scheduler = self.get_lr_scheduler(optimizer)
 
         # --- 日志 ---
-        num_muon_params = sum(p.numel() for p in transformer_matrix_params)
+        num_tf_head_matrix_params = sum(p.numel() for p in tf_head_matrix_params)
+        num_tf_head_scalar_params = sum(p.numel() for p in tf_head_scalar_params)
+        num_tf_head_params = num_tf_head_matrix_params + num_tf_head_scalar_params
+        num_tf_head_matrix_muon_params = sum(p.numel() for p in tf_head_matrix_muon_params)
+        num_tf_head_matrix_adamw_params = sum(p.numel() for p in tf_head_matrix_adamw_params)
+        num_muon_params = sum(p.numel() for p in muon_matrix_params)
         num_ve_params = (
             sum(p.numel() for p in ve_embed_params) +
             sum(p.numel() for p in ve_gate_params)
@@ -1831,15 +2060,31 @@ class ModelTrainer(LightningModule):
             sum(p.numel() for p in embedding_params) +
             sum(p.numel() for p in vocab_to_embed_params) +
             sum(p.numel() for p in transformer_scalar_params) +
-            num_ve_params
+            num_tf_head_scalar_params +
+            num_ve_params +
+            sum(p.numel() for p in energy_head_matrix_params)
         )
+        total_optimized_params = num_muon_params + num_adamw_params
         print(f"=" * 80)
         print(f"[Muon+AdamW] 混合优化器已启用:")
         print(f"  Muon groups: {len(shape_groups)} (按 shape 分组)")
-        print(f"  Muon params: {num_muon_params:,} ({num_muon_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
-        print(f"  AdamW params: {num_adamw_params:,} ({num_adamw_params/(num_muon_params+num_adamw_params)*100:.1f}%)")
+        print(f"  Muon params: {num_muon_params:,} ({num_muon_params/total_optimized_params*100:.1f}%)")
+        print(f"  AdamW params: {num_adamw_params:,} ({num_adamw_params/total_optimized_params*100:.1f}%)")
+        if num_tf_head_params > 0:
+            print(
+                f"  TF head params: {num_tf_head_params:,} "
+                f"(matrix/Muon: {num_tf_head_matrix_muon_params:,}, "
+                f"matrix/AdamW: {num_tf_head_matrix_adamw_params:,}, "
+                f"scalar/AdamW: {num_tf_head_scalar_params:,})"
+            )
         if num_ve_params > 0:
             print(f"  VE params: {num_ve_params:,} (AdamW, embedding_lr)")
+        if energy_head_matrix_params:
+            print(
+                "  Energy final-layer matrix params: "
+                f"{sum(p.numel() for p in energy_head_matrix_params):,} "
+                "(AdamW for pre_update_hidden_unembed)"
+            )
         print(f"  Muon LR: {muon_lr}, momentum: {muon_momentum}, ns_steps: {muon_ns_steps}, beta2: {muon_beta2}")
         print(f"  Alpha LR: {alpha_lr} (AdamW) [EBT 特有]")
         print(f"  Embedding LR: {embedding_lr} (AdamW)")
@@ -1873,7 +2118,7 @@ class ModelTrainer(LightningModule):
 
             if use_layered_lr:
                 # 分层参数组 (参考 NanoChat base_train.py)
-                alpha_param = [self.model.alpha]
+                alpha_param = self._alpha_optimizer_params()
                 embedding_params = list(self.model.embeddings.parameters())
 
                 # vocab_to_embed 参数 (类似 unembedding)
@@ -1889,6 +2134,7 @@ class ModelTrainer(LightningModule):
                         transformer_matrix_params.append(param)
                     else:  # 标量/向量参数 (biases, layer norms, etc.)
                         transformer_scalar_params.append(param)
+                tf_head_matrix_params, tf_head_scalar_params = self._split_tf_head_params()
 
                 # 学习率倍数 (可通过命令行参数覆盖)
                 embedding_lr_mult = getattr(self.hparams, 'embedding_lr_mult', 0.3)
@@ -1908,10 +2154,10 @@ class ModelTrainer(LightningModule):
                     {'params': vocab_to_embed_params, 'weight_decay': 0.0,
                      'lr': self.hparams.peak_learning_rate * vocab_to_embed_lr_mult},
                     # Transformer 矩阵: 主学习率
-                    {'params': transformer_matrix_params, 'weight_decay': self.hparams.weight_decay,
+                    {'params': transformer_matrix_params + tf_head_matrix_params, 'weight_decay': self.hparams.weight_decay,
                      'lr': self.hparams.peak_learning_rate},
                     # Transformer 标量: 较高学习率，无 weight decay
-                    {'params': transformer_scalar_params, 'weight_decay': 0.0,
+                    {'params': transformer_scalar_params + tf_head_scalar_params, 'weight_decay': 0.0,
                      'lr': self.hparams.peak_learning_rate * scalar_lr_mult},
                 ]
 
@@ -1924,16 +2170,25 @@ class ModelTrainer(LightningModule):
                 print(f"  - vocab_to_embed LR: {self.hparams.peak_learning_rate * vocab_to_embed_lr_mult}")
                 print(f"  - Transformer Matrix LR: {self.hparams.peak_learning_rate}")
                 print(f"  - Transformer Scalar LR: {self.hparams.peak_learning_rate * scalar_lr_mult}")
+                if tf_head_matrix_params or tf_head_scalar_params:
+                    print(
+                        f"  - TF head params: "
+                        f"{sum(p.numel() for p in tf_head_matrix_params) + sum(p.numel() for p in tf_head_scalar_params):,}"
+                    )
             else:
                 # 原始实现
-                alpha_param = self.model.alpha
+                alpha_param = self._alpha_optimizer_params()
                 other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha'])]
                 assert len(other_params) > 1, "Could not gather model params correctly please investigate"
 
-                optimizer_parameters = [
-                    {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},
+                optimizer_parameters = []
+                if alpha_param:
+                    optimizer_parameters.append(
+                        {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate}
+                    )
+                optimizer_parameters.append(
                     {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate}
-                ]
+                )
 
             return self.get_optimizer_scheduler_dict(optimizer_parameters)
             
@@ -1950,16 +2205,17 @@ class ModelTrainer(LightningModule):
         
     def configure_optimizers_vid(self):
         if self.hparams.model_name == "ebt":
-            alpha_param = self.model.alpha
+            alpha_param = self._alpha_optimizer_params()
             encoder_params = list(self.model.image_encoder.parameters())
             other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha', 'image_encoder'])]
             assert len(other_params) > 1, "Could not gather model params correctly please investigate"
             
             optimizer_parameters = [
-                {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},  # No weight decay for alpha
                 {'params': encoder_params, 'weight_decay': 0.0, 'lr': 0.0},
                 {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate}  # Weight decay for other parameters
             ]
+            if alpha_param:
+                optimizer_parameters.insert(0, {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate})  # No weight decay for alpha
             return self.get_optimizer_scheduler_dict(optimizer_parameters)
             
         elif self.hparams.model_name == "baseline_transformer":
@@ -1977,14 +2233,15 @@ class ModelTrainer(LightningModule):
         
     def configure_optimizers_img(self):
         if self.hparams.model_name == "ebt":
-            alpha_param = self.model.alpha
+            alpha_param = self._alpha_optimizer_params()
             other_params = [param for name, param in self.model.named_parameters() if not any(keyword in name for keyword in ['alpha', 'image_encoder', 'text_encoder'])]
             assert len(other_params) > 1, "Could not gather model params correctly please investigate"
             
             optimizer_parameters = [
-                {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate},  # No weight decay for alpha
                 {'params': other_params, 'weight_decay': self.hparams.weight_decay, 'lr': self.hparams.peak_learning_rate} # Weight decay for other parameters
             ]
+            if alpha_param:
+                optimizer_parameters.insert(0, {'params': alpha_param, 'weight_decay': 0.0, 'lr': self.hparams.mcmc_step_size_lr_multiplier*self.hparams.peak_learning_rate})  # No weight decay for alpha
             
             # if self.hparams.image_task == "t2i": # do this bc other models wont have these 'sub' models
             #     image_encoder_params = list(self.model.image_encoder.parameters())
@@ -2125,6 +2382,9 @@ class ModelTrainer(LightningModule):
     def  train_dataloader(self):
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
+        base_train_dataset = getattr(self.hparams, 'base_train_dataset', 'fineweb')
+        base_train_data_dir = getattr(self.hparams, 'base_train_data_dir', '')
+        base_train_data_dir = base_train_data_dir or None
 
         # 从 checkpoint 恢复的 dataloader 位置（只用一次）
         resume_state = getattr(self, '_dataloader_resume_state', None)
@@ -2185,6 +2445,8 @@ class ModelTrainer(LightningModule):
                 split="train",
                 device=self.device,
                 resume_state_dict=resume_state,
+                base_train_dataset=base_train_dataset,
+                base_train_data_dir=base_train_data_dir,
             )
         return train_dataloader
 
@@ -2198,6 +2460,9 @@ class ModelTrainer(LightningModule):
 
         # Use tokenizer_obj for dataloader
         tokenizer = self.hparams.tokenizer_obj if hasattr(self.hparams, 'tokenizer_obj') else self.hparams.tokenizer
+        base_train_dataset = getattr(self.hparams, 'base_train_dataset', 'fineweb')
+        base_train_data_dir = getattr(self.hparams, 'base_train_data_dir', '')
+        base_train_data_dir = base_train_data_dir or None
 
         if getattr(self.hparams, 'dataset_name', 'nanochat') == 'nanochat_sft':
             _sft_trainer_debug(
@@ -2257,6 +2522,8 @@ class ModelTrainer(LightningModule):
                 split="val",
                 device=self.device,
                 resume_state_dict=None,
+                base_train_dataset=base_train_dataset,
+                base_train_data_dir=base_train_data_dir,
             )
 
         return val_dataloader

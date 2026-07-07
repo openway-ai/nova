@@ -17,22 +17,67 @@ from multiprocessing import Pool
 from nanochat.common import get_base_dir
 
 # -----------------------------------------------------------------------------
-# The specifics of the current pretraining dataset
+# The specifics of the current pretraining datasets
 
 # The URL on the internet where the data is hosted and downloaded from on demand
 BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main"
 MAX_SHARD = 1822 # the last datashard is shard_01822.parquet
 index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
 base_dir = get_base_dir()
-DATA_DIR = os.path.join(base_dir, "base_data")
+VALID_BASE_TRAIN_DATASETS = ("fineweb", "climbmix", "dclm")
+DEFAULT_BASE_TRAIN_DATASET = "fineweb"
+
+
+def normalize_base_train_dataset(dataset_name=None):
+    """Return a validated base pretraining dataset name."""
+    dataset_name = (
+        dataset_name
+        or os.environ.get("BASE_TRAIN_DATASET")
+        or os.environ.get("NANOCHAT_BASE_TRAIN_DATASET")
+        or DEFAULT_BASE_TRAIN_DATASET
+    )
+    dataset_name = str(dataset_name).strip().lower()
+    if dataset_name not in VALID_BASE_TRAIN_DATASETS:
+        valid = ", ".join(VALID_BASE_TRAIN_DATASETS)
+        raise ValueError(f"Unknown base_train_dataset={dataset_name!r}; expected one of: {valid}")
+    return dataset_name
+
+
+def get_dataset_dir(dataset_name=None, data_dir=None):
+    """
+    Return the local parquet directory for a base pretraining dataset.
+
+    The preferred layout is:
+      $NANOCHAT_BASE_DIR/fineweb/
+      $NANOCHAT_BASE_DIR/climbmix/
+      $NANOCHAT_BASE_DIR/dclm/
+
+    For backward compatibility, FineWeb also falls back to the old NanoChat
+    $NANOCHAT_BASE_DIR/base_data/ directory when $NANOCHAT_BASE_DIR/fineweb/
+    does not exist.
+    """
+    if data_dir:
+        return os.path.abspath(data_dir)
+
+    dataset_name = normalize_base_train_dataset(dataset_name)
+    dataset_dir = os.path.join(get_base_dir(), dataset_name)
+    legacy_fineweb_dir = os.path.join(get_base_dir(), "base_data")
+    if dataset_name == "fineweb" and not os.path.isdir(dataset_dir) and os.path.isdir(legacy_fineweb_dir):
+        return legacy_fineweb_dir
+    return dataset_dir
+
+
+DATA_DIR = get_dataset_dir(DEFAULT_BASE_TRAIN_DATASET)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
 
-def list_parquet_files(data_dir=None):
+def list_parquet_files(data_dir=None, dataset_name=None):
     """ Looks into a data dir and returns full paths to all parquet files. """
-    data_dir = DATA_DIR if data_dir is None else data_dir
+    data_dir = get_dataset_dir(dataset_name=dataset_name, data_dir=data_dir)
+    if not os.path.isdir(data_dir):
+        return []
     parquet_files = sorted([
         f for f in os.listdir(data_dir)
         if f.endswith('.parquet') and not f.endswith('.tmp')
@@ -40,7 +85,7 @@ def list_parquet_files(data_dir=None):
     parquet_paths = [os.path.join(data_dir, f) for f in parquet_files]
     return parquet_paths
 
-def parquets_iter_batched(split, start=0, step=1):
+def parquets_iter_batched(split, start=0, step=1, dataset_name=None, data_dir=None):
     """
     Iterate through the dataset, in batches of underlying row_groups for efficiency.
     - split can be "train" or "val". the last parquet file will be val.
@@ -52,7 +97,7 @@ def parquets_iter_batched(split, start=0, step=1):
     This split is NOT configurable!
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
-    parquet_paths = list_parquet_files()
+    parquet_paths = list_parquet_files(data_dir=data_dir, dataset_name=dataset_name)
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
     for filepath in parquet_paths:
         pf = pq.ParquetFile(filepath)

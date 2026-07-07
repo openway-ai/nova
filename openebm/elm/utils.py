@@ -115,6 +115,7 @@ model_sizes = { # small -> xl same as mamba https://arxiv.org/pdf/2312.00752; al
         "embedding_dim": 2048,
     },
 
+    "d24": nanochat_depth_scaling(24),
     "d26": nanochat_depth_scaling(26),
 }
 
